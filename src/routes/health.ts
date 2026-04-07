@@ -6,6 +6,10 @@ const healthRoutes: FastifyPluginAsync = async (fastify) => {
     return reply.send({ status: 'ok' });
   });
 
+  fastify.get('/healthz', async (_req, reply) => {
+    return reply.send({ status: 'ok' });
+  });
+
   fastify.get('/ready', async (_req, reply) => {
     const ready = await isDbReady();
     if (!ready) {
