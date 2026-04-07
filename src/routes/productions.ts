@@ -110,7 +110,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       const updated = { ...doc, status: 'active' as const, updatedAt: new Date().toISOString() };
       await getDb().insert(updated);
 
-      const strom = new StromClient({ baseUrl: config.stromUrl });
+      const strom = new StromClient({ baseUrl: config.stromUrl, token: config.stromToken });
       const stromVersion = await strom.system.version()
         .then((info) => info.version)
         .catch(() => null);

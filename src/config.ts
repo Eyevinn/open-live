@@ -10,5 +10,6 @@ export const config = {
   couchdbName: process.env['COUCHDB_NAME'] ?? 'open-live',
   corsOrigin: process.env['CORS_ORIGIN'] ?? 'http://localhost:5173',
   stromUrl: process.env['STROM_URL'] ?? 'http://localhost:7000',
+  stromToken: process.env['STROM_TOKEN'] ?? undefined,
   logLevel: process.env['LOG_LEVEL'] ?? 'info',
 } as const;
