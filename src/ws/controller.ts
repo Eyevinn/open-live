@@ -64,7 +64,7 @@ async function handleMessage(
       break;
     }
     case 'GO_LIVE': {
-      const updated: ProductionDoc = { ...doc, status: 'on-air', updatedAt: new Date().toISOString() };
+      const updated: ProductionDoc = { ...doc, status: 'active', updatedAt: new Date().toISOString() };
       await db.insert(updated);
       broadcast(productionId, { type: 'ON_AIR', value: true });
       break;

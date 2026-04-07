@@ -18,7 +18,7 @@ const ProductionInput = z.object({
 
 const ProductionPatch = z.object({
   name: z.string().min(1).optional(),
-  status: z.enum(['idle', 'active', 'on-air']).optional(),
+  status: z.enum(['active', 'inactive']).optional(),
 });
 
 const SourcePatch = z.object({
@@ -44,7 +44,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       _id: `prod-${randomUUID()}`,
       type: 'production',
       name: body.name,
-      status: 'idle',
+      status: 'inactive',
       sources: (body.sources ?? []).map((s) => ({
         id: `src-${randomUUID()}`,
         name: s.name,
@@ -96,6 +96,30 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       const doc = await getDb().get(req.params.id);
       await getDb().destroy(doc._id, doc._rev!);
       return reply.status(204).send();
+    } catch {
+      return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+    }
+  });
+
+  // Activate a production
+  fastify.post<{ Params: { id: string } }>('/api/v1/productions/:id/activate', async (req, reply) => {
+    try {
+      const doc = await getDb().get(req.params.id);
+      const updated = { ...doc, status: 'active' as const, updatedAt: new Date().toISOString() };
+      await getDb().insert(updated);
+      return reply.send({ id: updated._id, name: updated.name, status: updated.status });
+    } catch {
+      return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+    }
+  });
+
+  // Deactivate a production
+  fastify.post<{ Params: { id: string } }>('/api/v1/productions/:id/deactivate', async (req, reply) => {
+    try {
+      const doc = await getDb().get(req.params.id);
+      const updated = { ...doc, status: 'inactive' as const, updatedAt: new Date().toISOString() };
+      await getDb().insert(updated);
+      return reply.send({ id: updated._id, name: updated.name, status: updated.status });
     } catch {
       return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
     }

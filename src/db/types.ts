@@ -42,7 +42,7 @@ export interface Tally {
   pvw: string | null;
 }
 
-export type ProductionStatus = 'idle' | 'active' | 'on-air';
+export type ProductionStatus = 'active' | 'inactive';
 
 export interface ProductionDoc {
   _id: string;

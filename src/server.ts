@@ -24,7 +24,7 @@ export async function buildServer() {
   // Add basic JSON body parsing (built-in to Fastify)
   fastify.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body, done) => {
     try {
-      done(null, JSON.parse(body as string));
+      done(null, body ? JSON.parse(body as string) : {});
     } catch (e) {
       done(e instanceof Error ? e : new Error(String(e)), undefined);
     }
