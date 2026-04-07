@@ -4,33 +4,20 @@ import { z } from 'zod';
 import { getTemplatesDb } from '../db/index.js';
 import type { StromFlowTemplate } from '../db/types.js';
 
-const FlowElementSchema = z.object({
-  id: z.string(),
-  element_type: z.string(),
-  properties: z.record(z.unknown()).optional(),
-  block_id: z.string().optional(),
-  x: z.number().optional(),
-  y: z.number().optional(),
-});
+// Flow content uses open-ended schemas to accommodate the full Strom block
+// shape (block_definition_id, position, computed_external_pads, etc.) as
+// well as Strom's "from":"id:pad" link shorthand from GET responses.
+const FlowElementSchema = z.record(z.unknown()).refine(
+  (v) => typeof v['id'] === 'string',
+  { message: 'element must have an id string' },
+);
 
-const FlowLinkSchema = z.object({
-  from_element: z.string(),
-  from_pad: z.string().optional(),
-  to_element: z.string(),
-  to_pad: z.string().optional(),
-});
+const FlowLinkSchema = z.record(z.unknown());
 
-const FlowBlockSchema = z.object({
-  id: z.string(),
-  name: z.string(),
-  category: z.string().optional(),
-  description: z.string().optional(),
-  elements: z.array(FlowElementSchema).optional(),
-  links: z.array(FlowLinkSchema).optional(),
-  inputs: z.array(z.string()).optional(),
-  outputs: z.array(z.string()).optional(),
-  properties: z.record(z.unknown()).optional(),
-});
+const FlowBlockSchema = z.record(z.unknown()).refine(
+  (v) => typeof v['id'] === 'string',
+  { message: 'block must have an id string' },
+);
 
 const TemplateInputSlotSchema = z.object({
   id: z.string().min(1),

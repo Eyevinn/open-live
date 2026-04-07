@@ -41,22 +41,26 @@ export async function activateStromFlow(
     const source = sourceMap.get(assignment.sourceId);
     if (!source) continue;
 
-    const block = flow.blocks.find((b) => b.id === slot.blockId);
+    const block = flow.blocks.find((b) => b['id'] === slot.blockId) as Record<string, unknown> | undefined;
     if (!block) continue;
 
-    if (!block.properties) block.properties = {};
-    block.properties[slot.addressProperty] = source.address;
+    if (!block['properties'] || typeof block['properties'] !== 'object') {
+      block['properties'] = {};
+    }
+    (block['properties'] as Record<string, unknown>)[slot.addressProperty] = source.address;
   }
 
-  // Create the flow in Strom
+  // Create the flow in Strom — pass the raw flow content through as-is
   const flowName = `${production.name}-${randomUUID().slice(0, 8)}`;
   const created = await strom.flows.create({
     name: flowName,
     description: `Production: ${production.name}`,
-    elements: flow.elements,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    elements: flow.elements as any,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     blocks: flow.blocks as any,
-    links: flow.links,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    links: flow.links as any,
   });
 
   const flowId = created.flow.id;

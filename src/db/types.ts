@@ -68,10 +68,16 @@ export interface StromFlowTemplate {
   type: 'template';
   name: string;
   description?: string;
+  /**
+   * Raw Strom flow JSON — stored and forwarded as-is.
+   * Using Record<string, unknown>[] to accommodate the full Strom block
+   * schema (block_definition_id, position, computed_external_pads, etc.)
+   * without fighting the type system.
+   */
   flow: {
-    elements: FlowElement[];
-    blocks: FlowBlock[];
-    links: FlowLink[];
+    elements: Record<string, unknown>[];
+    blocks: Record<string, unknown>[];
+    links: Record<string, unknown>[];
   };
   /** Defines which blocks are parametric source inputs */
   inputs: TemplateInputSlot[];
