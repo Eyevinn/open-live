@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { getDb } from '../db/index.js';
 import type { ProductionDoc, Source } from '../db/types.js';
 import { StromClient } from '../lib/strom.js';
+import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
 
 const SourceInput = z.object({
@@ -110,7 +111,8 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       const updated = { ...doc, status: 'active' as const, updatedAt: new Date().toISOString() };
       await getDb().insert(updated);
 
-      const strom = new StromClient({ baseUrl: config.stromUrl, token: config.stromToken });
+      const stromToken = await getStromToken(config.stromToken).catch(() => undefined);
+      const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
       const stromVersion = await strom.system.version()
         .then((info) => info.version)
         .catch(() => null);
