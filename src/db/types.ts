@@ -8,6 +8,20 @@ export interface Source {
   config: Record<string, unknown>;
 }
 
+export type SourceStatus = 'active' | 'inactive';
+
+export interface SourceDoc {
+  _id: string;
+  _rev?: string;
+  type: 'source';
+  name: string;
+  address: string;
+  status: SourceStatus;
+  liveCamera?: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export type PipelineStatus = 'stopped' | 'running';
 
 export interface Pipeline {

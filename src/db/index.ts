@@ -1,11 +1,15 @@
 import Nano from 'nano';
 import { config } from '../config.js';
-import type { ProductionDoc } from './types.js';
+import type { ProductionDoc, SourceDoc } from './types.js';
 
 let db: Nano.DocumentScope<ProductionDoc>;
 
 export function getDb(): Nano.DocumentScope<ProductionDoc> {
   return db;
+}
+
+export function getSourcesDb(): Nano.DocumentScope<SourceDoc> {
+  return db as unknown as Nano.DocumentScope<SourceDoc>;
 }
 
 export async function connectDb(): Promise<void> {
