@@ -26,6 +26,7 @@ Copy `.env.example` to `.env` and fill in the values:
 | `COUCHDB_URL` | Full CouchDB connection URL including credentials | `http://admin:password@localhost:5984` |
 | `COUCHDB_NAME` | CouchDB database name | `open-live` |
 | `CORS_ORIGIN` | Allowed CORS origin(s), comma-separated | `http://localhost:5173` |
+| `STROM_URL` | Base URL of the Strom pipeline engine | `http://localhost:7000` |
 | `LOG_LEVEL` | Fastify log level (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
 
 > **Never commit `.env`** — it is gitignored. Use `.env.example` as the reference.

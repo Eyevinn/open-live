@@ -3,6 +3,8 @@ import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
 import type { ProductionDoc, Source } from '../db/types.js';
+import { StromClient } from '../lib/strom.js';
+import { config } from '../config.js';
 
 const SourceInput = z.object({
   name: z.string().min(1),
@@ -107,7 +109,13 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       const doc = await getDb().get(req.params.id);
       const updated = { ...doc, status: 'active' as const, updatedAt: new Date().toISOString() };
       await getDb().insert(updated);
-      return reply.send({ id: updated._id, name: updated.name, status: updated.status });
+
+      const strom = new StromClient({ baseUrl: config.stromUrl });
+      const stromVersion = await strom.system.version()
+        .then((info) => info.version)
+        .catch(() => null);
+
+      return reply.send({ id: updated._id, name: updated.name, status: updated.status, stromVersion });
     } catch {
       return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
     }
