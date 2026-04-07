@@ -1,0 +1,27 @@
+{
+  "name": "open-live",
+  "version": "0.1.0",
+  "description": "Open Live — central orchestration API server",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.2",
+    "@fastify/websocket": "^11.0.2",
+    "fastify": "^5.3.2",
+    "fastify-type-provider-zod": "^4.0.2",
+    "nano": "^10.1.4",
+    "zod": "^3.24.3"
+  },
+  "devDependencies": {
+    "@types/nano": "^7.0.0",
+    "@types/node": "^22.15.3",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3"
+  }
+}

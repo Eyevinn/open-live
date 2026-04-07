@@ -1,0 +1,26 @@
+services:
+  couchdb:
+    image: couchdb:3
+    environment:
+      COUCHDB_USER: admin
+      COUCHDB_PASSWORD: password
+    ports:
+      - "5984:5984"
+    volumes:
+      - couchdb_data:/opt/couchdb/data
+
+  open-live:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+      COUCHDB_URL: http://admin:password@couchdb:5984
+      COUCHDB_NAME: open-live
+      CORS_ORIGIN: http://localhost:5173
+      LOG_LEVEL: info
+    depends_on:
+      - couchdb
+
+volumes:
+  couchdb_data:
