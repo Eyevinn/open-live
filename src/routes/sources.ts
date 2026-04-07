@@ -7,6 +7,7 @@ import type { SourceDoc } from '../db/types.js';
 const SourceInput = z.object({
   name: z.string().min(1),
   address: z.string(),
+  streamType: z.enum(['srt', 'whip']),
   status: z.enum(['active', 'inactive']).default('inactive'),
   liveCamera: z.boolean().optional(),
 });
@@ -14,6 +15,7 @@ const SourceInput = z.object({
 const SourcePatch = z.object({
   name: z.string().min(1).optional(),
   address: z.string().optional(),
+  streamType: z.enum(['srt', 'whip']).optional(),
   status: z.enum(['active', 'inactive']).optional(),
   liveCamera: z.boolean().optional(),
 });
@@ -40,6 +42,7 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       type: 'source',
       name: body.name,
       address: body.address,
+      streamType: body.streamType,
       status: body.status,
       liveCamera: body.liveCamera,
       createdAt: now,

@@ -5,6 +5,7 @@ import { config } from './config.js';
 import healthRoutes from './routes/health.js';
 import productionsRoutes from './routes/productions.js';
 import sourcesRoutes from './routes/sources.js';
+import templatesRoutes from './routes/templates.js';
 import pipelineRoutes from './routes/pipeline.js';
 import controllerWs from './ws/controller.js';
 
@@ -40,6 +41,7 @@ export async function buildServer() {
   await fastify.register(healthRoutes);
   await fastify.register(productionsRoutes);
   await fastify.register(sourcesRoutes);
+  await fastify.register(templatesRoutes);
   await fastify.register(pipelineRoutes);
   await fastify.register(controllerWs);
 

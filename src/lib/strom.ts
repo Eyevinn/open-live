@@ -146,6 +146,7 @@ export interface CreateFlowRequest {
   name: string
   description?: string
   elements?: FlowElement[]
+  blocks?: BlockDefinition[]
   links?: FlowLink[]
   clock_type?: string
 }

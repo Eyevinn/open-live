@@ -63,11 +63,31 @@ pnpm start
 | `GET` | `/ready` | Readiness check (requires CouchDB) |
 | `GET/POST` | `/api/v1/productions` | List / create productions |
 | `GET/PATCH/DELETE` | `/api/v1/productions/:id` | Get / update / delete a production |
-| `POST` | `/api/v1/productions/:id/activate` | Activate a production (also fetches Strom version) |
-| `POST` | `/api/v1/productions/:id/deactivate` | Deactivate a production |
+| `POST` | `/api/v1/productions/:id/activate` | Activate production — creates + starts Strom flow |
+| `POST` | `/api/v1/productions/:id/deactivate` | Deactivate production — stops + deletes Strom flow |
+| `POST` | `/api/v1/productions/:id/sources` | Assign a source to a mixer input |
+| `DELETE` | `/api/v1/productions/:id/sources/:mixerInput` | Remove a source assignment |
 | `GET/POST` | `/api/v1/sources` | List / create sources |
 | `GET/PATCH/DELETE` | `/api/v1/sources/:id` | Get / update / delete a source |
+| `GET/POST` | `/api/v1/templates` | List / create Strom flow templates |
+| `GET/PATCH/DELETE` | `/api/v1/templates/:id` | Get / update / delete a template |
 | `WS` | `/ws/productions/:id/controller` | WebSocket controller channel |
+
+### Source model
+
+Sources represent individual video/audio feeds. Each source has a `streamType` (`srt` or `whip`) and an `address` (SRT URI or WHIP endpoint URL).
+
+### Template model
+
+A template is a reusable Strom flow blueprint. It contains:
+- `flow` — the full Strom flow JSON (`elements[]`, `blocks[]`, `links[]`)
+- `inputs[]` — parametric input slots: `{ id, blockId, addressProperty }` — maps a logical input name to a block in the flow and the property that receives the source address
+
+### Activation flow
+
+1. A production is given a `templateId` and source assignments (`POST /api/v1/productions/:id/sources`)
+2. `POST /api/v1/productions/:id/activate` clones the template flow, patches each assigned source's address into the matching block, creates the flow in Strom, and starts it. The `stromFlowId` is stored on the production.
+3. `POST /api/v1/productions/:id/deactivate` stops and deletes the Strom flow and clears `stromFlowId`.
 
 ## OSC deployment
 
