@@ -1,6 +1,7 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import websocket from '@fastify/websocket';
+import { ZodError } from 'zod';
 import { config } from './config.js';
 import healthRoutes from './routes/health.js';
 import productionsRoutes from './routes/productions.js';
@@ -36,6 +37,9 @@ export async function buildServer() {
 
   // Error handler
   fastify.setErrorHandler((error: Error & { statusCode?: number }, _req, reply) => {
+    if (error instanceof ZodError) {
+      return reply.status(400).send({ error: 'Validation error', issues: error.issues, statusCode: 400 });
+    }
     const statusCode = error.statusCode ?? 500;
     fastify.log.error(error);
     reply.status(statusCode).send({ error: error.message, statusCode });
