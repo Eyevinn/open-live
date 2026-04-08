@@ -42,6 +42,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       sources: [],
       pipeline: { stromConfig: null, status: 'stopped' },
       graphics: [],
+      macros: [],
       tally: { pgm: null, pvw: null },
       createdAt: now,
       updatedAt: now,
@@ -108,14 +109,26 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         .catch(() => null);
 
       // Start Strom flow if a template is configured
+      let mixerBlockId: string | undefined;
       if (doc.templateId) {
         stromFlowId = await activateStromFlow(doc, strom);
+
+        // Resolve mixer block ID from template for DSK/transition operations
+        const tmpl = await getDb().get(doc.templateId).catch(() => null);
+        if (tmpl) {
+          const mixerBlock = (tmpl as unknown as { flow?: { blocks?: Array<Record<string, unknown>> } })
+            .flow?.blocks?.find((b) => b['category'] === 'mixer');
+          if (mixerBlock && typeof mixerBlock['id'] === 'string') {
+            mixerBlockId = mixerBlock['id'];
+          }
+        }
       }
 
       const updated: ProductionDoc = {
         ...doc,
         status: 'active',
         ...(stromFlowId !== undefined && { stromFlowId }),
+        ...(mixerBlockId !== undefined && { mixerBlockId }),
         updatedAt: new Date().toISOString(),
       };
       const response = await getDb().insert(updated);
