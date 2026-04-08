@@ -45,7 +45,8 @@ const DEFAULT_TEMPLATE: Omit<StromFlowTemplate, '_id' | '_rev'> = {
         block_definition_id: 'builtin.vision_mixer',
         name: 'Mixer',
         properties: {
-          input_0_alpha: 1.0,
+          compositor_preference: 'cpu',
+          input_0_alpha: 0.0,
           input_1_alpha: 0.0,
           input_2_alpha: 0.0,
           input_3_alpha: 0.0,
@@ -164,16 +165,16 @@ const DEFAULT_TEMPLATE: Omit<StromFlowTemplate, '_id' | '_rev'> = {
 };
 
 /**
- * Ensures the default template exists in CouchDB.
- * Called once at startup — idempotent.
+ * Ensures the default template is up to date in CouchDB.
+ * Always overwrites the existing template so deploys pick up seed changes.
  */
 export async function seedDefaultTemplate(): Promise<void> {
   const db = getTemplatesDb();
   try {
-    await db.get(DEFAULT_TEMPLATE_ID);
-    // Already exists — nothing to do
+    const existing = await db.get(DEFAULT_TEMPLATE_ID) as { _rev: string };
+    await db.insert({ ...DEFAULT_TEMPLATE, _rev: existing._rev } as never, DEFAULT_TEMPLATE_ID);
   } catch {
-    // Not found — insert it with the well-known ID
+    // Not found — insert fresh
     await db.insert(DEFAULT_TEMPLATE as never, DEFAULT_TEMPLATE_ID);
   }
 }
@@ -197,8 +198,8 @@ const DEV_TEMPLATE: Omit<StromFlowTemplate, '_id' | '_rev'> = {
     elements: [
       { id: 'e-dev-ts-1', element_type: 'videotestsrc', properties: { pattern: 'Pinwheel' }, position: [50, 100] },
       { id: 'e-dev-ts-2', element_type: 'videotestsrc', properties: { pattern: 'Colors' },   position: [50, 250] },
-      { id: 'e-dev-ts-3', element_type: 'videotestsrc', properties: { pattern: 'Ball' },     position: [50, 400] },
-      { id: 'e-dev-ts-4', element_type: 'videotestsrc', properties: { pattern: 'Snow' },     position: [50, 550] },
+      { id: 'e-dev-ts-3', element_type: 'videotestsrc', properties: { pattern: 'Pinwheel' }, position: [50, 400] },
+      { id: 'e-dev-ts-4', element_type: 'videotestsrc', properties: { pattern: 'Colors' },   position: [50, 550] },
     ],
     blocks: [
       {
@@ -220,7 +221,8 @@ const DEV_TEMPLATE: Omit<StromFlowTemplate, '_id' | '_rev'> = {
       {
         id: 'b-dev-mixer', block_definition_id: 'builtin.vision_mixer', name: 'Mixer',
         properties: {
-          input_0_alpha: 1.0, input_1_alpha: 0.0,
+          compositor_preference: 'cpu',
+          input_0_alpha: 0.0, input_1_alpha: 0.0,
           input_2_alpha: 0.0, input_3_alpha: 0.0,
           multiview_resolution: '640x360', pgm_resolution: '640x360',
         },

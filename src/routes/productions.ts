@@ -90,7 +90,7 @@ async function runActivationFlow(
       const tmpl = await getDb().get(doc.templateId).catch(() => null);
       if (tmpl) {
         const mixerBlock = (tmpl as unknown as { flow?: { blocks?: Array<Record<string, unknown>> } })
-          .flow?.blocks?.find((b) => b['category'] === 'mixer');
+          .flow?.blocks?.find((b) => (b['block_definition_id'] as string | undefined)?.includes('vision_mixer'));
         if (mixerBlock && typeof mixerBlock['id'] === 'string') {
           mixerBlockId = mixerBlock['id'];
         }
@@ -130,7 +130,7 @@ async function runActivationFlow(
             await deactivateStromFlow(stromFlowId, strom).catch(() => {});
             return;
           }
-          if (resp) whepEndpoint = resp.url;
+          if (resp?.endpoint) whepEndpoint = `${config.stromUrl}${resp.endpoint}`;
         }
 
         if (signal.aborted) {
