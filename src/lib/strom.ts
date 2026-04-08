@@ -82,10 +82,10 @@ export interface FlowElement {
 }
 
 export interface FlowLink {
-  from_element: string
-  from_pad?: string
-  to_element: string
-  to_pad?: string
+  /** Format: "element_id" or "element_id:pad_name" */
+  from: string
+  /** Format: "element_id" or "element_id:pad_name" */
+  to: string
 }
 
 export interface BlockDefinition {
@@ -124,14 +124,27 @@ export interface CreateBlockRequest {
 
 export type FlowState = 'idle' | 'playing' | 'paused'
 
+/**
+ * A block instance in a flow — references a block definition by ID and
+ * provides property values for it. This is the runtime shape stored in
+ * Flow.blocks, distinct from BlockDefinition (the catalog entry).
+ */
+export interface BlockInstance {
+  id: string
+  block_definition_id: string
+  name?: string | null
+  properties: Record<string, unknown>
+  position: { x: number; y: number }
+}
+
 export interface Flow {
   id: string
   name: string
   description?: string
-  state: FlowState
-  elements: FlowElement[]
-  links: FlowLink[]
-  clock_type?: string
+  running?: boolean
+  elements?: FlowElement[]
+  blocks?: BlockInstance[]
+  links?: FlowLink[]
 }
 
 export interface FlowResponse {
@@ -142,13 +155,13 @@ export interface FlowListResponse {
   flows: Flow[]
 }
 
+/**
+ * POST /api/flows only accepts name + description.
+ * To set blocks/elements/links, PUT /api/flows/{id} with the full Flow body.
+ */
 export interface CreateFlowRequest {
   name: string
   description?: string
-  elements?: FlowElement[]
-  blocks?: BlockDefinition[]
-  links?: FlowLink[]
-  clock_type?: string
 }
 
 export interface UpdateFlowPropertiesRequest {

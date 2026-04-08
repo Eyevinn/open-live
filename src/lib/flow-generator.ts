@@ -50,9 +50,18 @@ export async function activateStromFlow(
     (block['properties'] as Record<string, unknown>)[slot.addressProperty] = source.address;
   }
 
-  // Create the flow in Strom — pass the raw flow content through as-is
+  // Step 1: Create an empty flow (POST only accepts name + description).
   const flowName = `${production.name}-${randomUUID().slice(0, 8)}`;
   const created = await strom.flows.create({
+    name: flowName,
+    description: `Production: ${production.name}`,
+  });
+
+  const flowId = created.flow.id;
+
+  // Step 2: Write the full flow content via PUT.
+  await strom.flows.update(flowId, {
+    id: flowId,
     name: flowName,
     description: `Production: ${production.name}`,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -62,8 +71,6 @@ export async function activateStromFlow(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     links: flow.links as any,
   });
-
-  const flowId = created.flow.id;
 
   // Start the flow
   await strom.flows.start(flowId);
