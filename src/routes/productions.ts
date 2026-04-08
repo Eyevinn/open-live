@@ -123,11 +123,18 @@ async function runActivationFlow(
         let whepEndpoint: string | undefined;
         if (mixerBlockId) {
           const resp = await strom.mixer.multiviewEndpoint(stromFlowId, mixerBlockId).catch(() => null);
+          // Guard: deactivate may have fired while multiviewEndpoint() was in-flight.
+          // Without this check, updateProductionDoc would write status:'active' after
+          // deactivate has already written status:'inactive'.
+          if (signal.aborted) {
+            await deactivateStromFlow(stromFlowId, strom).catch(() => {});
+            return;
+          }
           if (resp) whepEndpoint = resp.url;
         }
 
         if (signal.aborted) {
-          await deactivateStromFlow(stromFlowId, strom).catch(() => undefined);
+          await deactivateStromFlow(stromFlowId, strom).catch(() => {});
           return;
         }
 

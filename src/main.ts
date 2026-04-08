@@ -3,12 +3,15 @@ import { connectDb, getDb } from './db/index.js';
 import { seedDefaultTemplate } from './db/seed.js';
 import { buildServer } from './server.js';
 import type { ProductionDoc } from './db/types.js';
+import type { FastifyBaseLogger } from 'fastify';
 
 /**
  * Startup recovery: reset any productions that were left in 'activating'
  * state (e.g. from a crash mid-polling loop) back to 'inactive'.
  */
-async function recoverStaleActivations(): Promise<void> {
+async function recoverStaleActivations(
+  log: FastifyBaseLogger,
+): Promise<void> {
   const db = getDb();
   const result = await db.find({ selector: { type: 'production', status: 'activating' } });
   for (const doc of result.docs as ProductionDoc[]) {
@@ -22,9 +25,9 @@ async function recoverStaleActivations(): Promise<void> {
         updatedAt: new Date().toISOString(),
       };
       await db.insert(updated);
-      console.info(`[startup] Reset stale 'activating' production ${doc._id} to 'inactive'`);
+      log.info({ productionId: doc._id }, "[startup] Reset stale 'activating' production to 'inactive'");
     } catch (err) {
-      console.error(`[startup] Failed to reset production ${doc._id}:`, err);
+      log.error({ err, productionId: doc._id }, '[startup] Failed to reset production to inactive');
     }
   }
 }
@@ -32,9 +35,9 @@ async function recoverStaleActivations(): Promise<void> {
 async function main() {
   await connectDb();
   await seedDefaultTemplate();
-  await recoverStaleActivations();
 
   const app = await buildServer();
+  await recoverStaleActivations(app.log);
   await app.listen({ port: config.port, host: '0.0.0.0' });
 }
 
