@@ -121,48 +121,51 @@ async function handleMessage(
       for (let i = 0; i < macro.actions.length; i++) {
         const action = macro.actions[i];
         try {
+          // Re-fetch the document before each write to get the current _rev and
+          // avoid CouchDB 409 conflicts or overwriting changes from prior actions.
+          const currentDoc = await getDb().get(productionId);
           if (action.type === 'CUT' && action.sourceId) {
             const tally = getTally(productionId);
             const newTally = { pgm: action.sourceId, pvw: tally.pgm };
             setTally(productionId, newTally);
-            const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
+            const updated: ProductionDoc = { ...currentDoc, tally: newTally, updatedAt: new Date().toISOString() };
             await getDb().insert(updated);
             broadcast(productionId, { type: 'TALLY', ...newTally });
           } else if (action.type === 'TRANSITION' && action.sourceId) {
             const tally = getTally(productionId);
             const newTally = { pgm: action.sourceId, pvw: tally.pgm };
             setTally(productionId, newTally);
-            const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
+            const updated: ProductionDoc = { ...currentDoc, tally: newTally, updatedAt: new Date().toISOString() };
             await getDb().insert(updated);
             broadcast(productionId, { type: 'TALLY', ...newTally, transitionType: action.transitionType, durationMs: action.durationMs });
           } else if (action.type === 'TAKE') {
             const tally = getTally(productionId);
             const newTally = { pgm: tally.pvw, pvw: tally.pgm };
             setTally(productionId, newTally);
-            const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
+            const updated: ProductionDoc = { ...currentDoc, tally: newTally, updatedAt: new Date().toISOString() };
             await getDb().insert(updated);
             broadcast(productionId, { type: 'TALLY', ...newTally });
           } else if (action.type === 'GRAPHIC_ON' && action.overlayId) {
             const updated: ProductionDoc = {
-              ...doc,
-              graphics: doc.graphics.map((g) => g.id === action.overlayId ? { ...g, active: true } : g),
+              ...currentDoc,
+              graphics: currentDoc.graphics.map((g) => g.id === action.overlayId ? { ...g, active: true } : g),
               updatedAt: new Date().toISOString(),
             };
             await getDb().insert(updated);
             broadcast(productionId, { type: 'GRAPHIC', overlayId: action.overlayId, active: true });
           } else if (action.type === 'GRAPHIC_OFF' && action.overlayId) {
             const updated: ProductionDoc = {
-              ...doc,
-              graphics: doc.graphics.map((g) => g.id === action.overlayId ? { ...g, active: false } : g),
+              ...currentDoc,
+              graphics: currentDoc.graphics.map((g) => g.id === action.overlayId ? { ...g, active: false } : g),
               updatedAt: new Date().toISOString(),
             };
             await getDb().insert(updated);
             broadcast(productionId, { type: 'GRAPHIC', overlayId: action.overlayId, active: false });
           } else if (action.type === 'DSK_TOGGLE') {
-            if (!doc.stromFlowId || !doc.mixerBlockId) {
+            if (!currentDoc.stromFlowId || !currentDoc.mixerBlockId) {
               throw new Error('Pipeline not active or mixer block not resolved');
             }
-            await strom.mixer.toggleDsk(doc.stromFlowId, doc.mixerBlockId, {
+            await strom.mixer.toggleDsk(currentDoc.stromFlowId, currentDoc.mixerBlockId, {
               layer: action.layer ?? 0,
               visible: action.visible,
             });
