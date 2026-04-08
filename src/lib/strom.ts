@@ -502,21 +502,14 @@ export class StromClient {
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const bodyStr = body !== undefined ? JSON.stringify(body) : undefined
-    // DEBUG: log outgoing Strom requests to help diagnose 422s — remove after fix confirmed
-    console.log('[strom-debug]', method, path, bodyStr ? bodyStr.slice(0, 500) : '(no body)')
     const res = await fetch(`${this.baseUrl}${path}`, {
       method,
       headers: this.headers(),
-      body: bodyStr,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
     })
     if (res.status === 204) return undefined as T
     const json = await res.json()
-    if (!res.ok) {
-      // DEBUG: log full error response body
-      console.log('[strom-debug] error response:', JSON.stringify(json))
-      throw new StromClientError(res.status, (json as StromError).error ?? res.statusText)
-    }
+    if (!res.ok) throw new StromClientError(res.status, (json as StromError).error ?? res.statusText)
     return json as T
   }
 
