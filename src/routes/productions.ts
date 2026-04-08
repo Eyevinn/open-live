@@ -78,7 +78,7 @@ async function runActivationFlow(
     // Load the current production doc
     const doc = await getDb().get(productionId);
 
-    const stromToken = await getStromToken(config.stromToken).catch(() => undefined);
+    const stromToken = await getStromToken(config.stromToken).catch((err) => { log.error({ err }, "SAT exchange failed — proceeding without auth"); return undefined; });
     const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
 
     // Step 1: Start the Strom flow
@@ -163,7 +163,7 @@ async function runActivationFlow(
 
     // Best-effort flow cleanup
     if (stromFlowId) {
-      const stromToken = await getStromToken(config.stromToken).catch(() => undefined);
+      const stromToken = await getStromToken(config.stromToken).catch((err) => { log.error({ err }, "SAT exchange failed — proceeding without auth"); return undefined; });
       const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
       await deactivateStromFlow(stromFlowId, strom).catch(() => undefined);
     }
@@ -333,7 +333,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       }
 
       if (doc.stromFlowId) {
-        const stromToken = await getStromToken(config.stromToken).catch(() => undefined);
+        const stromToken = await getStromToken(config.stromToken).catch((err) => { req.log.error({ err }, "SAT exchange failed — proceeding without auth"); return undefined; });
         const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
         await deactivateStromFlow(doc.stromFlowId, strom);
       }
