@@ -78,7 +78,7 @@ async function runActivationFlow(
     // Load the current production doc
     const doc = await getDb().get(productionId);
 
-    const stromToken = await getStromToken(config.stromToken).catch((err) => { log.error({ err }, "SAT exchange failed — proceeding without auth"); return undefined; });
+    const stromToken = await getStromToken(config.stromToken);
     const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
 
     // Step 1: Start the Strom flow
