@@ -160,14 +160,8 @@ export interface FlowListResponse {
  * The deployed Strom version deserialises this as the full Flow struct,
  * so blocks/elements/links can be included on creation.
  */
-export interface CreateFlowRequest {
-  id: string
-  name: string
-  description?: string
-  elements?: FlowElement[]
-  blocks?: BlockInstance[]
-  links?: FlowLink[]
-}
+// POST /api/flows takes the full Flow struct (id required, overwritten server-side)
+export type CreateFlowRequest = Flow
 
 export interface UpdateFlowPropertiesRequest {
   description?: string
@@ -317,7 +311,7 @@ export interface DynamicPadsResponse {
 }
 
 export interface MultiviewEndpointResponse {
-  url: string
+  endpoint: string
 }
 
 // --- Probes ---
@@ -524,8 +518,11 @@ export class StromClient {
       )
     }
 
-    const json = await res.json()
-    if (!res.ok) throw new StromClientError(res.status, (json as StromError).error ?? res.statusText)
+    const json = await res.json() as (StromError & { details?: string })
+    if (!res.ok) {
+      const msg = [json.error, json.details].filter(Boolean).join(' — ')
+      throw new StromClientError(res.status, msg || res.statusText)
+    }
     return json as T
   }
 
