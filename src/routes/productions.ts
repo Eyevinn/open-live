@@ -118,7 +118,7 @@ async function runActivationFlow(
 
       const { flow } = await strom.flows.get(stromFlowId);
 
-      if (flow.state === 'playing') {
+      if (flow.running === true) {
         // Step 4: Retrieve WHEP multiview endpoint
         let whepEndpoint: string | undefined;
         if (mixerBlockId) {
