@@ -50,12 +50,11 @@ export async function activateStromFlow(
     (block['properties'] as Record<string, unknown>)[slot.addressProperty] = source.address;
   }
 
-  // Create the flow — the deployed Strom version requires a client-supplied UUID
-  // and accepts blocks/elements/links in the same POST body.
-  const flowId = randomUUID();
-  const flowName = `${production.name}-${flowId.slice(0, 8)}`;
+  // Create the flow — Strom ignores the client-supplied id and assigns its own UUID.
+  // Always use created.flow.id (the server-assigned ID) for all subsequent calls.
+  const flowName = `${production.name}-${randomUUID().slice(0, 8)}`;
   const created = await strom.flows.create({
-    id: flowId,
+    id: randomUUID(), // Strom ignores this; included because the deployed version requires the field
     name: flowName,
     description: `Production: ${production.name}`,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -65,6 +64,14 @@ export async function activateStromFlow(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     links: flow.links as any,
   });
+
+  const flowId = created.flow.id; // Use the server-assigned ID, not what we sent
+
+  // DEBUG: inspect created flow before starting
+  const createdFlow = await strom.flows.get(flowId);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  console.log('[flow-debug] created flow blocks:', JSON.stringify(createdFlow.flow.blocks?.map((b: any) => ({ id: b['id'], def: b['block_definition_id'] })), null, 2));
+  console.log('[flow-debug] created flow links:', JSON.stringify(createdFlow.flow.links, null, 2));
 
   // Start the flow
   await strom.flows.start(flowId);

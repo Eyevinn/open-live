@@ -509,7 +509,11 @@ export class StromClient {
     })
     if (res.status === 204) return undefined as T
     const json = await res.json()
-    if (!res.ok) throw new StromClientError(res.status, (json as StromError).error ?? res.statusText)
+    if (!res.ok) {
+      // DEBUG: log full Strom error body to diagnose start failures
+      console.log('[strom-debug] error', method, path, 'status', res.status, JSON.stringify(json))
+      throw new StromClientError(res.status, (json as StromError).error ?? res.statusText)
+    }
     return json as T
   }
 
