@@ -147,7 +147,7 @@ export interface Tally {
   pvw: string | null;
 }
 
-export type ProductionStatus = 'active' | 'inactive';
+export type ProductionStatus = 'active' | 'inactive' | 'activating';
 
 export interface ProductionDoc {
   _id: string;
@@ -161,6 +161,8 @@ export interface ProductionDoc {
   templateId?: string;
   /** ID of the running Strom flow (set on activate, cleared on deactivate) */
   stromFlowId?: string;
+  /** WHEP multiview endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */
+  whepEndpoint?: string;
   pipeline: Pipeline;
   graphics: GraphicOverlay[];
   macros: Macro[];

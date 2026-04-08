@@ -3,10 +3,188 @@ import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
 import type { ProductionDoc, ProductionSourceAssignment } from '../db/types.js';
-import { StromClient } from '../lib/strom.js';
+import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js';
 import { config } from '../config.js';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const FLOW_POLL_INTERVAL_MS = 500;
+const FLOW_POLL_TIMEOUT_MS = 30_000;
+const MAX_DB_WRITE_RETRIES = 3;
+
+// ---------------------------------------------------------------------------
+// AbortController map — keyed by production ID, allows deactivate to cancel
+// an in-progress activation polling loop.
+// ---------------------------------------------------------------------------
+
+const activationAbortControllers = new Map<string, AbortController>();
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Write a partial update to ProductionDoc with retry-on-409.
+ * Re-reads the document before each retry to get the latest _rev.
+ */
+async function updateProductionDoc(
+  productionId: string,
+  patch: Partial<ProductionDoc>,
+): Promise<void> {
+  for (let attempt = 0; attempt < MAX_DB_WRITE_RETRIES; attempt++) {
+    try {
+      const doc = await getDb().get(productionId);
+      const updated: ProductionDoc = {
+        ...doc,
+        ...patch,
+        updatedAt: new Date().toISOString(),
+      };
+      await getDb().insert(updated);
+      return;
+    } catch (err) {
+      // CouchDB 409 = revision conflict — retry after re-read
+      if (err instanceof Error && 'statusCode' in err && (err as { statusCode?: number }).statusCode === 409) {
+        if (attempt < MAX_DB_WRITE_RETRIES - 1) continue;
+      }
+      throw err;
+    }
+  }
+}
+
+/**
+ * Async activation polling loop — runs fire-and-forget after the HTTP
+ * response has already been sent.
+ *
+ * Lifecycle:
+ *   1. Call activateStromFlow to create + start the Strom flow.
+ *   2. Persist stromFlowId + mixerBlockId (status stays 'activating').
+ *   3. Poll strom.flows.get(flowId) every FLOW_POLL_INTERVAL_MS.
+ *   4. On flow.state === 'playing': fetch WHEP URL, set status 'active'.
+ *   5. On timeout, error, or abort: best-effort cleanup, set status 'inactive'.
+ */
+async function runActivationFlow(
+  productionId: string,
+  signal: AbortSignal,
+  log: { error: (obj: unknown, msg: string) => void; info: (obj: unknown, msg: string) => void },
+): Promise<void> {
+  let stromFlowId: string | undefined;
+  let mixerBlockId: string | undefined;
+
+  try {
+    // Load the current production doc
+    const doc = await getDb().get(productionId);
+
+    const stromToken = await getStromToken(config.stromToken).catch(() => undefined);
+    const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
+
+    // Step 1: Start the Strom flow
+    if (signal.aborted) return;
+    stromFlowId = await activateStromFlow(doc, strom);
+
+    // Resolve mixerBlockId from template
+    if (doc.templateId) {
+      const tmpl = await getDb().get(doc.templateId).catch(() => null);
+      if (tmpl) {
+        const mixerBlock = (tmpl as unknown as { flow?: { blocks?: Array<Record<string, unknown>> } })
+          .flow?.blocks?.find((b) => b['category'] === 'mixer');
+        if (mixerBlock && typeof mixerBlock['id'] === 'string') {
+          mixerBlockId = mixerBlock['id'];
+        }
+      }
+    }
+
+    // Step 2: Persist stromFlowId + mixerBlockId
+    if (signal.aborted) {
+      await deactivateStromFlow(stromFlowId, strom).catch(() => undefined);
+      return;
+    }
+    await updateProductionDoc(productionId, {
+      stromFlowId,
+      ...(mixerBlockId !== undefined && { mixerBlockId }),
+    });
+
+    // Step 3: Poll until flow reaches 'playing' or we time out
+    const deadline = Date.now() + FLOW_POLL_TIMEOUT_MS;
+
+    while (Date.now() < deadline) {
+      if (signal.aborted) {
+        await deactivateStromFlow(stromFlowId, strom).catch(() => undefined);
+        return;
+      }
+
+      const { flow } = await strom.flows.get(stromFlowId);
+
+      if (flow.state === 'playing') {
+        // Step 4: Retrieve WHEP multiview endpoint
+        let whepEndpoint: string | undefined;
+        if (mixerBlockId) {
+          const resp = await strom.mixer.multiviewEndpoint(stromFlowId, mixerBlockId).catch(() => null);
+          // Guard: deactivate may have fired while multiviewEndpoint() was in-flight.
+          // Without this check, updateProductionDoc would write status:'active' after
+          // deactivate has already written status:'inactive'.
+          if (signal.aborted) {
+            await deactivateStromFlow(stromFlowId, strom).catch(() => {});
+            return;
+          }
+          if (resp) whepEndpoint = resp.url;
+        }
+
+        if (signal.aborted) {
+          await deactivateStromFlow(stromFlowId, strom).catch(() => {});
+          return;
+        }
+
+        await updateProductionDoc(productionId, {
+          status: 'active',
+          whepEndpoint,
+        });
+
+        log.info({ productionId, stromFlowId, whepEndpoint }, 'Production activated — flow playing');
+        return;
+      }
+
+      // Wait before next poll
+      await new Promise<void>((resolve) => setTimeout(resolve, FLOW_POLL_INTERVAL_MS));
+    }
+
+    // Timeout reached
+    throw new Error(`Strom flow ${stromFlowId} did not reach 'playing' state within ${FLOW_POLL_TIMEOUT_MS}ms`);
+  } catch (err) {
+    if (signal.aborted) {
+      // Deactivate called during activation — cleanup already handled by deactivate handler
+      return;
+    }
+
+    log.error({ err, productionId, stromFlowId }, 'Activation flow failed — resetting to inactive');
+
+    // Best-effort flow cleanup
+    if (stromFlowId) {
+      const stromToken = await getStromToken(config.stromToken).catch(() => undefined);
+      const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
+      await deactivateStromFlow(stromFlowId, strom).catch(() => undefined);
+    }
+
+    // Reset production to inactive, clearing all flow-related fields
+    await updateProductionDoc(productionId, {
+      status: 'inactive',
+      stromFlowId: undefined,
+      mixerBlockId: undefined,
+      whepEndpoint: undefined,
+    }).catch((resetErr) => {
+      log.error({ resetErr, productionId }, 'Failed to reset production to inactive after activation failure');
+    });
+  } finally {
+    activationAbortControllers.delete(productionId);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Zod schemas
+// ---------------------------------------------------------------------------
 
 const ProductionInput = z.object({
   name: z.string().min(1),
@@ -21,6 +199,10 @@ const SourceAssignmentInput = z.object({
   sourceId: z.string().min(1),
   mixerInput: z.string().min(1),
 });
+
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
 
 const productionsRoutes: FastifyPluginAsync = async (fastify) => {
   // List all productions
@@ -92,66 +274,63 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
     }
   });
 
-  // Activate a production — creates and starts a Strom flow
+  // Activate a production — immediately returns 'activating', then polls Strom
+  // for flow state in a fire-and-forget async loop.
   fastify.post<{ Params: { id: string } }>('/api/v1/productions/:id/activate', async (req, reply) => {
     try {
       const doc = await getDb().get(req.params.id);
 
-      const stromToken = await getStromToken(config.stromToken).catch(() => undefined);
-      const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
-
-      let stromFlowId: string | undefined;
-      let stromVersion: string | null = null;
-
-      // Fetch Strom version (best-effort)
-      stromVersion = await strom.system.version()
-        .then((info) => info.version)
-        .catch(() => null);
-
-      // Start Strom flow if a template is configured
-      let mixerBlockId: string | undefined;
-      if (doc.templateId) {
-        stromFlowId = await activateStromFlow(doc, strom);
-
-        // Resolve mixer block ID from template for DSK/transition operations
-        const tmpl = await getDb().get(doc.templateId).catch(() => null);
-        if (tmpl) {
-          const mixerBlock = (tmpl as unknown as { flow?: { blocks?: Array<Record<string, unknown>> } })
-            .flow?.blocks?.find((b) => b['category'] === 'mixer');
-          if (mixerBlock && typeof mixerBlock['id'] === 'string') {
-            mixerBlockId = mixerBlock['id'];
-          }
-        }
+      // Guard: reject if already active or activating
+      if (doc.status === 'active' || doc.status === 'activating') {
+        return reply.status(409).send({
+          error: `Production is already '${doc.status}'`,
+          statusCode: 409,
+        });
       }
 
-      const updated: ProductionDoc = {
+      // Transition to 'activating' immediately and respond
+      const activatingDoc: ProductionDoc = {
         ...doc,
-        status: 'active',
-        ...(stromFlowId !== undefined && { stromFlowId }),
-        ...(mixerBlockId !== undefined && { mixerBlockId }),
+        status: 'activating',
         updatedAt: new Date().toISOString(),
       };
-      const response = await getDb().insert(updated);
+      const insertResponse = await getDb().insert(activatingDoc);
+
+      // Set up AbortController so deactivate can cancel the polling loop
+      const abortController = new AbortController();
+      activationAbortControllers.set(doc._id, abortController);
+
+      // Fire-and-forget — must never let a rejection escape to the global handler
+      void runActivationFlow(doc._id, abortController.signal, fastify.log).catch((err) => {
+        fastify.log.error({ err, productionId: doc._id }, 'Unhandled error in runActivationFlow');
+      });
 
       return reply.send({
-        id: updated._id,
-        name: updated.name,
-        status: updated.status,
-        stromFlowId: updated.stromFlowId,
-        stromVersion,
-        _rev: response.rev,
+        id: activatingDoc._id,
+        name: activatingDoc.name,
+        status: activatingDoc.status,
+        stromFlowId: activatingDoc.stromFlowId,
+        _rev: insertResponse.rev,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      fastify.log.error({ err }, 'Failed to activate production');
+      fastify.log.error({ err }, 'Failed to initiate production activation');
       return reply.status(500).send({ error: message, statusCode: 500 });
     }
   });
 
-  // Deactivate a production — stops and deletes the Strom flow
+  // Deactivate a production — stops and deletes the Strom flow, cancels any
+  // in-progress activation polling loop.
   fastify.post<{ Params: { id: string } }>('/api/v1/productions/:id/deactivate', async (req, reply) => {
     try {
       const doc = await getDb().get(req.params.id);
+
+      // Cancel any in-progress activation loop
+      const abortController = activationAbortControllers.get(doc._id);
+      if (abortController) {
+        abortController.abort();
+        activationAbortControllers.delete(doc._id);
+      }
 
       if (doc.stromFlowId) {
         const stromToken = await getStromToken(config.stromToken).catch(() => undefined);
@@ -163,6 +342,8 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         ...doc,
         status: 'inactive',
         stromFlowId: undefined,
+        mixerBlockId: undefined,
+        whepEndpoint: undefined,
         updatedAt: new Date().toISOString(),
       };
       const response = await getDb().insert(updated);
@@ -215,4 +396,5 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
   );
 };
 
+export { activationAbortControllers };
 export default productionsRoutes;

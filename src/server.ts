@@ -11,6 +11,7 @@ import pipelineRoutes from './routes/pipeline.js';
 import macrosRoutes from './routes/macros.js';
 import audioRoutes from './routes/audio.js';
 import statsRoutes from './routes/stats.js';
+import iceServersRoutes from './routes/ice-servers.js';
 import controllerWs from './ws/controller.js';
 
 export async function buildServer() {
@@ -53,6 +54,7 @@ export async function buildServer() {
   await fastify.register(macrosRoutes);
   await fastify.register(audioRoutes);
   await fastify.register(statsRoutes);
+  await fastify.register(iceServersRoutes);
   await fastify.register(controllerWs);
 
   return fastify;
