@@ -1,5 +1,5 @@
-import { getTemplatesDb } from './index.js';
-import type { StromFlowTemplate } from './types.js';
+import { getTemplatesDb, getSourcesDb } from './index.js';
+import type { StromFlowTemplate, SourceDoc } from './types.js';
 
 /**
  * Well-known CouchDB ID for the default vision-mixer template.
@@ -175,5 +175,158 @@ export async function seedDefaultTemplate(): Promise<void> {
   } catch {
     // Not found — insert it with the well-known ID
     await db.insert(DEFAULT_TEMPLATE as never, DEFAULT_TEMPLATE_ID);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Dev / test fixtures
+// ---------------------------------------------------------------------------
+
+const DEV_TEMPLATE_ID = 'tmpl-dev-test-no-sources';
+
+/**
+ * Development template: 4 videotestsrc elements (Pinwheel, Colors, Balls, Snow)
+ * wired directly into the vision mixer. No SRT/WHIP inputs — activates instantly
+ * with no sources assigned. Use this for local dev and CI testing.
+ */
+const DEV_TEMPLATE: Omit<StromFlowTemplate, '_id' | '_rev'> = {
+  type: 'template',
+  name: 'Dev Test (No Sources)',
+  description: 'Four videotestsrc patterns into the vision mixer. No external sources needed.',
+  flow: {
+    elements: [
+      { id: 'e-dev-ts-1', element_type: 'videotestsrc', properties: { pattern: 'Pinwheel' }, position: [50, 100] },
+      { id: 'e-dev-ts-2', element_type: 'videotestsrc', properties: { pattern: 'Colors' },   position: [50, 250] },
+      { id: 'e-dev-ts-3', element_type: 'videotestsrc', properties: { pattern: 'Ball' },     position: [50, 400] },
+      { id: 'e-dev-ts-4', element_type: 'videotestsrc', properties: { pattern: 'Snow' },     position: [50, 550] },
+    ],
+    blocks: [
+      {
+        id: 'b-dev-fmt-1', block_definition_id: 'builtin.videoformat', name: 'Format 1',
+        properties: { resolution: '640x360' }, position: { x: 300, y: 100 },
+      },
+      {
+        id: 'b-dev-fmt-2', block_definition_id: 'builtin.videoformat', name: 'Format 2',
+        properties: { resolution: '640x360' }, position: { x: 300, y: 250 },
+      },
+      {
+        id: 'b-dev-fmt-3', block_definition_id: 'builtin.videoformat', name: 'Format 3',
+        properties: { resolution: '640x360' }, position: { x: 300, y: 400 },
+      },
+      {
+        id: 'b-dev-fmt-4', block_definition_id: 'builtin.videoformat', name: 'Format 4',
+        properties: { resolution: '640x360' }, position: { x: 300, y: 550 },
+      },
+      {
+        id: 'b-dev-mixer', block_definition_id: 'builtin.vision_mixer', name: 'Mixer',
+        properties: {
+          input_0_alpha: 1.0, input_1_alpha: 0.0,
+          input_2_alpha: 0.0, input_3_alpha: 0.0,
+          multiview_resolution: '640x360', pgm_resolution: '640x360',
+        },
+        position: { x: 600, y: 300 },
+      },
+      {
+        id: 'b-dev-enc-pgm', block_definition_id: 'builtin.videoenc', name: 'Enc PGM',
+        properties: {}, position: { x: 900, y: 200 },
+      },
+      {
+        id: 'b-dev-enc-mv', block_definition_id: 'builtin.videoenc', name: 'Enc MV',
+        properties: {}, position: { x: 900, y: 400 },
+      },
+      {
+        id: 'b-dev-pgm-out', block_definition_id: 'builtin.whep_output', name: 'PGM Output',
+        properties: { endpoint_id: 'pgm' }, position: { x: 1150, y: 200 },
+      },
+      {
+        id: 'b-dev-mv-out', block_definition_id: 'builtin.whep_output', name: 'Multiview Output',
+        properties: { endpoint_id: 'mv' }, position: { x: 1150, y: 400 },
+      },
+    ],
+    links: [
+      // videotestsrc elements → videoformat blocks
+      { from: 'e-dev-ts-1:src', to: 'b-dev-fmt-1:video_in' },
+      { from: 'e-dev-ts-2:src', to: 'b-dev-fmt-2:video_in' },
+      { from: 'e-dev-ts-3:src', to: 'b-dev-fmt-3:video_in' },
+      { from: 'e-dev-ts-4:src', to: 'b-dev-fmt-4:video_in' },
+      // videoformat blocks → mixer inputs
+      { from: 'b-dev-fmt-1:video_out', to: 'b-dev-mixer:video_in_0' },
+      { from: 'b-dev-fmt-2:video_out', to: 'b-dev-mixer:video_in_1' },
+      { from: 'b-dev-fmt-3:video_out', to: 'b-dev-mixer:video_in_2' },
+      { from: 'b-dev-fmt-4:video_out', to: 'b-dev-mixer:video_in_3' },
+      // mixer → encoders → WHEP outputs
+      { from: 'b-dev-mixer:pgm_out',       to: 'b-dev-enc-pgm:video_in' },
+      { from: 'b-dev-enc-pgm:encoded_out', to: 'b-dev-pgm-out:video_in' },
+      { from: 'b-dev-mixer:multiview_out', to: 'b-dev-enc-mv:video_in' },
+      { from: 'b-dev-enc-mv:encoded_out',  to: 'b-dev-mv-out:video_in' },
+    ],
+  },
+  inputs: [],  // No parametric source inputs — activates with no sources assigned
+  audioElements: [],
+  createdAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString(),
+};
+
+const DEV_SOURCES: Array<{ id: string; doc: Omit<SourceDoc, '_id' | '_rev'> }> = [
+  {
+    id: 'src-dev-srt-1',
+    doc: {
+      type: 'source',
+      name: 'Test Camera 1 (SRT)',
+      address: 'srt://127.0.0.1:9001?mode=caller&latency=200',
+      streamType: 'srt',
+      status: 'inactive',
+      liveCamera: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+  },
+  {
+    id: 'src-dev-srt-2',
+    doc: {
+      type: 'source',
+      name: 'Test Camera 2 (SRT)',
+      address: 'srt://127.0.0.1:9002?mode=caller&latency=200',
+      streamType: 'srt',
+      status: 'inactive',
+      liveCamera: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+  },
+  {
+    id: 'src-dev-whip-1',
+    doc: {
+      type: 'source',
+      name: 'Test Browser Input (WHIP)',
+      address: 'browser-test-1',
+      streamType: 'whip',
+      status: 'inactive',
+      liveCamera: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+  },
+];
+
+async function seedOne<T extends object>(
+  db: ReturnType<typeof getTemplatesDb>,
+  id: string,
+  doc: T,
+): Promise<void> {
+  try {
+    await (db as unknown as { get: (id: string) => Promise<unknown> }).get(id);
+  } catch {
+    await (db as unknown as { insert: (doc: T, id: string) => Promise<unknown> }).insert(doc, id);
+  }
+}
+
+export async function seedDevFixtures(): Promise<void> {
+  const templatesDb = getTemplatesDb();
+  await seedOne(templatesDb, DEV_TEMPLATE_ID, DEV_TEMPLATE as never);
+
+  const sourcesDb = getSourcesDb();
+  for (const { id, doc } of DEV_SOURCES) {
+    await seedOne(sourcesDb as unknown as ReturnType<typeof getTemplatesDb>, id, doc as never);
   }
 }

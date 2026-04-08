@@ -1,6 +1,6 @@
 import { config } from './config.js';
 import { connectDb, getDb } from './db/index.js';
-import { seedDefaultTemplate } from './db/seed.js';
+import { seedDefaultTemplate, seedDevFixtures } from './db/seed.js';
 import { buildServer } from './server.js';
 import type { ProductionDoc } from './db/types.js';
 import type { FastifyBaseLogger } from 'fastify';
@@ -35,6 +35,7 @@ async function recoverStaleActivations(
 async function main() {
   await connectDb();
   await seedDefaultTemplate();
+  await seedDevFixtures();
 
   const app = await buildServer();
   await recoverStaleActivations(app.log);
