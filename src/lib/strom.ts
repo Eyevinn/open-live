@@ -502,15 +502,30 @@ export class StromClient {
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
-      method,
-      headers: this.headers(),
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    })
+    let res: Response
+    try {
+      res = await fetch(`${this.baseUrl}${path}`, {
+        method,
+        headers: this.headers(),
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+      })
+    } catch (err) {
+      throw new StromClientError(0, `Strom unreachable: ${(err as Error).message}`)
+    }
+
     if (res.status === 204) return undefined as T
+
+    const contentType = res.headers.get('content-type') ?? ''
+    if (!contentType.includes('application/json')) {
+      const text = await res.text()
+      throw new StromClientError(
+        res.status,
+        `Strom returned non-JSON response (${res.status}): ${text.slice(0, 120)}`,
+      )
+    }
+
     const json = await res.json()
     if (!res.ok) {
-      // DEBUG: log full Strom error body to diagnose start failures
       console.log('[strom-debug] error', method, path, 'status', res.status, JSON.stringify(json))
       throw new StromClientError(res.status, (json as StromError).error ?? res.statusText)
     }
