@@ -67,12 +67,6 @@ export async function activateStromFlow(
 
   const flowId = created.flow.id; // Use the server-assigned ID, not what we sent
 
-  // DEBUG: inspect created flow before starting
-  const createdFlow = await strom.flows.get(flowId);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  console.log('[flow-debug] created flow blocks:', JSON.stringify(createdFlow.flow.blocks?.map((b: any) => ({ id: b['id'], def: b['block_definition_id'] })), null, 2));
-  console.log('[flow-debug] created flow links:', JSON.stringify(createdFlow.flow.links, null, 2));
-
   // Start the flow
   await strom.flows.start(flowId);
 

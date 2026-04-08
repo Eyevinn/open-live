@@ -33,7 +33,7 @@ export async function getStromToken(pat: string | undefined): Promise<string | u
     return cache.token
   }
 
-  console.log('[strom-token] exchanging PAT for SAT...')
+  // (no debug log — exchange is a normal background operation)
   const res = await fetch(TOKEN_EXCHANGE_URL, {
     method: 'POST',
     headers: {
@@ -50,7 +50,6 @@ export async function getStromToken(pat: string | undefined): Promise<string | u
   }
 
   const data = (await res.json()) as { token: string; expiry: number }
-  console.log('[strom-token] SAT obtained, expires at', new Date(data.expiry * 1000).toISOString())
   cache = { token: data.token, expiresAt: data.expiry * 1000 }
   return cache.token
 }
