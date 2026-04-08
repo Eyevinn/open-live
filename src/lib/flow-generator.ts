@@ -50,17 +50,11 @@ export async function activateStromFlow(
     (block['properties'] as Record<string, unknown>)[slot.addressProperty] = source.address;
   }
 
-  // Step 1: Create an empty flow (POST only accepts name + description).
-  const flowName = `${production.name}-${randomUUID().slice(0, 8)}`;
+  // Create the flow — the deployed Strom version requires a client-supplied UUID
+  // and accepts blocks/elements/links in the same POST body.
+  const flowId = randomUUID();
+  const flowName = `${production.name}-${flowId.slice(0, 8)}`;
   const created = await strom.flows.create({
-    name: flowName,
-    description: `Production: ${production.name}`,
-  });
-
-  const flowId = created.flow.id;
-
-  // Step 2: Write the full flow content via PUT.
-  await strom.flows.update(flowId, {
     id: flowId,
     name: flowName,
     description: `Production: ${production.name}`,

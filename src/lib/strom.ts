@@ -156,12 +156,17 @@ export interface FlowListResponse {
 }
 
 /**
- * POST /api/flows only accepts name + description.
- * To set blocks/elements/links, PUT /api/flows/{id} with the full Flow body.
+ * POST /api/flows requires a client-supplied id (UUID).
+ * The deployed Strom version deserialises this as the full Flow struct,
+ * so blocks/elements/links can be included on creation.
  */
 export interface CreateFlowRequest {
+  id: string
   name: string
   description?: string
+  elements?: FlowElement[]
+  blocks?: BlockInstance[]
+  links?: FlowLink[]
 }
 
 export interface UpdateFlowPropertiesRequest {
@@ -497,14 +502,21 @@ export class StromClient {
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const bodyStr = body !== undefined ? JSON.stringify(body) : undefined
+    // DEBUG: log outgoing Strom requests to help diagnose 422s — remove after fix confirmed
+    console.log('[strom-debug]', method, path, bodyStr ? bodyStr.slice(0, 500) : '(no body)')
     const res = await fetch(`${this.baseUrl}${path}`, {
       method,
       headers: this.headers(),
-      body: body !== undefined ? JSON.stringify(body) : undefined,
+      body: bodyStr,
     })
     if (res.status === 204) return undefined as T
     const json = await res.json()
-    if (!res.ok) throw new StromClientError(res.status, (json as StromError).error ?? res.statusText)
+    if (!res.ok) {
+      // DEBUG: log full error response body
+      console.log('[strom-debug] error response:', JSON.stringify(json))
+      throw new StromClientError(res.status, (json as StromError).error ?? res.statusText)
+    }
     return json as T
   }
 
