@@ -2,7 +2,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { getTemplatesDb } from '../db/index.js';
-import type { StromFlowTemplate } from '../db/types.js';
+import type { StromFlowTemplate, AudioElement } from '../db/types.js';
 
 // Flow content uses open-ended schemas to accommodate the full Strom block
 // shape (block_definition_id, position, computed_external_pads, etc.) as
@@ -25,6 +25,13 @@ const TemplateInputSlotSchema = z.object({
   addressProperty: z.string().min(1),
 });
 
+const AudioElementSchema = z.object({
+  id: z.string().min(1),
+  blockId: z.string().min(1),
+  elementId: z.string().min(1),
+  label: z.string().min(1),
+});
+
 const TemplateInput = z.object({
   name: z.string().min(1),
   description: z.string().optional(),
@@ -34,6 +41,7 @@ const TemplateInput = z.object({
     links: z.array(FlowLinkSchema).default([]),
   }),
   inputs: z.array(TemplateInputSlotSchema).default([]),
+  audioElements: z.array(AudioElementSchema).default([]),
 });
 
 const TemplatePatch = z.object({
@@ -45,6 +53,7 @@ const TemplatePatch = z.object({
     links: z.array(FlowLinkSchema).optional(),
   }).optional(),
   inputs: z.array(TemplateInputSlotSchema).optional(),
+  audioElements: z.array(AudioElementSchema).optional(),
 });
 
 function toApi(doc: StromFlowTemplate) {
@@ -71,6 +80,7 @@ const templatesRoutes: FastifyPluginAsync = async (fastify) => {
       description: body.description,
       flow: body.flow,
       inputs: body.inputs,
+      audioElements: body.audioElements as AudioElement[],
       createdAt: now,
       updatedAt: now,
     };
@@ -106,6 +116,7 @@ const templatesRoutes: FastifyPluginAsync = async (fastify) => {
           },
         }),
         ...(body.inputs !== undefined && { inputs: body.inputs }),
+        ...(body.audioElements !== undefined && { audioElements: body.audioElements as AudioElement[] }),
         updatedAt: new Date().toISOString(),
       };
       const response = await getTemplatesDb().insert(updated as never);

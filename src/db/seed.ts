@@ -158,6 +158,7 @@ const DEFAULT_TEMPLATE: Omit<StromFlowTemplate, '_id' | '_rev'> = {
       addressProperty: 'endpoint_id',
     },
   ],
+  audioElements: [],
   createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
 };

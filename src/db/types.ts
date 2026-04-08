@@ -1,3 +1,34 @@
+// --------------- Macro types ---------------
+
+export type MacroActionType = 'CUT' | 'TRANSITION' | 'TAKE' | 'GRAPHIC_ON' | 'GRAPHIC_OFF' | 'DSK_TOGGLE';
+
+export interface MacroAction {
+  type: MacroActionType;
+  sourceId?: string;
+  transitionType?: string;
+  durationMs?: number;
+  overlayId?: string;
+  layer?: number;
+  visible?: boolean;
+}
+
+export interface Macro {
+  id: string;      // "macro-<uuid>"
+  slot: number;    // 0-7 (F1-F8)
+  label: string;
+  color: string;   // hex color, e.g. "#3B82F6"
+  actions: MacroAction[];
+}
+
+// --------------- Audio element types ---------------
+
+export interface AudioElement {
+  id: string;
+  blockId: string;
+  elementId: string;
+  label: string;
+}
+
 // --------------- Source types ---------------
 
 export type StreamType = 'srt' | 'whip';
@@ -81,6 +112,7 @@ export interface StromFlowTemplate {
   };
   /** Defines which blocks are parametric source inputs */
   inputs: TemplateInputSlot[];
+  audioElements: AudioElement[];
   createdAt: string;
   updatedAt: string;
 }
@@ -131,7 +163,9 @@ export interface ProductionDoc {
   stromFlowId?: string;
   pipeline: Pipeline;
   graphics: GraphicOverlay[];
+  macros: Macro[];
   tally: Tally;
+  mixerBlockId?: string;
   createdAt: string;
   updatedAt: string;
 }
