@@ -23,11 +23,21 @@ function isExpiringSoon(cache: SatCache): boolean {
 }
 
 /**
- * Returns a valid Strom SAT, exchanging or refreshing as needed.
- * Returns undefined if no PAT is configured (local dev without auth).
+ * Returns a valid Strom auth token.
+ *
+ * - STROM_AUTH_MODE=direct: returns the API key as-is (self-hosted Strom)
+ * - STROM_AUTH_MODE=osc (default): exchanges the PAT for a short-lived SAT
+ *   via the OSC token service (required for OSC-hosted Strom instances)
+ *
+ * Returns undefined if no token is configured (local dev without auth).
  */
 export async function getStromToken(pat: string | undefined): Promise<string | undefined> {
   if (!pat) return undefined
+
+  // Direct mode: API key is used as Bearer token without any exchange
+  if (process.env['STROM_AUTH_MODE'] === 'direct') {
+    return pat
+  }
 
   if (cache && !isExpiringSoon(cache)) {
     return cache.token
