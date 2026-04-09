@@ -31,7 +31,7 @@ const activationAbortControllers = new Map<string, AbortController>();
  * Write a partial update to ProductionDoc with retry-on-409.
  * Re-reads the document before each retry to get the latest _rev.
  */
-async function updateProductionDoc(
+export async function updateProductionDoc(
   productionId: string,
   patch: Partial<ProductionDoc>,
 ): Promise<void> {

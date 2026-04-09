@@ -41,6 +41,9 @@ export async function activateStromFlow(
     const source = sourceMap.get(assignment.sourceId);
     if (!source) continue;
 
+    // Skip patching when addressProperty is empty (e.g. hardwired dev template inputs)
+    if (!slot.addressProperty) continue;
+
     const block = flow.blocks.find((b) => b['id'] === slot.blockId) as Record<string, unknown> | undefined;
     if (!block) continue;
 

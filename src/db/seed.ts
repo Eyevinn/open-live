@@ -1,4 +1,5 @@
-import { getTemplatesDb, getSourcesDb } from './index.js';
+import { getTemplatesDb, getSourcesDb, getDb } from './index.js';
+import type { ProductionDoc } from './types.js';
 import type { StromFlowTemplate, SourceDoc } from './types.js';
 
 /**
@@ -263,7 +264,18 @@ const DEV_TEMPLATE: Omit<StromFlowTemplate, '_id' | '_rev'> = {
       { from: 'b-dev-enc-mv:encoded_out',  to: 'b-dev-mv-out:video_in' },
     ],
   },
-  inputs: [],  // No parametric source inputs — activates with no sources assigned
+  /**
+   * Parametric input slots: id matches the mixer pad name so getMixerInput()
+   * can resolve source → mixer input at runtime. addressProperty is empty
+   * because these videotestsrc elements are hardwired in the flow — no address
+   * patching is needed at activation time.
+   */
+  inputs: [
+    { id: 'video_in_0', blockId: 'b-dev-fmt-1', addressProperty: '' },
+    { id: 'video_in_1', blockId: 'b-dev-fmt-2', addressProperty: '' },
+    { id: 'video_in_2', blockId: 'b-dev-fmt-3', addressProperty: '' },
+    { id: 'video_in_3', blockId: 'b-dev-fmt-4', addressProperty: '' },
+  ],
   audioElements: [],
   createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
@@ -271,11 +283,11 @@ const DEV_TEMPLATE: Omit<StromFlowTemplate, '_id' | '_rev'> = {
 
 const DEV_SOURCES: Array<{ id: string; doc: Omit<SourceDoc, '_id' | '_rev'> }> = [
   {
-    id: 'src-dev-srt-1',
+    id: 'src-dev-pat-1',
     doc: {
       type: 'source',
-      name: 'Test Camera 1 (SRT)',
-      address: 'srt://127.0.0.1:9001?mode=caller&latency=200',
+      name: 'Pinwheel A',
+      address: '',
       streamType: 'srt',
       status: 'inactive',
       liveCamera: false,
@@ -284,11 +296,11 @@ const DEV_SOURCES: Array<{ id: string; doc: Omit<SourceDoc, '_id' | '_rev'> }> =
     },
   },
   {
-    id: 'src-dev-srt-2',
+    id: 'src-dev-pat-2',
     doc: {
       type: 'source',
-      name: 'Test Camera 2 (SRT)',
-      address: 'srt://127.0.0.1:9002?mode=caller&latency=200',
+      name: 'Colors A',
+      address: '',
       streamType: 'srt',
       status: 'inactive',
       liveCamera: false,
@@ -297,12 +309,25 @@ const DEV_SOURCES: Array<{ id: string; doc: Omit<SourceDoc, '_id' | '_rev'> }> =
     },
   },
   {
-    id: 'src-dev-whip-1',
+    id: 'src-dev-pat-3',
     doc: {
       type: 'source',
-      name: 'Test Browser Input (WHIP)',
-      address: 'browser-test-1',
-      streamType: 'whip',
+      name: 'Pinwheel B',
+      address: '',
+      streamType: 'srt',
+      status: 'inactive',
+      liveCamera: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+  },
+  {
+    id: 'src-dev-pat-4',
+    doc: {
+      type: 'source',
+      name: 'Colors B',
+      address: '',
+      streamType: 'srt',
       status: 'inactive',
       liveCamera: false,
       createdAt: new Date().toISOString(),
@@ -310,6 +335,32 @@ const DEV_SOURCES: Array<{ id: string; doc: Omit<SourceDoc, '_id' | '_rev'> }> =
     },
   },
 ];
+
+const DEV_PRODUCTION_ID = 'prod-dev-test';
+
+/**
+ * Dev production pre-wired to the dev template and the 4 test pattern sources.
+ * Source assignments map each pattern source to its fixed mixer pad — no address
+ * patching occurs at activation because addressProperty is empty on the template inputs.
+ */
+const DEV_PRODUCTION: Omit<ProductionDoc, '_id' | '_rev'> = {
+  type: 'production',
+  name: 'Dev Test Production',
+  status: 'inactive',
+  templateId: DEV_TEMPLATE_ID,
+  sources: [
+    { sourceId: 'src-dev-pat-1', mixerInput: 'video_in_0' },
+    { sourceId: 'src-dev-pat-2', mixerInput: 'video_in_1' },
+    { sourceId: 'src-dev-pat-3', mixerInput: 'video_in_2' },
+    { sourceId: 'src-dev-pat-4', mixerInput: 'video_in_3' },
+  ],
+  pipeline: { stromConfig: null, status: 'stopped' },
+  graphics: [],
+  macros: [],
+  tally: { pgm: null, pvw: null },
+  createdAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString(),
+};
 
 async function seedOne<T extends object>(
   db: ReturnType<typeof getTemplatesDb>,
@@ -325,10 +376,19 @@ async function seedOne<T extends object>(
 
 export async function seedDevFixtures(): Promise<void> {
   const templatesDb = getTemplatesDb();
-  await seedOne(templatesDb, DEV_TEMPLATE_ID, DEV_TEMPLATE as never);
+  // Always upsert the dev template so changes to inputs/flow are picked up on restart
+  try {
+    const existing = await templatesDb.get(DEV_TEMPLATE_ID) as { _rev: string };
+    await templatesDb.insert({ ...DEV_TEMPLATE, _rev: existing._rev } as never, DEV_TEMPLATE_ID);
+  } catch {
+    await templatesDb.insert(DEV_TEMPLATE as never, DEV_TEMPLATE_ID);
+  }
 
   const sourcesDb = getSourcesDb();
   for (const { id, doc } of DEV_SOURCES) {
     await seedOne(sourcesDb as unknown as ReturnType<typeof getTemplatesDb>, id, doc as never);
   }
+
+  const productionsDb = getDb() as unknown as ReturnType<typeof getTemplatesDb>;
+  await seedOne(productionsDb, DEV_PRODUCTION_ID, DEV_PRODUCTION as never);
 }

@@ -173,8 +173,8 @@ export interface UpdateFlowPropertiesRequest {
 export type TransitionType = 'cut' | 'fade' | 'slide_left' | 'slide_right' | 'slide_up' | 'slide_down'
 
 export interface TriggerTransitionRequest {
-  from_input: string
-  to_input: string
+  from_input: number
+  to_input: number
   transition_type: TransitionType
   duration_ms?: number
 }
@@ -184,11 +184,11 @@ export interface TransitionResponse {
 }
 
 export interface SelectPreviewRequest {
-  input: string
+  input: number
 }
 
 export interface SelectPreviewResponse {
-  input: string
+  input: number
 }
 
 export interface AnimateInputRequest {
@@ -220,6 +220,7 @@ export interface DskToggleResponse {
 
 export interface FadeToBlackRequest {
   active?: boolean
+  duration_ms: number
 }
 
 export interface FadeToBlackResponse {
@@ -624,6 +625,9 @@ export class StromClient {
 
     animateInput: (flowId: string, blockId: string, body: AnimateInputRequest) =>
       this.post<void>(`/api/flows/${flowId}/blocks/${blockId}/animate`, body),
+
+    getOverlayAlpha: (flowId: string, blockId: string) =>
+      this.get<OverlayAlphaResponse>(`/api/flows/${flowId}/blocks/${blockId}/overlay-alpha`),
 
     setOverlayAlpha: (flowId: string, blockId: string, body: OverlayAlphaRequest) =>
       this.post<OverlayAlphaResponse>(`/api/flows/${flowId}/blocks/${blockId}/overlay-alpha`, body),

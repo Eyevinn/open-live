@@ -167,6 +167,7 @@ export interface ProductionDoc {
   graphics: GraphicOverlay[];
   macros: Macro[];
   tally: Tally;
+  overlayAlpha?: number;
   mixerBlockId?: string;
   createdAt: string;
   updatedAt: string;
