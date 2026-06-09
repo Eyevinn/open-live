@@ -1,6 +1,27 @@
+[![Try on OSC](https://img.shields.io/badge/Try%20on-Open%20Source%20Cloud-blue)](https://openlive.apps.osaas.io)
+
 # open-live
 
-Central API server for the Open Live broadcast production platform. Built with Node.js, TypeScript, and Fastify. Persists data to CouchDB.
+Open Live is a cloud-native live broadcast production suite that replaces traditional hardware — vision mixers, audio consoles, and multiviewers — with a fully browser-based solution. This repository is the central API server. The browser-based production controller lives in [open-live-studio](https://github.com/Eyevinn/open-live-studio).
+
+## Try it on OSC
+
+The fastest way to try Open Live — no Kubernetes required.
+
+Visit **[openlive.apps.osaas.io](https://openlive.apps.osaas.io)** to spin up a managed Open Live instance on Open Source Cloud. Start for an event, tear down after. No infrastructure to manage and no monthly minimum.
+
+- 14-day free trial, free plan available
+- 15 EUR/month (self-hosted Strom) or 69 EUR/month (shared GPU in Frankfurt)
+
+## Features
+
+- **Vision mixing** — cuts, auto transitions, DSK layers, picture-in-picture, graphics overlays, and fade-to-black
+- **Audio mixer** — per-channel faders with EBU R128 loudness metering
+- **Multiviewer** — sub-500ms WebRTC glass-to-glass latency
+- **Stream Deck control** — hardware button panel integration
+- **Up to 16 sources** per production
+- **REMI / remote production** — crews work from anywhere via browser; eliminates travel and equipment shipping
+- **Self-hostable** on any Kubernetes cluster, zero vendor lock-in
 
 ## Requirements
 
