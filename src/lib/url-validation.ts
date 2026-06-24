@@ -2,7 +2,7 @@
  * URL validation helpers for security-sensitive inputs.
  *
  * Rules:
- * - httpUrlOnly: allow only http/https schemes
+ * - httpUrlOnly: allow only http/https schemes with no private-IP targets
  * - graphicUrl:  httpUrlOnly OR safe data: image URIs (no svg, no text/html)
  * - srtUrl:      srt:// scheme only; reject private/internal hosts (listener form allowed)
  */
@@ -73,7 +73,19 @@ function isPrivateIPv6(host: string): boolean {
 }
 
 /**
+ * Hostnames that resolve to loopback/link-local/internal addresses but are not
+ * themselves IP literals, so `isPrivateHost()` cannot catch them.
+ */
+const BLOCKED_HOSTNAMES = new Set([
+  'localhost',
+  'metadata.google.internal', // GCP metadata endpoint
+]);
+
+/**
  * Throws if the URL is not a safe http/https URL.
+ * Rejects private/loopback/link-local/internal IP literals (via `isPrivateHost`,
+ * which also catches IPv4-mapped IPv6 such as ::ffff:169.254.169.254 — the AWS
+ * IMDS bypass an IPv4-only regex would miss) and well-known SSRF hostnames.
  */
 export function httpUrlOnly(url: string): void {
   let parsed: URL;
@@ -87,6 +99,14 @@ export function httpUrlOnly(url: string): void {
   }
   if (!parsed.hostname) {
     throw new Error('URL must have a hostname');
+  }
+  // Strip surrounding brackets from IPv6 literals (e.g. [::1] → ::1)
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, '');
+  if (isPrivateHost(hostname)) {
+    throw new Error(`URL hostname "${hostname}" is in a private/reserved IP range — SSRF blocked`);
+  }
+  if (BLOCKED_HOSTNAMES.has(hostname.toLowerCase())) {
+    throw new Error(`URL hostname "${hostname}" is not allowed — SSRF blocked`);
   }
 }
 
@@ -109,7 +129,7 @@ export function graphicUrl(url: string): void {
     }
     return;
   }
-  // Otherwise must be a safe http/https URL
+  // Otherwise must be a safe http/https URL with no private IP
   httpUrlOnly(url);
 }
 
