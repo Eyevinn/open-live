@@ -328,7 +328,7 @@ const SourceAssignmentInput = z.object({
 
 const GraphicAssignmentInput = z.object({
   graphicId: z.string().min(1),
-  dskInput: z.string().min(1),
+  dskInput: z.string().regex(/^dsk_in_\d+$/).max(20),
 });
 
 const OutputAssignmentInput = z.object({
