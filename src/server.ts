@@ -112,7 +112,7 @@ export async function buildServer() {
     fastify.addHook('onRequest', async (req, reply) => {
       const path = req.url.split('?')[0]!;
       if (AUTH_EXEMPT_PATHS.has(path)) return;
-      if (!req.url.startsWith('/api/v1')) return;
+      if (!req.url.startsWith('/api/v1') && !req.url.startsWith('/documentation')) return;
 
       const authHeader = req.headers['authorization'];
       const keyFromHeader = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined;
