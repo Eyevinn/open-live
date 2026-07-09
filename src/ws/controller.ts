@@ -749,12 +749,20 @@ async function handleMessage(
       break;
     }
     case 'GO_LIVE': {
+      if (!doc.stromFlowId) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Production is not activated' }));
+        break;
+      }
       const updated: ProductionDoc = { ...doc, status: 'active', updatedAt: new Date().toISOString() };
       await db.insert(updated);
       broadcast(productionId, { type: 'ON_AIR', value: true });
       break;
     }
     case 'CUT_STREAM': {
+      if (!doc.stromFlowId) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Production is not activated' }));
+        break;
+      }
       const updated: ProductionDoc = { ...doc, status: 'active', updatedAt: new Date().toISOString() };
       await db.insert(updated);
       broadcast(productionId, { type: 'ON_AIR', value: false });
