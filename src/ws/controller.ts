@@ -762,6 +762,11 @@ async function handleMessage(
     }
     case 'GRAPHIC_ON':
     case 'GRAPHIC_OFF': {
+      const graphic = doc.graphics.find((g) => g.id === msg.overlayId);
+      if (!graphic) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Overlay not found' }));
+        break;
+      }
       const active = msg.type === 'GRAPHIC_ON';
       const updated: ProductionDoc = {
         ...doc,
