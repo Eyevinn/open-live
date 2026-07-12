@@ -289,3 +289,58 @@ describe('GET /api/v1/ice-servers', () => {
     expect(res.statusCode).toBe(502);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Tests: PATCH /api/v1/productions/:id — values field validation
+// ---------------------------------------------------------------------------
+
+describe('PATCH /api/v1/productions/:id values validation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockFind.mockResolvedValue({ docs: [] });
+  });
+
+  it('rejects invalid pgm_resolution format', async () => {
+    const app = await buildServer();
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/api/v1/productions/prod-test-1',
+      payload: { values: { pgm_resolution: 'bad-value' } },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('rejects invalid pgm_framerate format', async () => {
+    const app = await buildServer();
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/api/v1/productions/prod-test-1',
+      payload: { values: { pgm_framerate: 'not/valid/framerate' } },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('rejects unknown clock type', async () => {
+    const app = await buildServer();
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/api/v1/productions/prod-test-1',
+      payload: { values: { clock: 'ntp;DROP TABLE--' } },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('accepts valid resolution, framerate, and clock values', async () => {
+    const doc = makeProductionDoc();
+    mockGet.mockResolvedValue(doc);
+    mockInsert.mockResolvedValue({ rev: '2-bcd', ok: true, id: doc._id });
+
+    const app = await buildServer();
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/api/v1/productions/prod-test-1',
+      payload: { values: { pgm_resolution: '1920x1080', pgm_framerate: '30000/1001', clock: 'ntp' } },
+    });
+    expect(res.statusCode).toBe(200);
+  });
+});

@@ -312,9 +312,31 @@ const ProductionInput = z.object({
   name: z.string().min(1),
 });
 
+const RESOLUTION_RE = /^\d{3,5}x\d{3,5}$/;
+const FRAMERATE_RE = /^\d{1,3}\/\d{1,3}$|^\d{1,3}$/;
+const CLOCK_TYPES = ['ntp', 'gst', 'system'] as const;
+
 const ProductionPatch = z.object({
   name: z.string().min(1).optional(),
-  values: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
+  values: z.record(z.union([z.string(), z.number(), z.boolean()]))
+    .superRefine((vals, ctx) => {
+      if (typeof vals['pgm_resolution'] === 'string' && !RESOLUTION_RE.test(vals['pgm_resolution'] as string)) {
+        ctx.addIssue({ code: 'custom', path: ['pgm_resolution'], message: 'Must match WIDTHxHEIGHT (e.g. 1920x1080)' });
+      }
+      if (typeof vals['pgm_framerate'] === 'string' && !FRAMERATE_RE.test(vals['pgm_framerate'] as string)) {
+        ctx.addIssue({ code: 'custom', path: ['pgm_framerate'], message: 'Must be a framerate like 30 or 30000/1001' });
+      }
+      if (typeof vals['multiview_resolution'] === 'string' && !RESOLUTION_RE.test(vals['multiview_resolution'] as string)) {
+        ctx.addIssue({ code: 'custom', path: ['multiview_resolution'], message: 'Must match WIDTHxHEIGHT (e.g. 1920x1080)' });
+      }
+      if (typeof vals['multiview_framerate'] === 'string' && !FRAMERATE_RE.test(vals['multiview_framerate'] as string)) {
+        ctx.addIssue({ code: 'custom', path: ['multiview_framerate'], message: 'Must be a framerate like 30 or 30000/1001' });
+      }
+      if (typeof vals['clock'] === 'string' && vals['clock'] !== '' && !(CLOCK_TYPES as readonly string[]).includes(vals['clock'] as string)) {
+        ctx.addIssue({ code: 'custom', path: ['clock'], message: `Must be one of: ${CLOCK_TYPES.join(', ')}` });
+      }
+    })
+    .optional(),
   airTime: z.string().datetime().nullable().optional(),
 });
 

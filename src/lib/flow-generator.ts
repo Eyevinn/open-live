@@ -4,6 +4,30 @@ import { getSourcesDb, getGraphicsDb } from '../db/index.js';
 import { StromClient } from './strom.js';
 import { DEFAULT_FLOW, type FlowTopology } from './default-flow.js';
 
+const RESOLUTION_RE = /^\d{3,5}x\d{3,5}$/;
+const FRAMERATE_RE = /^\d{1,3}\/\d{1,3}$|^\d{1,3}$/;
+const CLOCK_TYPES = new Set(['ntp', 'gst', 'system']);
+
+function validateProductionValues(values: Record<string, string | number | boolean> | undefined): void {
+  if (!values) return;
+  const { pgm_resolution, pgm_framerate, multiview_resolution, multiview_framerate, clock } = values as Record<string, unknown>;
+  if (typeof pgm_resolution === 'string' && !RESOLUTION_RE.test(pgm_resolution)) {
+    throw new Error(`Invalid pgm_resolution value: ${pgm_resolution}`);
+  }
+  if (typeof pgm_framerate === 'string' && !FRAMERATE_RE.test(pgm_framerate)) {
+    throw new Error(`Invalid pgm_framerate value: ${pgm_framerate}`);
+  }
+  if (typeof multiview_resolution === 'string' && !RESOLUTION_RE.test(multiview_resolution)) {
+    throw new Error(`Invalid multiview_resolution value: ${multiview_resolution}`);
+  }
+  if (typeof multiview_framerate === 'string' && !FRAMERATE_RE.test(multiview_framerate)) {
+    throw new Error(`Invalid multiview_framerate value: ${multiview_framerate}`);
+  }
+  if (typeof clock === 'string' && clock !== '' && !CLOCK_TYPES.has(clock)) {
+    throw new Error(`Invalid clock type: ${clock}`);
+  }
+}
+
 /**
  * Generates a Strom flow from a template + source assignments,
  * creates it in Strom, starts it, and returns the flow ID.
@@ -54,6 +78,8 @@ export async function activateStromFlow(
   stromUrl?: string,
   outputDocs?: OutputDoc[],
 ): Promise<ActivationResult> {
+  validateProductionValues(production.values);
+
   // Virtual source IDs for test streams — no DB lookup needed
   const VIRTUAL_SOURCES: Record<string, Pick<SourceDoc, 'streamType' | 'address' | 'name'>> = {
     'Whip': { streamType: 'whip', address: '', name: 'WHIP Input' },
