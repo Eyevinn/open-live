@@ -1361,6 +1361,48 @@ async function handleMessage(
   }
 }
 
+/** Per-connection sliding-window WS message rate limit (issue #52). */
+const WS_MSG_LIMIT_PER_SEC = 20;
+const WS_EXPENSIVE_LIMIT_PER_SEC = 5;
+const WS_EXPENSIVE_TYPES = new Set([
+  'MACRO_EXEC',
+  'GO_LIVE',
+  'CUT_STREAM',
+  'TRANSITION',
+  'TAKE',
+  'AUTO',
+]);
+
+function createWsMessageGate(socket: WebSocket): (raw: string) => boolean {
+  let times: number[] = [];
+  let expensiveTimes: number[] = [];
+  return (raw: string): boolean => {
+    const now = Date.now();
+    times = times.filter((t) => now - t < 1000);
+    if (times.length >= WS_MSG_LIMIT_PER_SEC) {
+      socket.send(JSON.stringify({ error: 'rate_limit', retryAfterMs: 1000 }));
+      return false;
+    }
+    times.push(now);
+
+    let type: string | undefined;
+    try {
+      type = (JSON.parse(raw) as { type?: string })?.type;
+    } catch {
+      /* invalid JSON handled downstream */
+    }
+    if (type && WS_EXPENSIVE_TYPES.has(type)) {
+      expensiveTimes = expensiveTimes.filter((t) => now - t < 1000);
+      if (expensiveTimes.length >= WS_EXPENSIVE_LIMIT_PER_SEC) {
+        socket.send(JSON.stringify({ error: 'rate_limit', type, retryAfterMs: 1000 }));
+        return false;
+      }
+      expensiveTimes.push(now);
+    }
+    return true;
+  };
+}
+
 const controllerWs: FastifyPluginAsync = async (fastify) => {
   fastify.get<{ Params: { id: string } }>(
     '/ws/productions/:id/controller',
@@ -1373,11 +1415,14 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
       // Per-connection context — mutable so the audio block ID can be populated
       // at connect time and reused on every subsequent AUDIO_SET without a flow fetch.
       const ctx: { audioBlockId?: string } = {};
+      const allowMessage = createWsMessageGate(socket);
 
       // Register message/close handlers immediately so no messages are dropped
       // while we perform the async connect-time sync below.
       socket.on('message', (raw: Buffer | string) => {
-        handleMessage(id, socket, raw.toString(), ctx).catch((err) => {
+        const text = raw.toString();
+        if (!allowMessage(text)) return;
+        handleMessage(id, socket, text, ctx).catch((err) => {
           console.error('[controller] unhandled message error:', err);
         });
       });
