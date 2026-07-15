@@ -63,17 +63,75 @@ const busSchema = z.number().int().min(1).max(8);
 const rampMsSchema = z.number().int().min(0).max(60000);
 const offsetMsSchema = z.number().int().min(0).max(60000);
 
+// #67: allowlist matches open-live-studio TransitionType (+ cut)
+const transitionTypeSchema = z.enum([
+  'cut',
+  'fade', 'dip_to_black',
+  'slide_left', 'slide_right', 'slide_up', 'slide_down',
+  'push_left', 'push_right', 'push_up', 'push_down',
+  'wipe_left', 'wipe_right', 'wipe_up', 'wipe_down',
+  'iris_open', 'iris_close', 'clock_wipe', 'blinds', 'checker',
+  'noise_dissolve', 'luma_wipe', 'barn_doors', 'star_wipe',
+  'pinwheel', 'crosshatch', 'hex_dissolve', 'warp_wipe', 'melt', 'heart_iris',
+  'glitch_cut', 'flash_dissolve', 'whip_pan_left', 'whip_pan_right',
+  'punch_zoom', 'pixelate_take', 'zoom_blur', 'spin', 'tv_roll',
+  'negative_flash', 'ripple',
+]);
+
+// #68: #RRGGBB or #RRGGBBAA only
+const hexColorSchema = z.string().regex(/^#([0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/);
+
+// #66: strict effect shapes (no .passthrough) aligned with Strom VideoEffect
+const videoEffectSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('none') }),
+  z.object({
+    type: z.literal('chroma_key'),
+    key_color: z.string().max(32).optional(),
+    similarity: z.number().optional(),
+    smoothness: z.number().optional(),
+    spill: z.number().optional(),
+  }),
+  z.object({ type: z.literal('pixelate'), block_size: z.number().optional() }),
+  z.object({ type: z.literal('blur'), radius: z.number().optional() }),
+  z.object({
+    type: z.literal('duotone'),
+    low: z.string().max(32).optional(),
+    high: z.string().max(32).optional(),
+    mix: z.number().optional(),
+  }),
+  z.object({ type: z.literal('vignette'), amount: z.number().optional(), softness: z.number().optional() }),
+  z.object({ type: z.literal('vhs'), intensity: z.number().optional() }),
+  z.object({ type: z.literal('old_film'), intensity: z.number().optional() }),
+  z.object({ type: z.literal('edge_glow'), color: z.string().max(32).optional(), intensity: z.number().optional() }),
+  z.object({ type: z.literal('crt'), intensity: z.number().optional() }),
+  z.object({ type: z.literal('halftone'), dot_size: z.number().optional() }),
+  z.object({ type: z.literal('thermal'), intensity: z.number().optional() }),
+  z.object({ type: z.literal('night_vision'), intensity: z.number().optional() }),
+  z.object({ type: z.literal('posterize'), levels: z.number().optional() }),
+  z.object({ type: z.literal('underwater'), intensity: z.number().optional() }),
+  z.object({
+    type: z.literal('color_correct'),
+    brightness: z.number().optional(),
+    contrast: z.number().optional(),
+    saturation: z.number().optional(),
+    hue: z.number().optional(),
+    gamma: z.number().optional(),
+    temperature: z.number().optional(),
+    tint: z.number().optional(),
+  }),
+]);
+
 const PipZoneSchema = z.object({
   rect: z.object({ x: z.number(), y: z.number(), w: z.number(), h: z.number() }).nullable(),
   capacity: z.number().nullable(),
   sources: z.array(z.number().int().min(0).max(15)),
-  border: z.object({ color: z.string().max(9), width: z.number().min(0).max(64) }).nullish(),
+  border: z.object({ color: hexColorSchema, width: z.number().min(0).max(64) }).nullish(),
 });
 
 const InboundMessageSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('CUT'), mixerInput: mixerInputSchema, afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional() }),
-  z.object({ type: z.literal('TRANSITION'), mixerInput: mixerInputSchema, transitionType: z.string().max(32), durationMs: rampMsSchema.optional(), afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional() }),
-  z.object({ type: z.literal('TAKE'), pip: pipIndexSchema.optional(), transitionType: z.string().max(32).optional(), durationMs: rampMsSchema.optional(), afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional() }),
+  z.object({ type: z.literal('TRANSITION'), mixerInput: mixerInputSchema, transitionType: transitionTypeSchema, durationMs: rampMsSchema.optional(), afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional() }),
+  z.object({ type: z.literal('TAKE'), pip: pipIndexSchema.optional(), transitionType: transitionTypeSchema.optional(), durationMs: rampMsSchema.optional(), afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional() }),
   z.object({ type: z.literal('SET_PVW'), mixerInput: mixerInputSchema }),
   z.object({ type: z.literal('FTB'), active: z.boolean().optional(), durationMs: rampMsSchema.optional() }),
   z.object({ type: z.literal('SET_OVL'), alpha: alphaSchema }),
@@ -113,7 +171,7 @@ const InboundMessageSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('SET_EFFECT'),
     target: z.union([z.object({ input: z.number().int().min(0).max(15) }), z.literal('master')]),
-    effect: z.object({ type: z.string().min(1).max(64) }).passthrough(),
+    effect: videoEffectSchema,
   }),
 ]);
 
