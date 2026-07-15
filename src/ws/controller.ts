@@ -1366,6 +1366,19 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
     '/ws/productions/:id/controller',
     { websocket: true },
     async (socket, req) => {
+      // Defence-in-depth: same API key gate as HTTP (/ws was previously unguarded).
+      if (config.apiKey) {
+        const authHeader = req.headers['authorization'];
+        const keyFromHeader =
+          authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined;
+        const keyFromQuery = (req.query as Record<string, string> | undefined)?.['key'];
+        const provided = keyFromHeader ?? keyFromQuery;
+        if (provided !== config.apiKey) {
+          socket.close(1008, 'Unauthorized');
+          return;
+        }
+      }
+
       const { id } = req.params;
       subscribe(id, socket);
       notifySubscriberJoin(id);

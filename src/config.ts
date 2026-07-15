@@ -27,8 +27,9 @@ export const config = {
   stromAuthMode: (process.env['STROM_AUTH_MODE'] ?? 'osc') as 'osc' | 'direct',
   logLevel: process.env['LOG_LEVEL'] ?? 'info',
   /**
-   * Optional static API key. When set, all /api/v1 routes require:
+   * Optional static API key. When set, /api/v1 and /ws/ routes require:
    *   Authorization: Bearer <API_KEY>
+   * WebSocket upgrades may also pass ?key=<API_KEY>.
    * Leave unset when running behind OSC's reverse-proxy auth wall.
    */
   apiKey: process.env['API_KEY'] ?? undefined,

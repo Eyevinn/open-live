@@ -107,12 +107,14 @@ export async function buildServer() {
 
   // Optional API key authentication — enabled when API_KEY env var is set.
   // Exempt: health/ready probes and status/reconnect endpoints.
-  // WS connections: pass key via Authorization header or ?key= query param on upgrade.
+  // Covers REST (/api/v1) and controller WebSocket (/ws/) — not just /api/v1
+  // (incomplete guard previously let /ws/* bypass auth; see #101).
+  // WS: pass key via Authorization header or ?key= query param on upgrade.
   if (config.apiKey) {
     fastify.addHook('onRequest', async (req, reply) => {
       const path = req.url.split('?')[0]!;
       if (AUTH_EXEMPT_PATHS.has(path)) return;
-      if (!req.url.startsWith('/api/v1')) return;
+      if (!req.url.startsWith('/api/v1') && !req.url.startsWith('/ws/')) return;
 
       const authHeader = req.headers['authorization'];
       const keyFromHeader = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined;
