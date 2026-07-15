@@ -5,7 +5,7 @@ services:
       COUCHDB_USER: ${COUCHDB_USER:-admin}
       COUCHDB_PASSWORD: ${COUCHDB_PASSWORD:?Set COUCHDB_PASSWORD in .env (see .env.example)}
     ports:
-      - "5984:5984"
+      - "127.0.0.1:5984:5984"  # loopback only — not 0.0.0.0 (see security #62)
     volumes:
       - couchdb_data:/opt/couchdb/data
 
