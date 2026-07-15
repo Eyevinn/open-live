@@ -749,14 +749,23 @@ async function handleMessage(
       break;
     }
     case 'GO_LIVE': {
+      // #87: do not mark active/on-air without an activated Strom flow
+      if (!doc.stromFlowId) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Production is not activated' }));
+        break;
+      }
       const updated: ProductionDoc = { ...doc, status: 'active', updatedAt: new Date().toISOString() };
       await db.insert(updated);
       broadcast(productionId, { type: 'ON_AIR', value: true });
       break;
     }
     case 'CUT_STREAM': {
-      const updated: ProductionDoc = { ...doc, status: 'active', updatedAt: new Date().toISOString() };
-      await db.insert(updated);
+      if (!doc.stromFlowId) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Production is not activated' }));
+        break;
+      }
+      const updatedCut: ProductionDoc = { ...doc, status: 'active', updatedAt: new Date().toISOString() };
+      await db.insert(updatedCut);
       broadcast(productionId, { type: 'ON_AIR', value: false });
       break;
     }
