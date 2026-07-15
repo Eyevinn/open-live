@@ -96,6 +96,17 @@ async function main() {
   }
 
   startIdleWatchdog(app.log);
+
+  if (!config.apiKey) {
+    const msg =
+      'API_KEY is not set — all /api/v1 routes are unauthenticated. Set API_KEY for any network-accessible deployment.';
+    if (process.env['NODE_ENV'] === 'production') {
+      app.log.error(msg);
+    } else {
+      app.log.warn(msg);
+    }
+  }
+
   await app.listen({ port: config.port, host: '0.0.0.0' });
 }
 
