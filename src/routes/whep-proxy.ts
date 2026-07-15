@@ -41,7 +41,13 @@ const whepProxyRoutes: FastifyPluginAsync = async (fastify) => {
     done(null, body)
   })
 
-  fastify.post<{ Querystring: { target: string } }>('/api/v1/whep-proxy', async (req, reply) => {
+  // #83: tighter than global limit
+  const whepRateLimit = { config: { rateLimit: { max: 10, timeWindow: '1 minute' as const } } };
+
+  fastify.post<{ Querystring: { target: string } }>(
+    '/api/v1/whep-proxy',
+    whepRateLimit,
+    async (req, reply) => {
     const target = req.query.target
     if (!target) return reply.status(400).send({ error: 'Missing target query parameter' })
 
@@ -89,27 +95,32 @@ const whepProxyRoutes: FastifyPluginAsync = async (fastify) => {
 
     reply.header('Content-Type', 'application/sdp')
     return reply.status(201).send(answerSdp)
-  })
+    },
+  )
 
-  fastify.delete<{ Querystring: { target: string } }>('/api/v1/whep-proxy', async (req, reply) => {
-    const target = req.query.target
-    if (!target) return reply.status(400).send({ error: 'Missing target query parameter' })
+  fastify.delete<{ Querystring: { target: string } }>(
+    '/api/v1/whep-proxy',
+    whepRateLimit,
+    async (req, reply) => {
+      const target = req.query.target
+      if (!target) return reply.status(400).send({ error: 'Missing target query parameter' })
 
-    let targetUrl: string
-    try {
-      targetUrl = decodeURIComponent(target)
-      validateProxyTarget(targetUrl)
-    } catch (err) {
-      return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid target URL' })
-    }
+      let targetUrl: string
+      try {
+        targetUrl = decodeURIComponent(target)
+        validateProxyTarget(targetUrl)
+      } catch (err) {
+        return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid target URL' })
+      }
 
-    const token = await getStromToken(config.stromToken).catch(() => undefined)
-    const headers: Record<string, string> = {}
-    if (token) headers['Authorization'] = `Bearer ${token}`
+      const token = await getStromToken(config.stromToken).catch(() => undefined)
+      const headers: Record<string, string> = {}
+      if (token) headers['Authorization'] = `Bearer ${token}`
 
-    await fetch(targetUrl, { method: 'DELETE', headers }).catch(() => {/* ignore teardown errors */})
-    return reply.status(204).send()
-  })
+      await fetch(targetUrl, { method: 'DELETE', headers }).catch(() => {/* ignore teardown errors */})
+      return reply.status(204).send()
+    },
+  )
 }
 
 export default whepProxyRoutes

@@ -57,8 +57,12 @@ const whipRoutes: FastifyPluginAsync = async (fastify) => {
   })
 
   // POST — initial WHIP offer/answer
+  // #83: tighter limit than global (pipeline / Strom signaling cost)
+  const whipRateLimit = { config: { rateLimit: { max: 10, timeWindow: '1 minute' as const } } };
+
   fastify.post<{ Params: { id: string; mixerInput: string } }>(
     '/api/v1/productions/:id/whip/:mixerInput',
+    whipRateLimit,
     async (req, reply) => {
       const { id: productionId, mixerInput } = req.params
       const stromTarget = resolveStromWhipUrl(productionId, mixerInput)
@@ -102,6 +106,7 @@ const whipRoutes: FastifyPluginAsync = async (fastify) => {
     Querystring: { session?: string }
   }>(
     '/api/v1/productions/:id/whip/:mixerInput',
+    whipRateLimit,
     async (req, reply) => {
       let target: string;
       if (req.query.session) {
@@ -133,6 +138,7 @@ const whipRoutes: FastifyPluginAsync = async (fastify) => {
     Querystring: { session?: string }
   }>(
     '/api/v1/productions/:id/whip/:mixerInput',
+    whipRateLimit,
     async (req, reply) => {
       let target: string;
       if (req.query.session) {
