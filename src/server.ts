@@ -107,17 +107,24 @@ export async function buildServer() {
 
   // Optional API key authentication — enabled when API_KEY env var is set.
   // Exempt: health/ready probes and status/reconnect endpoints.
-  // WS connections: pass key via Authorization header or ?key= query param on upgrade.
+  // Protects /api/v1/* , /documentation* (#81), and /ws/* (#38 self-hosted).
+  // WS: Authorization header or ?key= / ?token= query on upgrade.
   if (config.apiKey) {
     fastify.addHook('onRequest', async (req, reply) => {
       const path = req.url.split('?')[0]!;
       if (AUTH_EXEMPT_PATHS.has(path)) return;
-      if (!req.url.startsWith('/api/v1')) return;
+      const needsAuth =
+        req.url.startsWith('/api/v1') ||
+        req.url.startsWith('/ws/') ||
+        path === '/documentation' ||
+        path.startsWith('/documentation/');
+      if (!needsAuth) return;
 
       const authHeader = req.headers['authorization'];
       const keyFromHeader = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined;
-      // WS upgrade carries key in query string since JS WebSocket API doesn't support custom headers
-      const keyFromQuery = (req.query as Record<string, string>)?.['key'];
+      // WS upgrade cannot set custom headers — token in query string
+      const q = req.query as Record<string, string | undefined>;
+      const keyFromQuery = q?.['key'] ?? q?.['token'];
       const provided = keyFromHeader ?? keyFromQuery;
 
       if (provided !== config.apiKey) {
