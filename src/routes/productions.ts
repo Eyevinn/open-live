@@ -11,6 +11,7 @@ import { clearProductionPflState } from '../services/pfl-state.js';
 import { clearPipState, clearAudioState, clearFxState } from '../ws/controller.js';
 import { config } from '../config.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
+import { validateProductionValues } from '../lib/production-values.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -316,6 +317,12 @@ const ProductionPatch = z.object({
   name: z.string().min(1).optional(),
   values: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
   airTime: z.string().datetime().nullable().optional(),
+}).superRefine((body, ctx) => {
+  if (!body.values) return;
+  const result = validateProductionValues(body.values);
+  if (!result.ok) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: result.error, path: ['values'] });
+  }
 });
 
 // mixerInput must match the Strom pad naming convention (e.g. "video_in_0", "video_in_15")
@@ -408,10 +415,19 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
     const body = ProductionPatch.parse(req.body);
     try {
       const doc = await getDb().get(req.params.id);
+      let nextValues = doc.values;
+      if (body.values !== undefined) {
+        const merged = { ...(doc.values ?? {}), ...body.values };
+        const checked = validateProductionValues(merged);
+        if (!checked.ok) {
+          return reply.status(400).send({ error: checked.error, statusCode: 400 });
+        }
+        nextValues = checked.values;
+      }
       const updated: ProductionDoc = {
         ...doc,
         ...(body.name !== undefined && { name: body.name }),
-        ...(body.values !== undefined && { values: { ...(doc.values ?? {}), ...body.values } }),
+        ...(body.values !== undefined && { values: nextValues }),
         ...(body.airTime !== undefined && { airTime: body.airTime ?? undefined }),
         updatedAt: new Date().toISOString(),
       };
@@ -450,7 +466,10 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
 
   // Activate a production — immediately returns 'activating', then polls Strom
   // for flow state in a fire-and-forget async loop.
-  fastify.post<{ Params: { id: string } }>('/api/v1/productions/:id/activate', async (req, reply) => {
+  fastify.post<{ Params: { id: string } }>(
+    '/api/v1/productions/:id/activate',
+    { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
+    async (req, reply) => {
     try {
       const doc = await getDb().get(req.params.id);
 
