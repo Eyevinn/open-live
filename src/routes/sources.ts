@@ -7,7 +7,7 @@ import { updateProductionDoc } from './productions.js';
 import { graphicUrl, srtUrl } from '../lib/url-validation.js';
 
 const SourceInput = z.object({
-  name: z.string().min(1),
+  name: z.string().min(1).max(256),
   address: z.string(),
   streamType: z.enum(['srt', 'efp', 'whip', 'html']),
   status: z.enum(['active', 'inactive']).default('inactive'),
@@ -32,7 +32,7 @@ const SourceInput = z.object({
 });
 
 const SourcePatch = z.object({
-  name: z.string().min(1).optional(),
+  name: z.string().min(1).max(256).optional(),
   address: z.string().optional(),
   streamType: z.enum(['srt', 'efp', 'whip', 'html']).optional(),
   status: z.enum(['active', 'inactive']).optional(),

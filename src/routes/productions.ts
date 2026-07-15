@@ -309,11 +309,11 @@ async function runActivationFlow(
 // ---------------------------------------------------------------------------
 
 const ProductionInput = z.object({
-  name: z.string().min(1),
+  name: z.string().min(1).max(256),
 });
 
 const ProductionPatch = z.object({
-  name: z.string().min(1).optional(),
+  name: z.string().min(1).max(256).optional(),
   values: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
   airTime: z.string().datetime().nullable().optional(),
 });
