@@ -3,6 +3,7 @@ import type { ProductionDoc, SourceDoc, GraphicDoc, OutputDoc } from '../db/type
 import { getSourcesDb, getGraphicsDb } from '../db/index.js';
 import { StromClient } from './strom.js';
 import { DEFAULT_FLOW, type FlowTopology } from './default-flow.js';
+import { redactSensitive, safeFlowProjection } from './log-redact.js';
 
 /**
  * Generates a Strom flow from a template + source assignments,
@@ -827,13 +828,18 @@ export async function activateStromFlow(
     await strom.flows.start(flowId);
   } catch (err) {
     // Log a sanitized flow projection — never log block properties (may contain SRT URIs, tokens, passphrases)
-    const safeFlow = {
-      blockCount: flow.blocks.length,
-      blocks: flow.blocks.map((b) => ({ id: b['id'], block_definition_id: b['block_definition_id'] })),
-      linkCount: flow.links.length,
-    };
-    console.error('[flow-generator] Flow start failed. Flow topology (properties redacted):',
-      JSON.stringify(safeFlow, null, 2));
+    // #69: wire log-redact helpers (were previously dead code)
+    console.error(
+      '[flow-generator] Flow start failed:',
+      JSON.stringify(
+        redactSensitive({
+          err: err instanceof Error ? err.message : String(err),
+          flow: safeFlowProjection(flow as unknown as Record<string, unknown>),
+        }),
+        null,
+        2,
+      ),
+    );
     // Start failed — clean up the created flow so the endpoint isn't left registered
     try {
       await strom.flows.delete(flowId);

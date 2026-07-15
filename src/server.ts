@@ -33,6 +33,21 @@ export async function buildServer() {
   const fastify = Fastify({
     logger: {
       level: config.logLevel,
+      // #69: defence-in-depth — never log credential-like fields even if handlers pass them
+      redact: {
+        paths: [
+          '*.passphrase',
+          '*.address',
+          '*.key',
+          '*.password',
+          '*.token',
+          '*.pat',
+          '*.secret',
+          '*.authorization',
+          '*.srt_uri',
+        ],
+        censor: '[REDACTED]',
+      },
     },
     disableRequestLogging: true,
     // Prevent memory exhaustion via oversized request bodies (1 MB limit)

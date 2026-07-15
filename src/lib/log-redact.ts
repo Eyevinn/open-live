@@ -2,7 +2,7 @@
  * Redacts sensitive values from log objects to prevent credential leakage.
  */
 
-const SENSITIVE_KEYS = /srt_uri|passphrase|streamid|authorization|token|pat|secret/i;
+const SENSITIVE_KEYS = /srt_uri|passphrase|streamid|authorization|token|pat|secret|address|password|key/i;
 
 export function redactSensitive(obj: unknown): unknown {
   if (Array.isArray(obj)) {
