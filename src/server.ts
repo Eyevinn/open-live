@@ -60,8 +60,8 @@ export async function buildServer() {
     crossOriginResourcePolicy: { policy: 'cross-origin' },
   });
 
-  // Rate limiting — 200 requests per minute per IP on API routes
-  // Activation and WHIP/WHEP proxy get tighter limits (10/min) to prevent abuse
+  // Rate limiting — 200 requests per minute per IP on API routes.
+  // Activation and WHIP/WHEP use route-level max: 10/min (see routes).
   await fastify.register(rateLimit, {
     global: true,
     max: 200,
