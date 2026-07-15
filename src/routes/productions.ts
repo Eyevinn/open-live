@@ -530,9 +530,12 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         _rev: insertResponse.rev,
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      fastify.log.error({ err }, 'Failed to initiate production activation');
-      return reply.status(500).send({ error: message, statusCode: 500 });
+      // Do not forward err.message to clients — can leak Strom/CouchDB/SAT internals (#79)
+      req.log.error({ err }, 'Failed to initiate production activation');
+      return reply.status(500).send({
+        error: 'Activation failed — check server logs',
+        statusCode: 500,
+      });
     }
   });
 
@@ -584,9 +587,12 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       notifyProductionDeactivated(doc._id);
       return reply.send({ id: updated._id, name: updated.name, status: updated.status, _rev: response.rev });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      fastify.log.error({ err }, 'Failed to deactivate production');
-      return reply.status(500).send({ error: message, statusCode: 500 });
+      // Do not forward err.message to clients — can leak Strom/CouchDB/SAT internals (#79)
+      req.log.error({ err }, 'Failed to deactivate production');
+      return reply.status(500).send({
+        error: 'Deactivation failed — check server logs',
+        statusCode: 500,
+      });
     }
   });
 
