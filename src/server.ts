@@ -50,7 +50,10 @@ export async function buildServer() {
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: false,
     maxAge: 86400,
-    strictPreflight: false,
+    // Enforce CORS preflight for non-simple requests (default @fastify/cors).
+    // strictPreflight:false let non-standard header requests skip preflight
+    // negotiation; with allowlisted origin this is a meaningful CSRF-adjacent layer.
+    strictPreflight: true,
   });
 
   await fastify.register(helmet, {
