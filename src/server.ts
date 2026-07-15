@@ -107,12 +107,17 @@ export async function buildServer() {
 
   // Optional API key authentication — enabled when API_KEY env var is set.
   // Exempt: health/ready probes and status/reconnect endpoints.
+  // Protects /api/v1/* and /documentation* (Swagger UI + OpenAPI JSON/YAML) — #81.
   // WS connections: pass key via Authorization header or ?key= query param on upgrade.
   if (config.apiKey) {
     fastify.addHook('onRequest', async (req, reply) => {
       const path = req.url.split('?')[0]!;
       if (AUTH_EXEMPT_PATHS.has(path)) return;
-      if (!req.url.startsWith('/api/v1')) return;
+      const needsAuth =
+        req.url.startsWith('/api/v1') ||
+        path === '/documentation' ||
+        path.startsWith('/documentation/');
+      if (!needsAuth) return;
 
       const authHeader = req.headers['authorization'];
       const keyFromHeader = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined;
