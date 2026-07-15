@@ -3,6 +3,7 @@ import type { ProductionDoc, SourceDoc, GraphicDoc, OutputDoc } from '../db/type
 import { getSourcesDb, getGraphicsDb } from '../db/index.js';
 import { StromClient } from './strom.js';
 import { DEFAULT_FLOW, type FlowTopology } from './default-flow.js';
+import { validateProductionValues } from './production-values.js';
 
 /**
  * Generates a Strom flow from a template + source assignments,
@@ -111,11 +112,22 @@ export async function activateStromFlow(
     }
   }
 
+  // Sanitize values again at flow-build time (defence-in-depth vs stored docs).
+  let safeValues = production.values as Record<string, string | number | boolean> | undefined;
+  if (safeValues && typeof safeValues === 'object') {
+    const checked = validateProductionValues(safeValues);
+    if (!checked.ok) {
+      throw new Error(`Invalid production values: ${checked.error}`);
+    }
+    safeValues = checked.values;
+  }
+  const values = safeValues ?? production.values;
+
   // Resolve pgm_resolution: production.values takes precedence over the template
   // mixer block's default — avoids in-mixer upscaling on static inputs (test
   // sources) which causes QoS/videoconvert falling-behind events.
   const pgmResolution = (() => {
-    if (typeof production.values?.pgm_resolution === 'string') return production.values.pgm_resolution;
+    if (typeof values?.pgm_resolution === 'string') return values.pgm_resolution;
     const mixer = flow.blocks.find(
       (b) => (b as Record<string, unknown>)['block_definition_id'] === 'builtin.vision_mixer',
     ) as Record<string, unknown> | undefined;
@@ -123,30 +135,30 @@ export async function activateStromFlow(
     return typeof p['pgm_resolution'] === 'string' ? p['pgm_resolution'] : '1280x720';
   })();
 
-  const pgmBitrate = typeof production.values?.bitrate === 'number' ? production.values.bitrate : undefined;
-  const multiviewBitrate = typeof production.values?.multiview_bitrate === 'number' ? production.values.multiview_bitrate : undefined;
-  const pgmFramerate = typeof production.values?.pgm_framerate === 'string' ? production.values.pgm_framerate : undefined;
-  const multiviewResolution = typeof production.values?.multiview_resolution === 'string' ? production.values.multiview_resolution : undefined;
-  const multiviewFramerate = typeof production.values?.multiview_framerate === 'string' ? production.values.multiview_framerate : undefined;
+  const pgmBitrate = typeof values?.bitrate === 'number' ? values.bitrate : undefined;
+  const multiviewBitrate = typeof values?.multiview_bitrate === 'number' ? values.multiview_bitrate : undefined;
+  const pgmFramerate = typeof values?.pgm_framerate === 'string' ? values.pgm_framerate : undefined;
+  const multiviewResolution = typeof values?.multiview_resolution === 'string' ? values.multiview_resolution : undefined;
+  const multiviewFramerate = typeof values?.multiview_framerate === 'string' ? values.multiview_framerate : undefined;
   const numAuxBuses = (() => {
-    const v = production.values?.num_aux_buses;
+    const v = values?.num_aux_buses;
     if (typeof v === 'number') return v;
     if (typeof v === 'string') { const n = parseInt(v, 10); return isNaN(n) ? undefined : n; }
     return undefined;
   })();
   const numGroups = (() => {
-    const v = production.values?.num_groups;
+    const v = values?.num_groups;
     if (typeof v === 'number') return v;
     if (typeof v === 'string') { const n = parseInt(v, 10); return isNaN(n) ? undefined : n; }
     return undefined;
   })();
   const mixLatency = (() => {
-    const v = production.values?.mix_latency;
+    const v = values?.mix_latency;
     if (typeof v === 'number' && Number.isFinite(v)) return Math.max(0, Math.round(v));
     if (typeof v === 'string') { const n = parseInt(v, 10); return isNaN(n) ? 100 : Math.max(0, n); }
     return 100;
   })();
-  const clockType = typeof production.values?.clock === 'string' && production.values.clock !== '' ? production.values.clock : undefined;
+  const clockType = typeof values?.clock === 'string' && values.clock !== '' ? values.clock : undefined;
 
   for (const block of flow.blocks) {
     const b = block as Record<string, unknown>;
@@ -159,7 +171,7 @@ export async function activateStromFlow(
       if (multiviewResolution !== undefined) props['multiview_resolution'] = multiviewResolution;
       if (multiviewFramerate !== undefined) props['multiview_framerate'] = multiviewFramerate;
       // swap_pvw_pgm (PR #637): non-live property — only applied at pipeline build time.
-      const swapPvwPgm = production.values?.swap_pvw_pgm === true || production.values?.swap_pvw_pgm === 'true';
+      const swapPvwPgm = values?.swap_pvw_pgm === true || values?.swap_pvw_pgm === 'true';
       if (swapPvwPgm) props['swap_pvw_pgm'] = true;
       b['properties'] = props;
     }

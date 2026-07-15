@@ -763,6 +763,11 @@ async function handleMessage(
     case 'GRAPHIC_ON':
     case 'GRAPHIC_OFF': {
       const active = msg.type === 'GRAPHIC_ON';
+      const graphic = (doc.graphics ?? []).find((g) => g.id === msg.overlayId);
+      if (!graphic) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Overlay not found' }));
+        break;
+      }
       const updated: ProductionDoc = {
         ...doc,
         graphics: doc.graphics.map((g) =>
@@ -836,6 +841,9 @@ async function handleMessage(
             broadcast(productionId, { type: 'TALLY', ...newTally });
             await stromTransition(currentDoc, tally.pgm, tally.pvw, 'cut');
           } else if (action.type === 'GRAPHIC_ON' && action.overlayId) {
+            if (!(currentDoc.graphics ?? []).some((g) => g.id === action.overlayId)) {
+              throw new Error('Overlay not found');
+            }
             const updated: ProductionDoc = {
               ...currentDoc,
               graphics: currentDoc.graphics.map((g) => g.id === action.overlayId ? { ...g, active: true } : g),
@@ -844,6 +852,9 @@ async function handleMessage(
             await getDb().insert(updated);
             broadcast(productionId, { type: 'GRAPHIC', overlayId: action.overlayId, active: true });
           } else if (action.type === 'GRAPHIC_OFF' && action.overlayId) {
+            if (!(currentDoc.graphics ?? []).some((g) => g.id === action.overlayId)) {
+              throw new Error('Overlay not found');
+            }
             const updated: ProductionDoc = {
               ...currentDoc,
               graphics: currentDoc.graphics.map((g) => g.id === action.overlayId ? { ...g, active: false } : g),
