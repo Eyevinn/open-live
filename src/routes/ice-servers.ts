@@ -18,7 +18,9 @@ import { config } from '../config.js';
  * config changes rarely so a stale response is far better than a 502.
  */
 
-let cachedIceServers: IceServer[] | null = null
+let cachedIceServers: IceServer[] | null = null;
+let cacheTimestamp = 0;
+const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 const iceServersRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get('/api/v1/ice-servers', async (_req, reply) => {
@@ -28,12 +30,15 @@ const iceServersRoutes: FastifyPluginAsync = async (fastify) => {
 
       const { ice_servers } = await strom.system.iceServers();
       cachedIceServers = ice_servers;
+      cacheTimestamp = Date.now();
       return reply.send({ iceServers: ice_servers });
     } catch (err) {
-      if (cachedIceServers) {
+      const isCacheValid = cachedIceServers && (Date.now() - cacheTimestamp < CACHE_TTL_MS);
+      if (isCacheValid) {
         fastify.log.warn({ err }, 'Strom unreachable fetching ICE servers — serving cached response');
         return reply.send({ iceServers: cachedIceServers });
       }
+      cachedIceServers = null;
       if (err instanceof StromClientError) {
         fastify.log.error({ err }, 'Strom returned an error fetching ICE servers');
         return reply.status(502).send({ error: 'Strom returned an error fetching ICE servers', statusCode: 502 });
