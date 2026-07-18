@@ -763,6 +763,11 @@ async function handleMessage(
     case 'GRAPHIC_ON':
     case 'GRAPHIC_OFF': {
       const active = msg.type === 'GRAPHIC_ON';
+      const exists = doc.graphics.some((g) => g.id === msg.overlayId);
+      if (!exists) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: `Graphic overlay ID '${msg.overlayId}' not found in production` }));
+        break;
+      }
       const updated: ProductionDoc = {
         ...doc,
         graphics: doc.graphics.map((g) =>
