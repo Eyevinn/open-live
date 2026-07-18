@@ -19,7 +19,14 @@ const statusRoutes: FastifyPluginAsync = async (fastify) => {
     }
   });
 
-  fastify.post('/api/v1/reconnect', async (_req, reply) => {
+  fastify.post('/api/v1/reconnect', {
+    config: {
+      rateLimit: {
+        max: 5,
+        timeWindow: '1 minute',
+      },
+    },
+  }, async (_req, reply) => {
     const result: { db: boolean; strom: boolean } = { db: isDbConnected(), strom: false };
 
     if (!result.db) {
