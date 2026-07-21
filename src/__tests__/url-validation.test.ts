@@ -152,4 +152,30 @@ describe('srtUrl', () => {
     expect(() => srtUrl('srt://[::1]:9000')).toThrow(/private|loopback/i);
     expect(() => srtUrl('srt://[fc00::1]:9000')).toThrow(/private|loopback/i);
   });
+
+  it('accepts safe query params', () => {
+    expect(() => srtUrl('srt://example.com:9999?passphrase=abc123&mode=caller')).not.toThrow();
+  });
+
+  it('rejects CR/LF injection in the query string', () => {
+    expect(() => srtUrl('srt://example.com:9999?x=a\r\ninjected=1')).toThrow('Control characters not allowed');
+    expect(() => srtUrl('srt://example.com:9999?x=a\ninjected')).toThrow('Control characters not allowed');
+  });
+
+  it('rejects a NUL byte', () => {
+    expect(() => srtUrl('srt://example.com:9999?x=\x00')).toThrow('Control characters not allowed');
+  });
+
+  it('rejects a URL exceeding the max length', () => {
+    expect(() => srtUrl('srt://example.com:9999?' + 'a'.repeat(600))).toThrow('SRT URL too long');
+  });
+
+  it('rejects backslash and quotes in the query string', () => {
+    expect(() => srtUrl('srt://example.com:9999?x=a\\b')).toThrow('Invalid SRT URL format');
+    expect(() => srtUrl('srt://example.com:9999?x="evil"')).toThrow('Invalid SRT URL format');
+  });
+
+  it('rejects a URL with no port', () => {
+    expect(() => srtUrl('srt://example.com')).toThrow('Invalid SRT URL format');
+  });
 });
