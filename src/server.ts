@@ -5,6 +5,7 @@ import rateLimit from '@fastify/rate-limit';
 import websocket from '@fastify/websocket';
 import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
+import { timingSafeEqual } from 'crypto';
 import { ZodError } from 'zod';
 import { config } from './config.js';
 import { isDbConnected } from './db/index.js';
@@ -35,6 +36,7 @@ export async function buildServer() {
       level: config.logLevel,
     },
     disableRequestLogging: true,
+    trustProxy: true,
     // Prevent memory exhaustion via oversized request bodies (1 MB limit)
     bodyLimit: 1_048_576,
   });
@@ -69,7 +71,7 @@ export async function buildServer() {
     // Skip health/ready probes — they are high-frequency and come from the cluster
     allowList: (req: { url: string }) => req.url === '/health' || req.url === '/ready',
     skipOnError: false,
-    keyGenerator: (req: { headers: Record<string, string | string[] | undefined>; ip: string }) => (req.headers['x-forwarded-for'] as string ?? req.ip).split(',')[0]!.trim(),
+    keyGenerator: (req: { ip: string }) => req.ip,
     errorResponseBuilder: (_req, context) => ({
       error: 'Too many requests',
       statusCode: 429,
@@ -120,7 +122,19 @@ export async function buildServer() {
       const keyFromQuery = (req.query as Record<string, string>)?.['key'];
       const provided = keyFromHeader ?? keyFromQuery;
 
-      if (provided !== config.apiKey) {
+      if (!provided || !config.apiKey) {
+        return reply.status(401).send({ error: 'Unauthorized', statusCode: 401 });
+      }
+
+      // Pad both buffers to a fixed max length (256 bytes) to prevent
+      // timing side-channel attacks that leak the API key length.
+      const MAX_KEY_LENGTH = 256;
+      const bufProvided = Buffer.alloc(MAX_KEY_LENGTH, 0);
+      const bufKey = Buffer.alloc(MAX_KEY_LENGTH, 0);
+      Buffer.from(provided).copy(bufProvided);
+      Buffer.from(config.apiKey).copy(bufKey);
+
+      if (!timingSafeEqual(bufProvided, bufKey)) {
         return reply.status(401).send({ error: 'Unauthorized', statusCode: 401 });
       }
     });
@@ -130,7 +144,7 @@ export async function buildServer() {
   fastify.addHook('onResponse', async (req, reply) => {
     if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return;
     if (!req.url.startsWith('/api/v1')) return;
-    const ip = ((req.headers['x-forwarded-for'] as string | undefined) ?? req.ip ?? '').split(',')[0]!.trim();
+    const ip = req.ip ?? '';
     fastify.log.info({
       audit: true,
       method: req.method,
