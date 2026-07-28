@@ -37,6 +37,11 @@ export async function buildServer() {
     disableRequestLogging: true,
     // Prevent memory exhaustion via oversized request bodies (1 MB limit)
     bodyLimit: 1_048_576,
+    // Trust the X-Forwarded-For header from the ingress proxy so that req.ip
+    // resolves to the real client IP rather than the proxy's address.
+    // Without this, the header is treated as user-controlled input, allowing
+    // spoofed IPs to bypass rate limiting.
+    trustProxy: true,
   });
 
   // CORS must be registered before Helmet so its onRequest hook runs first
@@ -69,7 +74,7 @@ export async function buildServer() {
     // Skip health/ready probes — they are high-frequency and come from the cluster
     allowList: (req: { url: string }) => req.url === '/health' || req.url === '/ready',
     skipOnError: false,
-    keyGenerator: (req: { headers: Record<string, string | string[] | undefined>; ip: string }) => (req.headers['x-forwarded-for'] as string ?? req.ip).split(',')[0]!.trim(),
+    keyGenerator: (req: { ip: string }) => req.ip,
     errorResponseBuilder: (_req, context) => ({
       error: 'Too many requests',
       statusCode: 429,
@@ -130,7 +135,7 @@ export async function buildServer() {
   fastify.addHook('onResponse', async (req, reply) => {
     if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return;
     if (!req.url.startsWith('/api/v1')) return;
-    const ip = ((req.headers['x-forwarded-for'] as string | undefined) ?? req.ip ?? '').split(',')[0]!.trim();
+    const ip = req.ip ?? '';
     fastify.log.info({
       audit: true,
       method: req.method,
