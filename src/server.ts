@@ -5,6 +5,7 @@ import rateLimit from '@fastify/rate-limit';
 import websocket from '@fastify/websocket';
 import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
+import { timingSafeEqual } from 'crypto';
 import { ZodError } from 'zod';
 import { config } from './config.js';
 import { isDbConnected } from './db/index.js';
@@ -163,7 +164,9 @@ export async function buildServer() {
       const keyFromQuery = (req.query as Record<string, string>)?.['key'];
       const provided = keyFromHeader ?? keyFromQuery;
 
-      if (provided !== config.apiKey) {
+      const a = Buffer.from(provided ?? '');
+      const b = Buffer.from(config.apiKey);
+      if (a.length !== b.length || !timingSafeEqual(a, b)) {
         return reply.status(401).send({ error: 'Unauthorized', statusCode: 401 });
       }
     });
