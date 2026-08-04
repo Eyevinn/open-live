@@ -105,6 +105,26 @@ async function main() {
     }
   }
 
+  // PUBLIC_BASE_URL is required in production to prevent X-Forwarded-Host injection.
+  // Without it, the activation endpoint derives the public WHIP URL from the raw
+  // X-Forwarded-Host header, which an attacker can forge to redirect camera streams
+  // to an attacker-controlled server (CVE category: host-header injection).
+  if (!config.publicBaseUrl) {
+    if (process.env['NODE_ENV'] === 'production') {
+      throw new Error(
+        'PUBLIC_BASE_URL must be set in production deployments. ' +
+        'Without it the activation endpoint derives WHIP endpoint URLs from the ' +
+        'X-Forwarded-Host request header, enabling host-header injection attacks.'
+      );
+    } else {
+      console.warn(
+        '[security] PUBLIC_BASE_URL is not set. WHIP endpoint URLs will be derived ' +
+        'from request headers (X-Forwarded-Host / Host). Set PUBLIC_BASE_URL to the ' +
+        'externally reachable URL of this service before deploying to production.'
+      );
+    }
+  }
+
   const app = await buildServer();
 
   try {
