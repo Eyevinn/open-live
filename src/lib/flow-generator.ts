@@ -665,8 +665,14 @@ export async function activateStromFlow(
         properties: { url: graphic.url },
         position: [COL_ELEM, dskY],
       });
+      // Resolution only — deliberately no framerate. cefsrc advertises
+      // framerate=0/1 (variable), and builtin.videoformat is
+      // videoscale -> videoconvert -> capsfilter with no videorate, so pinning
+      // a fixed framerate here cannot be satisfied: the capsfilter fails to
+      // negotiate, cefsrc's task pauses on not-negotiated, and the DSK renders
+      // nothing at all. The source-side format blocks above already pass
+      // resolution only. The mixer still emits pgm_framerate downstream.
       const fmtProps: Record<string, unknown> = { resolution: pgmResolution };
-      if (pgmFramerate !== undefined) fmtProps['framerate'] = pgmFramerate;
       flow.blocks.push({
         id: fmtId,
         block_definition_id: 'builtin.videoformat',
