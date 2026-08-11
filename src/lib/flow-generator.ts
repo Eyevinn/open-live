@@ -794,7 +794,9 @@ export async function activateStromFlow(
       flow.elements.push({
         id: drainId,
         element_type: 'fakesink',
-        properties: { sync: false },
+        // async: false — this drain may never receive a buffer (group bus with
+        // nothing routed to it), so it must not block pipeline preroll.
+        properties: { sync: false, async: false },
         position: [encX, drainBaseY + ROW_H * (i - 1)],
       } as unknown as typeof flow.elements[number]);
       flow.links.push({ from: `${audioMixerBlockId}:group_out_${i}`, to: `${drainId}:sink` });
