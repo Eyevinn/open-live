@@ -565,7 +565,13 @@ export async function activateStromFlow(
         id: inputId,
         block_definition_id: 'builtin.whip_input',
         name: `WHIP Input (V${padIndex})`,
-        properties: { endpoint_id: endpointId },
+        // do_retransmission: false — works around a gst-plugins-base crash in
+        // RTX + RTP header-extension aggregation. On a DISCONT buffer the
+        // depayloader resets hdrext_buffers but not hdrext_delayed, then
+        // asserts the latter is NULL and aborts the process:
+        // https://gitlab.freedesktop.org/gstreamer/gstreamer/-/blob/43de6c053f3658c528269a42638b2d52f5adc0cb/subprojects/gst-plugins-base/gst-libs/gst/rtp/gstrtpbasedepayload.c#L896-897
+        // Property exposed by Eyevinn/strom#663; revert once upstream is fixed.
+        properties: { endpoint_id: endpointId, do_retransmission: false },
         position: { x: COL_INPUT, y: yPos },
       });
       flow.links.push({ from: `${inputId}:video_out`, to: `${offsetId}:in` });
@@ -737,6 +743,9 @@ export async function activateStromFlow(
           name: outputDoc.name,
           properties: {
             endpoint_id: endpointId,
+            // See the WHIP Input block above: RTX trips a gst-plugins-base
+            // assertion, so it stays off on both legs until that is fixed.
+            do_retransmission: false,
             ...(mainAudioSource && { num_audio_tracks: 1 + (monitorAudioSource ? 1 : 0) + auxCount }),
           },
           position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
