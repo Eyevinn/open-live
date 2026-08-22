@@ -57,7 +57,10 @@ export async function buildServer() {
     contentSecurityPolicy: {
       directives: { defaultSrc: ["'none'"], connectSrc: ["'self'"] },
     },
-    crossOriginResourcePolicy: { policy: 'cross-origin' },
+    // same-origin: this is a private JSON API, not a public CDN. cross-origin
+    // reads are already selectively permitted via CORS preflight; a global
+    // cross-origin CRP would additionally expose responses to no-cors fetches.
+    crossOriginResourcePolicy: { policy: 'same-origin' },
   });
 
   // Rate limiting — 200 requests per minute per IP on API routes
