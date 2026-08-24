@@ -5,6 +5,7 @@ import { getSourcesDb, getDb } from '../db/index.js';
 import type { SourceDoc, ProductionDoc } from '../db/types.js';
 import { updateProductionDoc } from './productions.js';
 import { graphicUrl, srtUrl } from '../lib/url-validation.js';
+import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
 
 const SourceInput = z.object({
   name: z.string().min(1),
@@ -47,7 +48,10 @@ function maskSrtPassphrase(address: string): string {
 
 function toApi(doc: SourceDoc) {
   const { _id, _rev, type, ...rest } = doc;
-  return { id: _id, ...rest, address: maskSrtPassphrase(rest.address) };
+  // Passphrases are stored encrypted (encv1:...); decrypt before masking so the
+  // mask matches on the "passphrase=" param regardless of storage form. Legacy
+  // plaintext passphrases pass through decryption unchanged.
+  return { id: _id, ...rest, address: maskSrtPassphrase(decryptAddressPassphrase(rest.address)) };
 }
 
 const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
@@ -72,7 +76,8 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       _id: `src-${randomUUID()}`,
       type: 'source',
       name: body.name,
-      address: body.address,
+      // Encrypt any embedded SRT passphrase before it touches CouchDB (issue #160).
+      address: encryptAddressPassphrase(body.address),
       streamType: body.streamType,
       status: body.status,
       liveCamera: body.liveCamera,
@@ -99,9 +104,11 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
     const body = SourcePatch.parse(req.body);
     try {
       const doc = await getSourcesDb().get(req.params.id);
-      // Determine effective streamType and address after the patch
+      // Determine effective streamType and address after the patch. Validate
+      // against the plaintext form — a new body.address is already plaintext,
+      // while the stored doc.address may hold an encrypted passphrase.
       const effectiveStreamType = body.streamType ?? doc.streamType;
-      const effectiveAddress = body.address ?? doc.address;
+      const effectiveAddress = body.address ?? decryptAddressPassphrase(doc.address);
       if (effectiveAddress) {
         try {
           if (effectiveStreamType === 'html') {
@@ -113,7 +120,12 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
           return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid source address' });
         }
       }
-      const updated: SourceDoc = { ...doc, ...body, updatedAt: new Date().toISOString() };
+      // Encrypt the passphrase in an updated address before persisting. When the
+      // patch leaves the address untouched, keep the already-stored value as-is.
+      const addressPatch = body.address !== undefined
+        ? { address: encryptAddressPassphrase(body.address) }
+        : {};
+      const updated: SourceDoc = { ...doc, ...body, ...addressPatch, updatedAt: new Date().toISOString() };
       await getSourcesDb().insert(updated);
       return reply.send(toApi(updated));
     } catch (err: unknown) {

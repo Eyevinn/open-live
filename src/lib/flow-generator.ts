@@ -3,6 +3,7 @@ import type { ProductionDoc, SourceDoc, GraphicDoc, OutputDoc } from '../db/type
 import { getSourcesDb, getGraphicsDb } from '../db/index.js';
 import { StromClient } from './strom.js';
 import { DEFAULT_FLOW, type FlowTopology } from './default-flow.js';
+import { decryptAddressPassphrase } from './srt-passphrase-crypto.js';
 
 /**
  * Generates a Strom flow from a template + source assignments,
@@ -69,6 +70,9 @@ export async function activateStromFlow(
     if (assignment.sourceId in VIRTUAL_SOURCES) continue;
     try {
       const src = await sourcesDb.get(assignment.sourceId) as unknown as SourceDoc;
+      // Decrypt the at-rest SRT passphrase so Strom receives a usable srt_uri.
+      // Legacy plaintext addresses pass through unchanged (issue #160).
+      src.address = decryptAddressPassphrase(src.address);
       sourceMap.set(assignment.sourceId, src);
     } catch {
       console.warn(`[flow-generator] Source ${assignment.sourceId} (${assignment.mixerInput}) not found — skipping`);
