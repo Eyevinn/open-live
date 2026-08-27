@@ -219,6 +219,35 @@ describe('macro TRANSITION with a PiP on program', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Macro TAKE promoting a PiP that is sitting in preview
+// ---------------------------------------------------------------------------
+
+describe('macro TAKE with a PiP in preview', () => {
+  it('takes the PiP to program instead of reporting an empty bus', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([{ type: 'TAKE' }]));
+
+    // PiP 1 into preview only — nothing on program yet.
+    await send({ type: 'SELECT_PVW_PIP', pip: 1 });
+    resetRecordings();
+
+    await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
+
+    // The regression: previously stromTransition early-returned on the null
+    // target and Strom was never called at all.
+    expect(requestsTo(TRANSITION)).toHaveLength(1);
+    expect(requestsTo(PREVIEW)).toContainEqual({
+      method: 'PUT',
+      path: PREVIEW,
+      body: { source: { pip: 1 } },
+    });
+
+    // The server records the PiP as being on program.
+    expect(pipStates()).toHaveLength(1);
+    expect(pipStates()[0]).toMatchObject({ pgmPip: 1, pvwPip: null });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // No PiP involved — the pre-existing path must be untouched
 // ---------------------------------------------------------------------------
 
