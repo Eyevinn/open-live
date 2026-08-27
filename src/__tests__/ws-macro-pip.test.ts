@@ -164,6 +164,61 @@ beforeEach(() => {
 });
 
 // ---------------------------------------------------------------------------
+// Macro CUT / TRANSITION over a PiP that is on program
+// ---------------------------------------------------------------------------
+
+describe('macro CUT with a PiP on program', () => {
+  it('moves the PiP to preview, tells clients, and restores it in Strom', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([{ type: 'CUT', sourceId: 'cam3' }]));
+
+    // Put PiP 0 on program: select it into preview, then take.
+    await send({ type: 'SELECT_PVW_PIP', pip: 0 });
+    await send({ type: 'TAKE' });
+    resetRecordings();
+
+    await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
+
+    // The PiP leaves program for preview, and every subscriber is told.
+    expect(pipStates()).toHaveLength(1);
+    expect(pipStates()[0]).toMatchObject({ pgmPip: null, pvwPip: 0 });
+
+    // The PiP is put back on Strom's preview bus.
+    expect(requestsTo(PREVIEW)).toContainEqual({
+      method: 'PUT',
+      path: PREVIEW,
+      body: { source: { pip: 0 } },
+    });
+
+    // from_input is the tracked background (video_in_1), not a collapsed to_input.
+    expect(requestsTo(TRANSITION)[0]?.body).toMatchObject({ from_input: 1, to_input: 2 });
+  });
+});
+
+describe('macro TRANSITION with a PiP on program', () => {
+  it('moves the PiP to preview and restores it in Strom', async () => {
+    mockGet.mockResolvedValue(
+      makeProductionDoc([
+        { type: 'TRANSITION', sourceId: 'cam3', transitionType: 'mix', durationMs: 500 },
+      ]),
+    );
+
+    await send({ type: 'SELECT_PVW_PIP', pip: 0 });
+    await send({ type: 'TAKE' });
+    resetRecordings();
+
+    await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
+
+    expect(pipStates()).toHaveLength(1);
+    expect(pipStates()[0]).toMatchObject({ pgmPip: null, pvwPip: 0 });
+    expect(requestsTo(PREVIEW)).toContainEqual({
+      method: 'PUT',
+      path: PREVIEW,
+      body: { source: { pip: 0 } },
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // No PiP involved — the pre-existing path must be untouched
 // ---------------------------------------------------------------------------
 
