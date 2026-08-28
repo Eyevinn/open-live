@@ -13,6 +13,24 @@ Visit **[openlive.apps.osaas.io](https://openlive.apps.osaas.io)** to spin up a 
 - 14-day free trial, free plan available
 - 15 EUR/month (self-hosted Strom) or 69 EUR/month (shared GPU in Frankfurt)
 
+The in-app **Create New Open Live** flow provisions CouchDB for you and generates its admin
+password automatically. You do not choose or handle that password yourself on this path.
+The `COUCHDB_URL` environment variable documented under [Environment variables](#environment-variables)
+below is only for a self-hosted deployment where you run CouchDB yourself; it does not apply
+to the managed OSC flow above.
+
+**Before you start, two things that are not obvious from the pricing line above:**
+
+- **Shared Strom (the 69 EUR/month option) requires the Professional plan or above.** If your
+  account is not eligible, the app shows this up front when you open the environment, not as a
+  failed submission after you try to create one.
+- **Your own ("BYO") Strom instance has no plan requirement, but its URL must be publicly
+  reachable.** A plain local-network or loopback address is rejected. A mesh VPN such as
+  [Tailscale](https://tailscale.com) or a self-hosted [Headscale](https://github.com/juanfont/headscale)
+  server is one way to give a locally hosted Strom instance a publicly routable address without
+  port-forwarding. On the free plan this path is metered by your token allowance rather than
+  gated by plan, so budget for that if you are testing rather than running on a paid plan.
+
 ## Features
 
 - **Vision mixing** — cuts, auto transitions, DSK layers, picture-in-picture, graphics overlays, and fade-to-black
