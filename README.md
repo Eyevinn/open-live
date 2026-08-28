@@ -25,11 +25,15 @@ to the managed OSC flow above.
   account is not eligible, the app shows this up front when you open the environment, not as a
   failed submission after you try to create one.
 - **Your own ("BYO") Strom instance has no plan requirement, but its URL must be publicly
-  reachable.** A plain local-network or loopback address is rejected. A mesh VPN such as
-  [Tailscale](https://tailscale.com) or a self-hosted [Headscale](https://github.com/juanfont/headscale)
-  server is one way to give a locally hosted Strom instance a publicly routable address without
-  port-forwarding. On the free plan this path is metered by your token allowance rather than
-  gated by plan, so budget for that if you are testing rather than running on a paid plan.
+  reachable.** A plain local-network or loopback address is rejected, and so is any address
+  that is not reachable from OSC, including a plain Tailscale or other mesh-VPN address in the
+  `100.64.0.0/10` range even though it clears the initial check. To expose a locally hosted
+  Strom instance without port-forwarding, use a public ingress feature such as
+  [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) (opt-in, off by default; also
+  implemented by self-hosted [Headscale](https://github.com/juanfont/headscale)), which gives
+  the instance a genuinely public `ts.net` hostname. On the free plan this path is metered by
+  your one-time token allowance rather than gated by plan, so budget for that if you are
+  testing rather than running on a paid plan.
 
 ## Features
 
