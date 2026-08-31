@@ -20,6 +20,7 @@ vi.mock('../db/index.js', () => ({
   getSourcesDb: () => ({ get: mockGet }),
   connectDb: vi.fn().mockResolvedValue(undefined),
   isDbReady: vi.fn().mockResolvedValue(true),
+  isDbConnected: vi.fn().mockReturnValue(true),
 }));
 
 // ---------------------------------------------------------------------------
