@@ -19,15 +19,14 @@ on:
         required: true
         type: string
 
-concurrency:
-  group: sync-fork-${{ inputs.environment }}
-  cancel-in-progress: false
-
 jobs:
   sync-fork:
     name: Sync fork (${{ inputs.environment }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    concurrency:
+      group: sync-fork-${{ inputs.environment }}
+      cancel-in-progress: false
     steps:
       - name: Validate environment
         run: |
