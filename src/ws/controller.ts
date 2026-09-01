@@ -67,7 +67,7 @@ const PipZoneSchema = z.object({
   rect: z.object({ x: z.number(), y: z.number(), w: z.number(), h: z.number() }).nullable(),
   capacity: z.number().nullable(),
   sources: z.array(z.number().int().min(0).max(15)),
-  border: z.object({ color: z.string().max(9), width: z.number().min(0).max(64) }).nullish(),
+  border: z.object({ color: z.string().regex(/^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/, 'Must be #RRGGBB or #RRGGBBAA'), width: z.number().int().min(0).max(64) }).nullish(),
 });
 
 const InboundMessageSchema = z.discriminatedUnion('type', [
