@@ -50,7 +50,7 @@ export async function buildServer() {
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: false,
     maxAge: 86400,
-    strictPreflight: false,
+    strictPreflight: true,
   });
 
   await fastify.register(helmet, {
