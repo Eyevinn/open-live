@@ -16,9 +16,13 @@ import { config } from '../config.js';
  * Stale-on-error: serves the last successful response when Strom is temporarily
  * unreachable (e.g. brief DNS failure after a network reconnect). ICE server
  * config changes rarely so a stale response is far better than a 502.
+ * Cache is invalidated after 5 minutes so expired TURN credentials are not
+ * served indefinitely.
  */
 
-let cachedIceServers: IceServer[] | null = null
+const CACHE_TTL_MS = 5 * 60 * 1000;
+let cachedIceServers: IceServer[] | null = null;
+let cacheTimestamp = 0;
 
 /**
  * Clear the module-level stale-on-error cache.
@@ -35,12 +39,17 @@ export function resetIceServersCache(): void {
 
 const iceServersRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get('/api/v1/ice-servers', async (_req, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    if (Date.now() - cacheTimestamp > CACHE_TTL_MS) {
+      cachedIceServers = null;
+    }
     try {
       const stromToken = await getStromToken(config.stromToken).catch(() => undefined);
       const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
 
       const { ice_servers } = await strom.system.iceServers();
       cachedIceServers = ice_servers;
+      cacheTimestamp = Date.now();
       return reply.send({ iceServers: ice_servers });
     } catch (err) {
       if (cachedIceServers) {
