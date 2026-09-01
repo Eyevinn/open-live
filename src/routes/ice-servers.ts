@@ -24,6 +24,19 @@ const CACHE_TTL_MS = 5 * 60 * 1000;
 let cachedIceServers: IceServer[] | null = null;
 let cacheTimestamp = 0;
 
+/**
+ * Clear the module-level stale-on-error cache.
+ *
+ * The cache is module-scoped so it survives across `buildServer()` instances —
+ * that is correct in production (the last-good ICE config should outlive a
+ * server rebuild) but leaks state between tests, where each test builds a fresh
+ * server yet shares this module. Tests call this in `beforeEach` so a cached
+ * success from an earlier test can't mask a later error expectation.
+ */
+export function resetIceServersCache(): void {
+  cachedIceServers = null
+}
+
 const iceServersRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get('/api/v1/ice-servers', async (_req, reply) => {
     reply.header('Cache-Control', 'no-store');

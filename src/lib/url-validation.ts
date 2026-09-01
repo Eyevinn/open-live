@@ -25,14 +25,14 @@ export function httpUrlOnly(url: string): void {
   }
 }
 
-const ALLOWED_DATA_MIME = /^data:(text\/html|image\/(png|jpeg|gif|webp))[;,]/i;
+const ALLOWED_DATA_MIME = /^data:image\/(png|jpeg|gif|webp)[;,]/i;
 const BLOCKED_SCHEMES = /^(file|javascript|ftp|gopher|chrome|about|data:application):/i;
 
 /**
  * Throws if the value is not a safe graphic URL.
- * Accepts: http/https URLs, data:text/html (inline HTML overlays rendered by Strom's headless browser),
- *          or data:image/(png|jpeg|gif|webp) base64 URIs.
- * Rejects: file://, javascript:, data:application/*, etc.
+ * Accepts: http/https URLs or data:image/(png|jpeg|gif|webp) base64 URIs.
+ * Rejects: data:text/html (JS execution risk in CEF), file://, javascript:, data:application/*, etc.
+ * HTML overlay sources must be served from a trusted https:// URL, not inline data URIs.
  */
 export function graphicUrl(url: string): void {
   if (BLOCKED_SCHEMES.test(url)) {
@@ -40,7 +40,7 @@ export function graphicUrl(url: string): void {
   }
   if (url.startsWith('data:')) {
     if (!ALLOWED_DATA_MIME.test(url)) {
-      throw new Error('Only data:text/html or data:image/(png|jpeg|gif|webp) URIs are allowed for graphics');
+      throw new Error('Only data:image/(png|jpeg|gif|webp) URIs are allowed for graphics; HTML overlays must use an https:// URL');
     }
     return;
   }
