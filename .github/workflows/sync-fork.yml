@@ -12,12 +12,21 @@ on:
           - prod
           - dev
           - stage
+  workflow_call:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: string
 
 jobs:
   sync-fork:
     name: Sync fork (${{ inputs.environment }})
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
+    concurrency:
+      group: sync-fork-${{ inputs.environment }}
+      cancel-in-progress: false
     steps:
       - name: Validate environment
         run: |
@@ -33,4 +42,13 @@ jobs:
         env:
           OSC_ACCESS_TOKEN: unused
           OSC_API_KEY: ${{ secrets.OSC_API_KEY }}
-        run: osc --env "${{ inputs.environment }}" admin sync-fork eyevinn-open-live
+        run: osc --env "${{ inputs.environment }}" admin sync-fork --wait eyevinn-open-live
+
+      - name: Restart olivedev service instances
+        if: inputs.environment == 'prod'
+        env:
+          OSC_ACCESS_TOKEN: unused
+          OSC_API_KEY: ${{ secrets.OSC_OLIVEDEV_PAT }}
+        run: |
+          osc --env prod restart eyevinn-open-live openlivedev
+          osc --env prod restart eyevinn-open-live-studio openlivedev
