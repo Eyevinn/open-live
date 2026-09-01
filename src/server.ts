@@ -57,7 +57,10 @@ export async function buildServer() {
     contentSecurityPolicy: {
       directives: { defaultSrc: ["'none'"], connectSrc: ["'self'"] },
     },
-    crossOriginResourcePolicy: { policy: 'cross-origin' },
+    // same-origin: this is a private JSON API, not a public CDN. cross-origin
+    // reads are already selectively permitted via CORS preflight; a global
+    // cross-origin CRP would additionally expose responses to no-cors fetches.
+    crossOriginResourcePolicy: { policy: 'same-origin' },
   });
 
   // Rate limiting — 200 requests per minute per IP on API routes
@@ -112,7 +115,10 @@ export async function buildServer() {
     fastify.addHook('onRequest', async (req, reply) => {
       const path = req.url.split('?')[0]!;
       if (AUTH_EXEMPT_PATHS.has(path)) return;
-      if (!req.url.startsWith('/api/v1')) return;
+      // Guard both the REST API and the WebSocket controller. The /ws/ prefix
+      // must be listed explicitly: without it, /ws/productions/:id/controller
+      // bypasses auth entirely and accepts live production commands unauthenticated.
+      if (!req.url.startsWith('/api/v1') && !req.url.startsWith('/ws/')) return;
 
       const authHeader = req.headers['authorization'];
       const keyFromHeader = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined;
