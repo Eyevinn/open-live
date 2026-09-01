@@ -6,7 +6,7 @@ on:
     branches: [main]
 
 concurrency:
-  group: sync-fork-prod
+  group: sync-fork-on-merge-prod
   cancel-in-progress: false
 
 jobs:
