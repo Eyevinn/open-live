@@ -2,6 +2,12 @@ import type { FastifyPluginAsync } from 'fastify';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
 
+/** Returns the effective TCP port for a URL, resolving protocol defaults when the port is omitted. */
+function effectivePort(u: URL): string {
+  if (u.port) return u.port;
+  return u.protocol === 'https:' ? '443' : '80';
+}
+
 /** Validates a proxy target URL is on the configured Strom host (prevents SSRF + token exfiltration). */
 function validateProxyTarget(targetUrl: string): void {
   let parsed: URL;
@@ -13,7 +19,7 @@ function validateProxyTarget(targetUrl: string): void {
   if (parsed.hostname !== strom.hostname) {
     throw new Error('Target URL host does not match configured Strom host');
   }
-  if (strom.port && parsed.port && parsed.port !== strom.port) {
+  if (effectivePort(parsed) !== effectivePort(strom)) {
     throw new Error('Target URL port does not match configured Strom port');
   }
 }
