@@ -79,12 +79,33 @@ components:
           minimum: 20
           maximum: 8000
           description: SRT latency in milliseconds
+        provider:
+          $ref: '#/components/schemas/SourceProviderRef'
+        readOnly:
+          type: boolean
+          description: Present and true when a source provider owns this source; PATCH and DELETE return 409.
         createdAt:
           type: string
           format: date-time
         updatedAt:
           type: string
           format: date-time
+
+    SourceProviderRef:
+      type: object
+      required: [id, externalId, syncedAt]
+      description: Identifies the source provider that created and maintains this source.
+      properties:
+        id:
+          type: string
+          description: Provider id, e.g. `weave`
+        externalId:
+          type: string
+          description: The provider's own identifier for the source
+        syncedAt:
+          type: string
+          format: date-time
+          description: When the provider last wrote this document
 
     SourceInput:
       type: object
@@ -686,6 +707,12 @@ paths:
                 $ref: '#/components/schemas/Source'
         '404':
           description: Not found
+        '409':
+          description: Source is managed by a source provider and cannot be edited
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
     delete:
       summary: Delete source
       operationId: deleteSource
@@ -695,6 +722,12 @@ paths:
           description: Deleted
         '404':
           description: Not found
+        '409':
+          description: Source is in use by an active production, or is managed by a source provider
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   # ── Graphics ─────────────────────────────────────────────────────────────────
 

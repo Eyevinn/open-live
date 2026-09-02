@@ -73,7 +73,16 @@ function toApi(doc: SourceDoc) {
   // Passphrases are stored encrypted (encv1:...); decrypt before masking so the
   // mask matches on the "passphrase=" param regardless of storage form. Legacy
   // plaintext passphrases pass through decryption unchanged.
-  return { id: _id, ...rest, address: maskSrtPassphrase(decryptAddressPassphrase(rest.address)) };
+  return {
+    id: _id,
+    ...rest,
+    address: maskSrtPassphrase(decryptAddressPassphrase(rest.address)),
+    ...(rest.provider ? { readOnly: true } : {}),
+  };
+}
+
+function providerManagedError(doc: SourceDoc) {
+  return { error: `Source is managed by provider ${doc.provider!.id}` };
 }
 
 const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
@@ -126,6 +135,7 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
     const body = SourcePatch.parse(req.body);
     try {
       const doc = await getSourcesDb().get(req.params.id);
+      if (doc.provider) return reply.status(409).send(providerManagedError(doc));
       // Determine effective streamType and address after the patch. Validate
       // against the plaintext form — a new body.address is already plaintext,
       // while the stored doc.address may hold an encrypted passphrase.
@@ -162,6 +172,7 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.delete<{ Params: { id: string } }>('/api/v1/sources/:id', async (req, reply) => {
     try {
       const doc = await getSourcesDb().get(req.params.id);
+      if (doc.provider) return reply.status(409).send(providerManagedError(doc));
 
       // Block deletion if source is used by an active/activating production
       const activeProductions = await getDb().find({
