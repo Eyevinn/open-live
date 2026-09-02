@@ -33,6 +33,26 @@ export async function buildServer() {
   const fastify = Fastify({
     logger: {
       level: config.logLevel,
+      // Defence-in-depth: strip credentials from any log object regardless of
+      // call site, in case a raw flow/source/error escapes explicit redaction.
+      // Field names mirror the sensitive keys in src/lib/log-redact.ts.
+      redact: {
+        paths: [
+          'srt_uri',
+          'passphrase',
+          'streamid',
+          'token',
+          'secret',
+          '*.srt_uri',
+          '*.passphrase',
+          '*.streamid',
+          '*.token',
+          '*.secret',
+          'req.headers.authorization',
+          'headers.authorization',
+        ],
+        censor: '[REDACTED]',
+      },
     },
     disableRequestLogging: true,
     // Prevent memory exhaustion via oversized request bodies (1 MB limit)
