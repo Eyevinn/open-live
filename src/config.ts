@@ -4,6 +4,16 @@ function requireEnv(name: string): string {
   return value;
 }
 
+function positiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`Invalid environment variable ${name}: expected a positive integer, got '${raw}'`);
+  }
+  return value;
+}
+
 function buildCouchdbUrl(): string {
   const raw = requireEnv('COUCHDB_URL');
   const url = new URL(raw);
@@ -58,4 +68,11 @@ export const config = {
     .split(',')
     .map((h) => h.trim().toLowerCase())
     .filter(Boolean),
+  /**
+   * Source providers to poll, as a comma-separated list of ids (e.g. "weave").
+   * Empty (the default) disables provider sync entirely.
+   */
+  sourceProviders: (process.env['SOURCE_PROVIDERS'] ?? '').split(',').map((s) => s.trim()).filter(Boolean),
+  /** Interval between source provider polls, in milliseconds. */
+  sourceProviderPollMs: positiveIntEnv('SOURCE_PROVIDER_POLL_MS', 5000),
 } as const;

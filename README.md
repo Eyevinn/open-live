@@ -73,6 +73,8 @@ Copy `.env.example` to `.env` and fill in the values:
 | `STROM_TOKEN` | OSC Personal Access Token for authenticating against an OSC-hosted Strom instance | _(empty — not needed for local Strom)_ |
 | `API_KEY` | Static API key protecting all `/api/v1` routes, the WebSocket controller, and the Swagger UI. **Required for any network-accessible deployment** (see below) | _(empty — routes unauthenticated)_ |
 | `LOG_LEVEL` | Fastify log level (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
+| `SOURCE_PROVIDERS` | Comma-separated ids of [source providers](#source-providers) to poll. Unknown ids fail startup. | _(empty — disabled)_ |
+| `SOURCE_PROVIDER_POLL_MS` | Interval between source provider polls, in milliseconds | `5000` |
 
 > **Never commit `.env`** — it is gitignored. Use `.env.example` as the reference.
 
@@ -148,6 +150,12 @@ broadcasts — is documented separately in [`docs/controller-websocket.md`](docs
 Sources represent individual video/audio feeds. Each source has a `streamType` (`srt` or `whip`) and an `address` (SRT URI or WHIP endpoint URL).
 
 SRT passphrases are embedded in the source `address` and encrypted at rest before being stored in CouchDB. For rotating a passphrase or responding to a suspected compromise, see the operator runbook in [`docs/srt-passphrase-rotation.md`](docs/srt-passphrase-rotation.md).
+
+### Source providers
+
+A source provider is a small module under `src/providers/` that lists source candidates produced by another system. The server polls every provider named in `SOURCE_PROVIDERS` and materialises the candidates as ordinary sources, so assignment, activation and the studio UI need no knowledge of where a source came from.
+
+Provider-owned sources carry a `provider` object (`{ id, externalId, syncedAt }`) and `readOnly: true` in API responses. `PATCH` and `DELETE` on them return `409`. A source that the provider stops listing is marked `inactive` rather than deleted, so a production that still references it keeps its assignment.
 
 ### Template model
 
