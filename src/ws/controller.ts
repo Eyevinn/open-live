@@ -356,6 +356,55 @@ export function clearPipState(productionId: string): void {
   })
 }
 
+/**
+ * Read-only view of the in-memory PiP layout cache for a production.
+ * Exported for tests.
+ */
+export function getPipConfigs(productionId: string): PipConfig[] | undefined {
+  return pipConfigsByProduction.get(productionId)
+}
+
+/**
+ * Store one PiP slot's layout in the in-memory cache and return the updated
+ * array. Does not persist to the DB — callers own persistence.
+ */
+export function setPipConfigSlot(productionId: string, pip: number, cfg: PipConfig): PipConfig[] {
+  const pips = (pipConfigsByProduction.get(productionId) ?? []).slice()
+  pips[pip] = cfg
+  pipConfigsByProduction.set(productionId, pips)
+  return pips
+}
+
+/**
+ * Hydrate the in-memory PiP cache for a production from its persisted
+ * ProductionDoc.pipConfigs (issue #177). Only runs when the cache is cold, so
+ * live edits are never clobbered. Falls back to empty slots seeded from
+ * num_pips when nothing was persisted.
+ *
+ * Returns the restored persisted layout when it was populated from the doc
+ * (so the caller can re-push it to Strom), otherwise null.
+ */
+export function hydratePipConfigsFromDoc(doc: ProductionDoc): PipConfig[] | null {
+  if (pipConfigsByProduction.has(doc._id)) return null
+  const rawNumPips = doc.values?.num_pips
+  const numPips = typeof rawNumPips === 'number' ? Math.max(0, Math.round(rawNumPips))
+    : typeof rawNumPips === 'string' ? Math.max(0, parseInt(rawNumPips, 10) || 0)
+    : 0
+  const persisted = doc.pipConfigs
+  if (persisted && persisted.length > 0) {
+    // Pad/truncate to the currently configured slot count so the cache matches
+    // num_pips even if it changed since the layout was saved.
+    const restored = Array.from({ length: Math.max(numPips, persisted.length) }, (_, i) =>
+      persisted[i] ?? { bg: null, zones: [], transforms: {} })
+    pipConfigsByProduction.set(doc._id, restored)
+    return restored
+  }
+  if (numPips > 0) {
+    pipConfigsByProduction.set(doc._id, Array.from({ length: numPips }, () => ({ bg: null, zones: [], transforms: {} })))
+  }
+  return null
+}
+
 /** Wipe all per-production FX state. Called when the pipeline changes or production deactivates. */
 export function clearFxState(productionId: string): void {
   inputEffectsByProduction.delete(productionId)
@@ -701,9 +750,7 @@ async function handleMessage(
         const strom = await makeStromClient();
         const transforms: PipTransforms = msg.transforms ?? {};
 
-        const pips = (pipConfigsByProduction.get(productionId) ?? []).slice();
-        pips[msg.pip] = { bg: msg.bg, zones: msg.zones, transforms };
-        pipConfigsByProduction.set(productionId, pips);
+        const pips = setPipConfigSlot(productionId, msg.pip, { bg: msg.bg, zones: msg.zones, transforms });
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: pgmPipByProduction.get(productionId) ?? null, pvwPip: pvwPipByProduction.get(productionId) ?? null, pips });
 
         const resp = await strom.mixer.updatePipConfig(doc.stromFlowId, doc.mixerBlockId, msg.pip, {
@@ -713,12 +760,18 @@ async function handleMessage(
         });
         // Sync back Strom-clamped transforms (may differ due to clamping)
         if (resp?.transforms && Object.keys(resp.transforms).length > 0) {
-          const syncedPips = (pipConfigsByProduction.get(productionId) ?? []).slice();
-          if (syncedPips[msg.pip]) {
-            syncedPips[msg.pip] = { ...syncedPips[msg.pip]!, transforms: resp.transforms };
-            pipConfigsByProduction.set(productionId, syncedPips);
+          const current = pipConfigsByProduction.get(productionId)?.[msg.pip];
+          if (current) {
+            setPipConfigSlot(productionId, msg.pip, { ...current, transforms: resp.transforms });
           }
         }
+
+        // Persist the PiP layout to the ProductionDoc so it survives
+        // deactivate/reactivate and server restarts (issue #177). The in-memory
+        // cache is authoritative for the write; updateProductionDoc is 409-safe.
+        await updateProductionDoc(productionId, {
+          pipConfigs: pipConfigsByProduction.get(productionId) ?? [],
+        }).catch((err) => console.warn('[controller] persist pipConfigs error:', err));
       } catch (err) {
         console.warn('[controller] Strom SET_PIP error:', err);
         ws.send(JSON.stringify({ type: 'ERROR', error: stromErrorMessage(err) }));
@@ -1437,23 +1490,41 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
       }
 
       // Sync PiP state from in-memory server cache (populated by SET_PIP / SELECT_PVW_PIP).
-      // If the cache is cold, seed empty slots from num_pips so the PipPanel shows the
-      // correct number of slots without requiring a SET_PIP first.
-      if (!pipConfigsByProduction.has(id)) {
-        const rawNumPips = connectDoc?.values?.num_pips;
-        const numPips = typeof rawNumPips === 'number' ? Math.max(0, Math.round(rawNumPips))
-          : typeof rawNumPips === 'string' ? Math.max(0, parseInt(rawNumPips, 10) || 0)
-          : 0;
-        if (numPips > 0) {
-          pipConfigsByProduction.set(id, Array.from({ length: numPips }, () => ({ bg: null, zones: [], transforms: {} })));
-        }
-      }
+      // If the cache is cold (fresh connect after deactivate or server restart),
+      // hydrate it from the persisted pipConfigs on the ProductionDoc (issue #177)
+      // so the operator's PiP layout is restored. If nothing was persisted, seed
+      // empty slots from num_pips so the PipPanel shows the correct number of slots
+      // without requiring a SET_PIP first.
+      const restoredPipConfigs = connectDoc ? hydratePipConfigsFromDoc(connectDoc) : null;
       socket.send(JSON.stringify({
         type: 'PIP_STATE',
         pgmPip: pgmPipByProduction.get(id) ?? null,
         pvwPip: pvwPipByProduction.get(id) ?? null,
         pips:   pipConfigsByProduction.get(id) ?? [],
       }));
+
+      // On the first connect after (re)activation, Strom's PiP slots start empty
+      // (flow-generator only sets num_pips). Re-push any restored persisted layout
+      // to Strom so what the operator saved is actually rendered (issue #177).
+      if (restoredPipConfigs && connectDoc?.stromFlowId && connectDoc.mixerBlockId) {
+        try {
+          const strom = await makeStromClient();
+          const flowId = connectDoc.stromFlowId;
+          const mixerBlockId = connectDoc.mixerBlockId;
+          for (let i = 0; i < restoredPipConfigs.length; i++) {
+            const cfg = restoredPipConfigs[i];
+            // Skip empty slots — nothing to restore.
+            if (!cfg || (cfg.bg === null && cfg.zones.length === 0)) continue;
+            await strom.mixer.updatePipConfig(flowId, mixerBlockId, i, {
+              bg: cfg.bg,
+              zones: cfg.zones,
+              transforms: cfg.transforms,
+            }).catch((err) => console.warn('[controller] restore pipConfig error:', err));
+          }
+        } catch (err) {
+          console.warn('[controller] restore pipConfigs to Strom error:', err);
+        }
+      }
 
       const cachedDskLayers = dskLayersByProduction.get(id);
       if (cachedDskLayers) {
