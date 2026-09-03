@@ -71,6 +71,29 @@ describe('httpUrlOnly', () => {
   it('rejects invalid URLs', () => {
     expect(() => httpUrlOnly('not-a-url')).toThrow();
   });
+
+  it('rejects private/loopback IP literals (SSRF)', () => {
+    expect(() => httpUrlOnly('http://127.0.0.1/')).toThrow();
+    expect(() => httpUrlOnly('http://10.0.0.1/')).toThrow();
+    expect(() => httpUrlOnly('http://169.254.169.254/')).toThrow(); // AWS/GCP IMDS
+  });
+
+  it('rejects IPv4-mapped IPv6 literals that resolve to a private address', () => {
+    // A bare IPv4 regex would miss these — the address is only private once the
+    // embedded IPv4 is evaluated. See isPrivateHost's ::ffff: handling.
+    expect(() => httpUrlOnly('http://[::ffff:169.254.169.254]/')).toThrow();
+    expect(() => httpUrlOnly('http://[::ffff:127.0.0.1]/')).toThrow();
+    expect(() => httpUrlOnly('http://[::ffff:10.0.0.1]/')).toThrow();
+  });
+
+  it('rejects well-known SSRF hostnames not caught by IP-literal checks', () => {
+    expect(() => httpUrlOnly('http://localhost/')).toThrow();
+    expect(() => httpUrlOnly('http://metadata.google.internal/')).toThrow();
+  });
+
+  it('accepts a public hostname that happens to contain a private-looking substring', () => {
+    expect(() => httpUrlOnly('https://10.0.0.1.example.com/')).not.toThrow();
+  });
 });
 
 describe('isPrivateHost', () => {
@@ -99,9 +122,18 @@ describe('isPrivateHost', () => {
     expect(isPrivateHost('fd12:3456::1')).toBe(true);
   });
 
-  it('flags IPv4-mapped IPv6 for private embedded addresses', () => {
+  it('flags IPv4-mapped IPv6 for private embedded addresses (dotted form)', () => {
     expect(isPrivateHost('::ffff:127.0.0.1')).toBe(true);
     expect(isPrivateHost('::ffff:10.0.0.1')).toBe(true);
+  });
+
+  it('flags IPv4-mapped IPv6 for private embedded addresses (hex-hextet form)', () => {
+    // The WHATWG URL parser normalizes a bracketed literal to this form —
+    // e.g. new URL('http://[::ffff:169.254.169.254]/').hostname is
+    // '[::ffff:a9fe:a9fe]', not the dotted form.
+    expect(isPrivateHost('::ffff:a9fe:a9fe')).toBe(true); // 169.254.169.254 (AWS/GCP IMDS)
+    expect(isPrivateHost('::ffff:7f00:1')).toBe(true); // 127.0.0.1
+    expect(isPrivateHost('::ffff:a00:1')).toBe(true); // 10.0.0.1
   });
 
   it('does not flag public IPv4/IPv6 addresses', () => {
