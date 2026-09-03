@@ -140,10 +140,22 @@ export async function buildServer() {
     fastify.addHook('onRequest', async (req, reply) => {
       const path = req.url.split('?')[0]!;
       if (AUTH_EXEMPT_PATHS.has(path)) return;
-      // Guard both the REST API and the WebSocket controller. The /ws/ prefix
-      // must be listed explicitly: without it, /ws/productions/:id/controller
-      // bypasses auth entirely and accepts live production commands unauthenticated.
-      if (!req.url.startsWith('/api/v1') && !req.url.startsWith('/ws/')) return;
+      // Guard the REST API, the WebSocket controller, and the Swagger UI /
+      // OpenAPI spec routes. The /ws/ prefix must be listed explicitly:
+      // without it, /ws/productions/:id/controller bypasses auth entirely and
+      // accepts live production commands unauthenticated. The /documentation
+      // prefix must also be listed: Swagger UI and its specs
+      // (/documentation, /documentation/json, /documentation/yaml) sit outside
+      // /api/v1 and would otherwise expose the full API blueprint — route
+      // signatures, schemas, and the bearer-auth config — unauthenticated even
+      // when API_KEY is set.
+      if (
+        !req.url.startsWith('/api/v1') &&
+        !req.url.startsWith('/ws/') &&
+        !req.url.startsWith('/documentation')
+      ) {
+        return;
+      }
 
       const authHeader = req.headers['authorization'];
       const keyFromHeader = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined;
