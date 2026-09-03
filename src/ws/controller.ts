@@ -312,6 +312,20 @@ const pvwBeforePipByProduction = new Map<string, string | null>()
  */
 const pgmBgByProduction = new Map<string, string | null>()
 
+/**
+ * The real input sitting behind a PiP that is on program, or null.
+ *
+ * While a PiP occupies PGM, `tally.pgm` is null and the background input is
+ * tracked only in `pgmBgByProduction`, which is never otherwise sent to a
+ * subscriber. Without it a client cannot tell "nothing on program" from "a PiP
+ * over input 3" — including on connect, where the distinction is otherwise
+ * unrecoverable, because the value is never re-broadcast.
+ *
+ * Read-only: nothing here changes mixer state or what airs.
+ */
+const pgmBgOf = (productionId: string): string | null =>
+  pgmBgByProduction.get(productionId) ?? null
+
 
 /** Wipe all per-production audio state. Called when the pipeline changes or production deactivates. */
 export function clearAudioState(productionId: string): void {
@@ -456,7 +470,8 @@ async function applyAudioFollow(
 // Message handler
 // ---------------------------------------------------------------------------
 
-async function handleMessage(
+/** Exported for tests: drives one inbound message against a production. */
+export async function handleMessage(
   productionId: string,
   ws: WebSocket,
   raw: string,
@@ -512,7 +527,7 @@ async function handleMessage(
       }
       const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
       await db.insert(updated).catch((err: any) => { if (err?.statusCode !== 409) throw err });
-      broadcast(productionId, { type: 'TALLY', ...newTally });
+      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId) });
       await stromTransition(doc, fromPadCut, msg.mixerInput, 'cut');
       if (curPgmPipCut !== null && doc.stromFlowId && doc.mixerBlockId) {
         try {
@@ -544,7 +559,7 @@ async function handleMessage(
       }
       const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
       await db.insert(updated).catch((err: any) => { if (err?.statusCode !== 409) throw err });
-      broadcast(productionId, { type: 'TALLY', ...newTally, transitionType: msg.transitionType, durationMs: msg.durationMs });
+      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId), transitionType: msg.transitionType, durationMs: msg.durationMs });
       await stromTransition(doc, fromPadTrans, msg.mixerInput, toStromTransition(msg.transitionType), msg.durationMs);
       if (curPgmPipTrans !== null && doc.stromFlowId && doc.mixerBlockId) {
         try {
@@ -582,7 +597,20 @@ async function handleMessage(
       pvwPipByProduction.set(productionId, newPvwPip);
       const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
       await db.insert(updated).catch((err: any) => { if (err?.statusCode !== 409) throw err });
-      broadcast(productionId, { type: 'TALLY', ...newTally });
+      // The background behind the PiP after this take. Derived from what is in
+      // scope, because `pgmBgByProduction` still holds the previous state here.
+      const pvwBeforePip = pvwBeforePipByProduction.get(productionId) ?? null;
+      // Falls back to the outgoing PGM input, matching the `to_input` the Strom
+      // transition below computes: when no PVW source was displaced, the mixer
+      // composites the PiP over whatever was already on program. Reporting null
+      // here would say "no background" while the mixer had one.
+      const newPgmBg = newPgmPip !== null ? (pvwBeforePip ?? tally.pgm) : null;
+      // Recorded before the Strom calls, not inside them. A client connecting
+      // later reads this map, so leaving it unset until Strom succeeds meant a
+      // reconnect during a PiP saw `pgm: null` with no background — the one case
+      // that cannot be reconstructed, and the reason this field exists.
+      if (newPgmPip !== null) pgmBgByProduction.set(productionId, newPgmBg);
+      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: newPgmBg });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: newPgmPip, pvwPip: newPvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
       const takeTransition = toStromTransition(msg.transitionType ?? 'cut');
       if (curPvwPip !== null) {
@@ -596,7 +624,6 @@ async function handleMessage(
           try {
             const strom = await makeStromClient();
             const fromInputIndex = tally.pgm ? (padToIndex(tally.pgm) ?? 0) : 0;
-            const pvwBeforePip = pvwBeforePipByProduction.get(productionId) ?? null;
             const toInputIndex = pvwBeforePip !== null ? (padToIndex(pvwBeforePip) ?? fromInputIndex) : fromInputIndex;
             await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: curPvwPip } });
             await strom.mixer.transition(doc.stromFlowId, doc.mixerBlockId, {
@@ -605,9 +632,7 @@ async function handleMessage(
               transition_type: takeTransition,
               ...(msg.durationMs !== undefined ? { duration_ms: msg.durationMs } : {}),
             });
-            // Track the new Strom PGM background (pvwBeforePip) so CUT/TRANSITION
-            // can pass the correct from_input while the PiP remains on PGM.
-            pgmBgByProduction.set(productionId, pvwBeforePip);
+            // `pgmBgByProduction` was already set above, before these calls.
             pvwBeforePipByProduction.delete(productionId);
           } catch (err) {
             console.warn('[controller] Strom PiP transition error:', err);
@@ -657,7 +682,7 @@ async function handleMessage(
       setTally(productionId, newTally);
       const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
       await db.insert(updated);
-      broadcast(productionId, { type: 'TALLY', ...newTally });
+      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId) });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: pgmPipByProduction.get(productionId) ?? null, pvwPip: null, pips: pipConfigsByProduction.get(productionId) ?? [] });
       if (doc.stromFlowId && doc.mixerBlockId) {
         const inputIndex = padToIndex(msg.mixerInput);
@@ -682,7 +707,7 @@ async function handleMessage(
       const newTally = { pgm: tally.pgm, pvw: null };
       setTally(productionId, newTally);
       await db.insert({ ...doc, tally: newTally, updatedAt: new Date().toISOString() }).catch((err: any) => { if (err?.statusCode !== 409) throw err });
-      broadcast(productionId, { type: 'TALLY', ...newTally });
+      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId) });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: pgmPipByProduction.get(productionId) ?? null, pvwPip: msg.pip, pips: pipConfigsByProduction.get(productionId) ?? [] });
       if (doc.stromFlowId && doc.mixerBlockId) {
         try {
@@ -828,7 +853,7 @@ async function handleMessage(
             setTally(productionId, newTally);
             const updated: ProductionDoc = { ...currentDoc, tally: newTally, updatedAt: new Date().toISOString() };
             await getDb().insert(updated);
-            broadcast(productionId, { type: 'TALLY', ...newTally });
+            broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId) });
             await stromTransition(currentDoc, tally.pgm, mixerInput, 'cut');
           } else if (action.type === 'TRANSITION' && action.sourceId) {
             const mixerInput = resolveInput(action.sourceId);
@@ -838,7 +863,7 @@ async function handleMessage(
             setTally(productionId, newTally);
             const updated: ProductionDoc = { ...currentDoc, tally: newTally, updatedAt: new Date().toISOString() };
             await getDb().insert(updated);
-            broadcast(productionId, { type: 'TALLY', ...newTally, transitionType: action.transitionType, durationMs: action.durationMs });
+            broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId), transitionType: action.transitionType, durationMs: action.durationMs });
             await stromTransition(currentDoc, tally.pgm, mixerInput, toStromTransition(action.transitionType ?? 'cut'), action.durationMs);
           } else if (action.type === 'TAKE') {
             const tally = getTally(productionId);
@@ -846,7 +871,7 @@ async function handleMessage(
             setTally(productionId, newTally);
             const updated: ProductionDoc = { ...currentDoc, tally: newTally, updatedAt: new Date().toISOString() };
             await getDb().insert(updated);
-            broadcast(productionId, { type: 'TALLY', ...newTally });
+            broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId) });
             await stromTransition(currentDoc, tally.pgm, tally.pvw, 'cut');
           } else if (action.type === 'GRAPHIC_ON' && action.overlayId) {
             const updated: ProductionDoc = {
@@ -1429,7 +1454,9 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
           setTally(id, tally);
         }
       }
-      socket.send(JSON.stringify({ type: 'TALLY', ...tally }));
+      // The connect case: without pgmBg a late joiner cannot tell an empty
+      // program from a PiP over a real input, and nothing re-broadcasts it.
+      socket.send(JSON.stringify({ type: 'TALLY', ...tally, pgmBg: pgmBgOf(id) }));
 
       const cachedAlpha = overlayAlphaByProduction.get(id);
       if (cachedAlpha !== undefined) {
