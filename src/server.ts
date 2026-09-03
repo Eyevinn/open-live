@@ -86,6 +86,11 @@ export async function buildServer() {
     // reads are already selectively permitted via CORS preflight; a global
     // cross-origin CRP would additionally expose responses to no-cors fetches.
     crossOriginResourcePolicy: { policy: 'same-origin' },
+    strictTransportSecurity: {
+      maxAge: 31536000,
+      includeSubDomains: true,
+      preload: true,
+    },
   });
 
   // Rate limiting — 200 requests per minute per IP on API routes
