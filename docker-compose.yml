@@ -19,6 +19,9 @@ services:
       COUCHDB_NAME: open-live
       CORS_ORIGIN: http://localhost:5173
       LOG_LEVEL: info
+      # Required for production deployments — set a strong random secret.
+      # Omit (or leave unset) only when running behind an external auth layer.
+      API_KEY: ${API_KEY:?Set API_KEY in .env (see .env.example)}
     depends_on:
       - couchdb
 

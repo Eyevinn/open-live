@@ -3,7 +3,6 @@ import { isDbReady, connectDb, isDbConnected } from '../db/index.js';
 import { StromClient } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
-import { cleanLegacyFixtures } from '../db/seed.js';
 
 const statusRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get('/api/v1/ping', async (_req, reply) => {
@@ -19,13 +18,15 @@ const statusRoutes: FastifyPluginAsync = async (fastify) => {
     }
   });
 
-  fastify.post('/api/v1/reconnect', async (_req, reply) => {
+  fastify.post(
+    '/api/v1/reconnect',
+    { config: { rateLimit: { max: 5, timeWindow: '1 minute' } } },
+    async (_req, reply) => {
     const result: { db: boolean; strom: boolean } = { db: isDbConnected(), strom: false };
 
     if (!result.db) {
       try {
         await connectDb();
-        await cleanLegacyFixtures();
         fastify.log.info('[reconnect] Database connection restored');
         result.db = true;
       } catch (err: any) {
@@ -44,7 +45,8 @@ const statusRoutes: FastifyPluginAsync = async (fastify) => {
 
     const ok = result.db && result.strom;
     return reply.status(ok ? 200 : 503).send({ ok, ...result });
-  });
+  },
+  );
 
   fastify.get('/api/v1/status', async (_req, reply) => {
     const [db, strom] = await Promise.all([
