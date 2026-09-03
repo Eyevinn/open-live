@@ -148,8 +148,11 @@ export function graphicUrl(url: string): void {
   httpUrlOnly(url);
 }
 
-// srt://<host>:<port>[?params] or srt://:<port>[?params] (empty host = bind all interfaces)
-const SRT_URL_RE = /^srt:\/\/[^!; ]*$/i;
+// Strict allowlist: srt://<host>:<port>[?params] or srt://:<port>[?params] (bind all interfaces)
+// Host: alphanumeric, dots, hyphens, or IPv6 bracketed address
+// Port: 1–5 digits
+// Query: alphanumeric and safe URL chars only — no control characters, no quotes, no backslash
+const SRT_URL_RE = /^srt:\/\/(([A-Za-z0-9.\-]|\[[0-9a-fA-F:]+\])*:\d{1,5})(\?[A-Za-z0-9._\-=&%+]+)?$/;
 
 /**
  * Throws if the value is not a valid SRT URL.
@@ -159,11 +162,15 @@ const SRT_URL_RE = /^srt:\/\/[^!; ]*$/i;
  * prevent SSRF from the GStreamer pipeline to internal services.
  */
 export function srtUrl(url: string): void {
-  if (!url.startsWith('srt://')) {
-    throw new Error('Only srt:// URLs are allowed');
+  if (url.length > 512) {
+    throw new Error('SRT URL too long');
+  }
+  // Reject control characters before regex (covers CR, LF, tab, NUL, etc.)
+  if (/[\x00-\x1f\x7f]/.test(url)) {
+    throw new Error('Control characters not allowed in SRT URL');
   }
   if (!SRT_URL_RE.test(url)) {
-    throw new Error('SRT URL contains disallowed characters');
+    throw new Error('Invalid SRT URL format — expected srt://host:port or srt://:port with safe query params');
   }
 
   // Extract the authority (host[:port]) from srt://<authority>[/path][?query].
