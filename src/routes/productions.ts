@@ -312,9 +312,58 @@ const ProductionInput = z.object({
   name: z.string().min(1).max(256),
 });
 
+// Format-specific allowlists for production `values` that are forwarded verbatim
+// to Strom block properties by flow-generator.ts. Validated here so malformed
+// values are rejected with a 400 (via the global ZodError handler) rather than
+// being injected into Strom flow properties (issue #88).
+//
+// - resolution keys (pgm_resolution, multiview_resolution) → e.g. "1280x720"
+// - framerate keys  (pgm_framerate, multiview_framerate)   → e.g. "30" or "30000/1001"
+//   (fractions must allow NTSC-style rates like 30000/1001, so up to 6 digits/side)
+// - clock → forwarded as the flow-level `clock_type` property; fixed set only.
+const RESOLUTION_RE = /^\d{3,5}x\d{3,5}$/;
+const FRAMERATE_RE = /^\d{1,6}\/\d{1,6}$|^\d{1,3}$/;
+const CLOCK_TYPES = new Set(['ntp', 'gst', 'system']);
+
+const RESOLUTION_VALUE_KEYS = ['pgm_resolution', 'multiview_resolution'] as const;
+const FRAMERATE_VALUE_KEYS = ['pgm_framerate', 'multiview_framerate'] as const;
+
+const ProductionValues = z
+  .record(z.union([z.string(), z.number(), z.boolean()]))
+  .superRefine((values, ctx) => {
+    for (const key of RESOLUTION_VALUE_KEYS) {
+      const v = values[key];
+      if (typeof v === 'string' && !RESOLUTION_RE.test(v)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [key],
+          message: `${key} must match <width>x<height> (e.g. "1280x720")`,
+        });
+      }
+    }
+    for (const key of FRAMERATE_VALUE_KEYS) {
+      const v = values[key];
+      if (typeof v === 'string' && !FRAMERATE_RE.test(v)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [key],
+          message: `${key} must be an integer or fraction (e.g. "30" or "30000/1001")`,
+        });
+      }
+    }
+    const clock = values['clock'];
+    if (typeof clock === 'string' && clock !== '' && !CLOCK_TYPES.has(clock)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['clock'],
+        message: `clock must be one of: ${[...CLOCK_TYPES].join(', ')}`,
+      });
+    }
+  });
+
 const ProductionPatch = z.object({
   name: z.string().min(1).max(256).optional(),
-  values: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
+  values: ProductionValues.optional(),
   airTime: z.string().datetime().nullable().optional(),
 });
 
