@@ -18,6 +18,59 @@ function stromErrorMessage(err: unknown): string {
   return String(err);
 }
 
+// Mirror of MAX_DB_WRITE_RETRIES in routes/productions.ts — the number of
+// insert attempts a mixer write makes before giving up on a CouchDB 409.
+const MAX_DB_WRITE_RETRIES = 3;
+
+function isConflictError(err: unknown): boolean {
+  return (
+    err instanceof Error &&
+    'statusCode' in err &&
+    (err as { statusCode?: number }).statusCode === 409
+  );
+}
+
+/**
+ * Durably persist a mixer mutation to a ProductionDoc.
+ *
+ * CouchDB rejects an insert with 409 when the doc's `_rev` is stale (a
+ * concurrent write landed first). Previously these mixer writes swallowed the
+ * 409 and moved on, so the broadcast reflected a cut/transition that was never
+ * saved. Here we re-read the latest doc and re-apply the mutation against the
+ * fresh `_rev` before each retry, so the change actually lands. `mutate`
+ * receives the freshly read doc and returns the updated doc to insert;
+ * `updatedAt` is stamped automatically. If every attempt still conflicts the
+ * failure is logged at warn (with productionId + action) instead of silently
+ * dropped — it is no longer thrown, to keep the mixer broadcast path unchanged.
+ */
+async function persistMixerMutation(
+  productionId: string,
+  action: string,
+  mutate: (doc: ProductionDoc) => ProductionDoc,
+): Promise<void> {
+  const db = getDb();
+  for (let attempt = 0; attempt < MAX_DB_WRITE_RETRIES; attempt++) {
+    try {
+      const current = await db.get(productionId);
+      const updated: ProductionDoc = {
+        ...mutate(current),
+        updatedAt: new Date().toISOString(),
+      };
+      await db.insert(updated);
+      return;
+    } catch (err) {
+      // On a revision conflict, loop to re-read the latest _rev and re-apply.
+      if (isConflictError(err) && attempt < MAX_DB_WRITE_RETRIES - 1) continue;
+      console.warn(
+        `[controller] Failed to persist mixer mutation after ${attempt + 1} attempt(s)`,
+        { productionId, action },
+        err,
+      );
+      return;
+    }
+  }
+}
+
 type InboundMessage =
   | { type: 'CUT'; mixerInput: string; afvRampUpMs?: number; afvRampDownMs?: number }
   | { type: 'TRANSITION'; mixerInput: string; transitionType: string; durationMs?: number; afvRampUpMs?: number; afvRampDownMs?: number }
@@ -559,8 +612,7 @@ async function handleMessage(
         pvwPipByProduction.set(productionId, null);
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: null, pips: pipConfigsByProduction.get(productionId) ?? [] });
       }
-      const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
-      await db.insert(updated).catch((err: any) => { if (err?.statusCode !== 409) throw err });
+      await persistMixerMutation(productionId, 'CUT', (d) => ({ ...d, tally: newTally }));
       broadcast(productionId, { type: 'TALLY', ...newTally });
       await stromTransition(doc, fromPadCut, msg.mixerInput, 'cut');
       if (curPgmPipCut !== null && doc.stromFlowId && doc.mixerBlockId) {
@@ -591,8 +643,7 @@ async function handleMessage(
         pgmBgByProduction.delete(productionId);
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: curPgmPipTrans, pips: pipConfigsByProduction.get(productionId) ?? [] });
       }
-      const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
-      await db.insert(updated).catch((err: any) => { if (err?.statusCode !== 409) throw err });
+      await persistMixerMutation(productionId, 'TRANSITION', (d) => ({ ...d, tally: newTally }));
       broadcast(productionId, { type: 'TALLY', ...newTally, transitionType: msg.transitionType, durationMs: msg.durationMs });
       await stromTransition(doc, fromPadTrans, msg.mixerInput, toStromTransition(msg.transitionType), msg.durationMs);
       if (curPgmPipTrans !== null && doc.stromFlowId && doc.mixerBlockId) {
@@ -629,8 +680,7 @@ async function handleMessage(
       setTally(productionId, newTally);
       pgmPipByProduction.set(productionId, newPgmPip);
       pvwPipByProduction.set(productionId, newPvwPip);
-      const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
-      await db.insert(updated).catch((err: any) => { if (err?.statusCode !== 409) throw err });
+      await persistMixerMutation(productionId, 'TAKE', (d) => ({ ...d, tally: newTally }));
       broadcast(productionId, { type: 'TALLY', ...newTally });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: newPgmPip, pvwPip: newPvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
       const takeTransition = toStromTransition(msg.transitionType ?? 'cut');
@@ -704,8 +754,7 @@ async function handleMessage(
       pvwBeforePipByProduction.delete(productionId);
       const newTally = { pgm: tally.pgm, pvw: msg.mixerInput };
       setTally(productionId, newTally);
-      const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
-      await db.insert(updated);
+      await persistMixerMutation(productionId, 'SET_PVW', (d) => ({ ...d, tally: newTally }));
       broadcast(productionId, { type: 'TALLY', ...newTally });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: pgmPipByProduction.get(productionId) ?? null, pvwPip: null, pips: pipConfigsByProduction.get(productionId) ?? [] });
       if (doc.stromFlowId && doc.mixerBlockId) {
@@ -730,7 +779,7 @@ async function handleMessage(
       pvwPipByProduction.set(productionId, msg.pip);
       const newTally = { pgm: tally.pgm, pvw: null };
       setTally(productionId, newTally);
-      await db.insert({ ...doc, tally: newTally, updatedAt: new Date().toISOString() }).catch((err: any) => { if (err?.statusCode !== 409) throw err });
+      await persistMixerMutation(productionId, 'SELECT_PVW_PIP', (d) => ({ ...d, tally: newTally }));
       broadcast(productionId, { type: 'TALLY', ...newTally });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: pgmPipByProduction.get(productionId) ?? null, pvwPip: msg.pip, pips: pipConfigsByProduction.get(productionId) ?? [] });
       if (doc.stromFlowId && doc.mixerBlockId) {
@@ -879,8 +928,7 @@ async function handleMessage(
             const tally = getTally(productionId);
             const newTally = { pgm: mixerInput, pvw: tally.pgm };
             setTally(productionId, newTally);
-            const updated: ProductionDoc = { ...currentDoc, tally: newTally, updatedAt: new Date().toISOString() };
-            await getDb().insert(updated);
+            await persistMixerMutation(productionId, 'MACRO_EXEC:CUT', (d) => ({ ...d, tally: newTally }));
             broadcast(productionId, { type: 'TALLY', ...newTally });
             await stromTransition(currentDoc, tally.pgm, mixerInput, 'cut');
           } else if (action.type === 'TRANSITION' && action.sourceId) {
@@ -889,33 +937,27 @@ async function handleMessage(
             const tally = getTally(productionId);
             const newTally = { pgm: mixerInput, pvw: tally.pgm };
             setTally(productionId, newTally);
-            const updated: ProductionDoc = { ...currentDoc, tally: newTally, updatedAt: new Date().toISOString() };
-            await getDb().insert(updated);
+            await persistMixerMutation(productionId, 'MACRO_EXEC:TRANSITION', (d) => ({ ...d, tally: newTally }));
             broadcast(productionId, { type: 'TALLY', ...newTally, transitionType: action.transitionType, durationMs: action.durationMs });
             await stromTransition(currentDoc, tally.pgm, mixerInput, toStromTransition(action.transitionType ?? 'cut'), action.durationMs);
           } else if (action.type === 'TAKE') {
             const tally = getTally(productionId);
             const newTally = { pgm: tally.pvw, pvw: tally.pgm };
             setTally(productionId, newTally);
-            const updated: ProductionDoc = { ...currentDoc, tally: newTally, updatedAt: new Date().toISOString() };
-            await getDb().insert(updated);
+            await persistMixerMutation(productionId, 'MACRO_EXEC:TAKE', (d) => ({ ...d, tally: newTally }));
             broadcast(productionId, { type: 'TALLY', ...newTally });
             await stromTransition(currentDoc, tally.pgm, tally.pvw, 'cut');
           } else if (action.type === 'GRAPHIC_ON' && action.overlayId) {
-            const updated: ProductionDoc = {
-              ...currentDoc,
-              graphics: currentDoc.graphics.map((g) => g.id === action.overlayId ? { ...g, active: true } : g),
-              updatedAt: new Date().toISOString(),
-            };
-            await getDb().insert(updated);
+            await persistMixerMutation(productionId, 'MACRO_EXEC:GRAPHIC_ON', (d) => ({
+              ...d,
+              graphics: d.graphics.map((g) => g.id === action.overlayId ? { ...g, active: true } : g),
+            }));
             broadcast(productionId, { type: 'GRAPHIC', overlayId: action.overlayId, active: true });
           } else if (action.type === 'GRAPHIC_OFF' && action.overlayId) {
-            const updated: ProductionDoc = {
-              ...currentDoc,
-              graphics: currentDoc.graphics.map((g) => g.id === action.overlayId ? { ...g, active: false } : g),
-              updatedAt: new Date().toISOString(),
-            };
-            await getDb().insert(updated);
+            await persistMixerMutation(productionId, 'MACRO_EXEC:GRAPHIC_OFF', (d) => ({
+              ...d,
+              graphics: d.graphics.map((g) => g.id === action.overlayId ? { ...g, active: false } : g),
+            }));
             broadcast(productionId, { type: 'GRAPHIC', overlayId: action.overlayId, active: false });
           } else if (action.type === 'DSK_TOGGLE') {
             if (!currentDoc.stromFlowId || !currentDoc.mixerBlockId) {
