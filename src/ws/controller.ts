@@ -588,7 +588,8 @@ async function applyAudioFollow(
 // Message handler
 // ---------------------------------------------------------------------------
 
-async function handleMessage(
+/** Exported for tests: drives one inbound message against a production. */
+export async function handleMessage(
   productionId: string,
   ws: WebSocket,
   raw: string,
