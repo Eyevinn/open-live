@@ -3,6 +3,8 @@ import type { ProductionDoc, SourceDoc, GraphicDoc, OutputDoc } from '../db/type
 import { getSourcesDb, getGraphicsDb } from '../db/index.js';
 import { StromClient } from './strom.js';
 import { DEFAULT_FLOW, type FlowTopology } from './default-flow.js';
+import { decryptAddressPassphrase } from './srt-passphrase-crypto.js';
+import { safeFlowProjection } from './log-redact.js';
 
 /**
  * Generates a Strom flow from a template + source assignments,
@@ -69,6 +71,9 @@ export async function activateStromFlow(
     if (assignment.sourceId in VIRTUAL_SOURCES) continue;
     try {
       const src = await sourcesDb.get(assignment.sourceId) as unknown as SourceDoc;
+      // Decrypt the at-rest SRT passphrase so Strom receives a usable srt_uri.
+      // Legacy plaintext addresses pass through unchanged (issue #160).
+      src.address = decryptAddressPassphrase(src.address);
       sourceMap.set(assignment.sourceId, src);
     } catch {
       console.warn(`[flow-generator] Source ${assignment.sourceId} (${assignment.mixerInput}) not found — skipping`);
@@ -376,15 +381,15 @@ export async function activateStromFlow(
     mixerBlock['properties'] = props;
   }
 
-  // Set num_channels on the audio mixer = number of SRT/EFP/WHIP sources
-  // (test1/test2 sources don't carry audio; html sources do via cefdemux).
+  // Set num_channels on the audio mixer = number of audio-bearing sources.
+  // test1/test2 sources get a silent audiotestsrc below, so they count here too.
   // num_channels is a UInt — set it to exactly the number of audio-bearing sources.
   if (audioMixerBlock) {
-    const srtEfpCount = sortedAssignments.filter((a) => {
+    const audioSourceCount = sortedAssignments.filter((a) => {
       const src = sourceMap.get(a.sourceId) ?? (VIRTUAL_SOURCES[a.sourceId] as SourceDoc | undefined);
-      return src && src.streamType !== 'test1' && src.streamType !== 'test2';
+      return src != null;
     }).length;
-    const numChannels = Math.max(1, srtEfpCount);
+    const numChannels = Math.max(1, audioSourceCount);
     const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
     props['num_channels'] = numChannels;
     // ch{N}_aux{M}_pre is a build-time topology property — must be set here at flow
@@ -468,8 +473,11 @@ export async function activateStromFlow(
 
     const TEST_PATTERNS: Record<string, string> = { test1: 'Pinwheel', test2: 'Colors' }
     if (source.streamType === 'test1' || source.streamType === 'test2') {
+      const audioChannel = audioChannelIndex++;
       const elemId = `e-test-${padIndex}-${endpointSuffix}`;
       const fmtId = `b-fmt-${padIndex}-${endpointSuffix}`;
+      const audioElemId = `e-test-audio-${padIndex}-${endpointSuffix}`;
+      const audioOffsetId = `b-audio-offset-${padIndex}-${endpointSuffix}`;
       flow.elements.push({
         id: elemId,
         element_type: 'videotestsrc',
@@ -487,6 +495,33 @@ export async function activateStromFlow(
         { from: `${elemId}:src`, to: `${fmtId}:video_in` },
         { from: `${fmtId}:video_out`, to: `${offsetId}:in` },
       );
+      // Add a silent audio branch so every test pattern has a linked audio producer.
+      // Without this, the audio mixer ends up with channels that have no source,
+      // causing the aggregator to stall waiting for buffers that never arrive.
+      flow.elements.push({
+        id: audioElemId,
+        element_type: 'audiotestsrc',
+        properties: { wave: 'silence', 'is-live': true },
+        position: [COL_ELEM, yPos - 80],
+      });
+      flow.blocks.push({
+        id: audioOffsetId,
+        block_definition_id: 'builtin.time_offset',
+        name: `Offset A${padIndex}`,
+        properties: { offset_ms: 0.0 },
+        position: { x: COL_OFFSET, y: yPos - 80 },
+      });
+      sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetId;
+      flow.links.push({ from: `${audioElemId}:src`, to: `${audioOffsetId}:in` });
+      flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      if (audioMixerBlock && audioMixerBlockId) {
+        flow.links.push({ from: `${audioOffsetId}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
+        if (source.name) {
+          const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
+          props[`ch${audioChannel + 1}_label`] = source.name;
+          audioMixerBlock['properties'] = props;
+        }
+      }
     } else if (source.streamType === 'html') {
       const audioChannel = audioChannelIndex++;
       const elemId = `e-html-${padIndex}-${endpointSuffix}`;
@@ -833,11 +868,7 @@ export async function activateStromFlow(
     await strom.flows.start(flowId);
   } catch (err) {
     // Log a sanitized flow projection — never log block properties (may contain SRT URIs, tokens, passphrases)
-    const safeFlow = {
-      blockCount: flow.blocks.length,
-      blocks: flow.blocks.map((b) => ({ id: b['id'], block_definition_id: b['block_definition_id'] })),
-      linkCount: flow.links.length,
-    };
+    const safeFlow = safeFlowProjection(flow as unknown as Record<string, unknown>);
     console.error('[flow-generator] Flow start failed. Flow topology (properties redacted):',
       JSON.stringify(safeFlow, null, 2));
     // Start failed — clean up the created flow so the endpoint isn't left registered
