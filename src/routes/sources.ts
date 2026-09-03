@@ -39,6 +39,28 @@ const SourcePatch = z.object({
   status: z.enum(['active', 'inactive']).optional(),
   liveCamera: z.boolean().optional(),
   latency: z.number().int().min(20).max(8000).optional(),
+}).superRefine((data, ctx) => {
+  // Cross-field validation only applies when both address and streamType are present in
+  // the same patch body. The combined-with-existing-document case is validated procedurally
+  // in the route handler, which has access to the stored source document.
+  if (data.address === undefined || data.streamType === undefined) {
+    return;
+  }
+  if (data.streamType === 'html') {
+    // html sources use a browser URL — validate for SSRF (file://, javascript:, private IPs, etc.)
+    try {
+      graphicUrl(data.address);
+    } catch (err) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['address'], message: err instanceof Error ? err.message : 'Invalid HTML source URL' });
+    }
+  } else if (data.streamType === 'srt' || data.streamType === 'efp') {
+    // SRT/EFP sources: must be a valid srt:// URI pointing to a non-private host
+    try {
+      srtUrl(data.address);
+    } catch (err) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['address'], message: err instanceof Error ? err.message : 'Invalid SRT source address' });
+    }
+  }
 });
 
 /** Masks passphrase values in SRT URIs so credentials are never returned to clients. */
