@@ -94,8 +94,7 @@ export async function buildServer() {
     },
   });
 
-  // Rate limiting — 200 requests per minute per IP on API routes
-  // Activation and WHIP/WHEP proxy get tighter limits (10/min) to prevent abuse
+  // Rate limiting — 200 requests per minute per IP on API routes; tight per-route limits on activate/WHIP/WHEP
   await fastify.register(rateLimit, {
     global: true,
     max: 200,

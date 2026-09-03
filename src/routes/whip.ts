@@ -65,6 +65,7 @@ const whipRoutes: FastifyPluginAsync = async (fastify) => {
   // POST — initial WHIP offer/answer
   fastify.post<{ Params: { id: string; mixerInput: string } }>(
     '/api/v1/productions/:id/whip/:mixerInput',
+    { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
     async (req, reply) => {
       const { id: productionId, mixerInput } = req.params
       const stromTarget = resolveStromWhipUrl(productionId, mixerInput)

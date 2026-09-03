@@ -499,7 +499,10 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
 
   // Activate a production — immediately returns 'activating', then polls Strom
   // for flow state in a fire-and-forget async loop.
-  fastify.post<{ Params: { id: string } }>('/api/v1/productions/:id/activate', async (req, reply) => {
+  fastify.post<{ Params: { id: string } }>(
+    '/api/v1/productions/:id/activate',
+    { config: { rateLimit: { max: 5, timeWindow: '1 minute' } } },
+    async (req, reply) => {
     try {
       const doc = await getDb().get(req.params.id);
 

@@ -47,7 +47,10 @@ const whepProxyRoutes: FastifyPluginAsync = async (fastify) => {
     done(null, body)
   })
 
-  fastify.post<{ Querystring: { target: string } }>('/api/v1/whep-proxy', async (req, reply) => {
+  fastify.post<{ Querystring: { target: string } }>(
+    '/api/v1/whep-proxy',
+    { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
+    async (req, reply) => {
     const target = req.query.target
     if (!target) return reply.status(400).send({ error: 'Missing target query parameter' })
 
