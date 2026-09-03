@@ -123,10 +123,23 @@ const PipZoneSchema = z.object({
   border: z.object({ color: z.string().regex(/^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/, 'Must be #RRGGBB or #RRGGBBAA'), width: z.number().int().min(0).max(64) }).nullish(),
 });
 
+const TransitionTypeSchema = z.enum([
+  'cut', 'fade', 'dip_to_black',
+  'slide_left', 'slide_right', 'slide_up', 'slide_down',
+  'push_left', 'push_right', 'push_up', 'push_down',
+  'wipe_left', 'wipe_right', 'wipe_up', 'wipe_down',
+  'iris_open', 'iris_close', 'clock_wipe', 'blinds', 'checker',
+  'noise_dissolve', 'luma_wipe', 'barn_doors', 'star_wipe',
+  'pinwheel', 'crosshatch', 'hex_dissolve', 'warp_wipe', 'melt', 'heart_iris',
+  'glitch_cut', 'flash_dissolve', 'whip_pan_left', 'whip_pan_right',
+  'punch_zoom', 'pixelate_take', 'zoom_blur', 'spin', 'tv_roll',
+  'negative_flash', 'ripple',
+]);
+
 const InboundMessageSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('CUT'), mixerInput: mixerInputSchema, afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional() }),
-  z.object({ type: z.literal('TRANSITION'), mixerInput: mixerInputSchema, transitionType: z.string().max(32), durationMs: rampMsSchema.optional(), afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional() }),
-  z.object({ type: z.literal('TAKE'), pip: pipIndexSchema.optional(), transitionType: z.string().max(32).optional(), durationMs: rampMsSchema.optional(), afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional() }),
+  z.object({ type: z.literal('TRANSITION'), mixerInput: mixerInputSchema, transitionType: TransitionTypeSchema, durationMs: rampMsSchema.optional(), afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional() }),
+  z.object({ type: z.literal('TAKE'), pip: pipIndexSchema.optional(), transitionType: TransitionTypeSchema.optional(), durationMs: rampMsSchema.optional(), afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional() }),
   z.object({ type: z.literal('SET_PVW'), mixerInput: mixerInputSchema }),
   z.object({ type: z.literal('FTB'), active: z.boolean().optional(), durationMs: rampMsSchema.optional() }),
   z.object({ type: z.literal('SET_OVL'), alpha: alphaSchema }),
