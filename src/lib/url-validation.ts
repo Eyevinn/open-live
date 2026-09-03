@@ -15,7 +15,12 @@
  * - IPv4: 10/8, 172.16/12, 192.168/16, 127/8 (loopback), 169.254/16 (link-local),
  *   0.0.0.0
  * - IPv6: ::1 (loopback), fe80::/10 (link-local), fc00::/7 (unique-local)
- * - IPv4-mapped IPv6: ::ffff:a.b.c.d (evaluated as the embedded IPv4 address)
+ * - IPv4-mapped IPv6: ::ffff:a.b.c.d (evaluated as the embedded IPv4 address) —
+ *   in BOTH forms the WHATWG URL parser can produce: dotted-decimal
+ *   (::ffff:127.0.0.1) and the two-hextet hex form it normalizes bracketed
+ *   literals to (`new URL('http://[::ffff:169.254.169.254]/').hostname` is
+ *   `[::ffff:a9fe:a9fe]`, not the dotted form) — checking only the former
+ *   lets a bracketed IPv4-mapped literal sail straight through.
  *
  * Non-IP hostnames (public DNS names) are NOT flagged here — DNS resolution is out
  * of scope for this synchronous validator; this blocks the direct-IP SSRF vector.
@@ -25,10 +30,20 @@ export function isPrivateHost(hostname: string): boolean {
   const host = hostname.trim().replace(/^\[|\]$/g, '').toLowerCase();
   if (!host) return false;
 
-  // IPv4-mapped IPv6, e.g. ::ffff:127.0.0.1 — evaluate the embedded IPv4.
-  const mapped = host.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
-  if (mapped) {
-    return isPrivateIPv4(mapped[1]!);
+  // IPv4-mapped IPv6, dotted-decimal form, e.g. ::ffff:127.0.0.1.
+  const mappedDotted = host.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  if (mappedDotted) {
+    return isPrivateIPv4(mappedDotted[1]!);
+  }
+
+  // IPv4-mapped IPv6, hex-hextet form, e.g. ::ffff:a9fe:a9fe (== 169.254.169.254).
+  // This is the form the URL parser actually produces for a bracketed literal.
+  const mappedHex = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (mappedHex) {
+    const hi = parseInt(mappedHex[1]!, 16);
+    const lo = parseInt(mappedHex[2]!, 16);
+    const dotted = [hi >> 8, hi & 0xff, lo >> 8, lo & 0xff].join('.');
+    return isPrivateIPv4(dotted);
   }
 
   if (host.includes(':')) {
