@@ -120,13 +120,15 @@ async function main() {
   await app.listen({ port: config.port, host: '0.0.0.0' });
 }
 
-process.on('uncaughtException', (err) => {
-  console.error({ err }, '[process] Uncaught exception — keeping alive');
-});
+const shutdown = (err: unknown, origin: string): void => {
+  console.error({ err, origin }, 'Fatal error — shutting down');
+  // Force-exit if graceful shutdown stalls
+  setTimeout(() => process.exit(1), 5000).unref();
+  process.exit(1);
+};
 
-process.on('unhandledRejection', (reason) => {
-  console.error({ reason }, '[process] Unhandled promise rejection — keeping alive');
-});
+process.on('uncaughtException', (err, origin) => shutdown(err, origin));
+process.on('unhandledRejection', (reason) => shutdown(reason, 'unhandledRejection'));
 
 main().catch((err) => {
   console.error(err);
