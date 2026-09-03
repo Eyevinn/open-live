@@ -138,6 +138,11 @@ export async function buildServer() {
   // Exempt: health/ready probes and status/reconnect endpoints.
   // WS connections: pass key via Authorization header or ?key= query param on upgrade.
   if (config.apiKey) {
+    // Captured here, outside the closure: TS narrows `config.apiKey` from
+    // `string | undefined` to `string` at this `if`, but that narrowing does
+    // not carry into the callback passed to addHook below (a new, separate
+    // function scope), so `config.apiKey` inside it is still `string | undefined`.
+    const apiKey = config.apiKey;
     fastify.addHook('onRequest', async (req, reply) => {
       const path = req.url.split('?')[0]!;
       if (AUTH_EXEMPT_PATHS.has(path)) return;
@@ -165,7 +170,7 @@ export async function buildServer() {
       const provided = keyFromHeader ?? keyFromQuery;
 
       const a = Buffer.from(provided ?? '');
-      const b = Buffer.from(config.apiKey);
+      const b = Buffer.from(apiKey);
       if (a.length !== b.length || !timingSafeEqual(a, b)) {
         return reply.status(401).send({ error: 'Unauthorized', statusCode: 401 });
       }
