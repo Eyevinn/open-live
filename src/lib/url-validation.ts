@@ -2,7 +2,7 @@
  * URL validation helpers for security-sensitive inputs.
  *
  * Rules:
- * - httpUrlOnly: allow only http/https schemes
+ * - httpUrlOnly: allow only http/https schemes with no private-IP targets
  * - graphicUrl:  httpUrlOnly OR safe data: image URIs (no svg, no text/html)
  * - srtUrl:      srt:// scheme only; reject private/internal hosts (listener form allowed)
  */
@@ -15,7 +15,12 @@
  * - IPv4: 10/8, 172.16/12, 192.168/16, 127/8 (loopback), 169.254/16 (link-local),
  *   0.0.0.0
  * - IPv6: ::1 (loopback), fe80::/10 (link-local), fc00::/7 (unique-local)
- * - IPv4-mapped IPv6: ::ffff:a.b.c.d (evaluated as the embedded IPv4 address)
+ * - IPv4-mapped IPv6: ::ffff:a.b.c.d (evaluated as the embedded IPv4 address) —
+ *   in BOTH forms the WHATWG URL parser can produce: dotted-decimal
+ *   (::ffff:127.0.0.1) and the two-hextet hex form it normalizes bracketed
+ *   literals to (`new URL('http://[::ffff:169.254.169.254]/').hostname` is
+ *   `[::ffff:a9fe:a9fe]`, not the dotted form) — checking only the former
+ *   lets a bracketed IPv4-mapped literal sail straight through.
  *
  * Non-IP hostnames (public DNS names) are NOT flagged here — DNS resolution is out
  * of scope for this synchronous validator; this blocks the direct-IP SSRF vector.
@@ -25,10 +30,20 @@ export function isPrivateHost(hostname: string): boolean {
   const host = hostname.trim().replace(/^\[|\]$/g, '').toLowerCase();
   if (!host) return false;
 
-  // IPv4-mapped IPv6, e.g. ::ffff:127.0.0.1 — evaluate the embedded IPv4.
-  const mapped = host.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
-  if (mapped) {
-    return isPrivateIPv4(mapped[1]!);
+  // IPv4-mapped IPv6, dotted-decimal form, e.g. ::ffff:127.0.0.1.
+  const mappedDotted = host.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  if (mappedDotted) {
+    return isPrivateIPv4(mappedDotted[1]!);
+  }
+
+  // IPv4-mapped IPv6, hex-hextet form, e.g. ::ffff:a9fe:a9fe (== 169.254.169.254).
+  // This is the form the URL parser actually produces for a bracketed literal.
+  const mappedHex = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (mappedHex) {
+    const hi = parseInt(mappedHex[1]!, 16);
+    const lo = parseInt(mappedHex[2]!, 16);
+    const dotted = [hi >> 8, hi & 0xff, lo >> 8, lo & 0xff].join('.');
+    return isPrivateIPv4(dotted);
   }
 
   if (host.includes(':')) {
@@ -73,7 +88,19 @@ function isPrivateIPv6(host: string): boolean {
 }
 
 /**
+ * Hostnames that resolve to loopback/link-local/internal addresses but are not
+ * themselves IP literals, so `isPrivateHost()` cannot catch them.
+ */
+const BLOCKED_HOSTNAMES = new Set([
+  'localhost',
+  'metadata.google.internal', // GCP metadata endpoint
+]);
+
+/**
  * Throws if the URL is not a safe http/https URL.
+ * Rejects private/loopback/link-local/internal IP literals (via `isPrivateHost`,
+ * which also catches IPv4-mapped IPv6 such as ::ffff:169.254.169.254 — the AWS
+ * IMDS bypass an IPv4-only regex would miss) and well-known SSRF hostnames.
  */
 export function httpUrlOnly(url: string): void {
   let parsed: URL;
@@ -87,6 +114,14 @@ export function httpUrlOnly(url: string): void {
   }
   if (!parsed.hostname) {
     throw new Error('URL must have a hostname');
+  }
+  // Strip surrounding brackets from IPv6 literals (e.g. [::1] → ::1)
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, '');
+  if (isPrivateHost(hostname)) {
+    throw new Error(`URL hostname "${hostname}" is in a private/reserved IP range — SSRF blocked`);
+  }
+  if (BLOCKED_HOSTNAMES.has(hostname.toLowerCase())) {
+    throw new Error(`URL hostname "${hostname}" is not allowed — SSRF blocked`);
   }
 }
 
@@ -109,12 +144,15 @@ export function graphicUrl(url: string): void {
     }
     return;
   }
-  // Otherwise must be a safe http/https URL
+  // Otherwise must be a safe http/https URL with no private IP
   httpUrlOnly(url);
 }
 
-// srt://<host>:<port>[?params] or srt://:<port>[?params] (empty host = bind all interfaces)
-const SRT_URL_RE = /^srt:\/\/[^!; ]*$/i;
+// Strict allowlist: srt://<host>:<port>[?params] or srt://:<port>[?params] (bind all interfaces)
+// Host: alphanumeric, dots, hyphens, or IPv6 bracketed address
+// Port: 1–5 digits
+// Query: alphanumeric and safe URL chars only — no control characters, no quotes, no backslash
+const SRT_URL_RE = /^srt:\/\/(([A-Za-z0-9.\-]|\[[0-9a-fA-F:]+\])*:\d{1,5})(\?[A-Za-z0-9._\-=&%+]+)?$/;
 
 /**
  * Throws if the value is not a valid SRT URL.
@@ -124,11 +162,15 @@ const SRT_URL_RE = /^srt:\/\/[^!; ]*$/i;
  * prevent SSRF from the GStreamer pipeline to internal services.
  */
 export function srtUrl(url: string): void {
-  if (!url.startsWith('srt://')) {
-    throw new Error('Only srt:// URLs are allowed');
+  if (url.length > 512) {
+    throw new Error('SRT URL too long');
+  }
+  // Reject control characters before regex (covers CR, LF, tab, NUL, etc.)
+  if (/[\x00-\x1f\x7f]/.test(url)) {
+    throw new Error('Control characters not allowed in SRT URL');
   }
   if (!SRT_URL_RE.test(url)) {
-    throw new Error('SRT URL contains disallowed characters');
+    throw new Error('Invalid SRT URL format — expected srt://host:port or srt://:port with safe query params');
   }
 
   // Extract the authority (host[:port]) from srt://<authority>[/path][?query].

@@ -71,6 +71,29 @@ describe('httpUrlOnly', () => {
   it('rejects invalid URLs', () => {
     expect(() => httpUrlOnly('not-a-url')).toThrow();
   });
+
+  it('rejects private/loopback IP literals (SSRF)', () => {
+    expect(() => httpUrlOnly('http://127.0.0.1/')).toThrow();
+    expect(() => httpUrlOnly('http://10.0.0.1/')).toThrow();
+    expect(() => httpUrlOnly('http://169.254.169.254/')).toThrow(); // AWS/GCP IMDS
+  });
+
+  it('rejects IPv4-mapped IPv6 literals that resolve to a private address', () => {
+    // A bare IPv4 regex would miss these — the address is only private once the
+    // embedded IPv4 is evaluated. See isPrivateHost's ::ffff: handling.
+    expect(() => httpUrlOnly('http://[::ffff:169.254.169.254]/')).toThrow();
+    expect(() => httpUrlOnly('http://[::ffff:127.0.0.1]/')).toThrow();
+    expect(() => httpUrlOnly('http://[::ffff:10.0.0.1]/')).toThrow();
+  });
+
+  it('rejects well-known SSRF hostnames not caught by IP-literal checks', () => {
+    expect(() => httpUrlOnly('http://localhost/')).toThrow();
+    expect(() => httpUrlOnly('http://metadata.google.internal/')).toThrow();
+  });
+
+  it('accepts a public hostname that happens to contain a private-looking substring', () => {
+    expect(() => httpUrlOnly('https://10.0.0.1.example.com/')).not.toThrow();
+  });
 });
 
 describe('isPrivateHost', () => {
@@ -99,9 +122,18 @@ describe('isPrivateHost', () => {
     expect(isPrivateHost('fd12:3456::1')).toBe(true);
   });
 
-  it('flags IPv4-mapped IPv6 for private embedded addresses', () => {
+  it('flags IPv4-mapped IPv6 for private embedded addresses (dotted form)', () => {
     expect(isPrivateHost('::ffff:127.0.0.1')).toBe(true);
     expect(isPrivateHost('::ffff:10.0.0.1')).toBe(true);
+  });
+
+  it('flags IPv4-mapped IPv6 for private embedded addresses (hex-hextet form)', () => {
+    // The WHATWG URL parser normalizes a bracketed literal to this form —
+    // e.g. new URL('http://[::ffff:169.254.169.254]/').hostname is
+    // '[::ffff:a9fe:a9fe]', not the dotted form.
+    expect(isPrivateHost('::ffff:a9fe:a9fe')).toBe(true); // 169.254.169.254 (AWS/GCP IMDS)
+    expect(isPrivateHost('::ffff:7f00:1')).toBe(true); // 127.0.0.1
+    expect(isPrivateHost('::ffff:a00:1')).toBe(true); // 10.0.0.1
   });
 
   it('does not flag public IPv4/IPv6 addresses', () => {
@@ -151,5 +183,31 @@ describe('srtUrl', () => {
   it('rejects IPv6 loopback and ULA hosts', () => {
     expect(() => srtUrl('srt://[::1]:9000')).toThrow(/private|loopback/i);
     expect(() => srtUrl('srt://[fc00::1]:9000')).toThrow(/private|loopback/i);
+  });
+
+  it('accepts safe query params', () => {
+    expect(() => srtUrl('srt://example.com:9999?passphrase=abc123&mode=caller')).not.toThrow();
+  });
+
+  it('rejects CR/LF injection in the query string', () => {
+    expect(() => srtUrl('srt://example.com:9999?x=a\r\ninjected=1')).toThrow('Control characters not allowed');
+    expect(() => srtUrl('srt://example.com:9999?x=a\ninjected')).toThrow('Control characters not allowed');
+  });
+
+  it('rejects a NUL byte', () => {
+    expect(() => srtUrl('srt://example.com:9999?x=\x00')).toThrow('Control characters not allowed');
+  });
+
+  it('rejects a URL exceeding the max length', () => {
+    expect(() => srtUrl('srt://example.com:9999?' + 'a'.repeat(600))).toThrow('SRT URL too long');
+  });
+
+  it('rejects backslash and quotes in the query string', () => {
+    expect(() => srtUrl('srt://example.com:9999?x=a\\b')).toThrow('Invalid SRT URL format');
+    expect(() => srtUrl('srt://example.com:9999?x="evil"')).toThrow('Invalid SRT URL format');
+  });
+
+  it('rejects a URL with no port', () => {
+    expect(() => srtUrl('srt://example.com')).toThrow('Invalid SRT URL format');
   });
 });
