@@ -166,7 +166,24 @@ const InboundMessageSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('SET_EFFECT'),
     target: z.union([z.object({ input: z.number().int().min(0).max(15) }), z.literal('master')]),
-    effect: z.object({ type: z.string().min(1).max(64) }).passthrough(),
+    effect: z.discriminatedUnion('type', [
+      z.object({ type: z.literal('none') }),
+      z.object({ type: z.literal('chroma_key'), key_color: z.string().optional(), similarity: z.number().optional(), smoothness: z.number().optional(), spill: z.number().optional() }),
+      z.object({ type: z.literal('pixelate'), block_size: z.number().int().min(1).max(512).optional() }),
+      z.object({ type: z.literal('blur'), radius: z.number().min(0).max(100).optional() }),
+      z.object({ type: z.literal('duotone'), low: z.string().optional(), high: z.string().optional(), mix: z.number().min(0).max(1).optional() }),
+      z.object({ type: z.literal('vignette'), amount: z.number().min(0).max(1).optional(), softness: z.number().min(0).max(1).optional() }),
+      z.object({ type: z.literal('vhs'), intensity: z.number().min(0).max(1).optional() }),
+      z.object({ type: z.literal('old_film'), intensity: z.number().min(0).max(1).optional() }),
+      z.object({ type: z.literal('edge_glow'), color: z.string().optional(), intensity: z.number().min(0).max(1).optional() }),
+      z.object({ type: z.literal('crt'), intensity: z.number().min(0).max(1).optional() }),
+      z.object({ type: z.literal('halftone'), dot_size: z.number().min(1).max(64).optional() }),
+      z.object({ type: z.literal('thermal'), intensity: z.number().min(0).max(1).optional() }),
+      z.object({ type: z.literal('night_vision'), intensity: z.number().min(0).max(1).optional() }),
+      z.object({ type: z.literal('posterize'), levels: z.number().int().min(2).max(256).optional() }),
+      z.object({ type: z.literal('underwater'), intensity: z.number().min(0).max(1).optional() }),
+      z.object({ type: z.literal('color_correct'), brightness: z.number().optional(), contrast: z.number().optional(), saturation: z.number().optional(), hue: z.number().optional(), gamma: z.number().optional(), temperature: z.number().optional(), tint: z.number().optional() }),
+    ]),
   }),
 ]);
 
