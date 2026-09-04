@@ -34,7 +34,7 @@ const basic: ProviderSource = {
   externalId: 'basic/0',
   name: 'basic',
   streamType: 'srt',
-  address: 'srt://172.27.0.10:20003?mode=caller',
+  address: 'srt://203.0.113.10:20003?mode=caller',
   status: 'active',
 };
 
@@ -77,7 +77,7 @@ describe('providerSourceId', () => {
 
 describe('syncProvider', () => {
   it('creates a provider-owned doc for each new candidate', async () => {
-    const second: ProviderSource = { ...basic, externalId: 'fanout/1', name: 'fanout (node-2)', address: 'srt://172.27.0.10:20004?mode=caller' };
+    const second: ProviderSource = { ...basic, externalId: 'fanout/1', name: 'fanout (node-2)', address: 'srt://203.0.113.10:20004?mode=caller' };
     const result = await syncProvider(fakeProvider(async () => [basic, second]), log);
 
     expect(result).toMatchObject({ created: 2, updated: 0, deactivated: 0, skipped: [] });
@@ -116,7 +116,7 @@ describe('syncProvider', () => {
   it('updates the existing doc in place when the address changes', async () => {
     const stored = storedDoc(basic);
     mockFind.mockResolvedValue({ docs: [stored] });
-    const moved = { ...basic, address: 'srt://172.27.0.11:20005?mode=caller' };
+    const moved = { ...basic, address: 'srt://203.0.113.11:20005?mode=caller' };
     const result = await syncProvider(fakeProvider(async () => [moved]), log);
 
     expect(result).toMatchObject({ created: 0, updated: 1, deactivated: 0 });
@@ -189,6 +189,48 @@ describe('syncProvider', () => {
     expect(mockInsert).toHaveBeenCalledTimes(1);
   });
 
+  describe('private provider addresses', () => {
+    // A provider that places media on a container or cluster network lists
+    // RFC1918 addresses for every source, which srtUrl() rejects by default.
+    const priv = { ...basic, address: 'srt://172.27.0.10:20003?mode=caller' };
+
+    async function syncWith(flag: string | undefined): Promise<import('../providers/registry.js').SyncResult> {
+      vi.resetModules();
+      if (flag === undefined) vi.stubEnv('SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS', '');
+      else vi.stubEnv('SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS', flag);
+      const { syncProvider: sync } = await import('../providers/registry.js');
+      return sync(fakeProvider(async () => [priv]), log);
+    }
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    });
+
+    it('skips them by default, leaving upstream\'s SSRF rule in force', async () => {
+      const result = await syncWith(undefined);
+
+      expect(result.created).toBe(0);
+      expect(result.skipped).toEqual([
+        { externalId: 'basic/0', reason: 'SRT URL must not target private, loopback, or link-local addresses' },
+      ]);
+      expect(mockInsert).not.toHaveBeenCalled();
+    });
+
+    it('accepts them when SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS is true', async () => {
+      const result = await syncWith('true');
+
+      expect(result.skipped).toEqual([]);
+      expect(result.created).toBe(1);
+      expect(mockInsert.mock.calls[0][0].address).toBe('srt://172.27.0.10:20003?mode=caller');
+    });
+
+    it('treats any other value as off', async () => {
+      expect((await syncWith('1')).created).toBe(0);
+      expect((await syncWith('yes')).created).toBe(0);
+    });
+  });
+
   describe('with SRT_PASSPHRASE_KEY set', () => {
     beforeEach(() => {
       vi.stubEnv('SRT_PASSPHRASE_KEY', Buffer.alloc(32, 7).toString('base64'));
@@ -200,7 +242,7 @@ describe('syncProvider', () => {
     });
 
     it('stores the passphrase encrypted and compares against the decrypted form', async () => {
-      const secret = { ...basic, address: 'srt://172.27.0.10:20003?passphrase=hunter22&mode=caller' };
+      const secret = { ...basic, address: 'srt://203.0.113.10:20003?passphrase=hunter22&mode=caller' };
       await syncProvider(fakeProvider(async () => [secret]), log);
 
       const stored = mockInsert.mock.calls[0][0];

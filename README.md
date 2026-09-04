@@ -75,6 +75,7 @@ Copy `.env.example` to `.env` and fill in the values:
 | `LOG_LEVEL` | Fastify log level (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
 | `SOURCE_PROVIDERS` | Comma-separated ids of [source providers](#source-providers) to poll. Unknown ids fail startup. | _(empty — disabled)_ |
 | `SOURCE_PROVIDER_POLL_MS` | Interval between source provider polls, in milliseconds | `5000` |
+| `SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS` | Set to `true` to accept provider-listed SRT addresses on private, loopback or link-local hosts. See [source providers](#source-providers). | `false` |
 | `WEAVE_NORTHBOUND_URL` | Base URL of the open-weave northbound API (e.g. `http://localhost:29080`). Required when `weave` is in `SOURCE_PROVIDERS`. | _(unset)_ |
 | `WEAVE_NORTHBOUND_TOKEN` | Bearer token for the open-weave northbound API. Required when `weave` is in `SOURCE_PROVIDERS`. | _(unset)_ |
 
@@ -159,6 +160,8 @@ A source provider is a small module under `src/providers/` that lists source can
 
 Provider-owned sources carry a `provider` object (`{ id, externalId, syncedAt }`) and `readOnly: true` in API responses. `PATCH` and `DELETE` on them return `409`. A source that the provider stops listing is marked `inactive` rather than deleted, so a production that still references it keeps its assignment.
 
+`srtUrl()` rejects private, loopback and link-local hosts so a source address in a request body cannot make the pipeline dial internal services. A provider that places media on a container or cluster network lists RFC1918 addresses for every source — open-weave puts its SRT outputs on a node subnet — so the rule would reject all of them. `SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS=true` waives it for provider-listed addresses only, which do not come from a request. The REST routes keep the rule unconditionally.
+
 Available providers:
 
 | Id | System | Configuration |
@@ -169,6 +172,7 @@ The `weave` provider lists every enabled stream on the northbound API and offers
 
 ```bash
 SOURCE_PROVIDERS=weave \
+SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS=true \
 WEAVE_NORTHBOUND_URL=http://localhost:29080 \
 WEAVE_NORTHBOUND_TOKEN=<token> \
 pnpm dev

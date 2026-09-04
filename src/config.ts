@@ -75,4 +75,16 @@ export const config = {
   sourceProviders: (process.env['SOURCE_PROVIDERS'] ?? '').split(',').map((s) => s.trim()).filter(Boolean),
   /** Interval between source provider polls, in milliseconds. */
   sourceProviderPollMs: positiveIntEnv('SOURCE_PROVIDER_POLL_MS', 5000),
+  /**
+   * Accept provider-listed SRT addresses on private, loopback or link-local
+   * hosts. Off by default, which keeps srtUrl()'s SSRF rule intact everywhere.
+   *
+   * A provider address is not attacker-supplied: it comes from the system named
+   * in SOURCE_PROVIDERS, over the URL the operator configured. Providers that
+   * place media on container or cluster networks — open-weave puts SRT outputs
+   * on a node subnet — produce RFC1918 addresses for every source, so the rule
+   * would reject all of them. This does not relax the REST routes, where an
+   * address does arrive in a request body.
+   */
+  sourceProviderAllowPrivateHosts: process.env['SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS'] === 'true',
 } as const;

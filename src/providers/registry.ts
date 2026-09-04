@@ -12,6 +12,7 @@
  */
 
 import type { FastifyBaseLogger } from 'fastify';
+import { config } from '../config.js';
 import { getSourcesDb, isDbConnected } from '../db/index.js';
 import type { SourceDoc } from '../db/types.js';
 import { srtUrl } from '../lib/url-validation.js';
@@ -46,7 +47,7 @@ function validateCandidate(candidate: ProviderSource): string | null {
   if (!candidate.name) return 'missing name';
   if (candidate.streamType === 'srt' || candidate.streamType === 'efp') {
     try {
-      srtUrl(candidate.address);
+      srtUrl(candidate.address, { allowPrivateHosts: config.sourceProviderAllowPrivateHosts });
     } catch (err) {
       return err instanceof Error ? err.message : 'invalid SRT address';
     }

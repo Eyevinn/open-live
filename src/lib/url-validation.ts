@@ -5,6 +5,10 @@
  * - httpUrlOnly: allow only http/https schemes with no private-IP targets
  * - graphicUrl:  httpUrlOnly OR safe data: image URIs (no svg, no text/html)
  * - srtUrl:      srt:// scheme only; reject private/internal hosts (listener form allowed)
+ *
+ * `srtUrl` takes the private-host rule as an option rather than reading config,
+ * so the module stays free of environment lookups and each caller states its own
+ * trust assumption at the call site.
  */
 
 /**
@@ -208,7 +212,13 @@ const SRT_URL_RE = /^srt:\/\/(([A-Za-z0-9.\-]|\[[0-9a-fA-F:]+\])*:\d{1,5})(\?[A-
  * URLs whose host is a private/loopback/link-local/internal IP are rejected to
  * prevent SSRF from the GStreamer pipeline to internal services.
  */
-export function srtUrl(url: string): void {
+export interface SrtUrlOptions {
+  /** Skip the private/loopback/link-local rejection. Only for addresses that did
+   *  not come from a request body — see SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS. */
+  allowPrivateHosts?: boolean;
+}
+
+export function srtUrl(url: string, options: SrtUrlOptions = {}): void {
   if (url.length > 512) {
     throw new Error('SRT URL too long');
   }
@@ -234,7 +244,7 @@ export function srtUrl(url: string): void {
     hostname = authority.replace(/:\d+$/, '');
   }
 
-  if (hostname && isPrivateHost(hostname)) {
+  if (!options.allowPrivateHosts && hostname && isPrivateHost(hostname)) {
     throw new Error('SRT URL must not target private, loopback, or link-local addresses');
   }
 }
