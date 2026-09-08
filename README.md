@@ -94,6 +94,10 @@ pnpm start
 | `GET/PATCH/DELETE` | `/api/v1/templates/:id` | Get / update / delete a template |
 | `WS` | `/ws/productions/:id/controller` | WebSocket controller channel |
 
+The REST API is documented in `docs/openapi.yaml` (also served at `/documentation`). The
+WebSocket controller channel — its authentication, inbound message types, and outbound
+broadcasts — is documented separately in [`docs/controller-websocket.md`](docs/controller-websocket.md).
+
 ### Source model
 
 Sources represent individual video/audio feeds. Each source has a `streamType` (`srt` or `whip`) and an `address` (SRT URI or WHIP endpoint URL).
