@@ -1,6 +1,9 @@
 import type { SourceProvider } from './types.js';
+import { weaveProviderFromEnv } from './weave.js';
 
-const PROVIDER_FACTORIES: Record<string, () => SourceProvider> = {};
+const PROVIDER_FACTORIES: Record<string, () => SourceProvider> = {
+  weave: weaveProviderFromEnv,
+};
 
 /** Resolve SOURCE_PROVIDERS ids to provider instances. Throws on an unknown id so a typo fails startup. */
 export function createSourceProviders(ids: string[]): SourceProvider[] {

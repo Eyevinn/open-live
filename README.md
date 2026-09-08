@@ -75,6 +75,8 @@ Copy `.env.example` to `.env` and fill in the values:
 | `LOG_LEVEL` | Fastify log level (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
 | `SOURCE_PROVIDERS` | Comma-separated ids of [source providers](#source-providers) to poll. Unknown ids fail startup. | _(empty — disabled)_ |
 | `SOURCE_PROVIDER_POLL_MS` | Interval between source provider polls, in milliseconds | `5000` |
+| `WEAVE_NORTHBOUND_URL` | Base URL of the open-weave northbound API (e.g. `http://localhost:29080`). Required when `weave` is in `SOURCE_PROVIDERS`. | _(unset)_ |
+| `WEAVE_NORTHBOUND_TOKEN` | Bearer token for the open-weave northbound API. Required when `weave` is in `SOURCE_PROVIDERS`. | _(unset)_ |
 
 > **Never commit `.env`** — it is gitignored. Use `.env.example` as the reference.
 
@@ -156,6 +158,21 @@ SRT passphrases are embedded in the source `address` and encrypted at rest befor
 A source provider is a small module under `src/providers/` that lists source candidates produced by another system. The server polls every provider named in `SOURCE_PROVIDERS` and materialises the candidates as ordinary sources, so assignment, activation and the studio UI need no knowledge of where a source came from.
 
 Provider-owned sources carry a `provider` object (`{ id, externalId, syncedAt }`) and `readOnly: true` in API responses. `PATCH` and `DELETE` on them return `409`. A source that the provider stops listing is marked `inactive` rather than deleted, so a production that still references it keeps its assignment.
+
+Available providers:
+
+| Id | System | Configuration |
+|---|---|---|
+| `weave` | [open-weave](https://github.com/Eyevinn/open-weave) | `WEAVE_NORTHBOUND_URL`, `WEAVE_NORTHBOUND_TOKEN` |
+
+The `weave` provider lists every enabled stream on the northbound API and offers each placed, node-hosted output as an SRT source with `?mode=caller` appended, which is the address open-live's `builtin.mpegtssrt_input` block dials. Outputs that weave dials out to (remote destinations) and streams that are not yet placed are skipped. The matching destination's declared SRT latency is carried onto the source, so the input block and the vision mixer's `min_upstream_latency` agree with what weave configured; a value outside the 20–8000 ms the REST schema allows is ignored in favour of the default.
+
+```bash
+SOURCE_PROVIDERS=weave \
+WEAVE_NORTHBOUND_URL=http://localhost:29080 \
+WEAVE_NORTHBOUND_TOKEN=<token> \
+pnpm dev
+```
 
 ### Template model
 
