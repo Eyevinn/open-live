@@ -40,8 +40,10 @@ function isConflictError(err: unknown): boolean {
  * fresh `_rev` before each retry, so the change actually lands. `mutate`
  * receives the freshly read doc and returns the updated doc to insert;
  * `updatedAt` is stamped automatically. If every attempt still conflicts the
- * failure is logged at warn (with productionId + action) instead of silently
- * dropped — it is no longer thrown, to keep the mixer broadcast path unchanged.
+ * failure is logged at warn (with productionId + action) and swallowed — a
+ * deliberate decision to keep the mixer broadcast path unchanged. Non-conflict
+ * errors (500s, transport failures, a not_found from the db.get) are NOT
+ * swallowed; they propagate to the socket handler's catch-all as before #175.
  */
 async function persistMixerMutation(
   productionId: string,
@@ -59,14 +61,21 @@ async function persistMixerMutation(
       await db.insert(updated);
       return;
     } catch (err) {
-      // On a revision conflict, loop to re-read the latest _rev and re-apply.
-      if (isConflictError(err) && attempt < MAX_DB_WRITE_RETRIES - 1) continue;
-      console.warn(
-        `[controller] Failed to persist mixer mutation after ${attempt + 1} attempt(s)`,
-        { productionId, action },
-        err,
-      );
-      return;
+      if (isConflictError(err)) {
+        // On a revision conflict, loop to re-read the latest _rev and re-apply.
+        if (attempt < MAX_DB_WRITE_RETRIES - 1) continue;
+        // Exhausted conflict retries: deliberately logged and swallowed to
+        // keep the mixer broadcast path unchanged (accepted decision).
+        console.warn(
+          `[controller] Failed to persist mixer mutation after ${attempt + 1} conflict attempt(s)`,
+          { productionId, action },
+          err,
+        );
+        return;
+      }
+      // Non-conflict errors (500s, socket resets, not_found from db.get, …)
+      // propagate to the socket handler's catch-all, as before #175.
+      throw err;
     }
   }
 }
