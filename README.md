@@ -49,9 +49,32 @@ Copy `.env.example` to `.env` and fill in the values:
 | `CORS_ORIGIN` | Allowed CORS origin (URL of the studio frontend) | `http://localhost:5173` |
 | `STROM_URL` | Base URL of the Strom pipeline engine | `http://localhost:7000` |
 | `STROM_TOKEN` | OSC Personal Access Token for authenticating against an OSC-hosted Strom instance | _(empty — not needed for local Strom)_ |
+| `API_KEY` | Static API key protecting all `/api/v1` routes, the WebSocket controller, and the Swagger UI. **Required for any network-accessible deployment** (see below) | _(empty — routes unauthenticated)_ |
 | `LOG_LEVEL` | Fastify log level (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
 
 > **Never commit `.env`** — it is gitignored. Use `.env.example` as the reference.
+
+### API authentication
+
+All `/api/v1` routes, the WebSocket controller (`/ws/`), and the Swagger UI
+(`/documentation`) are protected by a static API key when `API_KEY` is set. Clients
+must send it as a bearer token:
+
+```
+Authorization: Bearer <API_KEY>
+```
+
+WebSocket clients pass the key via the `?key=<API_KEY>` query parameter on the upgrade
+request, since the browser WebSocket API does not support custom headers.
+
+> **`API_KEY` must be set for any network-accessible deployment.** When `API_KEY` is
+> unset, every API route is unauthenticated — any client that can reach the service can
+> create, modify, delete, and activate productions. The server **refuses to start** when
+> `NODE_ENV=production` and `API_KEY` is unset, and logs a prominent warning otherwise.
+> Leave it unset **only** when running behind a trusted external auth layer (e.g. the OSC
+> reverse proxy). The reference `docker-compose.yml` requires `API_KEY` to be set in your
+> `.env` before the stack will start — generate a strong random value with
+> `openssl rand -base64 32`.
 
 ### Strom authentication
 
