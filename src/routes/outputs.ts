@@ -5,6 +5,7 @@ import { getOutputsDb, getDb } from '../db/index.js';
 import type { OutputDoc, ProductionDoc } from '../db/types.js';
 import { updateProductionDoc } from './productions.js';
 import { srtUrl } from '../lib/url-validation.js';
+import { evaluateListenerPort, getPortLease } from '../services/port-lease.js';
 
 const SRT_OUTPUT_TYPES = new Set(['mpegtssrt', 'efpsrt']);
 
@@ -47,6 +48,13 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
 
   fastify.post('/api/v1/outputs', async (req, reply) => {
     const body = OutputInput.parse(req.body);
+    if (SRT_OUTPUT_TYPES.has(body.outputType) && body.url) {
+      // A listener output binds a port on the shared Strom, like a listener source does.
+      const verdict = evaluateListenerPort(body.url, getPortLease());
+      if (!verdict.ok) {
+        return reply.status(verdict.statusCode).send({ error: verdict.error, statusCode: verdict.statusCode });
+      }
+    }
     const now = new Date().toISOString();
     const doc: OutputDoc = {
       _id: `output-${randomUUID()}`,
@@ -81,6 +89,14 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
           srtUrl(effectiveUrl);
         } catch (err) {
           return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid SRT URL' });
+        }
+        // Re-check the lease only when the URL changes — a rename must not fail
+        // because an older output predates the lease.
+        if (body.url !== undefined) {
+          const verdict = evaluateListenerPort(effectiveUrl, getPortLease());
+          if (!verdict.ok) {
+            return reply.status(verdict.statusCode).send({ error: verdict.error, statusCode: verdict.statusCode });
+          }
         }
       }
       const updated: OutputDoc = { ...doc, ...body, updatedAt: new Date().toISOString() };

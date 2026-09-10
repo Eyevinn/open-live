@@ -1,6 +1,6 @@
 /**
  * Route tests for the SRT port lease: /api/v1/server-info exposes the leased
- * range, and /api/v1/sources rejects listener ports outside it.
+ * range, and /api/v1/sources and /api/v1/outputs reject listener ports outside it.
  *
  * CouchDB, Strom client, and the WS controller are mocked — no real services
  * required. The lease state is set directly through the service's test hook.
@@ -9,7 +9,7 @@
 import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { PortLease } from '../lib/strom.js';
-import type { SourceDoc } from '../db/types.js';
+import type { OutputDoc, SourceDoc } from '../db/types.js';
 
 // ---------------------------------------------------------------------------
 // Mock CouchDB
@@ -17,10 +17,13 @@ import type { SourceDoc } from '../db/types.js';
 
 const mockSourcesGet = vi.fn();
 const mockSourcesInsert = vi.fn();
+const mockOutputsGet = vi.fn();
+const mockOutputsInsert = vi.fn();
 
 vi.mock('../db/index.js', () => ({
   getDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn() }),
   getSourcesDb: () => ({ get: mockSourcesGet, insert: mockSourcesInsert }),
+  getOutputsDb: () => ({ get: mockOutputsGet, insert: mockOutputsInsert }),
   connectDb: vi.fn().mockResolvedValue(undefined),
   isDbReady: vi.fn().mockResolvedValue(true),
   isDbConnected: vi.fn().mockReturnValue(true),
@@ -91,6 +94,17 @@ const EXISTING_SOURCE: SourceDoc = {
   updatedAt: '2026-01-01T00:00:00Z',
 };
 
+const EXISTING_OUTPUT: OutputDoc = {
+  _id: 'output-1',
+  _rev: '1-abc',
+  type: 'output',
+  name: 'Program',
+  outputType: 'mpegtssrt',
+  url: 'srt://:47118?mode=listener',
+  createdAt: '2026-01-01T00:00:00Z',
+  updatedAt: '2026-01-01T00:00:00Z',
+};
+
 let app: FastifyInstance;
 let _resetPortLeaseState: typeof import('../services/port-lease.js')._resetPortLeaseState;
 
@@ -105,6 +119,10 @@ beforeEach(() => {
   mockSourcesInsert.mockReset();
   mockSourcesInsert.mockResolvedValue({ ok: true });
   mockSourcesGet.mockResolvedValue(EXISTING_SOURCE);
+  mockOutputsGet.mockReset();
+  mockOutputsInsert.mockReset();
+  mockOutputsInsert.mockResolvedValue({ ok: true });
+  mockOutputsGet.mockResolvedValue(EXISTING_OUTPUT);
 });
 
 describe('GET /api/v1/server-info', () => {
@@ -216,5 +234,82 @@ describe('PATCH /api/v1/sources/:id port lease enforcement', () => {
     mockSourcesGet.mockResolvedValue({ ...EXISTING_SOURCE, streamType: 'efp', address: 'srt://:9000?mode=listener' });
     const res = await patch({ streamType: 'srt' });
     expect(res.statusCode).toBe(422);
+  });
+});
+
+describe('POST /api/v1/outputs port lease enforcement', () => {
+  const post = (url: string, outputType = 'mpegtssrt') =>
+    app.inject({ method: 'POST', url: '/api/v1/outputs', payload: { name: 'Program', url, outputType } });
+
+  it('accepts an in-range listener port', async () => {
+    _resetPortLeaseState({ status: 'leased', lease: LEASE });
+    const res = await post('srt://:47119?mode=listener');
+    expect(res.statusCode).toBe(201);
+    expect(mockOutputsInsert).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects an out-of-range listener port with 422 naming the range', async () => {
+    _resetPortLeaseState({ status: 'leased', lease: LEASE });
+    const res = await post('srt://:43524?mode=listener');
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error).toContain('47100-47119');
+    expect(mockOutputsInsert).not.toHaveBeenCalled();
+  });
+
+  it('applies the same check to efpsrt outputs', async () => {
+    _resetPortLeaseState({ status: 'leased', lease: LEASE });
+    const res = await post('srt://:43524?mode=listener', 'efpsrt');
+    expect(res.statusCode).toBe(422);
+  });
+
+  it('rejects listener outputs with 503 while the lease is pending', async () => {
+    _resetPortLeaseState({ status: 'pending' });
+    const res = await post('srt://:47119?mode=listener');
+    expect(res.statusCode).toBe(503);
+    expect(mockOutputsInsert).not.toHaveBeenCalled();
+  });
+
+  it('does not check caller-form URLs', async () => {
+    _resetPortLeaseState({ status: 'leased', lease: LEASE });
+    const res = await post('srt://cdn.example.com:9000?mode=caller');
+    expect(res.statusCode).toBe(201);
+  });
+
+  it('does not check WHEP outputs', async () => {
+    _resetPortLeaseState({ status: 'pending' });
+    const res = await app.inject({ method: 'POST', url: '/api/v1/outputs', payload: { name: 'Web', outputType: 'whep' } });
+    expect(res.statusCode).toBe(201);
+  });
+});
+
+describe('PATCH /api/v1/outputs/:id port lease enforcement', () => {
+  const patch = (payload: Record<string, unknown>) =>
+    app.inject({ method: 'PATCH', url: '/api/v1/outputs/output-1', payload });
+
+  it('rejects a new out-of-range listener URL with 422', async () => {
+    _resetPortLeaseState({ status: 'leased', lease: LEASE });
+    const res = await patch({ url: 'srt://:9000?mode=listener' });
+    expect(res.statusCode).toBe(422);
+    expect(mockOutputsInsert).not.toHaveBeenCalled();
+  });
+
+  it('accepts a new in-range listener URL', async () => {
+    _resetPortLeaseState({ status: 'leased', lease: LEASE });
+    const res = await patch({ url: 'srt://:47110?mode=listener' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().url).toBe('srt://:47110?mode=listener');
+  });
+
+  it('returns 503 for a listener URL while the lease is pending', async () => {
+    _resetPortLeaseState({ status: 'pending' });
+    const res = await patch({ url: 'srt://:47110?mode=listener' });
+    expect(res.statusCode).toBe(503);
+  });
+
+  it('does not re-check the stored URL on a rename', async () => {
+    _resetPortLeaseState({ status: 'pending' });
+    const res = await patch({ name: 'Program (renamed)' });
+    expect(res.statusCode).toBe(200);
+    expect(mockOutputsInsert).toHaveBeenCalledTimes(1);
   });
 });

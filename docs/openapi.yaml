@@ -862,6 +862,18 @@ paths:
                 $ref: '#/components/schemas/Output'
         '400':
           description: Validation error
+        '422':
+          description: Hostless SRT listener port is outside this instance's leased range (see /api/v1/server-info)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: SRT port range not yet allocated from Strom — retry shortly
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   /api/v1/outputs/{id}:
     parameters:
@@ -902,6 +914,18 @@ paths:
                 $ref: '#/components/schemas/Output'
         '404':
           description: Not found
+        '422':
+          description: Hostless SRT listener port is outside this instance's leased range (see /api/v1/server-info)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: SRT port range not yet allocated from Strom — retry shortly
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
     delete:
       summary: Delete output
       operationId: deleteOutput

@@ -1,12 +1,12 @@
 # SRT port lease on a shared Strom
 
 When several Open Live instances share one Strom, every SRT *listener* source
-(`srt://:PORT?mode=listener`) binds a port on that same Strom. Two instances
-picking the same port would collide. To prevent that, each Open Live instance
-leases a contiguous range of SRT listener ports from Strom and only accepts
-listener sources inside its range.
+or output (`srt://:PORT?mode=listener`) binds a port on that same Strom. Two
+instances picking the same port would collide. To prevent that, each Open Live
+instance leases a contiguous range of SRT listener ports from Strom and only
+accepts listener sources and outputs inside its range.
 
-Caller sources (`srt://host:PORT?mode=caller`), WHIP and HTML sources are not
+Caller addresses (`srt://host:PORT?mode=caller`), WHIP, WHEP and HTML are not
 affected.
 
 ## What the server does
@@ -37,15 +37,16 @@ sources they register:
 
 `srtPortLease` is one of:
 
-| Value | Meaning | Listener sources |
+| Value | Meaning | Listener sources and outputs |
 |---|---|---|
 | `leased` | Range acquired; `srtPortRange` is set | Must use a port in the range, otherwise `422` |
 | `pending` | Not acquired yet (Strom unreachable or pool full) | Rejected with `503` until the lease is acquired |
 | `unsupported` | Strom has no port lease API | Accepted, not checked |
 | `disabled` | `STROM_PORT_LEASE_DISABLED=true` | Accepted, not checked |
 
-`POST /api/v1/sources` and `PATCH /api/v1/sources/:id` apply the check when the
-address is a hostless SRT listener. A `422` response names the allowed range.
+`POST`/`PATCH` on `/api/v1/sources` and `/api/v1/outputs` apply the check when
+the address or URL is a hostless SRT listener. A `422` response names the
+allowed range.
 
 ## Environment variables
 
@@ -62,5 +63,7 @@ address is a hostless SRT listener. A `422` response names the allowed range.
 - If the server logs `Failed to acquire SRT port range` with a `409` from Strom,
   the pool cannot fit the request: lower `STROM_PORT_LEASE_SIZE`, release
   leases from decommissioned instances, or grow the pool on Strom.
-- Sources created before the lease existed are not re-validated on rename. They
-  are checked again the next time their address or stream type is edited.
+- Sources and outputs created before the lease existed are not re-validated on
+  rename. They are checked again the next time their address or URL is edited.
+- Size the range for sources and outputs together: a production's SRT outputs
+  in listener mode take ports from the same block.
