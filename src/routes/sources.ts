@@ -6,6 +6,7 @@ import type { SourceDoc, ProductionDoc } from '../db/types.js';
 import { updateProductionDoc } from './productions.js';
 import { graphicUrl, srtUrl } from '../lib/url-validation.js';
 import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
+import { evaluateListenerPort, getPortLease } from '../services/port-lease.js';
 
 const SourceInput = z.object({
   name: z.string().min(1).max(256),
@@ -93,6 +94,13 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
   // Create a source
   fastify.post('/api/v1/sources', async (req, reply) => {
     const body = SourceInput.parse(req.body);
+    if (body.streamType === 'srt' || body.streamType === 'efp') {
+      // Listener sources bind a port on the shared Strom — it must be inside this instance's lease.
+      const verdict = evaluateListenerPort(body.address, getPortLease());
+      if (!verdict.ok) {
+        return reply.status(verdict.statusCode).send({ error: verdict.error, statusCode: verdict.statusCode });
+      }
+    }
     const now = new Date().toISOString();
     const doc: SourceDoc = {
       _id: `src-${randomUUID()}`,
@@ -140,6 +148,17 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
           }
         } catch (err) {
           return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid source address' });
+        }
+        // Re-check the lease only when the address or stream type changes — a
+        // rename must not fail because an older source predates the lease.
+        if (
+          (body.address !== undefined || body.streamType !== undefined) &&
+          (effectiveStreamType === 'srt' || effectiveStreamType === 'efp')
+        ) {
+          const verdict = evaluateListenerPort(effectiveAddress, getPortLease());
+          if (!verdict.ok) {
+            return reply.status(verdict.statusCode).send({ error: verdict.error, statusCode: verdict.statusCode });
+          }
         }
       }
       // Encrypt the passphrase in an updated address before persisting. When the

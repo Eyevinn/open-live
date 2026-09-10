@@ -4,6 +4,22 @@ function requireEnv(name: string): string {
   return value;
 }
 
+function parseBoolEnv(name: string, defaultValue: boolean): boolean {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return defaultValue;
+  return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
+}
+
+function parsePositiveIntEnv(name: string, defaultValue: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return defaultValue;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error(`Environment variable ${name} must be a positive integer, got "${raw}"`);
+  }
+  return value;
+}
+
 function buildCouchdbUrl(): string {
   const raw = requireEnv('COUCHDB_URL');
   const url = new URL(raw);
@@ -58,4 +74,16 @@ export const config = {
     .split(',')
     .map((h) => h.trim().toLowerCase())
     .filter(Boolean),
+  /**
+   * Number of consecutive SRT listener ports to lease from the shared Strom
+   * instance at startup. Listener sources must use a port inside the leased range.
+   */
+  stromPortLeaseSize: parsePositiveIntEnv('STROM_PORT_LEASE_SIZE', 20),
+  /**
+   * Optional override for the lease client id sent to Strom. Defaults to the
+   * hostname of PUBLIC_BASE_URL, or `open-live-<hostname>` when that is unset.
+   */
+  stromPortLeaseClientId: process.env['STROM_PORT_LEASE_CLIENT_ID'] || undefined,
+  /** Set to true to skip port leasing entirely (single-tenant Strom setups). */
+  stromPortLeaseDisabled: parseBoolEnv('STROM_PORT_LEASE_DISABLED', false),
 } as const;

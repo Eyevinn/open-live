@@ -1,5 +1,6 @@
 import { config } from './config.js';
 import { startIdleWatchdog } from './services/idle-watchdog.js';
+import { startPortLease, stopPortLease } from './services/port-lease.js';
 import { connectDb, getDb, isDbConnected } from './db/index.js';
 import { cleanLegacyFixtures } from './db/seed.js';
 import { buildServer } from './server.js';
@@ -137,7 +138,22 @@ async function main() {
   }
 
   startIdleWatchdog(app.log);
+  startPortLease(app.log);
   await app.listen({ port: config.port, host: '0.0.0.0' });
+
+  // Graceful shutdown: release the Strom port lease so the range is free for
+  // the next instance, then close the server. Force-exit if it stalls.
+  const onSignal = (signal: NodeJS.Signals): void => {
+    app.log.info({ signal }, 'Shutting down');
+    setTimeout(() => process.exit(1), 5000).unref();
+    void (async () => {
+      await stopPortLease(app.log);
+      await app.close();
+      process.exit(0);
+    })();
+  };
+  process.once('SIGTERM', onSignal);
+  process.once('SIGINT', onSignal);
 }
 
 const shutdown = (err: unknown, origin: string): void => {

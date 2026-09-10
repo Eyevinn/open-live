@@ -73,6 +73,9 @@ Copy `.env.example` to `.env` and fill in the values:
 | `STROM_TOKEN` | OSC Personal Access Token for authenticating against an OSC-hosted Strom instance | _(empty — not needed for local Strom)_ |
 | `API_KEY` | Static API key protecting all `/api/v1` routes, the WebSocket controller, and the Swagger UI. **Required for any network-accessible deployment** (see below) | _(empty — routes unauthenticated)_ |
 | `LOG_LEVEL` | Fastify log level (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
+| `STROM_PORT_LEASE_SIZE` | Number of SRT listener ports to lease from a shared Strom — see [`docs/port-lease.md`](docs/port-lease.md) | `20` |
+| `STROM_PORT_LEASE_CLIENT_ID` | Stable lease client id sent to Strom | hostname of `PUBLIC_BASE_URL`, else `open-live-<hostname>` |
+| `STROM_PORT_LEASE_DISABLED` | Set to `true` to turn off port leasing | `false` |
 
 > **Never commit `.env`** — it is gitignored. Use `.env.example` as the reference.
 
