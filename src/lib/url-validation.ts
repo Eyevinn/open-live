@@ -24,6 +24,12 @@
  *
  * Non-IP hostnames (public DNS names) are NOT flagged here — DNS resolution is out
  * of scope for this synchronous validator; this blocks the direct-IP SSRF vector.
+ * The `localhost` hostname (not an IP literal) is handled separately by
+ * `BLOCKED_HOSTNAMES` in `httpUrlOnly`.
+ *
+ * Regression coverage for the #58 bypass set (IPv6 ULA fc00::/7, IPv4-mapped
+ * ::ffff: private ranges, 0.0.0.0, and the localhost hostname) lives in
+ * `src/__tests__/url-validation.test.ts`.
  */
 export function isPrivateHost(hostname: string): boolean {
   // Strip surrounding brackets from IPv6 literals and normalise case.

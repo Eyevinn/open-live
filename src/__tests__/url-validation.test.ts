@@ -101,6 +101,30 @@ describe('httpUrlOnly', () => {
   it('accepts a public hostname that happens to contain a private-looking substring', () => {
     expect(() => httpUrlOnly('https://10.0.0.1.example.com/')).not.toThrow();
   });
+
+  // Issue #58 regression: SSRF bypasses via IPv6 ULA, IPv4-mapped IPv6,
+  // 0.0.0.0, and the localhost hostname — exercised end-to-end through the
+  // WHATWG URL parser (bracketed literals get normalized), not just isPrivateHost.
+  it('rejects IPv6 ULA (fc00::/7) literals — Docker/K8s internal nets (#58)', () => {
+    expect(() => httpUrlOnly('http://[fd12::1]:8080/x')).toThrow(/SSRF/);
+    expect(() => httpUrlOnly('http://[fc00::1]/x')).toThrow(/SSRF/);
+  });
+
+  it('rejects IPv4-mapped IPv6 loopback literals (#58)', () => {
+    expect(() => httpUrlOnly('http://[::ffff:127.0.0.1]/')).toThrow(/SSRF/);
+  });
+
+  it('rejects 0.0.0.0 (#58)', () => {
+    expect(() => httpUrlOnly('http://0.0.0.0/')).toThrow(/SSRF/);
+  });
+
+  it('rejects the localhost hostname (#58)', () => {
+    expect(() => httpUrlOnly('http://localhost/')).toThrow(/SSRF|not allowed/);
+  });
+
+  it('still accepts a normal public host (#58 — no false positives)', () => {
+    expect(() => httpUrlOnly('https://example.com')).not.toThrow();
+  });
 });
 
 describe('isPrivateHost', () => {

@@ -27,8 +27,12 @@ import controllerWs from './ws/controller.js';
 
 // Routes exempt from the DB-availability guard (don't touch the DB)
 const DB_EXEMPT_PATHS = new Set(['/health', '/ready', '/api/v1/status', '/api/v1/server-info', '/api/v1/reconnect']);
-// Routes exempt from API key auth (health probes + reconnect/status used by the UI before auth is set up)
-const AUTH_EXEMPT_PATHS = new Set(['/health', '/ready', '/api/v1/status', '/api/v1/reconnect']);
+// Routes exempt from API key auth (health probes + status used by the UI before auth is set up).
+// /api/v1/reconnect is intentionally NOT exempt (#59): it triggers DB/Strom connection attempts
+// and returns their reachability, so an unauthenticated caller could leak infrastructure status
+// or exhaust connections. It is a mutating POST and the studio calls it via its authenticated
+// api client, so requiring the API key here does not break the legitimate caller.
+const AUTH_EXEMPT_PATHS = new Set(['/health', '/ready', '/api/v1/status']);
 
 export async function buildServer() {
   const fastify = Fastify({
@@ -155,7 +159,7 @@ export async function buildServer() {
   });
 
   // Optional API key authentication — enabled when API_KEY env var is set.
-  // Exempt: health/ready probes and status/reconnect endpoints.
+  // Exempt: health/ready probes and the read-only status endpoint.
   // WS connections: pass key via Authorization header or ?key= query param on upgrade.
   if (config.apiKey) {
     // Captured here, outside the closure: TS narrows `config.apiKey` from
