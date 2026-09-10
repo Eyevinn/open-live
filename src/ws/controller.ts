@@ -452,6 +452,17 @@ const pvwBeforePipByProduction = new Map<string, string | null>()
  */
 const pgmBgByProduction = new Map<string, string | null>()
 
+/**
+ * The real input sitting behind a PiP that is on program, or null.
+ *
+ * While a PiP occupies PGM, `tally.pgm` is null, so without this a subscriber
+ * cannot tell "nothing on program" from "a PiP over input 3". The value is
+ * never re-broadcast on its own, so a client attaching mid-show has no other
+ * way to recover it.
+ */
+const pgmBgOf = (productionId: string): string | null =>
+  pgmBgByProduction.get(productionId) ?? null
+
 
 /** Wipe all per-production audio state. Called when the pipeline changes or production deactivates. */
 export function clearAudioState(productionId: string): void {
@@ -709,7 +720,7 @@ export async function handleMessage(
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: null, pips: pipConfigsByProduction.get(productionId) ?? [] });
       }
       await persistMixerMutation(productionId, 'CUT', (d) => ({ ...d, tally: newTally }));
-      broadcast(productionId, { type: 'TALLY', ...newTally });
+      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId) });
       await stromTransition(doc, fromPadCut, msg.mixerInput, 'cut');
       if (curPgmPipCut !== null && doc.stromFlowId && doc.mixerBlockId) {
         try {
@@ -740,7 +751,7 @@ export async function handleMessage(
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: curPgmPipTrans, pips: pipConfigsByProduction.get(productionId) ?? [] });
       }
       await persistMixerMutation(productionId, 'TRANSITION', (d) => ({ ...d, tally: newTally }));
-      broadcast(productionId, { type: 'TALLY', ...newTally, transitionType: msg.transitionType, durationMs: msg.durationMs });
+      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId), transitionType: msg.transitionType, durationMs: msg.durationMs });
       await stromTransition(doc, fromPadTrans, msg.mixerInput, toStromTransition(msg.transitionType), msg.durationMs);
       if (curPgmPipTrans !== null && doc.stromFlowId && doc.mixerBlockId) {
         try {
@@ -777,7 +788,18 @@ export async function handleMessage(
       pgmPipByProduction.set(productionId, newPgmPip);
       pvwPipByProduction.set(productionId, newPvwPip);
       await persistMixerMutation(productionId, 'TAKE', (d) => ({ ...d, tally: newTally }));
-      broadcast(productionId, { type: 'TALLY', ...newTally });
+      // The background behind the PiP after this take. Derived from what is in
+      // scope, because `pgmBgByProduction` still holds the previous state here.
+      const pvwBeforePip = pvwBeforePipByProduction.get(productionId) ?? null;
+      // Falls back to the outgoing PGM input, matching the `to_input` the Strom
+      // transition below computes: with no PVW source displaced, the mixer
+      // composites the PiP over whatever was already on program.
+      const newPgmBg = newPgmPip !== null ? (pvwBeforePip ?? tally.pgm) : null;
+      // Set here rather than in the Strom block below: the connect handler
+      // reads this map, and it must hold the background the take just
+      // broadcast even when Strom is unconfigured or its call throws.
+      if (newPgmPip !== null) pgmBgByProduction.set(productionId, newPgmBg);
+      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: newPgmBg });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: newPgmPip, pvwPip: newPvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
       const takeTransition = toStromTransition(msg.transitionType ?? 'cut');
       if (curPvwPip !== null) {
@@ -791,7 +813,6 @@ export async function handleMessage(
           try {
             const strom = await makeStromClient();
             const fromInputIndex = tally.pgm ? (padToIndex(tally.pgm) ?? 0) : 0;
-            const pvwBeforePip = pvwBeforePipByProduction.get(productionId) ?? null;
             const toInputIndex = pvwBeforePip !== null ? (padToIndex(pvwBeforePip) ?? fromInputIndex) : fromInputIndex;
             await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: curPvwPip } });
             await strom.mixer.transition(doc.stromFlowId, doc.mixerBlockId, {
@@ -800,9 +821,6 @@ export async function handleMessage(
               transition_type: takeTransition,
               ...(msg.durationMs !== undefined ? { duration_ms: msg.durationMs } : {}),
             });
-            // Track the new Strom PGM background (pvwBeforePip) so CUT/TRANSITION
-            // can pass the correct from_input while the PiP remains on PGM.
-            pgmBgByProduction.set(productionId, pvwBeforePip);
             pvwBeforePipByProduction.delete(productionId);
           } catch (err) {
             console.warn('[controller] Strom PiP transition error:', err);
@@ -851,7 +869,7 @@ export async function handleMessage(
       const newTally = { pgm: tally.pgm, pvw: msg.mixerInput };
       setTally(productionId, newTally);
       await persistMixerMutation(productionId, 'SET_PVW', (d) => ({ ...d, tally: newTally }));
-      broadcast(productionId, { type: 'TALLY', ...newTally });
+      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId) });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: pgmPipByProduction.get(productionId) ?? null, pvwPip: null, pips: pipConfigsByProduction.get(productionId) ?? [] });
       if (doc.stromFlowId && doc.mixerBlockId) {
         const inputIndex = padToIndex(msg.mixerInput);
@@ -876,7 +894,7 @@ export async function handleMessage(
       const newTally = { pgm: tally.pgm, pvw: null };
       setTally(productionId, newTally);
       await persistMixerMutation(productionId, 'SELECT_PVW_PIP', (d) => ({ ...d, tally: newTally }));
-      broadcast(productionId, { type: 'TALLY', ...newTally });
+      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId) });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: pgmPipByProduction.get(productionId) ?? null, pvwPip: msg.pip, pips: pipConfigsByProduction.get(productionId) ?? [] });
       if (doc.stromFlowId && doc.mixerBlockId) {
         try {
@@ -1025,7 +1043,7 @@ export async function handleMessage(
             const newTally = { pgm: mixerInput, pvw: tally.pgm };
             setTally(productionId, newTally);
             await persistMixerMutation(productionId, 'MACRO_EXEC:CUT', (d) => ({ ...d, tally: newTally }));
-            broadcast(productionId, { type: 'TALLY', ...newTally });
+            broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId) });
             await stromTransition(currentDoc, tally.pgm, mixerInput, 'cut');
           } else if (action.type === 'TRANSITION' && action.sourceId) {
             const mixerInput = resolveInput(action.sourceId);
@@ -1034,14 +1052,14 @@ export async function handleMessage(
             const newTally = { pgm: mixerInput, pvw: tally.pgm };
             setTally(productionId, newTally);
             await persistMixerMutation(productionId, 'MACRO_EXEC:TRANSITION', (d) => ({ ...d, tally: newTally }));
-            broadcast(productionId, { type: 'TALLY', ...newTally, transitionType: action.transitionType, durationMs: action.durationMs });
+            broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId), transitionType: action.transitionType, durationMs: action.durationMs });
             await stromTransition(currentDoc, tally.pgm, mixerInput, toStromTransition(action.transitionType ?? 'cut'), action.durationMs);
           } else if (action.type === 'TAKE') {
             const tally = getTally(productionId);
             const newTally = { pgm: tally.pvw, pvw: tally.pgm };
             setTally(productionId, newTally);
             await persistMixerMutation(productionId, 'MACRO_EXEC:TAKE', (d) => ({ ...d, tally: newTally }));
-            broadcast(productionId, { type: 'TALLY', ...newTally });
+            broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId) });
             await stromTransition(currentDoc, tally.pgm, tally.pvw, 'cut');
           } else if (action.type === 'GRAPHIC_ON' && action.overlayId) {
             await persistMixerMutation(productionId, 'MACRO_EXEC:GRAPHIC_ON', (d) => ({
@@ -1620,7 +1638,7 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
           setTally(id, tally);
         }
       }
-      socket.send(JSON.stringify({ type: 'TALLY', ...tally }));
+      socket.send(JSON.stringify({ type: 'TALLY', ...tally, pgmBg: pgmBgOf(id) }));
 
       const cachedAlpha = overlayAlphaByProduction.get(id);
       if (cachedAlpha !== undefined) {
