@@ -18,6 +18,54 @@ function stromErrorMessage(err: unknown): string {
   return String(err);
 }
 
+// ---------------------------------------------------------------------------
+// Per-connection message rate limiting
+// ---------------------------------------------------------------------------
+//
+// HTTP routes are protected by @fastify/rate-limit, but WebSocket message
+// throughput was previously unbounded: a single authenticated client could
+// flood commands (each of which may trigger a downstream Strom API call),
+// causing DoS for other operators. We apply a sliding-window limit per
+// connection — a general cap plus a stricter cap on expensive commands.
+
+/** General cap: max inbound messages per connection per window. */
+const RATE_LIMIT_GENERAL_MAX = 20;
+/** Stricter cap for expensive commands (each triggers heavy Strom work). */
+const RATE_LIMIT_EXPENSIVE_MAX = 5;
+/** Sliding-window size in milliseconds. */
+const RATE_LIMIT_WINDOW_MS = 1000;
+
+/** Message types whose processing is expensive enough to warrant a tighter cap. */
+const EXPENSIVE_MESSAGE_TYPES = new Set(['MACRO_EXEC', 'GO_LIVE', 'CUT_STREAM']);
+
+/** Per-connection sliding-window timestamps. Lives on the connection ctx so it
+ * is garbage-collected when the socket closes (no global registry to leak). */
+interface RateLimitState {
+  general: number[];
+  expensive: number[];
+}
+
+/**
+ * Records the message against the sliding windows and reports whether it is
+ * allowed. Old timestamps outside the window are pruned on every call, so state
+ * stays bounded for the lifetime of the connection.
+ */
+function checkRateLimit(state: RateLimitState, isExpensive: boolean, now: number): boolean {
+  const cutoff = now - RATE_LIMIT_WINDOW_MS;
+
+  state.general = state.general.filter((t) => t > cutoff);
+  if (state.general.length >= RATE_LIMIT_GENERAL_MAX) return false;
+
+  if (isExpensive) {
+    state.expensive = state.expensive.filter((t) => t > cutoff);
+    if (state.expensive.length >= RATE_LIMIT_EXPENSIVE_MAX) return false;
+    state.expensive.push(now);
+  }
+
+  state.general.push(now);
+  return true;
+}
+
 // Mirror of MAX_DB_WRITE_RETRIES in routes/productions.ts — the number of
 // insert attempts a mixer write makes before giving up on a CouchDB 409.
 const MAX_DB_WRITE_RETRIES = 3;
@@ -602,7 +650,7 @@ export async function handleMessage(
   productionId: string,
   ws: WebSocket,
   raw: string,
-  ctx: { audioBlockId?: string },
+  ctx: { audioBlockId?: string; rateLimit?: RateLimitState },
 ): Promise<void> {
   let rawParsed: unknown;
   try {
@@ -617,6 +665,14 @@ export async function handleMessage(
     return;
   }
   const msg: InboundMessage = parseResult.data as unknown as InboundMessage;
+
+  // Per-connection rate limiting: drop (do not process) messages that exceed
+  // the sliding-window caps and inform the client via the standard ERROR frame.
+  if (!ctx.rateLimit) ctx.rateLimit = { general: [], expensive: [] };
+  if (!checkRateLimit(ctx.rateLimit, EXPENSIVE_MESSAGE_TYPES.has(msg.type), Date.now())) {
+    ws.send(JSON.stringify({ type: 'ERROR', error: 'Rate limit exceeded' }));
+    return;
+  }
 
 
   const db = getDb();
@@ -1520,7 +1576,7 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
 
       // Per-connection context — mutable so the audio block ID can be populated
       // at connect time and reused on every subsequent AUDIO_SET without a flow fetch.
-      const ctx: { audioBlockId?: string } = {};
+      const ctx: { audioBlockId?: string; rateLimit?: RateLimitState } = {};
 
       // Register message/close handlers immediately so no messages are dropped
       // while we perform the async connect-time sync below.
