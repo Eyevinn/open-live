@@ -34,9 +34,11 @@ export const config = {
   apiKey: process.env['API_KEY'] ?? undefined,
   /**
    * Allowed CORS origin(s). Comma-separated list or '*' (wildcard).
-   * Defaults to '*' for backward compatibility; tighten for production.
+   * Defaults to unset (no wildcard): when omitted, cross-origin requests are
+   * not permitted rather than being opened to any origin. Set an explicit
+   * origin (or comma-separated list) for browser clients.
    */
-  corsOrigin: process.env['CORS_ORIGIN'] ?? '*',
+  corsOrigin: process.env['CORS_ORIGIN'] ?? undefined,
   /**
    * Public base URL used to construct WHIP callback URLs stored in CouchDB.
    * Set this to the externally reachable URL of this service (e.g. https://live.example.com).
