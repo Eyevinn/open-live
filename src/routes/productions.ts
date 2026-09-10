@@ -370,6 +370,13 @@ const ProductionPatch = z.object({
 // mixerInput must match the Strom pad naming convention (e.g. "video_in_0", "video_in_15")
 const mixerInputSchema = z.string().regex(/^video_in_\d{1,2}$/, 'mixerInput must match video_in_N format').max(20);
 
+// dskInput must match the Strom DSK pad naming convention (e.g. "dsk_in_0"). It is
+// forwarded verbatim into a Strom flow link `to` field by flow-generator.ts
+// (`${mixerBlockId}:${assignment.dskInput}`), so an unvalidated value containing a
+// `:` or other unexpected characters corrupts the flow topology (issue #61). Mirror
+// the mixerInput allowlist so only well-formed pad names reach the Strom pipeline.
+const dskInputSchema = z.string().regex(/^dsk_in_\d+$/, 'dskInput must match dsk_in_N format').max(20);
+
 const SourceAssignmentInput = z.object({
   sourceId: z.string().min(1).max(128),
   mixerInput: mixerInputSchema,
@@ -377,7 +384,7 @@ const SourceAssignmentInput = z.object({
 
 const GraphicAssignmentInput = z.object({
   graphicId: z.string().min(1),
-  dskInput: z.string().min(1),
+  dskInput: dskInputSchema,
 });
 
 const OutputAssignmentInput = z.object({
@@ -717,6 +724,10 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.delete<{ Params: { id: string; dskInput: string } }>(
     '/api/v1/productions/:id/graphics/:dskInput',
     async (req, reply) => {
+      const dskInputParsed = dskInputSchema.safeParse(req.params.dskInput);
+      if (!dskInputParsed.success) {
+        return reply.status(400).send({ error: 'Invalid dskInput format', statusCode: 400 });
+      }
       try {
         const doc = await getDb().get(req.params.id);
         const exists = (doc.graphicAssignments ?? []).some((g) => g.dskInput === req.params.dskInput);

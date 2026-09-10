@@ -1,34 +1,14 @@
 import type { FastifyPluginAsync } from 'fastify'
 import { getStromToken } from '../lib/strom-token.js'
+import { assertSameStromOrigin } from '../lib/url-validation.js'
 import { config } from '../config.js'
-
-/** Returns the effective TCP port for a URL, resolving protocol defaults when the port is omitted. */
-function effectivePort(u: URL): string {
-  if (u.port) return u.port;
-  return u.protocol === 'https:' ? '443' : '80';
-}
 
 /**
  * Validates that a session URL belongs to the configured Strom host.
  * Prevents SSRF / SAT token exfiltration to an attacker-controlled host.
  */
 function validateSessionUrl(sessionUrl: string): void {
-  let parsed: URL;
-  try {
-    parsed = new URL(sessionUrl);
-  } catch {
-    throw new Error('Invalid session URL');
-  }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new Error('Session URL must use http or https');
-  }
-  const strom = new URL(config.stromUrl);
-  if (parsed.hostname !== strom.hostname) {
-    throw new Error('Session URL host does not match configured Strom host');
-  }
-  if (effectivePort(parsed) !== effectivePort(strom)) {
-    throw new Error('Session URL port does not match configured Strom port');
-  }
+  assertSameStromOrigin(sessionUrl, config.stromUrl, 'Session URL');
 }
 
 /**
