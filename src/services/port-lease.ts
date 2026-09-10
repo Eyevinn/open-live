@@ -124,9 +124,14 @@ export function getPortLease(): PortLeaseState {
   return state;
 }
 
-/** Old Strom without the feature: 404 with the generic "API endpoint not found" body. */
+/**
+ * Nothing answers POST /api/port-leases: a Strom without the feature, or a
+ * self-hosted Strom with no port broker proxied in front of it. The body is
+ * whatever the responder (Strom, a proxy) puts in a 404, so only the status
+ * counts. Create never 404s for any other reason.
+ */
 function isUnsupportedError(err: unknown): boolean {
-  return err instanceof StromClientError && err.status === 404 && /API endpoint not found/i.test(err.message);
+  return err instanceof StromClientError && err.status === 404;
 }
 
 function isNotFound(err: unknown): boolean {

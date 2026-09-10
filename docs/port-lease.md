@@ -3,8 +3,13 @@
 When several Open Live instances share one Strom, every SRT *listener* source
 or output (`srt://:PORT?mode=listener`) binds a port on that same Strom. Two
 instances picking the same port would collide. To prevent that, each Open Live
-instance leases a contiguous range of SRT listener ports from Strom and only
-accepts listener sources and outputs inside its range.
+instance leases a contiguous range of SRT listener ports and only accepts
+listener sources and outputs inside its range.
+
+The lease requests go to `STROM_URL` under `/api/port-leases`. On a shared
+Strom a proxy in front of it routes that path to a port broker service, which
+owns the pool; everything else passes through to Strom. A self-hosted Strom
+with no proxy answers 404, and Open Live then applies no port restriction.
 
 Caller addresses (`srt://host:PORT?mode=caller`), WHIP, WHEP and HTML are not
 affected.
@@ -19,8 +24,9 @@ affected.
   under the same client id and logs a warning if the range changed.
 - **On `SIGTERM` / `SIGINT`** it releases the lease so the ports are free for
   the next instance.
-- **If Strom is too old** to have the port lease API, the server logs one
-  warning, stops enforcing ports, and re-checks every 10 minutes.
+- **If nothing answers the lease routes** (a Strom with no port broker in
+  front of it), the server logs one warning, stops enforcing ports, and
+  re-checks every 10 minutes.
 
 ## Effect on the API
 
@@ -41,7 +47,7 @@ sources they register:
 |---|---|---|
 | `leased` | Range acquired; `srtPortRange` is set | Must use a port in the range, otherwise `422` |
 | `pending` | Not acquired yet (Strom unreachable or pool full) | Rejected with `503` until the lease is acquired |
-| `unsupported` | Strom has no port lease API | Accepted, not checked |
+| `unsupported` | No port broker answers at `STROM_URL` | Accepted, not checked |
 | `disabled` | `STROM_PORT_LEASE_DISABLED=true` | Accepted, not checked |
 
 `POST`/`PATCH` on `/api/v1/sources` and `/api/v1/outputs` apply the check when
@@ -62,7 +68,7 @@ allowed range.
   active at once; the pool on Strom is shared, so do not over-allocate.
 - If the server logs `Failed to acquire SRT port range` with a `409` from Strom,
   the pool cannot fit the request: lower `STROM_PORT_LEASE_SIZE`, release
-  leases from decommissioned instances, or grow the pool on Strom.
+  leases from decommissioned instances, or grow the pool on the port broker.
 - Sources and outputs created before the lease existed are not re-validated on
   rename. They are checked again the next time their address or URL is edited.
 - Size the range for sources and outputs together: a production's SRT outputs

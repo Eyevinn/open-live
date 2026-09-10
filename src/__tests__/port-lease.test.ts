@@ -240,6 +240,12 @@ describe('port lease service', () => {
     expect(log.warn).toHaveBeenCalledTimes(1);
   });
 
+  it('treats any 404 on create as unsupported, whatever the body says', async () => {
+    acquire.mockRejectedValue(new StromClientError(404, '<html>nginx: not found</html>'));
+    await tickPortLease(log);
+    expect(getPortLease()).toEqual({ status: 'unsupported' });
+  });
+
   it('re-probes an unsupported Strom after the back-off window', async () => {
     vi.useFakeTimers();
     try {
