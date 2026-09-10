@@ -15,7 +15,7 @@ import type { FastifyBaseLogger } from 'fastify';
 import { config } from '../config.js';
 import { getSourcesDb, isDbConnected } from '../db/index.js';
 import type { SourceDoc } from '../db/types.js';
-import { srtUrl } from '../lib/url-validation.js';
+import { httpUrlOnly, srtUrl } from '../lib/url-validation.js';
 import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
 import type { ProviderSource, SourceProvider } from './types.js';
 
@@ -42,15 +42,32 @@ export function providerSourceId(providerId: string, externalId: string): string
   return `src-ext-${providerId}-${slug}`.slice(0, MAX_SOURCE_ID_LENGTH);
 }
 
+/**
+ * The `never` default makes an added ProviderSource.streamType a compile error
+ * here, so a new stream type cannot reach the DB unvalidated.
+ */
+function assertCandidateAddress(candidate: ProviderSource): void {
+  const allowPrivateHosts = config.sourceProviderAllowPrivateHosts;
+  switch (candidate.streamType) {
+    case 'srt':
+    case 'efp':
+      return srtUrl(candidate.address, { allowPrivateHosts });
+    case 'whip':
+      return httpUrlOnly(candidate.address, { allowPrivateHosts });
+    default: {
+      const unsupported: never = candidate.streamType;
+      throw new Error(`unsupported stream type "${String(unsupported)}"`);
+    }
+  }
+}
+
 function validateCandidate(candidate: ProviderSource): string | null {
   if (!candidate.externalId) return 'missing externalId';
   if (!candidate.name) return 'missing name';
-  if (candidate.streamType === 'srt' || candidate.streamType === 'efp') {
-    try {
-      srtUrl(candidate.address, { allowPrivateHosts: config.sourceProviderAllowPrivateHosts });
-    } catch (err) {
-      return err instanceof Error ? err.message : 'invalid SRT address';
-    }
+  try {
+    assertCandidateAddress(candidate);
+  } catch (err) {
+    return err instanceof Error ? err.message : 'invalid address';
   }
   return null;
 }

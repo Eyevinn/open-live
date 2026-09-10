@@ -189,17 +189,38 @@ describe('syncProvider', () => {
     expect(mockInsert).toHaveBeenCalledTimes(1);
   });
 
+  it('skips a whip candidate whose address is not a safe http(s) URL', async () => {
+    const whip = { ...basic, externalId: 'whip/0', streamType: 'whip' as const, address: 'srt://203.0.113.10:20003' };
+    const result = await syncProvider(fakeProvider(async () => [whip]), log);
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toEqual([
+      { externalId: 'whip/0', reason: 'Disallowed URL scheme "srt:" — only http/https allowed' },
+    ]);
+    expect(mockInsert).not.toHaveBeenCalled();
+  });
+
+  it('accepts a whip candidate on a public https endpoint', async () => {
+    const whip = { ...basic, externalId: 'whip/0', streamType: 'whip' as const, address: 'https://ingest.example.com/whip/1' };
+    const result = await syncProvider(fakeProvider(async () => [whip]), log);
+
+    expect(result.skipped).toEqual([]);
+    expect(result.created).toBe(1);
+    expect(mockInsert.mock.calls[0][0]).toMatchObject({ streamType: 'whip' });
+  });
+
   describe('private provider addresses', () => {
     // A provider that places media on a container or cluster network lists
     // RFC1918 addresses for every source, which srtUrl() rejects by default.
     const priv = { ...basic, address: 'srt://172.27.0.10:20003?mode=caller' };
+    const privWhip = { ...basic, streamType: 'whip' as const, address: 'http://172.27.0.10:8080/whip/1' };
 
-    async function syncWith(flag: string | undefined): Promise<import('../providers/registry.js').SyncResult> {
+    async function syncWith(flag: string | undefined, candidate: ProviderSource = priv): Promise<import('../providers/registry.js').SyncResult> {
       vi.resetModules();
       if (flag === undefined) vi.stubEnv('SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS', '');
       else vi.stubEnv('SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS', flag);
       const { syncProvider: sync } = await import('../providers/registry.js');
-      return sync(fakeProvider(async () => [priv]), log);
+      return sync(fakeProvider(async () => [candidate]), log);
     }
 
     afterEach(() => {
@@ -223,6 +244,20 @@ describe('syncProvider', () => {
       expect(result.skipped).toEqual([]);
       expect(result.created).toBe(1);
       expect(mockInsert.mock.calls[0][0].address).toBe('srt://172.27.0.10:20003?mode=caller');
+    });
+
+    it('applies the same flag to whip candidates', async () => {
+      expect((await syncWith(undefined, privWhip)).skipped).toEqual([
+        { externalId: 'basic/0', reason: 'URL hostname "172.27.0.10" is in a private/reserved IP range — SSRF blocked' },
+      ]);
+      expect((await syncWith('true', privWhip)).created).toBe(1);
+    });
+
+    it('keeps blocking the cloud metadata hostname even with the flag on', async () => {
+      const metadata = { ...basic, streamType: 'whip' as const, address: 'http://metadata.google.internal/whip/1' };
+      expect((await syncWith('true', metadata)).skipped).toEqual([
+        { externalId: 'basic/0', reason: 'URL hostname "metadata.google.internal" is not allowed — SSRF blocked' },
+      ]);
     });
 
     it('treats any other value as off', async () => {

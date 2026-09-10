@@ -6,9 +6,9 @@
  * - graphicUrl:  httpUrlOnly OR safe data: image URIs (no svg, no text/html)
  * - srtUrl:      srt:// scheme only; reject private/internal hosts (listener form allowed)
  *
- * `srtUrl` takes the private-host rule as an option rather than reading config,
- * so the module stays free of environment lookups and each caller states its own
- * trust assumption at the call site.
+ * `httpUrlOnly` and `srtUrl` take the private-host rule as an option rather than
+ * reading config, so the module stays free of environment lookups and each caller
+ * states its own trust assumption at the call site.
  */
 
 /**
@@ -106,13 +106,20 @@ const BLOCKED_HOSTNAMES = new Set([
   'metadata.google.internal', // GCP metadata endpoint
 ]);
 
+export interface UrlValidationOptions {
+  /** Skip the private/loopback/link-local rejection. Only for addresses that did
+   *  not come from a request body — see SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS.
+   *  BLOCKED_HOSTNAMES stays in force regardless. */
+  allowPrivateHosts?: boolean;
+}
+
 /**
  * Throws if the URL is not a safe http/https URL.
  * Rejects private/loopback/link-local/internal IP literals (via `isPrivateHost`,
  * which also catches IPv4-mapped IPv6 such as ::ffff:169.254.169.254 — the AWS
  * IMDS bypass an IPv4-only regex would miss) and well-known SSRF hostnames.
  */
-export function httpUrlOnly(url: string): void {
+export function httpUrlOnly(url: string, options: UrlValidationOptions = {}): void {
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -127,7 +134,7 @@ export function httpUrlOnly(url: string): void {
   }
   // Strip surrounding brackets from IPv6 literals (e.g. [::1] → ::1)
   const hostname = parsed.hostname.replace(/^\[|\]$/g, '');
-  if (isPrivateHost(hostname)) {
+  if (!options.allowPrivateHosts && isPrivateHost(hostname)) {
     throw new Error(`URL hostname "${hostname}" is in a private/reserved IP range — SSRF blocked`);
   }
   if (BLOCKED_HOSTNAMES.has(hostname.toLowerCase())) {
@@ -212,13 +219,7 @@ const SRT_URL_RE = /^srt:\/\/(([A-Za-z0-9.\-]|\[[0-9a-fA-F:]+\])*:\d{1,5})(\?[A-
  * URLs whose host is a private/loopback/link-local/internal IP are rejected to
  * prevent SSRF from the GStreamer pipeline to internal services.
  */
-export interface SrtUrlOptions {
-  /** Skip the private/loopback/link-local rejection. Only for addresses that did
-   *  not come from a request body — see SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS. */
-  allowPrivateHosts?: boolean;
-}
-
-export function srtUrl(url: string, options: SrtUrlOptions = {}): void {
+export function srtUrl(url: string, options: UrlValidationOptions = {}): void {
   if (url.length > 512) {
     throw new Error('SRT URL too long');
   }

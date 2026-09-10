@@ -10,7 +10,7 @@ export interface ProviderSource {
   externalId: string;
   name: string;
   streamType: 'srt' | 'efp' | 'whip';
-  /** Validated with srtUrl() for srt/efp before it is stored. */
+  /** Validated before it is stored: srtUrl() for srt/efp, httpUrlOnly() for whip. */
   address: string;
   latency?: number;
   /** Defaults to 'active'. */
