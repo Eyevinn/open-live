@@ -108,7 +108,7 @@ are emitted from `src/ws/controller.ts` and `src/services/meter-relay.ts`:
 
 | `type` | Fields | Emitted when |
 |---|---|---|
-| `TALLY` | `pgm: string \| null`, `pvw: string \| null`, `transitionType?: string`, `durationMs?: number` | Tally (PGM/PVW) changes; also sent on connect |
+| `TALLY` | `pgm: string \| null`, `pvw: string \| null`, `pgmBg: string \| null`, `transitionType?: string`, `durationMs?: number` | Tally (PGM/PVW) changes; also sent on connect |
 | `PIP_STATE` | `pgmPip: number \| null`, `pvwPip: number \| null`, `pips: PipConfig[]` | PiP program/preview/config changes; also sent on connect |
 | `FTB_STATE` | `active: boolean` | Fade-to-black state changes |
 | `ON_AIR` | `value: boolean` | Production goes on/off air (`GO_LIVE` / `CUT_STREAM`) |
@@ -134,6 +134,12 @@ are emitted from `src/ws/controller.ts` and `src/services/meter-relay.ts`:
 | `METER_DATA` | `elementId: string`, `peak`, `rms` | Audio meter tick (relayed from Strom); `elementId` is `main`, `monitor`, `ch{N}`, `aux{N}`, or `grp{N}` |
 | `LOUDNESS_DATA` | `elementId: 'main'`, `momentary`, `shortterm`, `integrated`, `loudness_range`, `true_peak` | EBU R128 loudness tick (relayed from Strom) |
 | `ERROR` | `error: string` | An inbound frame was invalid or an operation failed (sent to originating socket) |
+
+`pgmBg` is the mixer input a PiP on program is composited over. It is `null` unless
+`PIP_STATE.pgmPip` is set, so the two fields together distinguish an empty program
+(`pgmPip` null) from a PiP over a known input (both set) from a PiP over nothing
+(`pgmPip` set, `pgmBg` null). It is not tracked across the `MACRO_EXEC` cut,
+transition, and take paths, which leave it holding the value from before the macro.
 
 ### Connect-time snapshot
 
