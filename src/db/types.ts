@@ -1,3 +1,5 @@
+import type { PipConfig } from '../lib/strom.js';
+
 // --------------- Macro types ---------------
 
 export type MacroActionType = 'CUT' | 'TRANSITION' | 'TAKE' | 'GRAPHIC_ON' | 'GRAPHIC_OFF' | 'DSK_TOGGLE';
@@ -138,6 +140,13 @@ export interface ProductionDoc {
   whepOutputUrls?: Array<{ outputId: string; url: string }>;
   /** Graphic-to-DSK-pad assignments for this production */
   graphicAssignments?: ProductionGraphicAssignment[];
+  /**
+   * Persisted Picture-in-Picture layout (background + zones + per-source crops)
+   * per PiP slot. Set via the WS SET_PIP handler; survives deactivate/reactivate
+   * and server restarts so operators do not have to reconfigure PiP placement.
+   * Indexed by PiP slot number.
+   */
+  pipConfigs?: PipConfig[];
   /** ID of the running Strom flow (set on activate, cleared on deactivate) */
   stromFlowId?: string;
   /** WHEP multiview endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */

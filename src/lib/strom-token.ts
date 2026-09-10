@@ -17,6 +17,8 @@ interface SatCache {
 }
 
 let cache: SatCache | null = null
+// Coalesce concurrent token exchange requests to avoid burst PAT exhaustion
+let inflightExchange: Promise<string> | null = null
 
 function isExpiringSoon(cache: SatCache): boolean {
   return Date.now() >= cache.expiresAt - REFRESH_BUFFER_MS
@@ -43,7 +45,14 @@ export async function getStromToken(pat: string | undefined): Promise<string | u
     return cache.token
   }
 
-  const res = await fetch(TOKEN_EXCHANGE_URL, {
+  // Coalesce: if an exchange is already in-flight, wait for it instead of
+  // issuing a duplicate request. This prevents burst activations from
+  // exhausting OSC per-PAT rate limits after a SAT expiry.
+  if (inflightExchange) {
+    return inflightExchange
+  }
+
+  inflightExchange = fetch(TOKEN_EXCHANGE_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -52,13 +61,18 @@ export async function getStromToken(pat: string | undefined): Promise<string | u
     },
     body: JSON.stringify({ serviceId: STROM_SERVICE_ID }),
   })
+    .then(async (res) => {
+      if (!res.ok) {
+        const body = await res.text()
+        throw new Error(`SAT exchange failed: ${res.status} ${res.statusText} — ${body.slice(0, 200)}`)
+      }
+      const data = (await res.json()) as { token: string; expiry: number }
+      cache = { token: data.token, expiresAt: data.expiry * 1000 }
+      return cache.token
+    })
+    .finally(() => {
+      inflightExchange = null
+    })
 
-  if (!res.ok) {
-    const body = await res.text()
-    throw new Error(`SAT exchange failed: ${res.status} ${res.statusText} — ${body.slice(0, 200)}`)
-  }
-
-  const data = (await res.json()) as { token: string; expiry: number }
-  cache = { token: data.token, expiresAt: data.expiry * 1000 }
-  return cache.token
+  return inflightExchange
 }

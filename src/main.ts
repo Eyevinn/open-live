@@ -84,6 +84,47 @@ async function reconcileProductionStatuses(
 }
 
 async function main() {
+  // API_KEY is required in production. Without it every route is unauthenticated,
+  // allowing any client that can reach port 3000 to create, modify, and delete
+  // productions. Omitting API_KEY is intentional only when running behind OSC's
+  // reverse-proxy auth wall or another trusted auth layer.
+  if (!config.apiKey) {
+    if (process.env['NODE_ENV'] === 'production') {
+      throw new Error(
+        'API_KEY must be set in production deployments. ' +
+        'Without it all API routes are unauthenticated. ' +
+        'Set API_KEY to a strong random secret, or set NODE_ENV to a value ' +
+        'other than "production" if this deployment intentionally relies on ' +
+        'an external auth layer (e.g. the OSC reverse proxy).'
+      );
+    } else {
+      console.warn(
+        '[security] API_KEY is not set — all /api/v1 routes are unauthenticated. ' +
+        'Set API_KEY before deploying to production.'
+      );
+    }
+  }
+
+  // PUBLIC_BASE_URL is required in production to prevent X-Forwarded-Host injection.
+  // Without it, the activation endpoint derives the public WHIP URL from the raw
+  // X-Forwarded-Host header, which an attacker can forge to redirect camera streams
+  // to an attacker-controlled server (CVE category: host-header injection).
+  if (!config.publicBaseUrl) {
+    if (process.env['NODE_ENV'] === 'production') {
+      throw new Error(
+        'PUBLIC_BASE_URL must be set in production deployments. ' +
+        'Without it the activation endpoint derives WHIP endpoint URLs from the ' +
+        'X-Forwarded-Host request header, enabling host-header injection attacks.'
+      );
+    } else {
+      console.warn(
+        '[security] PUBLIC_BASE_URL is not set. WHIP endpoint URLs will be derived ' +
+        'from request headers (X-Forwarded-Host / Host). Set PUBLIC_BASE_URL to the ' +
+        'externally reachable URL of this service before deploying to production.'
+      );
+    }
+  }
+
   const app = await buildServer();
 
   try {
@@ -99,13 +140,15 @@ async function main() {
   await app.listen({ port: config.port, host: '0.0.0.0' });
 }
 
-process.on('uncaughtException', (err) => {
-  console.error({ err }, '[process] Uncaught exception — keeping alive');
-});
+const shutdown = (err: unknown, origin: string): void => {
+  console.error({ err, origin }, 'Fatal error — shutting down');
+  // Force-exit if graceful shutdown stalls
+  setTimeout(() => process.exit(1), 5000).unref();
+  process.exit(1);
+};
 
-process.on('unhandledRejection', (reason) => {
-  console.error({ reason }, '[process] Unhandled promise rejection — keeping alive');
-});
+process.on('uncaughtException', (err, origin) => shutdown(err, origin));
+process.on('unhandledRejection', (reason) => shutdown(reason, 'unhandledRejection'));
 
 main().catch((err) => {
   console.error(err);

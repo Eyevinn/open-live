@@ -1,21 +1,11 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { getStromToken } from '../lib/strom-token.js';
+import { assertSameStromOrigin } from '../lib/url-validation.js';
 import { config } from '../config.js';
 
 /** Validates a proxy target URL is on the configured Strom host (prevents SSRF + token exfiltration). */
 function validateProxyTarget(targetUrl: string): void {
-  let parsed: URL;
-  try { parsed = new URL(targetUrl); } catch { throw new Error('Invalid target URL'); }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new Error('Target URL must use http or https');
-  }
-  const strom = new URL(config.stromUrl);
-  if (parsed.hostname !== strom.hostname) {
-    throw new Error('Target URL host does not match configured Strom host');
-  }
-  if (strom.port && parsed.port && parsed.port !== strom.port) {
-    throw new Error('Target URL port does not match configured Strom port');
-  }
+  assertSameStromOrigin(targetUrl, config.stromUrl, 'Target URL');
 }
 
 /**
@@ -41,7 +31,10 @@ const whepProxyRoutes: FastifyPluginAsync = async (fastify) => {
     done(null, body)
   })
 
-  fastify.post<{ Querystring: { target: string } }>('/api/v1/whep-proxy', async (req, reply) => {
+  fastify.post<{ Querystring: { target: string } }>(
+    '/api/v1/whep-proxy',
+    { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
+    async (req, reply) => {
     const target = req.query.target
     if (!target) return reply.status(400).send({ error: 'Missing target query parameter' })
 

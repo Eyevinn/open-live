@@ -3,6 +3,8 @@ import type { ProductionDoc, SourceDoc, GraphicDoc, OutputDoc } from '../db/type
 import { getSourcesDb, getGraphicsDb } from '../db/index.js';
 import { StromClient } from './strom.js';
 import { DEFAULT_FLOW, type FlowTopology } from './default-flow.js';
+import { decryptAddressPassphrase } from './srt-passphrase-crypto.js';
+import { safeFlowProjection } from './log-redact.js';
 
 /**
  * Generates a Strom flow from a template + source assignments,
@@ -69,6 +71,9 @@ export async function activateStromFlow(
     if (assignment.sourceId in VIRTUAL_SOURCES) continue;
     try {
       const src = await sourcesDb.get(assignment.sourceId) as unknown as SourceDoc;
+      // Decrypt the at-rest SRT passphrase so Strom receives a usable srt_uri.
+      // Legacy plaintext addresses pass through unchanged (issue #160).
+      src.address = decryptAddressPassphrase(src.address);
       sourceMap.set(assignment.sourceId, src);
     } catch {
       console.warn(`[flow-generator] Source ${assignment.sourceId} (${assignment.mixerInput}) not found — skipping`);
@@ -695,8 +700,14 @@ export async function activateStromFlow(
         properties: { url: graphic.url },
         position: [COL_ELEM, dskY],
       });
+      // Resolution only — deliberately no framerate. cefsrc advertises
+      // framerate=0/1 (variable), and builtin.videoformat is
+      // videoscale -> videoconvert -> capsfilter with no videorate, so pinning
+      // a fixed framerate here cannot be satisfied: the capsfilter fails to
+      // negotiate, cefsrc's task pauses on not-negotiated, and the DSK renders
+      // nothing at all. The source-side format blocks above already pass
+      // resolution only. The mixer still emits pgm_framerate downstream.
       const fmtProps: Record<string, unknown> = { resolution: pgmResolution };
-      if (pgmFramerate !== undefined) fmtProps['framerate'] = pgmFramerate;
       flow.blocks.push({
         id: fmtId,
         block_definition_id: 'builtin.videoformat',
@@ -824,7 +835,9 @@ export async function activateStromFlow(
       flow.elements.push({
         id: drainId,
         element_type: 'fakesink',
-        properties: { sync: false },
+        // async: false — this drain may never receive a buffer (group bus with
+        // nothing routed to it), so it must not block pipeline preroll.
+        properties: { sync: false, async: false },
         position: [encX, drainBaseY + ROW_H * (i - 1)],
       } as unknown as typeof flow.elements[number]);
       flow.links.push({ from: `${audioMixerBlockId}:group_out_${i}`, to: `${drainId}:sink` });
@@ -857,11 +870,7 @@ export async function activateStromFlow(
     await strom.flows.start(flowId);
   } catch (err) {
     // Log a sanitized flow projection — never log block properties (may contain SRT URIs, tokens, passphrases)
-    const safeFlow = {
-      blockCount: flow.blocks.length,
-      blocks: flow.blocks.map((b) => ({ id: b['id'], block_definition_id: b['block_definition_id'] })),
-      linkCount: flow.links.length,
-    };
+    const safeFlow = safeFlowProjection(flow as unknown as Record<string, unknown>);
     console.error('[flow-generator] Flow start failed. Flow topology (properties redacted):',
       JSON.stringify(safeFlow, null, 2));
     // Start failed — clean up the created flow so the endpoint isn't left registered

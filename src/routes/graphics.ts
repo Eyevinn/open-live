@@ -18,12 +18,12 @@ const safeGraphicUrl = z.string().min(1).max(524288).superRefine((s, ctx) => {
 });
 
 const GraphicInput = z.object({
-  name: z.string().min(1),
+  name: z.string().min(1).max(256),
   url: safeGraphicUrl,
 });
 
 const GraphicPatch = z.object({
-  name: z.string().min(1).optional(),
+  name: z.string().min(1).max(256).optional(),
   url: safeGraphicUrl.optional(),
 });
 

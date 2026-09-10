@@ -5,12 +5,12 @@ import { getConfigsDb } from '../db/index.js';
 import type { ProductionConfigDoc } from '../db/types.js';
 
 const ConfigInput = z.object({
-  name: z.string().min(1),
+  name: z.string().min(1).max(256),
   values: z.record(z.union([z.string(), z.number(), z.boolean()])),
 });
 
 const ConfigPatch = z.object({
-  name: z.string().min(1).optional(),
+  name: z.string().min(1).max(256).optional(),
   values: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
 });
 

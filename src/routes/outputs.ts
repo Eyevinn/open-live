@@ -9,7 +9,7 @@ import { srtUrl } from '../lib/url-validation.js';
 const SRT_OUTPUT_TYPES = new Set(['mpegtssrt', 'efpsrt']);
 
 const OutputInput = z.object({
-  name: z.string().min(1),
+  name: z.string().min(1).max(256),
   outputType: z.enum(['mpegtssrt', 'efpsrt', 'whep']),
   url: z.string().optional(),
 }).superRefine((data, ctx) => {
@@ -23,7 +23,7 @@ const OutputInput = z.object({
 });
 
 const OutputPatch = z.object({
-  name: z.string().min(1).optional(),
+  name: z.string().min(1).max(256).optional(),
   url: z.string().optional(),
 });
 

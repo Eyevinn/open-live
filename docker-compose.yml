@@ -5,7 +5,7 @@ services:
       COUCHDB_USER: ${COUCHDB_USER:-admin}
       COUCHDB_PASSWORD: ${COUCHDB_PASSWORD:?Set COUCHDB_PASSWORD in .env (see .env.example)}
     ports:
-      - "5984:5984"
+      - "127.0.0.1:5984:5984"
     volumes:
       - couchdb_data:/opt/couchdb/data
 
@@ -19,6 +19,9 @@ services:
       COUCHDB_NAME: open-live
       CORS_ORIGIN: http://localhost:5173
       LOG_LEVEL: info
+      # Required for production deployments — set a strong random secret.
+      # Omit (or leave unset) only when running behind an external auth layer.
+      API_KEY: ${API_KEY:?Set API_KEY in .env (see .env.example)}
     depends_on:
       - couchdb
 

@@ -5,6 +5,7 @@ import rateLimit from '@fastify/rate-limit';
 import websocket from '@fastify/websocket';
 import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
+import { timingSafeEqual } from 'crypto';
 import { ZodError } from 'zod';
 import { config } from './config.js';
 import { isDbConnected } from './db/index.js';
@@ -33,24 +34,65 @@ export async function buildServer() {
   const fastify = Fastify({
     logger: {
       level: config.logLevel,
+      // Defence-in-depth: strip credentials from any log object regardless of
+      // call site, in case a raw flow/source/error escapes explicit redaction.
+      // Field names mirror the sensitive keys in src/lib/log-redact.ts.
+      redact: {
+        paths: [
+          'srt_uri',
+          'passphrase',
+          'streamid',
+          'token',
+          'secret',
+          '*.srt_uri',
+          '*.passphrase',
+          '*.streamid',
+          '*.token',
+          '*.secret',
+          'req.headers.authorization',
+          'headers.authorization',
+        ],
+        censor: '[REDACTED]',
+      },
     },
     disableRequestLogging: true,
     // Prevent memory exhaustion via oversized request bodies (1 MB limit)
     bodyLimit: 1_048_576,
+    // Trust the X-Forwarded-For header from the ingress proxy so that req.ip
+    // resolves to the real client IP rather than the proxy's address.
+    // Without this, the header is treated as user-controlled input, allowing
+    // spoofed IPs to bypass rate limiting.
+    trustProxy: true,
   });
 
   // CORS must be registered before Helmet so its onRequest hook runs first
   // and Access-Control-Allow-Origin is set before Helmet's hooks fire.
-  const corsOrigins = config.corsOrigin === '*'
-    ? true
-    : config.corsOrigin.split(',').map((o) => o.trim()).filter(Boolean);
+  //
+  // When CORS_ORIGIN is unset we do NOT fall back to a permissive wildcard:
+  // an unconfigured deployment must not silently allow cross-origin reads.
+  // Instead we disable cross-origin access (origin: false) and warn loudly.
+  // An explicit '*' still opts in to wildcard; a comma-separated list is
+  // parsed into an allow-list.
+  let corsOrigins: boolean | string[];
+  if (config.corsOrigin === undefined) {
+    fastify.log.warn(
+      '[security] CORS_ORIGIN is not set — cross-origin requests are disabled. ' +
+      'Set CORS_ORIGIN to your browser client origin (e.g. http://localhost:5173) ' +
+      'or a comma-separated list of origins to enable CORS.'
+    );
+    corsOrigins = false;
+  } else if (config.corsOrigin === '*') {
+    corsOrigins = true;
+  } else {
+    corsOrigins = config.corsOrigin.split(',').map((o) => o.trim()).filter(Boolean);
+  }
   await fastify.register(cors, {
     origin: corsOrigins,
     methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: false,
     maxAge: 86400,
-    strictPreflight: false,
+    strictPreflight: true,
   });
 
   await fastify.register(helmet, {
@@ -61,10 +103,14 @@ export async function buildServer() {
     // reads are already selectively permitted via CORS preflight; a global
     // cross-origin CRP would additionally expose responses to no-cors fetches.
     crossOriginResourcePolicy: { policy: 'same-origin' },
+    strictTransportSecurity: {
+      maxAge: 31536000,
+      includeSubDomains: true,
+      preload: true,
+    },
   });
 
-  // Rate limiting — 200 requests per minute per IP on API routes
-  // Activation and WHIP/WHEP proxy get tighter limits (10/min) to prevent abuse
+  // Rate limiting — 200 requests per minute per IP on API routes; tight per-route limits on activate/WHIP/WHEP
   await fastify.register(rateLimit, {
     global: true,
     max: 200,
@@ -72,7 +118,7 @@ export async function buildServer() {
     // Skip health/ready probes — they are high-frequency and come from the cluster
     allowList: (req: { url: string }) => req.url === '/health' || req.url === '/ready',
     skipOnError: false,
-    keyGenerator: (req: { headers: Record<string, string | string[] | undefined>; ip: string }) => (req.headers['x-forwarded-for'] as string ?? req.ip).split(',')[0]!.trim(),
+    keyGenerator: (req: { ip: string }) => req.ip,
     errorResponseBuilder: (_req, context) => ({
       error: 'Too many requests',
       statusCode: 429,
@@ -112,13 +158,30 @@ export async function buildServer() {
   // Exempt: health/ready probes and status/reconnect endpoints.
   // WS connections: pass key via Authorization header or ?key= query param on upgrade.
   if (config.apiKey) {
+    // Captured here, outside the closure: TS narrows `config.apiKey` from
+    // `string | undefined` to `string` at this `if`, but that narrowing does
+    // not carry into the callback passed to addHook below (a new, separate
+    // function scope), so `config.apiKey` inside it is still `string | undefined`.
+    const apiKey = config.apiKey;
     fastify.addHook('onRequest', async (req, reply) => {
       const path = req.url.split('?')[0]!;
       if (AUTH_EXEMPT_PATHS.has(path)) return;
-      // Guard both the REST API and the WebSocket controller. The /ws/ prefix
-      // must be listed explicitly: without it, /ws/productions/:id/controller
-      // bypasses auth entirely and accepts live production commands unauthenticated.
-      if (!req.url.startsWith('/api/v1') && !req.url.startsWith('/ws/')) return;
+      // Guard the REST API, the WebSocket controller, and the Swagger UI /
+      // OpenAPI spec routes. The /ws/ prefix must be listed explicitly:
+      // without it, /ws/productions/:id/controller bypasses auth entirely and
+      // accepts live production commands unauthenticated. The /documentation
+      // prefix must also be listed: Swagger UI and its specs
+      // (/documentation, /documentation/json, /documentation/yaml) sit outside
+      // /api/v1 and would otherwise expose the full API blueprint — route
+      // signatures, schemas, and the bearer-auth config — unauthenticated even
+      // when API_KEY is set.
+      if (
+        !req.url.startsWith('/api/v1') &&
+        !req.url.startsWith('/ws/') &&
+        !req.url.startsWith('/documentation')
+      ) {
+        return;
+      }
 
       const authHeader = req.headers['authorization'];
       const keyFromHeader = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined;
@@ -126,7 +189,9 @@ export async function buildServer() {
       const keyFromQuery = (req.query as Record<string, string>)?.['key'];
       const provided = keyFromHeader ?? keyFromQuery;
 
-      if (provided !== config.apiKey) {
+      const a = Buffer.from(provided ?? '');
+      const b = Buffer.from(apiKey);
+      if (a.length !== b.length || !timingSafeEqual(a, b)) {
         return reply.status(401).send({ error: 'Unauthorized', statusCode: 401 });
       }
     });
@@ -136,7 +201,7 @@ export async function buildServer() {
   fastify.addHook('onResponse', async (req, reply) => {
     if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return;
     if (!req.url.startsWith('/api/v1')) return;
-    const ip = ((req.headers['x-forwarded-for'] as string | undefined) ?? req.ip ?? '').split(',')[0]!.trim();
+    const ip = req.ip ?? '';
     fastify.log.info({
       audit: true,
       method: req.method,

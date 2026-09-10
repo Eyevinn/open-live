@@ -1,5 +1,6 @@
 import type { FastifyPluginAsync } from 'fastify'
 import { getStromToken } from '../lib/strom-token.js'
+import { assertSameStromOrigin } from '../lib/url-validation.js'
 import { config } from '../config.js'
 
 /**
@@ -7,22 +8,7 @@ import { config } from '../config.js'
  * Prevents SSRF / SAT token exfiltration to an attacker-controlled host.
  */
 function validateSessionUrl(sessionUrl: string): void {
-  let parsed: URL;
-  try {
-    parsed = new URL(sessionUrl);
-  } catch {
-    throw new Error('Invalid session URL');
-  }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new Error('Session URL must use http or https');
-  }
-  const strom = new URL(config.stromUrl);
-  if (parsed.hostname !== strom.hostname) {
-    throw new Error('Session URL host does not match configured Strom host');
-  }
-  if (strom.port && parsed.port && parsed.port !== strom.port) {
-    throw new Error('Session URL port does not match configured Strom port');
-  }
+  assertSameStromOrigin(sessionUrl, config.stromUrl, 'Session URL');
 }
 
 /**
@@ -59,6 +45,7 @@ const whipRoutes: FastifyPluginAsync = async (fastify) => {
   // POST — initial WHIP offer/answer
   fastify.post<{ Params: { id: string; mixerInput: string } }>(
     '/api/v1/productions/:id/whip/:mixerInput',
+    { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
     async (req, reply) => {
       const { id: productionId, mixerInput } = req.params
       const stromTarget = resolveStromWhipUrl(productionId, mixerInput)
