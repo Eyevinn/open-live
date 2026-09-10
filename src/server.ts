@@ -67,9 +67,25 @@ export async function buildServer() {
 
   // CORS must be registered before Helmet so its onRequest hook runs first
   // and Access-Control-Allow-Origin is set before Helmet's hooks fire.
-  const corsOrigins = config.corsOrigin === '*'
-    ? true
-    : config.corsOrigin.split(',').map((o) => o.trim()).filter(Boolean);
+  //
+  // When CORS_ORIGIN is unset we do NOT fall back to a permissive wildcard:
+  // an unconfigured deployment must not silently allow cross-origin reads.
+  // Instead we disable cross-origin access (origin: false) and warn loudly.
+  // An explicit '*' still opts in to wildcard; a comma-separated list is
+  // parsed into an allow-list.
+  let corsOrigins: boolean | string[];
+  if (config.corsOrigin === undefined) {
+    fastify.log.warn(
+      '[security] CORS_ORIGIN is not set — cross-origin requests are disabled. ' +
+      'Set CORS_ORIGIN to your browser client origin (e.g. http://localhost:5173) ' +
+      'or a comma-separated list of origins to enable CORS.'
+    );
+    corsOrigins = false;
+  } else if (config.corsOrigin === '*') {
+    corsOrigins = true;
+  } else {
+    corsOrigins = config.corsOrigin.split(',').map((o) => o.trim()).filter(Boolean);
+  }
   await fastify.register(cors, {
     origin: corsOrigins,
     methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],

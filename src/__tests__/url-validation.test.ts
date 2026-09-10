@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { graphicUrl, httpUrlOnly, srtUrl, isPrivateHost } from '../lib/url-validation.js';
+import {
+  graphicUrl,
+  httpUrlOnly,
+  srtUrl,
+  isPrivateHost,
+  effectivePort,
+  assertSameStromOrigin,
+} from '../lib/url-validation.js';
 
 describe('graphicUrl', () => {
   it('accepts https:// URLs', () => {
@@ -209,5 +216,74 @@ describe('srtUrl', () => {
 
   it('rejects a URL with no port', () => {
     expect(() => srtUrl('srt://example.com')).toThrow('Invalid SRT URL format');
+  });
+});
+
+describe('effectivePort', () => {
+  it('resolves the protocol default when the port is omitted', () => {
+    expect(effectivePort(new URL('https://strom.example.com/whep'))).toBe('443');
+    expect(effectivePort(new URL('http://strom.example.com/whep'))).toBe('80');
+  });
+
+  it('returns the explicit port when present', () => {
+    expect(effectivePort(new URL('https://strom.example.com:8443/whep'))).toBe('8443');
+    expect(effectivePort(new URL('http://strom.example.com:7000/whep'))).toBe('7000');
+  });
+});
+
+describe('assertSameStromOrigin (WHEP/WHIP proxy SSRF guard — issue #55)', () => {
+  it('accepts an exact same-origin target', () => {
+    expect(() =>
+      assertSameStromOrigin('https://strom.example.com/whep/abc', 'https://strom.example.com'),
+    ).not.toThrow();
+  });
+
+  it('accepts a target whose omitted port equals the base default port', () => {
+    // base https (implicit 443) vs target with explicit :443 — must be treated equal
+    expect(() =>
+      assertSameStromOrigin('https://strom.example.com:443/whep', 'https://strom.example.com'),
+    ).not.toThrow();
+  });
+
+  it('rejects a different host', () => {
+    expect(() =>
+      assertSameStromOrigin('https://evil.example.com/whep', 'https://strom.example.com'),
+    ).toThrow(/host does not match/);
+  });
+
+  it('rejects a non-http(s) scheme', () => {
+    expect(() =>
+      assertSameStromOrigin('file:///etc/passwd', 'https://strom.example.com'),
+    ).toThrow(/http or https/);
+  });
+
+  it('rejects an invalid URL', () => {
+    expect(() =>
+      assertSameStromOrigin('not a url', 'https://strom.example.com'),
+    ).toThrow(/invalid/i);
+  });
+
+  // The core issue #55 regression: STROM_URL omits its port (canonical 443 for
+  // https), and the attacker supplies a target on the same host with a
+  // non-default port. Before the fix, strom.port === "" made the port check
+  // short-circuit and this was ACCEPTED — leaking the Bearer token to :9000.
+  it('rejects a non-default port when STROM_URL (https) omits its port', () => {
+    expect(() =>
+      assertSameStromOrigin('https://strom.example.com:9000/whep', 'https://strom.example.com'),
+    ).toThrow(/port does not match/);
+  });
+
+  it('rejects a non-default port when STROM_URL (http) omits its port', () => {
+    expect(() =>
+      assertSameStromOrigin('http://strom.example.com:9000/whep', 'http://strom.example.com'),
+    ).toThrow(/port does not match/);
+  });
+
+  // Symmetric bypass: STROM_URL pins an explicit port but the attacker omits it,
+  // relying on the target default. Must still be rejected.
+  it('rejects an omitted target port when STROM_URL pins an explicit port', () => {
+    expect(() =>
+      assertSameStromOrigin('https://strom.example.com/whep', 'https://strom.example.com:8443'),
+    ).toThrow(/port does not match/);
   });
 });

@@ -125,6 +125,47 @@ export function httpUrlOnly(url: string): void {
   }
 }
 
+/**
+ * Returns the effective TCP port for a URL, resolving protocol defaults when the
+ * port is omitted (443 for https, 80 for http).
+ *
+ * Security note: a bare `url.port` is the empty string when no explicit port is
+ * given, so comparing `a.port !== b.port` short-circuits to "equal" whenever
+ * EITHER side omits its port — letting an attacker target an arbitrary port on
+ * the Strom host (SSRF + Bearer-token exfiltration). Always compare via this
+ * helper so a missing port is normalised to the protocol default first.
+ */
+export function effectivePort(u: URL): string {
+  if (u.port) return u.port;
+  return u.protocol === 'https:' ? '443' : '80';
+}
+
+/**
+ * Throws unless `targetUrl` is same-origin with `baseUrl` for proxying to Strom:
+ * same http/https scheme, identical hostname, and identical *canonical* port.
+ * Prevents SSRF and Strom Bearer-token exfiltration to attacker-chosen
+ * hosts/ports. `label` customises the error messages (e.g. "Target URL",
+ * "Session URL").
+ */
+export function assertSameStromOrigin(targetUrl: string, baseUrl: string, label = 'Target URL'): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(targetUrl);
+  } catch {
+    throw new Error(`Invalid ${label.toLowerCase()}`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`${label} must use http or https`);
+  }
+  const strom = new URL(baseUrl);
+  if (parsed.hostname !== strom.hostname) {
+    throw new Error(`${label} host does not match configured Strom host`);
+  }
+  if (effectivePort(parsed) !== effectivePort(strom)) {
+    throw new Error(`${label} port does not match configured Strom port`);
+  }
+}
+
 const ALLOWED_DATA_MIME = /^data:image\/(png|jpeg|gif|webp)[;,]/i;
 const BLOCKED_SCHEMES = /^(file|javascript|ftp|gopher|chrome|about|data:application):/i;
 
