@@ -6,7 +6,7 @@ info:
     REST API for the Open Live broadcast production platform.
 
     **Authentication**: Pass an API key via `Authorization: Bearer <key>` header or `?key=<key>` query parameter.
-    The following paths are exempt from authentication: `/health`, `/ready`, `/api/v1/status`, `/api/v1/server-info`, `/api/v1/reconnect`.
+    The following paths are exempt from authentication: `/health`, `/ready`, `/api/v1/status`, `/api/v1/server-info`.
 
 servers:
   - url: /
@@ -591,7 +591,6 @@ paths:
     post:
       summary: Reconnect to database and Strom
       operationId: reconnect
-      security: []
       tags: [Status]
       responses:
         '200':
