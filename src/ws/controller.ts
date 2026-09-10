@@ -407,13 +407,10 @@ const pgmBgByProduction = new Map<string, string | null>()
 /**
  * The real input sitting behind a PiP that is on program, or null.
  *
- * While a PiP occupies PGM, `tally.pgm` is null and the background input is
- * tracked only in `pgmBgByProduction`, which is never otherwise sent to a
- * subscriber. Without it a client cannot tell "nothing on program" from "a PiP
- * over input 3" — including on connect, where the distinction is otherwise
- * unrecoverable, because the value is never re-broadcast.
- *
- * Read-only: nothing here changes mixer state or what airs.
+ * While a PiP occupies PGM, `tally.pgm` is null, so without this a subscriber
+ * cannot tell "nothing on program" from "a PiP over input 3". The value is
+ * never re-broadcast on its own, so a client attaching mid-show has no other
+ * way to recover it.
  */
 const pgmBgOf = (productionId: string): string | null =>
   pgmBgByProduction.get(productionId) ?? null
@@ -739,14 +736,12 @@ export async function handleMessage(
       // scope, because `pgmBgByProduction` still holds the previous state here.
       const pvwBeforePip = pvwBeforePipByProduction.get(productionId) ?? null;
       // Falls back to the outgoing PGM input, matching the `to_input` the Strom
-      // transition below computes: when no PVW source was displaced, the mixer
-      // composites the PiP over whatever was already on program. Reporting null
-      // here would say "no background" while the mixer had one.
+      // transition below computes: with no PVW source displaced, the mixer
+      // composites the PiP over whatever was already on program.
       const newPgmBg = newPgmPip !== null ? (pvwBeforePip ?? tally.pgm) : null;
-      // Recorded before the Strom calls, not inside them. A client connecting
-      // later reads this map, so leaving it unset until Strom succeeds meant a
-      // reconnect during a PiP saw `pgm: null` with no background — the one case
-      // that cannot be reconstructed, and the reason this field exists.
+      // Set here rather than in the Strom block below: the connect handler
+      // reads this map, and it must hold the background the take just
+      // broadcast even when Strom is unconfigured or its call throws.
       if (newPgmPip !== null) pgmBgByProduction.set(productionId, newPgmBg);
       broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: newPgmBg });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: newPgmPip, pvwPip: newPvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
@@ -770,7 +765,6 @@ export async function handleMessage(
               transition_type: takeTransition,
               ...(msg.durationMs !== undefined ? { duration_ms: msg.durationMs } : {}),
             });
-            // `pgmBgByProduction` was already set above, before these calls.
             pvwBeforePipByProduction.delete(productionId);
           } catch (err) {
             console.warn('[controller] Strom PiP transition error:', err);
@@ -1588,8 +1582,6 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
           setTally(id, tally);
         }
       }
-      // The connect case: without pgmBg a late joiner cannot tell an empty
-      // program from a PiP over a real input, and nothing re-broadcasts it.
       socket.send(JSON.stringify({ type: 'TALLY', ...tally, pgmBg: pgmBgOf(id) }));
 
       const cachedAlpha = overlayAlphaByProduction.get(id);
