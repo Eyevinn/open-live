@@ -87,16 +87,21 @@ async function reconcileProductionStatuses(
 async function main() {
   // API_KEY is required in production. Without it every route is unauthenticated,
   // allowing any client that can reach port 3000 to create, modify, and delete
-  // productions. Omitting API_KEY is intentional only when running behind OSC's
-  // reverse-proxy auth wall or another trusted auth layer.
+  // productions. Omitting API_KEY is intentional only when TRUST_EXTERNAL_AUTH
+  // acknowledges that another layer (e.g. OSC's reverse proxy) handles auth
+  // instead. NODE_ENV is deliberately NOT used as that signal: it reflects the
+  // deployment tier, not the auth architecture, and OSC-hosted deployments
+  // always run with NODE_ENV=production regardless of whether they sit behind
+  // that reverse proxy — so NODE_ENV alone can't distinguish "no auth wall" from
+  // "auth handled externally".
   if (!config.apiKey) {
-    if (process.env['NODE_ENV'] === 'production') {
+    if (process.env['NODE_ENV'] === 'production' && !config.trustExternalAuth) {
       throw new Error(
         'API_KEY must be set in production deployments. ' +
         'Without it all API routes are unauthenticated. ' +
-        'Set API_KEY to a strong random secret, or set NODE_ENV to a value ' +
-        'other than "production" if this deployment intentionally relies on ' +
-        'an external auth layer (e.g. the OSC reverse proxy).'
+        'Set API_KEY to a strong random secret, or set TRUST_EXTERNAL_AUTH=true ' +
+        'if this deployment intentionally relies on an external auth layer ' +
+        '(e.g. the OSC reverse proxy).'
       );
     } else {
       console.warn(
