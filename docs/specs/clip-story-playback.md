@@ -49,10 +49,57 @@ Add a clip source type. Two viable shapes (see Open Question 1):
 StreamType = 'srt' | 'efp' | 'whip' | 'test1' | 'test2' | 'html' | 'clip'
 ```
 
-A `clip` `SourceDoc` uses `address` to carry the clip reference (URL/asset id) — matching how
-existing types put their locator in `address` (`src/db/types.ts:33-43`). On activate, a clip
-source resolves to a Strom media-player block; `open-live` persists its block id on the
-production doc (see Data Model).
+A `clip` `SourceDoc` carries a **typed, versioned, extensible clip reference** rather than a
+bare `address` URL string. Per PM direction on #206, the reference is a discriminated union so
+new byte sources (object storage, time-addressable media) can be added without breaking the
+contract or reinterpreting an overloaded string. The existing `SourceDoc.address` field
+(`src/db/types.ts:33-43`) is retained for storage compatibility and holds a **serialized form**
+of this reference (a JSON string), so the additive data model stays backward compatible; the
+API contract, however, exposes the structured `ClipReference` below.
+
+```ts
+// v1 baseline: any fetchable file / object-storage URL. A presigned URL reduces to this.
+interface ClipReferenceUrl {
+  type: 'url';
+  url: string;
+  timerange?: string;   // optional; see below — nothing assumes a fixed file length
+}
+
+// Object storage (MinIO / S3 objects from epic #5).
+interface ClipReferenceS3 {
+  type: 's3';
+  bucket: string;
+  key: string;
+  timerange?: string;
+}
+
+// BBC Time-Addressable Media Store (flow + timerange). Reserved variant — see below.
+interface ClipReferenceTams {
+  type: 'tams';
+  store: string;
+  flowId: string;
+  timerange: string;
+}
+
+type ClipReference = ClipReferenceUrl | ClipReferenceS3 | ClipReferenceTams;
+```
+
+**Versioning / v1 scope (decided — was Open Question 5, answered by the PM on #206):**
+- **v1 implements `url` and `s3`.** A presigned URL for a MinIO/S3 object reduces to the `url`
+  variant; the `s3` variant lets `open-live` resolve the object (and presign) itself.
+- **`tams` is reserved and NOT implemented in v1**, but the schema must not preclude it. Any
+  reference may therefore carry an optional `timerange`, and **nothing in the data model assumes
+  media has a fixed file length** (growing/live-appending media). v1 MAY reject growing media at
+  cue time, but the reference type and duration/position semantics below must not bake in a
+  fixed-length assumption.
+- Validation like `src/lib/url-validation.ts` applies to the `url` variant; `s3` validates
+  bucket/key against the configured object store. `tams` fields are accepted-but-rejected (501/
+  not-implemented) in v1.
+
+On activate, a clip source resolves its `ClipReference` to a Strom media-player block;
+`open-live` persists that block id on the production doc (see Data Model). Reference resolution
+(URL fetch / S3 presign / — later — TAMS flow lookup) is confined to the resolve step; the
+control surface downstream never sees the reference type.
 
 ### REST — cue/play/stop/state
 
@@ -125,6 +172,15 @@ idle --CUE--> cued --PLAY--> playing --(end of media)--> completed
 `play` = `player.control({ action:'play' })`; `stop` = `player.control({ action:'stop' })`;
 `pause` = `player.control({ action:'pause' })`; `seek` = `player.seek({ position_ms })`.
 
+**Reference-type independence (invariant).** The cue → play → completed state machine, the WS
+`CLIP_STATE` events, and the `durationMs` / `positionMs` semantics are defined **independently of
+the `ClipReference` type**. `cue` resolves the reference (URL fetch / S3 presign / — reserved —
+TAMS lookup) to a playable Strom playlist entry and reports `durationMs` plus readiness;
+thereafter `play`, `pause`, `stop`, `seek`, and completion behave **identically regardless of the
+byte source**. `durationMs` and `positionMs` describe the cued/playing media as reported by
+Strom's `player.getState`; they do not presume the reference carried an inline length, so a
+`timerange`-scoped or growing reference feeds the same state machine unchanged.
+
 ### Error codes
 
 | Code | Condition |
@@ -154,9 +210,16 @@ in-memory per-production registry in a small `clip-state` service (mirroring
 ### Migration
 
 - Adding `'clip'` to `StreamType` and the source-input zod enum is additive/backward compatible.
+- The typed `ClipReference` is carried **without a schema change**: `clip` sources store the
+  serialized reference (JSON) in the existing optional `SourceDoc.address` field, so no new
+  persisted column/field is introduced and existing docs are unaffected. The structured union is
+  a contract-level (API/zod) concern; the stored representation stays a string. Because the
+  reference may carry a `timerange` and imposes no fixed-length assumption, no length field is
+  persisted either.
 - The new `clipPlayerBlockIds` field is optional; existing docs are unaffected. CouchDB is
   schemaless — no data migration. OpenAPI (`docs/openapi.yaml`) and the WS reference
-  (`docs/controller-websocket.md`) must be updated in lockstep.
+  (`docs/controller-websocket.md`) must be updated in lockstep, including the `ClipReference`
+  discriminated union and its v1-implemented (`url`, `s3`) vs reserved (`tams`) variants.
 
 ## Service Interactions
 
@@ -202,9 +265,12 @@ No new env vars strictly required — clip playback reuses the existing `STROM_U
    preview bus (so it shows in the multiviewer before play), or is cue purely a preload with the
    operator using the normal `SET_PVW`/`TAKE` switching to put it on air? This determines how
    clip cue/play interacts with the existing tally/switching model.
-5. **Clip ingest/storage:** #206 assumes a playable clip reference already exists. Confirm the
-   accepted `address` forms (HTTP(S) URL, MinIO/S3 object from #5, asset id) and whether any
-   validation like `src/lib/url-validation.ts` applies.
+
+> **Resolved (formerly Open Question 5 — clip ingest/storage / accepted address forms).** The PM
+> answered this on #206: the clip reference is the typed, versioned `ClipReference` union defined
+> in **API Design → Clip source model** (v1 implements `url` and `s3`; `tams` reserved), stored
+> serialized in `SourceDoc.address`. It is now an incorporated, decided element of the data model,
+> not an open question. `src/lib/url-validation.ts` applies to the `url` variant.
 
 ## Risks
 
