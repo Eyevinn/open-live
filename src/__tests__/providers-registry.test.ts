@@ -266,6 +266,62 @@ describe('syncProvider', () => {
     });
   });
 
+  describe('SOURCE_PROVIDER_ALLOWED_HOSTS', () => {
+    const onSubnet = { ...basic, address: 'srt://10.42.7.9:20003?mode=caller' };
+    const offSubnet = { ...basic, address: 'srt://10.99.7.9:20003?mode=caller' };
+    const publicHost = { ...basic, address: 'srt://attacker.example.com:9000?mode=caller' };
+
+    async function syncWith(
+      allowed: string,
+      candidate: ProviderSource,
+      allowPrivate = '',
+    ): Promise<import('../providers/registry.js').SyncResult> {
+      vi.resetModules();
+      vi.stubEnv('SOURCE_PROVIDER_ALLOWED_HOSTS', allowed);
+      vi.stubEnv('SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS', allowPrivate);
+      const { syncProvider: sync } = await import('../providers/registry.js');
+      return sync(fakeProvider(async () => [candidate]), log);
+    }
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    });
+
+    it('accepts an address inside the listed subnet without the private-host waiver', async () => {
+      const result = await syncWith('10.42.0.0/16', onSubnet);
+
+      expect(result.skipped).toEqual([]);
+      expect(result.created).toBe(1);
+    });
+
+    it('skips an address outside the listed subnet', async () => {
+      const result = await syncWith('10.42.0.0/16', offSubnet);
+
+      expect(result.created).toBe(0);
+      expect(result.skipped).toEqual([
+        { externalId: 'basic/0', reason: 'SRT URL host "10.99.7.9" is not in the configured host allow-list' },
+      ]);
+      expect(mockInsert).not.toHaveBeenCalled();
+    });
+
+    it('skips a public host a provider starts returning, which no private-host rule would catch', async () => {
+      expect((await syncWith('', publicHost)).created).toBe(1);
+      expect((await syncWith('10.42.0.0/16', publicHost)).created).toBe(0);
+    });
+
+    it('bounds the private-host waiver instead of stacking with it', async () => {
+      expect((await syncWith('', offSubnet, 'true')).created).toBe(1);
+      expect((await syncWith('10.42.0.0/16', offSubnet, 'true')).created).toBe(0);
+    });
+
+    it('fails at startup on a malformed entry rather than matching nothing', async () => {
+      vi.resetModules();
+      vi.stubEnv('SOURCE_PROVIDER_ALLOWED_HOSTS', '10.42.0.0/64');
+      await expect(import('../providers/registry.js')).rejects.toThrow(/prefix length/);
+    });
+  });
+
   describe('with SRT_PASSPHRASE_KEY set', () => {
     beforeEach(() => {
       vi.stubEnv('SRT_PASSPHRASE_KEY', Buffer.alloc(32, 7).toString('base64'));

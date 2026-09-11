@@ -1,3 +1,5 @@
+import { parseHostPatterns } from './lib/url-validation.js';
+
 export function requireEnv(name: string): string {
   const value = process.env[name];
   if (!value) throw new Error(`Missing required environment variable: ${name}`);
@@ -87,4 +89,17 @@ export const config = {
    * address does arrive in a request body.
    */
   sourceProviderAllowPrivateHosts: process.env['SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS'] === 'true',
+  /**
+   * Hosts a provider may name, as a comma-separated list of hostnames, IPs and
+   * CIDR blocks (e.g. "10.42.0.0/16,weave-1.internal"). When set, a candidate
+   * address outside the list is skipped whether its host is private or public,
+   * and SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS is not consulted.
+   *
+   * The list is the one input to provider validation that the provider does not
+   * supply, so it is what bounds a provider that starts returning addresses it
+   * should not. Prefer it over the blanket private-host waiver.
+   */
+  sourceProviderAllowedHosts: parseHostPatterns(
+    (process.env['SOURCE_PROVIDER_ALLOWED_HOSTS'] ?? '').split(',').map((h) => h.trim()).filter(Boolean),
+  ),
 } as const;

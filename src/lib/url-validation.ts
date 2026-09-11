@@ -19,12 +19,7 @@
  * - IPv4: 10/8, 172.16/12, 192.168/16, 127/8 (loopback), 169.254/16 (link-local),
  *   0.0.0.0
  * - IPv6: ::1 (loopback), fe80::/10 (link-local), fc00::/7 (unique-local)
- * - IPv4-mapped IPv6: ::ffff:a.b.c.d (evaluated as the embedded IPv4 address) —
- *   in BOTH forms the WHATWG URL parser can produce: dotted-decimal
- *   (::ffff:127.0.0.1) and the two-hextet hex form it normalizes bracketed
- *   literals to (`new URL('http://[::ffff:169.254.169.254]/').hostname` is
- *   `[::ffff:a9fe:a9fe]`, not the dotted form) — checking only the former
- *   lets a bracketed IPv4-mapped literal sail straight through.
+ * - IPv4-mapped IPv6: evaluated as the embedded IPv4 address (see `canonicalHost`)
  *
  * Non-IP hostnames (public DNS names) are NOT flagged here — DNS resolution is out
  * of scope for this synchronous validator; this blocks the direct-IP SSRF vector.
@@ -36,31 +31,36 @@
  * `src/__tests__/url-validation.test.ts`.
  */
 export function isPrivateHost(hostname: string): boolean {
-  // Strip surrounding brackets from IPv6 literals and normalise case.
-  const host = hostname.trim().replace(/^\[|\]$/g, '').toLowerCase();
+  const host = canonicalHost(hostname);
   if (!host) return false;
+  if (host.includes(':')) return isPrivateIPv6(host);
+  return isPrivateIPv4(host);
+}
 
-  // IPv4-mapped IPv6, dotted-decimal form, e.g. ::ffff:127.0.0.1.
+/**
+ * Unbracketed, lower-cased host, with an IPv4-mapped IPv6 literal reduced to the
+ * IPv4 address it embeds.
+ *
+ * Mapped literals must be reduced in BOTH forms the WHATWG URL parser can
+ * produce: dotted-decimal (::ffff:127.0.0.1) and the two-hextet hex form it
+ * normalizes bracketed literals to (`new URL('http://[::ffff:169.254.169.254]/')
+ * .hostname` is `[::ffff:a9fe:a9fe]`, not the dotted form). Handling only the
+ * former lets a bracketed IPv4-mapped literal sail straight through.
+ */
+export function canonicalHost(hostname: string): string {
+  const host = hostname.trim().replace(/^\[|\]$/g, '').toLowerCase();
+
   const mappedDotted = host.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
-  if (mappedDotted) {
-    return isPrivateIPv4(mappedDotted[1]!);
-  }
+  if (mappedDotted) return mappedDotted[1]!;
 
-  // IPv4-mapped IPv6, hex-hextet form, e.g. ::ffff:a9fe:a9fe (== 169.254.169.254).
-  // This is the form the URL parser actually produces for a bracketed literal.
   const mappedHex = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
   if (mappedHex) {
     const hi = parseInt(mappedHex[1]!, 16);
     const lo = parseInt(mappedHex[2]!, 16);
-    const dotted = [hi >> 8, hi & 0xff, lo >> 8, lo & 0xff].join('.');
-    return isPrivateIPv4(dotted);
+    return [hi >> 8, hi & 0xff, lo >> 8, lo & 0xff].join('.');
   }
 
-  if (host.includes(':')) {
-    return isPrivateIPv6(host);
-  }
-
-  return isPrivateIPv4(host);
+  return host;
 }
 
 /**
@@ -106,11 +106,79 @@ const BLOCKED_HOSTNAMES = new Set([
   'metadata.google.internal', // GCP metadata endpoint
 ]);
 
+/** An entry of an operator-configured host allow-list: one exact host, or one
+ *  CIDR block held as its network prefix. */
+export type HostPattern =
+  | { host: string }
+  | { prefix: bigint; bits: number; width: 32 | 128 };
+
+function ipToBigInt(host: string): { value: bigint; width: 32 | 128 } | null {
+  const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const octets = v4.slice(1, 5).map(Number);
+    if (octets.some((n) => n > 255)) return null;
+    return { value: octets.reduce((acc, n) => (acc << 8n) | BigInt(n), 0n), width: 32 };
+  }
+  if (!host.includes(':') || !/^[0-9a-f:]+$/.test(host)) return null;
+
+  const halves = host.split('::');
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const fill = 8 - head.length - tail.length;
+  if (halves.length === 1 ? fill !== 0 : fill < 0) return null;
+  const hextets = [...head, ...Array<string>(halves.length === 2 ? fill : 0).fill('0'), ...tail];
+
+  let value = 0n;
+  for (const hextet of hextets) {
+    if (!/^[0-9a-f]{1,4}$/.test(hextet)) return null;
+    value = (value << 16n) | BigInt(parseInt(hextet, 16));
+  }
+  return { value, width: 128 };
+}
+
+/**
+ * Parses allow-list entries — an exact hostname or IP (`weave-1.internal`,
+ * `10.42.0.5`) or a CIDR block (`10.42.0.0/16`, `fd00::/8`). Throws on a
+ * malformed entry so a typo in the operator's config fails at startup rather
+ * than silently matching nothing.
+ */
+export function parseHostPatterns(entries: string[]): HostPattern[] {
+  return entries.map((entry) => {
+    const value = entry.trim().toLowerCase();
+    const slash = value.lastIndexOf('/');
+    if (slash === -1) return { host: canonicalHost(value) };
+
+    const ip = ipToBigInt(canonicalHost(value.slice(0, slash)));
+    if (!ip) throw new Error(`Invalid host pattern "${entry}": "${value.slice(0, slash)}" is not an IP address`);
+    const bits = Number(value.slice(slash + 1));
+    if (!Number.isInteger(bits) || bits < 0 || bits > ip.width) {
+      throw new Error(`Invalid host pattern "${entry}": prefix length must be an integer between 0 and ${ip.width}`);
+    }
+    return { prefix: ip.value >> BigInt(ip.width - bits), bits, width: ip.width };
+  });
+}
+
+function hostMatchesPatterns(hostname: string, patterns: HostPattern[]): boolean {
+  const host = canonicalHost(hostname);
+  const ip = ipToBigInt(host);
+  return patterns.some((pattern) => {
+    if ('host' in pattern) return pattern.host === host;
+    if (!ip || ip.width !== pattern.width) return false;
+    return (ip.value >> BigInt(pattern.width - pattern.bits)) === pattern.prefix;
+  });
+}
+
 export interface UrlValidationOptions {
   /** Skip the private/loopback/link-local rejection. Only for addresses that did
    *  not come from a request body — see SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS.
    *  BLOCKED_HOSTNAMES stays in force regardless. */
   allowPrivateHosts?: boolean;
+  /** When non-empty, the host must match one of these entries and nothing else
+   *  is accepted — public hosts included, so this both replaces the private-host
+   *  rule and narrows what a provider may name. BLOCKED_HOSTNAMES stays in force
+   *  regardless. See SOURCE_PROVIDER_ALLOWED_HOSTS. */
+  allowedHosts?: HostPattern[];
 }
 
 /**
@@ -134,7 +202,11 @@ export function httpUrlOnly(url: string, options: UrlValidationOptions = {}): vo
   }
   // Strip surrounding brackets from IPv6 literals (e.g. [::1] → ::1)
   const hostname = parsed.hostname.replace(/^\[|\]$/g, '');
-  if (!options.allowPrivateHosts && isPrivateHost(hostname)) {
+  if (options.allowedHosts?.length) {
+    if (!hostMatchesPatterns(hostname, options.allowedHosts)) {
+      throw new Error(`URL hostname "${hostname}" is not in the configured host allow-list`);
+    }
+  } else if (!options.allowPrivateHosts && isPrivateHost(hostname)) {
     throw new Error(`URL hostname "${hostname}" is in a private/reserved IP range — SSRF blocked`);
   }
   if (BLOCKED_HOSTNAMES.has(hostname.toLowerCase())) {
@@ -245,7 +317,12 @@ export function srtUrl(url: string, options: UrlValidationOptions = {}): void {
     hostname = authority.replace(/:\d+$/, '');
   }
 
-  if (!options.allowPrivateHosts && hostname && isPrivateHost(hostname)) {
+  if (options.allowedHosts?.length) {
+    // The hostless listener form has nothing to match, so an allow-list rejects it.
+    if (!hostname || !hostMatchesPatterns(hostname, options.allowedHosts)) {
+      throw new Error(`SRT URL host "${hostname}" is not in the configured host allow-list`);
+    }
+  } else if (!options.allowPrivateHosts && hostname && isPrivateHost(hostname)) {
     throw new Error('SRT URL must not target private, loopback, or link-local addresses');
   }
 }

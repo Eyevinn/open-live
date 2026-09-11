@@ -50,6 +50,24 @@ function srtLatency(destination: { srt?: { latency?: number } } | null | undefin
   return latency;
 }
 
+/**
+ * The northbound base URL is operator config, so its host is the operator's
+ * choice — a node-local weave on `http://localhost:29080` is the documented
+ * setup. Only the scheme is checked, so the Bearer token cannot be sent over
+ * something that is not HTTP at all.
+ */
+function assertHttpBaseUrl(raw: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`WEAVE_NORTHBOUND_URL is not a valid URL: ${raw}`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`WEAVE_NORTHBOUND_URL must use http or https, got "${parsed.protocol}"`);
+  }
+}
+
 export function weaveProviderFromEnv(): SourceProvider {
   return createWeaveProvider({
     baseUrl: requireEnv('WEAVE_NORTHBOUND_URL'),
@@ -58,6 +76,7 @@ export function weaveProviderFromEnv(): SourceProvider {
 }
 
 export function createWeaveProvider(options: WeaveProviderOptions): SourceProvider {
+  assertHttpBaseUrl(options.baseUrl);
   const baseUrl = options.baseUrl.replace(/\/+$/, '');
   const fetchImpl = options.fetch ?? fetch;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;

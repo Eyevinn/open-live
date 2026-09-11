@@ -206,6 +206,20 @@ describe('provider factory', () => {
     expect(() => weaveProviderFromEnv()).toThrow('Missing required environment variable: WEAVE_NORTHBOUND_TOKEN');
   });
 
+  it('rejects a northbound base URL that is not http or https', () => {
+    vi.stubEnv('WEAVE_NORTHBOUND_TOKEN', 'tok');
+    vi.stubEnv('WEAVE_NORTHBOUND_URL', 'file:///etc/passwd');
+    expect(() => weaveProviderFromEnv()).toThrow(/must use http or https/);
+    vi.stubEnv('WEAVE_NORTHBOUND_URL', 'not-a-url');
+    expect(() => weaveProviderFromEnv()).toThrow(/not a valid URL/);
+  });
+
+  it('accepts a node-local northbound base URL', () => {
+    vi.stubEnv('WEAVE_NORTHBOUND_TOKEN', 'tok');
+    vi.stubEnv('WEAVE_NORTHBOUND_URL', 'http://localhost:29080');
+    expect(() => weaveProviderFromEnv()).not.toThrow();
+  });
+
   it('resolves the weave id and rejects unknown ids', () => {
     vi.stubEnv('WEAVE_NORTHBOUND_URL', 'http://localhost:29080');
     vi.stubEnv('WEAVE_NORTHBOUND_TOKEN', 'tok');

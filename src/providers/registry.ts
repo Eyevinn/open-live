@@ -47,13 +47,16 @@ export function providerSourceId(providerId: string, externalId: string): string
  * here, so a new stream type cannot reach the DB unvalidated.
  */
 function assertCandidateAddress(candidate: ProviderSource): void {
-  const allowPrivateHosts = config.sourceProviderAllowPrivateHosts;
+  const options = {
+    allowPrivateHosts: config.sourceProviderAllowPrivateHosts,
+    allowedHosts: config.sourceProviderAllowedHosts,
+  };
   switch (candidate.streamType) {
     case 'srt':
     case 'efp':
-      return srtUrl(candidate.address, { allowPrivateHosts });
+      return srtUrl(candidate.address, options);
     case 'whip':
-      return httpUrlOnly(candidate.address, { allowPrivateHosts });
+      return httpUrlOnly(candidate.address, options);
     default: {
       const unsupported: never = candidate.streamType;
       throw new Error(`unsupported stream type "${String(unsupported)}"`);
