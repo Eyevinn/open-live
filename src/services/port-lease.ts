@@ -98,15 +98,12 @@ export function getPortLease(): PortLeaseState {
 }
 
 /**
- * Nothing answers POST /api/port-leases: a Strom without the feature, or a
- * self-hosted Strom with no port broker proxied in front of it. The body is
- * whatever the responder (Strom, a proxy) puts in a 404, so only the status
- * counts. Create never 404s for any other reason.
+ * A 404 from the lease routes. What it means depends on the call: on create,
+ * nothing serves the routes at all (a Strom with no port broker proxied in
+ * front of it), so leasing is unsupported here; on renew, the routes work but
+ * this lease is gone, so it is re-acquired. The status is the whole signal
+ * either way; the body is whatever the responder (Strom, a proxy) puts in it.
  */
-function isUnsupportedError(err: unknown): boolean {
-  return err instanceof StromClientError && err.status === 404;
-}
-
 function isNotFound(err: unknown): boolean {
   return err instanceof StromClientError && err.status === 404;
 }
@@ -126,7 +123,8 @@ async function acquire(log: FastifyBaseLogger): Promise<void> {
       );
     }
   } catch (err) {
-    if (isUnsupportedError(err)) {
+    if (isNotFound(err)) {
+      // Create never 404s for any other reason: no broker answers here.
       if (state.status !== 'unsupported') {
         log.warn(
           { clientId },
@@ -150,6 +148,7 @@ async function renew(log: FastifyBaseLogger, current: PortLease): Promise<void> 
     log.debug({ leaseId: lease.id, expiresAt: lease.expires_at }, '[port-lease] Renewed SRT port lease');
   } catch (err) {
     if (isNotFound(err)) {
+      // The routes answered, so a broker is there; only this lease is gone.
       log.warn({ leaseId: current.id }, '[port-lease] Lease vanished from Strom — re-acquiring under the same client id');
       state = { status: 'pending' };
       await acquire(log);
