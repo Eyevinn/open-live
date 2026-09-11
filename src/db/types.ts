@@ -39,8 +39,16 @@ export interface SourceDoc {
   liveCamera?: boolean;
   /** SRT receiver buffer latency in ms. Only applies to srt/efp stream types. Default 125. */
   latency?: number;
+  /** Set when a source provider owns this document; such sources are read-only via the API. */
+  provider?: SourceProviderRef;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface SourceProviderRef {
+  id: string;
+  externalId: string;
+  syncedAt: string;
 }
 
 // --------------- Graphic types ---------------

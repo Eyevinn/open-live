@@ -73,6 +73,12 @@ Copy `.env.example` to `.env` and fill in the values:
 | `STROM_TOKEN` | OSC Personal Access Token for authenticating against an OSC-hosted Strom instance | _(empty — not needed for local Strom)_ |
 | `API_KEY` | Static API key protecting all `/api/v1` routes, the WebSocket controller, and the Swagger UI. **Required for any network-accessible deployment** (see below) | _(empty — routes unauthenticated)_ |
 | `LOG_LEVEL` | Fastify log level (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
+| `SOURCE_PROVIDERS` | Comma-separated ids of [source providers](#source-providers) to poll. Unknown ids fail startup. | _(empty — disabled)_ |
+| `SOURCE_PROVIDER_POLL_MS` | Interval between source provider polls, in milliseconds | `5000` |
+| `SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS` | Set to `true` to accept provider-listed SRT addresses on private, loopback or link-local hosts. See [source providers](#source-providers). | `false` |
+| `SOURCE_PROVIDER_ALLOWED_HOSTS` | Comma-separated hostnames, IPs and CIDR blocks a provider may name (e.g. `10.42.0.0/16`). When set, any other host is skipped and `SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS` is not consulted. See [source providers](#source-providers). | _(empty — not enforced)_ |
+| `WEAVE_NORTHBOUND_URL` | Base URL of the open-weave northbound API (e.g. `http://localhost:29080`). Required when `weave` is in `SOURCE_PROVIDERS`. | _(unset)_ |
+| `WEAVE_NORTHBOUND_TOKEN` | Bearer token for the open-weave northbound API. Required when `weave` is in `SOURCE_PROVIDERS`. | _(unset)_ |
 
 > **Never commit `.env`** — it is gitignored. Use `.env.example` as the reference.
 
@@ -148,6 +154,38 @@ broadcasts — is documented separately in [`docs/controller-websocket.md`](docs
 Sources represent individual video/audio feeds. Each source has a `streamType` (`srt` or `whip`) and an `address` (SRT URI or WHIP endpoint URL).
 
 SRT passphrases are embedded in the source `address` and encrypted at rest before being stored in CouchDB. For rotating a passphrase or responding to a suspected compromise, see the operator runbook in [`docs/srt-passphrase-rotation.md`](docs/srt-passphrase-rotation.md).
+
+### Source providers
+
+A source provider is a small module under `src/providers/` that lists source candidates produced by another system. The server polls every provider named in `SOURCE_PROVIDERS` and materialises the candidates as ordinary sources, so assignment, activation and the studio UI need no knowledge of where a source came from.
+
+Provider-owned sources carry a `provider` object (`{ id, externalId, syncedAt }`) and `readOnly: true` in API responses. `PATCH` and `DELETE` on them return `409`. A source that the provider stops listing is marked `inactive` rather than deleted, so a production that still references it keeps its assignment.
+
+`srtUrl()` rejects private, loopback and link-local hosts so a source address in a request body cannot make the pipeline dial internal services. A provider that places media on a container or cluster network lists RFC1918 addresses for every source — open-weave puts its SRT outputs on a node subnet — so the rule would reject all of them. `SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS=true` waives it for provider-listed addresses only, which do not come from a request. The REST routes keep the rule unconditionally.
+
+`SOURCE_PROVIDER_ALLOWED_HOSTS` is the tighter control and is what a deployment should prefer. It names the hostnames, IPs and CIDR blocks a provider is allowed to place sources on:
+
+```bash
+SOURCE_PROVIDER_ALLOWED_HOSTS=10.42.0.0/16,weave-1.internal
+```
+
+When it is set, a candidate whose host is not on the list is skipped and `SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS` is not consulted — the list already says which private hosts are acceptable. It also bounds candidates the private-host rule never looked at: a provider that starts returning `srt://attacker.example.com:9000` passes the SSRF rule, because that rule only rejects private IP literals, but fails the allow-list. Since the list comes from the operator rather than from the provider's own response, it is the part of provider validation a misbehaving provider cannot influence. A malformed entry fails at startup rather than silently matching nothing.
+
+Available providers:
+
+| Id | System | Configuration |
+|---|---|---|
+| `weave` | [open-weave](https://github.com/Eyevinn/open-weave) | `WEAVE_NORTHBOUND_URL`, `WEAVE_NORTHBOUND_TOKEN` |
+
+The `weave` provider lists every enabled stream on the northbound API and offers each placed, node-hosted output as an SRT source with `?mode=caller` appended, which is the address open-live's `builtin.mpegtssrt_input` block dials. Outputs that weave dials out to (remote destinations) and streams that are not yet placed are skipped. The matching destination's declared SRT latency is carried onto the source, so the input block and the vision mixer's `min_upstream_latency` agree with what weave configured; a value outside the 20–8000 ms the REST schema allows is ignored in favour of the default.
+
+```bash
+SOURCE_PROVIDERS=weave \
+SOURCE_PROVIDER_ALLOWED_HOSTS=10.42.0.0/16 \
+WEAVE_NORTHBOUND_URL=http://localhost:29080 \
+WEAVE_NORTHBOUND_TOKEN=<token> \
+pnpm dev
+```
 
 ### Template model
 

@@ -1,6 +1,18 @@
-function requireEnv(name: string): string {
+import { parseHostPatterns } from './lib/url-validation.js';
+
+export function requireEnv(name: string): string {
   const value = process.env[name];
   if (!value) throw new Error(`Missing required environment variable: ${name}`);
+  return value;
+}
+
+function positiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`Invalid environment variable ${name}: expected a positive integer, got '${raw}'`);
+  }
   return value;
 }
 
@@ -58,4 +70,36 @@ export const config = {
     .split(',')
     .map((h) => h.trim().toLowerCase())
     .filter(Boolean),
+  /**
+   * Source providers to poll, as a comma-separated list of ids (e.g. "weave").
+   * Empty (the default) disables provider sync entirely.
+   */
+  sourceProviders: (process.env['SOURCE_PROVIDERS'] ?? '').split(',').map((s) => s.trim()).filter(Boolean),
+  /** Interval between source provider polls, in milliseconds. */
+  sourceProviderPollMs: positiveIntEnv('SOURCE_PROVIDER_POLL_MS', 5000),
+  /**
+   * Accept provider-listed SRT addresses on private, loopback or link-local
+   * hosts. Off by default, which keeps srtUrl()'s SSRF rule intact everywhere.
+   *
+   * A provider address is not attacker-supplied: it comes from the system named
+   * in SOURCE_PROVIDERS, over the URL the operator configured. Providers that
+   * place media on container or cluster networks — open-weave puts SRT outputs
+   * on a node subnet — produce RFC1918 addresses for every source, so the rule
+   * would reject all of them. This does not relax the REST routes, where an
+   * address does arrive in a request body.
+   */
+  sourceProviderAllowPrivateHosts: process.env['SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS'] === 'true',
+  /**
+   * Hosts a provider may name, as a comma-separated list of hostnames, IPs and
+   * CIDR blocks (e.g. "10.42.0.0/16,weave-1.internal"). When set, a candidate
+   * address outside the list is skipped whether its host is private or public,
+   * and SOURCE_PROVIDER_ALLOW_PRIVATE_HOSTS is not consulted.
+   *
+   * The list is the one input to provider validation that the provider does not
+   * supply, so it is what bounds a provider that starts returning addresses it
+   * should not. Prefer it over the blanket private-host waiver.
+   */
+  sourceProviderAllowedHosts: parseHostPatterns(
+    (process.env['SOURCE_PROVIDER_ALLOWED_HOSTS'] ?? '').split(',').map((h) => h.trim()).filter(Boolean),
+  ),
 } as const;

@@ -6,6 +6,7 @@ import {
   isPrivateHost,
   effectivePort,
   assertSameStromOrigin,
+  parseHostPatterns,
 } from '../lib/url-validation.js';
 
 describe('graphicUrl', () => {
@@ -309,5 +310,70 @@ describe('assertSameStromOrigin (WHEP/WHIP proxy SSRF guard — issue #55)', () 
     expect(() =>
       assertSameStromOrigin('https://strom.example.com/whep', 'https://strom.example.com:8443'),
     ).toThrow(/port does not match/);
+  });
+});
+
+describe('allowedHosts', () => {
+  const nodeSubnet = parseHostPatterns(['10.42.0.0/16']);
+
+  it('accepts a private host inside the CIDR without the blanket private-host waiver', () => {
+    expect(() => srtUrl('srt://10.42.7.9:20003?mode=caller', { allowedHosts: nodeSubnet })).not.toThrow();
+    expect(() => httpUrlOnly('http://10.42.7.9:8080/whip/1', { allowedHosts: nodeSubnet })).not.toThrow();
+  });
+
+  it('rejects a private host outside the CIDR', () => {
+    expect(() => srtUrl('srt://10.43.7.9:20003', { allowedHosts: nodeSubnet })).toThrow(/not in the configured host allow-list/);
+  });
+
+  it('rejects a public host, which the private-host rule alone would accept', () => {
+    expect(() => srtUrl('srt://attacker.example.com:9000')).not.toThrow();
+    expect(() => srtUrl('srt://attacker.example.com:9000', { allowedHosts: nodeSubnet })).toThrow(/not in the configured host allow-list/);
+  });
+
+  it('overrides allowPrivateHosts rather than widening it', () => {
+    const options = { allowPrivateHosts: true, allowedHosts: nodeSubnet };
+    expect(() => srtUrl('srt://172.27.0.10:20003', options)).toThrow(/not in the configured host allow-list/);
+  });
+
+  it('matches a bracketed IPv4-mapped literal against an IPv4 CIDR', () => {
+    expect(() => httpUrlOnly('http://[::ffff:10.42.7.9]:8080/whip', { allowedHosts: nodeSubnet })).not.toThrow();
+    expect(() => httpUrlOnly('http://[::ffff:10.43.7.9]:8080/whip', { allowedHosts: nodeSubnet })).toThrow(/not in the configured host allow-list/);
+  });
+
+  it('matches exact hostnames and IPv6 CIDRs', () => {
+    const patterns = parseHostPatterns(['weave-1.internal', 'fd00::/8']);
+    expect(() => srtUrl('srt://weave-1.internal:20003', { allowedHosts: patterns })).not.toThrow();
+    expect(() => srtUrl('srt://weave-2.internal:20003', { allowedHosts: patterns })).toThrow(/not in the configured host allow-list/);
+    expect(() => srtUrl('srt://[fd12::1]:20003', { allowedHosts: patterns })).not.toThrow();
+    expect(() => srtUrl('srt://[fe80::1]:20003', { allowedHosts: patterns })).toThrow(/not in the configured host allow-list/);
+  });
+
+  it('rejects the hostless listener form, which has no host to match', () => {
+    expect(() => srtUrl('srt://:6000?mode=listener')).not.toThrow();
+    expect(() => srtUrl('srt://:6000?mode=listener', { allowedHosts: nodeSubnet })).toThrow(/not in the configured host allow-list/);
+  });
+
+  it('keeps blocking BLOCKED_HOSTNAMES even when the allow-list names them', () => {
+    const patterns = parseHostPatterns(['metadata.google.internal']);
+    expect(() => httpUrlOnly('http://metadata.google.internal/', { allowedHosts: patterns })).toThrow(/SSRF blocked/);
+  });
+
+  it('has no effect when empty, leaving the default rules in force', () => {
+    expect(() => srtUrl('srt://172.27.0.10:20003', { allowedHosts: [] })).toThrow(/private, loopback, or link-local/);
+  });
+});
+
+describe('parseHostPatterns', () => {
+  it('throws on a non-IP CIDR address so an operator typo fails at startup', () => {
+    expect(() => parseHostPatterns(['example.com/16'])).toThrow(/is not an IP address/);
+  });
+
+  it('throws on an out-of-range prefix length', () => {
+    expect(() => parseHostPatterns(['10.42.0.0/33'])).toThrow(/between 0 and 32/);
+    expect(() => parseHostPatterns(['fd00::/129'])).toThrow(/between 0 and 128/);
+  });
+
+  it('throws on a non-numeric prefix length', () => {
+    expect(() => parseHostPatterns(['10.42.0.0/sixteen'])).toThrow(/prefix length/);
   });
 });
