@@ -46,4 +46,16 @@ export const config = {
    * when Fastify's trustProxy is configured correctly for your reverse proxy setup.
    */
   publicBaseUrl: process.env['PUBLIC_BASE_URL'] ?? undefined,
+  /**
+   * Optional allow-list of hostnames that may be used to build request-derived
+   * WHIP callback URLs when PUBLIC_BASE_URL is not set. Comma-separated
+   * (e.g. "live.example.com,live2.example.com"). When set, a request whose
+   * derived host (from X-Forwarded-Host / Host, via Fastify's trustProxy) is
+   * not on this list is rejected rather than persisted — preventing an attacker
+   * from injecting X-Forwarded-Host: attacker.com to redirect WHIP clients.
+   */
+  trustedHosts: (process.env['TRUSTED_HOSTS'] ?? '')
+    .split(',')
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean),
 } as const;
