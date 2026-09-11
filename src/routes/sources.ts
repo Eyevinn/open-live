@@ -6,6 +6,8 @@ import type { SourceDoc, ProductionDoc } from '../db/types.js';
 import { updateProductionDoc } from './productions.js';
 import { graphicUrl, srtUrl } from '../lib/url-validation.js';
 import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
+import { getPortLease } from '../services/port-lease.js';
+import { clashesAfterWrite, listenerPortRequest, resolveListenerAddress, usedListenerPorts } from '../services/listener-ports.js';
 
 const SourceInput = z.object({
   name: z.string().min(1).max(256),
@@ -93,22 +95,48 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
   // Create a source
   fastify.post('/api/v1/sources', async (req, reply) => {
     const body = SourceInput.parse(req.body);
-    const now = new Date().toISOString();
-    const doc: SourceDoc = {
-      _id: `src-${randomUUID()}`,
-      type: 'source',
-      name: body.name,
-      // Encrypt any embedded SRT passphrase before it touches CouchDB (issue #160).
-      address: encryptAddressPassphrase(body.address),
-      streamType: body.streamType,
-      status: body.status,
-      liveCamera: body.liveCamera,
-      latency: body.latency,
-      createdAt: now,
-      updatedAt: now,
-    };
-    await getSourcesDb().insert(doc);
-    return reply.status(201).send(toApi(doc));
+    const isSrt = body.streamType === 'srt' || body.streamType === 'efp';
+    const id = `src-${randomUUID()}`;
+    // A listener source binds a port on the shared Strom: it must lie inside this
+    // instance's lease and no other source or output may hold it. Port 0 asks
+    // for the lowest free one. Written, then checked again, because two clients
+    // registering at once can both be handed the same free port.
+    let used = isSrt ? await usedListenerPorts() : [];
+    for (let attempt = 0; ; attempt++) {
+      let address = body.address;
+      let port: number | null = null;
+      if (isSrt) {
+        const resolved = resolveListenerAddress(body.address, getPortLease(), used);
+        if (!resolved.ok) {
+          return reply.status(resolved.statusCode).send({ error: resolved.error, statusCode: resolved.statusCode });
+        }
+        ({ address, port } = resolved);
+      }
+      const now = new Date().toISOString();
+      const doc: SourceDoc = {
+        _id: id,
+        type: 'source',
+        name: body.name,
+        // Encrypt any embedded SRT passphrase before it touches CouchDB (issue #160).
+        address: encryptAddressPassphrase(address),
+        streamType: body.streamType,
+        status: body.status,
+        liveCamera: body.liveCamera,
+        latency: body.latency,
+        createdAt: now,
+        updatedAt: now,
+      };
+      const written = await getSourcesDb().insert(doc);
+      if (port === null) return reply.status(201).send(toApi(doc));
+      used = await usedListenerPorts();
+      const clash = clashesAfterWrite(used, { kind: 'source', id }, port);
+      if (!clash) return reply.status(201).send(toApi(doc));
+      await getSourcesDb().destroy(id, written.rev);
+      if (listenerPortRequest(body.address) !== 0 || attempt >= 3) {
+        return reply.status(409).send({ error: `SRT listener port ${port} is already used by ${clash.kind} "${clash.name}"`, statusCode: 409 });
+      }
+      fastify.log.warn({ port, clash }, 'listener port was taken while assigning it, choosing another');
+    }
   });
 
   // Get a source
@@ -140,6 +168,23 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
           }
         } catch (err) {
           return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid source address' });
+        }
+        // Re-check the port only when the address or stream type changes — a
+        // rename must not fail because an older source predates the lease. Port 0
+        // keeps the port the source already has when that is still valid.
+        if (
+          (body.address !== undefined || body.streamType !== undefined) &&
+          (effectiveStreamType === 'srt' || effectiveStreamType === 'efp')
+        ) {
+          const stored = doc.streamType === 'srt' || doc.streamType === 'efp' ? listenerPortRequest(doc.address) : null;
+          const resolved = resolveListenerAddress(effectiveAddress, getPortLease(), await usedListenerPorts(), {
+            exclude: { kind: 'source', id: doc._id },
+            keep: stored,
+          });
+          if (!resolved.ok) {
+            return reply.status(resolved.statusCode).send({ error: resolved.error, statusCode: resolved.statusCode });
+          }
+          if (body.address !== undefined) body.address = resolved.address;
         }
       }
       // Encrypt the passphrase in an updated address before persisting. When the

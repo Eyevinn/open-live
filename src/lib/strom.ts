@@ -617,6 +617,30 @@ export interface IceServersResponse {
   ice_servers: IceServer[]
 }
 
+// --- Port leases ---
+
+/** A range of SRT listener ports reserved for one client on a shared Strom instance. */
+export interface PortLease {
+  id: string
+  client_id: string
+  first_port: number
+  last_port: number
+  /** RFC 3339 timestamp */
+  created_at: string
+  /** RFC 3339 timestamp */
+  expires_at: string
+}
+
+export interface AcquirePortLeaseRequest {
+  client_id: string
+  size: number
+  ttl_secs?: number
+}
+
+export interface RenewPortLeaseRequest {
+  ttl_secs?: number
+}
+
 export interface WhepStreamsResponse {
   streams: Array<{ endpoint_id: string; mode: string; has_audio: boolean; has_video: boolean }>
 }
@@ -745,6 +769,20 @@ export class StromClient {
     version: () => this.get<SystemInfo>('/api/version'),
     iceServers: () => this.get<IceServersResponse>('/api/ice-servers'),
     networkInterfaces: () => this.get<NetworkInterfacesResponse>('/api/network/interfaces'),
+  }
+
+  // -------------------------------------------------------------------------
+  // Port leases
+  // -------------------------------------------------------------------------
+
+  portLeases = {
+    list: () => this.get<PortLease[]>('/api/port-leases'),
+    get: (id: string) => this.get<PortLease>(`/api/port-leases/${id}`),
+    /** Idempotent on client_id: returns the existing (renewed) lease if one is held. */
+    acquire: (body: AcquirePortLeaseRequest) => this.post<PortLease>('/api/port-leases', body),
+    renew: (id: string, body: RenewPortLeaseRequest = {}) =>
+      this.post<PortLease>(`/api/port-leases/${id}/renew`, body),
+    release: (id: string) => this.del<void>(`/api/port-leases/${id}`),
   }
 
   // -------------------------------------------------------------------------

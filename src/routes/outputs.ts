@@ -5,6 +5,8 @@ import { getOutputsDb, getDb } from '../db/index.js';
 import type { OutputDoc, ProductionDoc } from '../db/types.js';
 import { updateProductionDoc } from './productions.js';
 import { srtUrl } from '../lib/url-validation.js';
+import { getPortLease } from '../services/port-lease.js';
+import { clashesAfterWrite, listenerPortRequest, resolveListenerAddress, usedListenerPorts } from '../services/listener-ports.js';
 
 const SRT_OUTPUT_TYPES = new Set(['mpegtssrt', 'efpsrt']);
 
@@ -47,18 +49,42 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
 
   fastify.post('/api/v1/outputs', async (req, reply) => {
     const body = OutputInput.parse(req.body);
-    const now = new Date().toISOString();
-    const doc: OutputDoc = {
-      _id: `output-${randomUUID()}`,
-      type: 'output',
-      name: body.name,
-      outputType: body.outputType,
-      url: body.url,
-      createdAt: now,
-      updatedAt: now,
-    };
-    await getOutputsDb().insert(doc);
-    return reply.status(201).send(toApi(doc));
+    const isSrt = SRT_OUTPUT_TYPES.has(body.outputType) && !!body.url;
+    const id = `output-${randomUUID()}`;
+    // A listener output binds a port on the shared Strom, like a listener source
+    // does: same range, same uniqueness, same port-0 assignment, same re-check.
+    let used = isSrt ? await usedListenerPorts() : [];
+    for (let attempt = 0; ; attempt++) {
+      let url = body.url;
+      let port: number | null = null;
+      if (isSrt && url) {
+        const resolved = resolveListenerAddress(url, getPortLease(), used);
+        if (!resolved.ok) {
+          return reply.status(resolved.statusCode).send({ error: resolved.error, statusCode: resolved.statusCode });
+        }
+        ({ address: url, port } = resolved);
+      }
+      const now = new Date().toISOString();
+      const doc: OutputDoc = {
+        _id: id,
+        type: 'output',
+        name: body.name,
+        outputType: body.outputType,
+        url,
+        createdAt: now,
+        updatedAt: now,
+      };
+      const written = await getOutputsDb().insert(doc);
+      if (port === null) return reply.status(201).send(toApi(doc));
+      used = await usedListenerPorts();
+      const clash = clashesAfterWrite(used, { kind: 'output', id }, port);
+      if (!clash) return reply.status(201).send(toApi(doc));
+      await getOutputsDb().destroy(id, written.rev);
+      if (listenerPortRequest(body.url ?? '') !== 0 || attempt >= 3) {
+        return reply.status(409).send({ error: `SRT listener port ${port} is already used by ${clash.kind} "${clash.name}"`, statusCode: 409 });
+      }
+      fastify.log.warn({ port, clash }, 'listener port was taken while assigning it, choosing another');
+    }
   });
 
   fastify.get<{ Params: { id: string } }>('/api/v1/outputs/:id', async (req, reply) => {
@@ -81,6 +107,18 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
           srtUrl(effectiveUrl);
         } catch (err) {
           return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid SRT URL' });
+        }
+        // Re-check the port only when the URL changes — a rename must not fail
+        // because an older output predates the lease. Port 0 keeps the current one.
+        if (body.url !== undefined) {
+          const resolved = resolveListenerAddress(effectiveUrl, getPortLease(), await usedListenerPorts(), {
+            exclude: { kind: 'output', id: doc._id },
+            keep: doc.url ? listenerPortRequest(doc.url) : null,
+          });
+          if (!resolved.ok) {
+            return reply.status(resolved.statusCode).send({ error: resolved.error, statusCode: resolved.statusCode });
+          }
+          body.url = resolved.address;
         }
       }
       const updated: OutputDoc = { ...doc, ...body, updatedAt: new Date().toISOString() };
