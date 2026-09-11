@@ -13,7 +13,6 @@ import {
   deriveClientId,
   parseListenerPort,
   isPortInLease,
-  evaluateListenerPort,
   getPortLease,
   tickPortLease,
   stopPortLease,
@@ -92,39 +91,6 @@ describe('isPortInLease', () => {
   it('rejects ports just outside the range', () => {
     expect(isPortInLease(47099, LEASE)).toBe(false);
     expect(isPortInLease(47120, LEASE)).toBe(false);
-  });
-});
-
-describe('evaluateListenerPort', () => {
-  it('passes non-listener addresses regardless of state', () => {
-    expect(evaluateListenerPort('srt://ingest.example.com:9000?mode=caller', { status: 'pending' })).toEqual({ ok: true });
-    expect(evaluateListenerPort('https://example.com/whip', { status: 'leased', lease: LEASE })).toEqual({ ok: true });
-  });
-
-  it('returns 422 naming the range for an out-of-range listener port', () => {
-    const verdict = evaluateListenerPort('srt://:9000?mode=listener', { status: 'leased', lease: LEASE });
-    expect(verdict.ok).toBe(false);
-    if (verdict.ok) return;
-    expect(verdict.statusCode).toBe(422);
-    expect(verdict.error).toContain('47100-47119');
-    expect(verdict.error).toContain('9000');
-  });
-
-  it('passes an in-range listener port', () => {
-    expect(evaluateListenerPort('srt://:47105?mode=listener', { status: 'leased', lease: LEASE })).toEqual({ ok: true });
-  });
-
-  it('returns 503 while the lease is pending', () => {
-    expect(evaluateListenerPort('srt://:47105?mode=listener', { status: 'pending' })).toEqual({
-      ok: false,
-      statusCode: 503,
-      error: 'SRT port range not yet allocated from Strom, retry shortly',
-    });
-  });
-
-  it('does not check when unsupported or disabled', () => {
-    expect(evaluateListenerPort('srt://:9000?mode=listener', { status: 'unsupported' })).toEqual({ ok: true });
-    expect(evaluateListenerPort('srt://:9000?mode=listener', { status: 'disabled' })).toEqual({ ok: true });
   });
 });
 

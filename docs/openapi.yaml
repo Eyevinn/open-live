@@ -592,8 +592,10 @@ paths:
                     nullable: true
                     description: >-
                       SRT listener ports this instance has leased on the shared Strom.
-                      Hostless listener sources (`srt://:PORT?mode=listener`) must use a
-                      port in this range. Null unless `srtPortLease` is `leased`.
+                      Hostless listener sources and outputs (`srt://:PORT?mode=listener`)
+                      must use a port in this range; `srt://:0?mode=listener` asks the
+                      server to assign the lowest free one. Null unless `srtPortLease`
+                      is `leased`.
                     required: [first, last]
                     properties:
                       first:
@@ -674,6 +676,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '409':
+          description: >-
+            Hostless SRT listener port is already held by another source or output, or no
+            port is free in the range for a port-0 assignment request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503':
           description: SRT port range not yet allocated from Strom — retry shortly
           content:
@@ -722,6 +732,14 @@ paths:
           description: Not found
         '422':
           description: Hostless SRT listener port is outside this instance's leased range (see /api/v1/server-info)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: >-
+            Hostless SRT listener port is already held by another source or output, or no
+            port is free in the range for a port-0 assignment request
           content:
             application/json:
               schema:
@@ -868,6 +886,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '409':
+          description: >-
+            Hostless SRT listener port is already held by another source or output, or no
+            port is free in the range for a port-0 assignment request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503':
           description: SRT port range not yet allocated from Strom — retry shortly
           content:
@@ -916,6 +942,14 @@ paths:
           description: Not found
         '422':
           description: Hostless SRT listener port is outside this instance's leased range (see /api/v1/server-info)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: >-
+            Hostless SRT listener port is already held by another source or output, or no
+            port is free in the range for a port-0 assignment request
           content:
             application/json:
               schema:

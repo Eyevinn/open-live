@@ -1,6 +1,7 @@
 /**
  * Route tests for the SRT port lease: /api/v1/server-info exposes the leased
- * range, and /api/v1/sources and /api/v1/outputs reject listener ports outside it.
+ * range, /api/v1/sources and /api/v1/outputs reject listener ports outside it or
+ * held by another document, and assign one when asked with port 0.
  *
  * CouchDB, Strom client, and the WS controller are mocked — no real services
  * required. The lease state is set directly through the service's test hook.
@@ -17,13 +18,17 @@ import type { OutputDoc, SourceDoc } from '../db/types.js';
 
 const mockSourcesGet = vi.fn();
 const mockSourcesInsert = vi.fn();
+const mockSourcesFind = vi.fn();
+const mockSourcesDestroy = vi.fn();
 const mockOutputsGet = vi.fn();
 const mockOutputsInsert = vi.fn();
+const mockOutputsFind = vi.fn();
+const mockOutputsDestroy = vi.fn();
 
 vi.mock('../db/index.js', () => ({
   getDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn() }),
-  getSourcesDb: () => ({ get: mockSourcesGet, insert: mockSourcesInsert }),
-  getOutputsDb: () => ({ get: mockOutputsGet, insert: mockOutputsInsert }),
+  getSourcesDb: () => ({ get: mockSourcesGet, insert: mockSourcesInsert, find: mockSourcesFind, destroy: mockSourcesDestroy }),
+  getOutputsDb: () => ({ get: mockOutputsGet, insert: mockOutputsInsert, find: mockOutputsFind, destroy: mockOutputsDestroy }),
   connectDb: vi.fn().mockResolvedValue(undefined),
   isDbReady: vi.fn().mockResolvedValue(true),
   isDbConnected: vi.fn().mockReturnValue(true),
@@ -117,12 +122,18 @@ beforeAll(async () => {
 beforeEach(() => {
   mockSourcesGet.mockReset();
   mockSourcesInsert.mockReset();
-  mockSourcesInsert.mockResolvedValue({ ok: true });
+  mockSourcesInsert.mockResolvedValue({ ok: true, rev: '1-new' });
   mockSourcesGet.mockResolvedValue(EXISTING_SOURCE);
+  mockSourcesFind.mockReset();
+  mockSourcesFind.mockResolvedValue({ docs: [EXISTING_SOURCE] });
+  mockSourcesDestroy.mockReset();
   mockOutputsGet.mockReset();
   mockOutputsInsert.mockReset();
-  mockOutputsInsert.mockResolvedValue({ ok: true });
+  mockOutputsInsert.mockResolvedValue({ ok: true, rev: '1-new' });
   mockOutputsGet.mockResolvedValue(EXISTING_OUTPUT);
+  mockOutputsFind.mockReset();
+  mockOutputsFind.mockResolvedValue({ docs: [EXISTING_OUTPUT] });
+  mockOutputsDestroy.mockReset();
 });
 
 describe('GET /api/v1/server-info', () => {
@@ -197,6 +208,78 @@ describe('POST /api/v1/sources port lease enforcement', () => {
   });
 });
 
+describe('POST /api/v1/sources port assignment', () => {
+  const post = (address: string) =>
+    app.inject({ method: 'POST', url: '/api/v1/sources', payload: { name: 'Cam', address, streamType: 'srt' } });
+
+  it('assigns the lowest free port in the range for port 0', async () => {
+    _resetPortLeaseState({ status: 'leased', lease: LEASE });
+    // 47105 is held by the existing source, 47118 by the existing output.
+    const res = await post('srt://:0?mode=listener&latency=200');
+    expect(res.statusCode).toBe(201);
+    expect(res.json().address).toBe('srt://:47100?mode=listener&latency=200');
+  });
+
+  it('skips ports held by other sources and outputs', async () => {
+    _resetPortLeaseState({ status: 'leased', lease: LEASE });
+    mockSourcesFind.mockResolvedValue({ docs: [
+      { ...EXISTING_SOURCE, _id: 's1', address: 'srt://:47100?mode=listener' },
+      { ...EXISTING_SOURCE, _id: 's2', address: 'srt://:47101?mode=listener' },
+    ] });
+    mockOutputsFind.mockResolvedValue({ docs: [{ ...EXISTING_OUTPUT, url: 'srt://:47102?mode=listener' }] });
+    const res = await post('srt://:0?mode=listener');
+    expect(res.statusCode).toBe(201);
+    expect(res.json().address).toBe('srt://:47103?mode=listener');
+  });
+
+  it('rejects an explicit port another source holds with 409 naming it', async () => {
+    _resetPortLeaseState({ status: 'leased', lease: LEASE });
+    const res = await post('srt://:47105?mode=listener');
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toContain('Camera 1');
+    expect(mockSourcesInsert).not.toHaveBeenCalled();
+  });
+
+  it('rejects an explicit port an output holds even without a lease', async () => {
+    _resetPortLeaseState({ status: 'unsupported' });
+    const res = await post('srt://:47118?mode=listener');
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toContain('Program');
+  });
+
+  it('answers 409 when the range is full', async () => {
+    _resetPortLeaseState({ status: 'leased', lease: { ...LEASE, first_port: 47100, last_port: 47101 } });
+    mockSourcesFind.mockResolvedValue({ docs: [
+      { ...EXISTING_SOURCE, _id: 's1', address: 'srt://:47100?mode=listener' },
+      { ...EXISTING_SOURCE, _id: 's2', address: 'srt://:47101?mode=listener' },
+    ] });
+    mockOutputsFind.mockResolvedValue({ docs: [] });
+    const res = await post('srt://:0?mode=listener');
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toContain('No free SRT listener port');
+  });
+
+  it('cannot assign without a range and says so', async () => {
+    _resetPortLeaseState({ status: 'unsupported' });
+    const res = await post('srt://:0?mode=listener');
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('retries with another port when the assigned one was taken meanwhile', async () => {
+    _resetPortLeaseState({ status: 'leased', lease: LEASE });
+    mockSourcesFind
+      .mockResolvedValueOnce({ docs: [] })                                                        // before the write: all free
+      .mockResolvedValueOnce({ docs: [{ ...EXISTING_SOURCE, _id: 'racer', name: 'Racer', address: 'srt://:47100?mode=listener' }] }) // after: someone took 47100
+      .mockResolvedValue({ docs: [{ ...EXISTING_SOURCE, _id: 'racer', name: 'Racer', address: 'srt://:47100?mode=listener' }] });
+    mockOutputsFind.mockResolvedValue({ docs: [] });
+    const res = await post('srt://:0?mode=listener');
+    expect(res.statusCode).toBe(201);
+    expect(res.json().address).toBe('srt://:47101?mode=listener');
+    expect(mockSourcesDestroy).toHaveBeenCalledTimes(1);
+    expect(mockSourcesInsert).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe('PATCH /api/v1/sources/:id port lease enforcement', () => {
   const patch = (payload: Record<string, unknown>) =>
     app.inject({ method: 'PATCH', url: '/api/v1/sources/src-1', payload });
@@ -227,6 +310,20 @@ describe('PATCH /api/v1/sources/:id port lease enforcement', () => {
     const res = await patch({ name: 'Camera 1 (renamed)' });
     expect(res.statusCode).toBe(200);
     expect(mockSourcesInsert).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the current port when patched with port 0', async () => {
+    _resetPortLeaseState({ status: 'leased', lease: LEASE });
+    const res = await patch({ address: 'srt://:0?mode=listener&latency=300' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().address).toBe('srt://:47105?mode=listener&latency=300');
+  });
+
+  it('rejects a move onto a port another document holds', async () => {
+    _resetPortLeaseState({ status: 'leased', lease: LEASE });
+    const res = await patch({ address: 'srt://:47118?mode=listener' });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toContain('Program');
   });
 
   it('re-checks the stored address when the stream type changes to srt', async () => {
@@ -273,6 +370,22 @@ describe('POST /api/v1/outputs port lease enforcement', () => {
     _resetPortLeaseState({ status: 'leased', lease: LEASE });
     const res = await post('srt://cdn.example.com:9000?mode=caller');
     expect(res.statusCode).toBe(201);
+  });
+
+  it('assigns a port for port 0, skipping the ports sources hold', async () => {
+    _resetPortLeaseState({ status: 'leased', lease: LEASE });
+    mockSourcesFind.mockResolvedValue({ docs: [{ ...EXISTING_SOURCE, address: 'srt://:47100?mode=listener' }] });
+    mockOutputsFind.mockResolvedValue({ docs: [] });
+    const res = await post('srt://:0?mode=listener');
+    expect(res.statusCode).toBe(201);
+    expect(res.json().url).toBe('srt://:47101?mode=listener');
+  });
+
+  it('rejects an explicit port a source holds with 409', async () => {
+    _resetPortLeaseState({ status: 'leased', lease: LEASE });
+    const res = await post('srt://:47105?mode=listener');
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toContain('Camera 1');
   });
 
   it('does not check WHEP outputs', async () => {

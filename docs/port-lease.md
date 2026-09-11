@@ -28,6 +28,23 @@ affected.
   front of it), the server logs one warning, stops enforcing ports, and
   re-checks every 10 minutes.
 
+## Ports inside the range
+
+The lease keeps instances apart; inside one instance every listener source and
+output must also have its own port, because each binds it on the same Strom.
+Open Live assigns those ports:
+
+- A listener address with port `0`, such as `srt://:0?mode=listener`, asks the
+  server to choose. The lowest port in the range not held by any other source
+  or output is written into the stored address and returned. Gateways register
+  this way, so several gateways can feed one instance without coordinating.
+- An explicit port must be inside the range and not held by another source or
+  output; otherwise the request fails with `422` or `409` naming the holder.
+- A `PATCH` with port `0` keeps the port the document already has when it is
+  still valid, so re-registering after a restart is stable.
+- Without a range (`unsupported` or `disabled`) explicit ports still have to be
+  unique, and port `0` is refused with `400` since there is nothing to choose from.
+
 ## Effect on the API
 
 `GET /api/v1/server-info` reports the range so gateways can pick ports for the
@@ -50,9 +67,9 @@ sources they register:
 | `unsupported` | No port broker answers at `STROM_URL` | Accepted, not checked |
 | `disabled` | `STROM_PORT_LEASE_DISABLED=true` | Accepted, not checked |
 
-`POST`/`PATCH` on `/api/v1/sources` and `/api/v1/outputs` apply the check when
-the address or URL is a hostless SRT listener. A `422` response names the
-allowed range.
+`POST`/`PATCH` on `/api/v1/sources` and `/api/v1/outputs` apply the checks when
+the address or URL is a hostless SRT listener. A `422` names the allowed range,
+a `409` names the source or output that already holds the port.
 
 ## Environment variables
 
@@ -72,4 +89,4 @@ allowed range.
 - Sources and outputs created before the lease existed are not re-validated on
   rename. They are checked again the next time their address or URL is edited.
 - Size the range for sources and outputs together: a production's SRT outputs
-  in listener mode take ports from the same block.
+  in listener mode take ports from the same block, one port per document.

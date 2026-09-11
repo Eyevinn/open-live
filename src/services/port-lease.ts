@@ -89,33 +89,6 @@ export function isPortInLease(port: number, lease: Pick<PortLease, 'first_port' 
   return port >= lease.first_port && port <= lease.last_port;
 }
 
-export type ListenerPortVerdict =
-  | { ok: true }
-  | { ok: false; statusCode: 422 | 503; error: string };
-
-/**
- * Decide whether a source address may be stored given the current lease state.
- * Only hostless SRT listener addresses are checked; everything else passes.
- */
-export function evaluateListenerPort(address: string, lease: PortLeaseState): ListenerPortVerdict {
-  const port = parseListenerPort(address);
-  if (port === null) return { ok: true };
-  switch (lease.status) {
-    case 'leased':
-      if (isPortInLease(port, lease.lease)) return { ok: true };
-      return {
-        ok: false,
-        statusCode: 422,
-        error: `SRT listener port ${port} is outside this instance's allocated range ${lease.lease.first_port}-${lease.lease.last_port}`,
-      };
-    case 'pending':
-      return { ok: false, statusCode: 503, error: 'SRT port range not yet allocated from Strom, retry shortly' };
-    case 'unsupported':
-    case 'disabled':
-      return { ok: true };
-  }
-}
-
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
