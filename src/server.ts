@@ -23,10 +23,14 @@ import whipRoutes from './routes/whip.js';
 import productionConfigsRoutes from './routes/production-configs.js';
 import graphicsRoutes from './routes/graphics.js';
 import outputsRoutes from './routes/outputs.js';
+import authRoutes from './routes/auth.js';
 import controllerWs from './ws/controller.js';
 
-// Routes exempt from the DB-availability guard (don't touch the DB)
-const DB_EXEMPT_PATHS = new Set(['/health', '/ready', '/api/v1/status', '/api/v1/server-info', '/api/v1/reconnect']);
+// Routes exempt from the DB-availability guard (don't touch the DB).
+// /api/v1/auth/token performs a SAT exchange and never touches CouchDB, so it
+// must remain available even when the DB is down. It is deliberately NOT added
+// to AUTH_EXEMPT_PATHS: it still requires the API key.
+const DB_EXEMPT_PATHS = new Set(['/health', '/ready', '/api/v1/status', '/api/v1/server-info', '/api/v1/reconnect', '/api/v1/auth/token']);
 // Routes exempt from API key auth (health probes + status used by the UI before auth is set up).
 // /api/v1/reconnect is intentionally NOT exempt (#59): it triggers DB/Strom connection attempts
 // and returns their reachability, so an unauthenticated caller could leak infrastructure status
@@ -313,6 +317,7 @@ export async function buildServer() {
   await fastify.register(productionConfigsRoutes);
   await fastify.register(graphicsRoutes);
   await fastify.register(outputsRoutes);
+  await fastify.register(authRoutes);
   await fastify.register(controllerWs);
 
   return fastify;
