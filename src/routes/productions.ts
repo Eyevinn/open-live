@@ -32,6 +32,86 @@ const activationAbortControllers = new Map<string, AbortController>();
 // ---------------------------------------------------------------------------
 
 /**
+ * Error thrown when the WHIP callback base URL cannot be safely resolved from
+ * an incoming request (e.g. an untrusted X-Forwarded-Host was supplied and
+ * neither PUBLIC_BASE_URL nor a TRUSTED_HOSTS allow-list vouches for it).
+ * Carries statusCode 400 so Fastify's error handler surfaces it as a client
+ * error rather than a 500.
+ */
+export class UntrustedHostError extends Error {
+  statusCode = 400;
+  constructor(message: string) {
+    super(message);
+    this.name = 'UntrustedHostError';
+  }
+}
+
+/**
+ * Resolve the public base URL used to build WHIP callback URLs that get
+ * persisted in CouchDB.
+ *
+ * Security (#50): the previous implementation read the raw X-Forwarded-Proto /
+ * X-Forwarded-Host headers, bypassing Fastify's trustProxy mechanism and
+ * letting any client inject `X-Forwarded-Host: attacker.com` to persist an
+ * attacker-controlled WHIP callback endpoint.
+ *
+ * Resolution order:
+ *   1. If PUBLIC_BASE_URL is configured, always use it (never trust the request).
+ *   2. Otherwise derive proto/host from `req.protocol` / `req.hostname`, which
+ *      honour X-Forwarded-* only for trusted proxies (Fastify trustProxy).
+ *      - If a TRUSTED_HOSTS allow-list is configured, the derived host must be
+ *        on it, else the request is rejected (UntrustedHostError → 400).
+ *      - If no allow-list is configured, only loopback/localhost hosts are
+ *        accepted; any other (proxy-forwarded) host is rejected so an attacker
+ *        cannot persist an arbitrary host. This keeps local dev working while
+ *        refusing to trust an unvalidated forwarded host in a proxied setup.
+ */
+export function resolvePublicBaseUrl(
+  req: { protocol?: string; hostname?: string },
+  cfg: { publicBaseUrl?: string; trustedHosts: readonly string[] } = config,
+): string {
+  if (cfg.publicBaseUrl) return cfg.publicBaseUrl;
+
+  const proto = req.protocol ?? 'https';
+  // req.hostname respects trustProxy: it reflects X-Forwarded-Host only when the
+  // connecting peer is a trusted proxy. It still cannot vouch for *which* host is
+  // legitimate, so we validate it below.
+  const host = (req.hostname ?? '').toLowerCase();
+  if (!host) {
+    throw new UntrustedHostError(
+      'Cannot determine request host to build the WHIP callback URL. ' +
+      'Set PUBLIC_BASE_URL to the externally reachable URL of this service.',
+    );
+  }
+
+  const hostname = host.split(':')[0]!;
+  const isLoopback =
+    hostname === 'localhost' ||
+    hostname === '127.0.0.1' ||
+    hostname === '::1' ||
+    hostname === '[::1]';
+
+  if (cfg.trustedHosts.length > 0) {
+    if (!cfg.trustedHosts.includes(hostname)) {
+      throw new UntrustedHostError(
+        `Request host "${hostname}" is not in the TRUSTED_HOSTS allow-list. ` +
+        'Set PUBLIC_BASE_URL or add the host to TRUSTED_HOSTS to build WHIP callback URLs.',
+      );
+    }
+  } else if (!isLoopback) {
+    // No allow-list and a non-loopback (proxy-forwarded) host: refuse to persist
+    // it, since we have no way to distinguish a legitimate host from an injected one.
+    throw new UntrustedHostError(
+      `Refusing to build a WHIP callback URL from untrusted host "${hostname}". ` +
+      'Set PUBLIC_BASE_URL to the externally reachable URL of this service, ' +
+      'or list allowed hosts in TRUSTED_HOSTS.',
+    );
+  }
+
+  return `${proto}://${host}`;
+}
+
+/**
  * Write a partial update to ProductionDoc with retry-on-409.
  * Re-reads the document before each retry to get the latest _rev.
  */
@@ -548,6 +628,15 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         }
       }
 
+      // Resolve the public base URL for WHIP callback URLs BEFORE mutating any
+      // state. Prefers the explicitly configured PUBLIC_BASE_URL; otherwise
+      // derives it from trustProxy-aware request fields and validates the host
+      // to prevent X-Forwarded-Host injection (#50). Throws UntrustedHostError
+      // (→ 400) rather than persisting an attacker-controlled host into CouchDB.
+      // Resolving here (before the 'activating' write) means a rejected host
+      // does not leave the production stuck mid-activation.
+      const publicBaseUrl = resolvePublicBaseUrl(req);
+
       // Transition to 'activating' immediately and respond; clear any deletion warnings
       const activatingDoc: ProductionDoc = {
         ...doc,
@@ -563,19 +652,6 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       const abortController = new AbortController();
       activationAbortControllers.set(doc._id, abortController);
 
-      // Prefer the explicitly configured PUBLIC_BASE_URL to avoid X-Forwarded-Host injection.
-      // Only fall back to request-derived values when PUBLIC_BASE_URL is not set.
-      const publicBaseUrl = config.publicBaseUrl
-        ?? (() => {
-          const proto = (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim()
-            ?? req.protocol
-            ?? 'https';
-          const host = (req.headers['x-forwarded-host'] as string | undefined)
-            ?? (req.headers.host as string | undefined)
-            ?? req.hostname;
-          return `${proto}://${host}`;
-        })()
-
       // Fire-and-forget — must never let a rejection escape to the global handler
       void runActivationFlow(doc._id, abortController.signal, fastify.log, publicBaseUrl).catch((err) => {
         fastify.log.error({ err, productionId: doc._id }, 'Unhandled error in runActivationFlow');
@@ -589,6 +665,12 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         _rev: insertResponse.rev,
       });
     } catch (err) {
+      // Untrusted / missing host for the WHIP callback URL is a client-input
+      // problem (host-header injection attempt or misconfiguration), not a
+      // server fault — surface it as a 400 rather than a generic 500.
+      if (err instanceof UntrustedHostError) {
+        return reply.status(400).send({ error: err.message, statusCode: 400 });
+      }
       req.log.error({ err }, 'Activation failed');
       return reply.status(500).send({ error: 'Activation failed — check server logs', statusCode: 500 });
     }

@@ -31,7 +31,17 @@ export function getSubscriberCount(productionId: string): number {
 export function broadcast(productionId: string, message: unknown): void {
   const subs = subscribers.get(productionId);
   if (!subs) return;
-  const payload = JSON.stringify(message);
+  // Stamp every outbound event with a server-side timestamp taken at handle
+  // time, so consumers do not fold WebSocket/scheduling latency into their own
+  // measurements (issue #169). Added centrally here so all message types get it
+  // consistently and future events inherit it. Additive/backward-compatible; an
+  // explicit `ts` on the message (if ever provided) is preserved. Shape matches
+  // the automation-control-contract spec envelope (`ts: '<ISO 8601 UTC>'`).
+  const stamped =
+    message !== null && typeof message === 'object' && !Array.isArray(message)
+      ? { ts: new Date().toISOString(), ...(message as Record<string, unknown>) }
+      : message;
+  const payload = JSON.stringify(stamped);
   for (const ws of subs) {
     if (ws.readyState === ws.OPEN) {
       ws.send(payload);

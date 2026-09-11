@@ -1,5 +1,6 @@
 import { config } from './config.js';
 import { startIdleWatchdog } from './services/idle-watchdog.js';
+import { startPortLease, stopPortLease } from './services/port-lease.js';
 import { connectDb, getDb, isDbConnected } from './db/index.js';
 import { cleanLegacyFixtures } from './db/seed.js';
 import { buildServer } from './server.js';
@@ -86,16 +87,21 @@ async function reconcileProductionStatuses(
 async function main() {
   // API_KEY is required in production. Without it every route is unauthenticated,
   // allowing any client that can reach port 3000 to create, modify, and delete
-  // productions. Omitting API_KEY is intentional only when running behind OSC's
-  // reverse-proxy auth wall or another trusted auth layer.
+  // productions. Omitting API_KEY is intentional only when TRUST_EXTERNAL_AUTH
+  // acknowledges that another layer (e.g. OSC's reverse proxy) handles auth
+  // instead. NODE_ENV is deliberately NOT used as that signal: it reflects the
+  // deployment tier, not the auth architecture, and OSC-hosted deployments
+  // always run with NODE_ENV=production regardless of whether they sit behind
+  // that reverse proxy — so NODE_ENV alone can't distinguish "no auth wall" from
+  // "auth handled externally".
   if (!config.apiKey) {
-    if (process.env['NODE_ENV'] === 'production') {
+    if (process.env['NODE_ENV'] === 'production' && !config.trustExternalAuth) {
       throw new Error(
         'API_KEY must be set in production deployments. ' +
         'Without it all API routes are unauthenticated. ' +
-        'Set API_KEY to a strong random secret, or set NODE_ENV to a value ' +
-        'other than "production" if this deployment intentionally relies on ' +
-        'an external auth layer (e.g. the OSC reverse proxy).'
+        'Set API_KEY to a strong random secret, or set TRUST_EXTERNAL_AUTH=true ' +
+        'if this deployment intentionally relies on an external auth layer ' +
+        '(e.g. the OSC reverse proxy).'
       );
     } else {
       console.warn(
@@ -137,7 +143,22 @@ async function main() {
   }
 
   startIdleWatchdog(app.log);
+  startPortLease(app.log);
   await app.listen({ port: config.port, host: '0.0.0.0' });
+
+  // Graceful shutdown: release the Strom port lease so the range is free for
+  // the next instance, then close the server. Force-exit if it stalls.
+  const onSignal = (signal: NodeJS.Signals): void => {
+    app.log.info({ signal }, 'Shutting down');
+    setTimeout(() => process.exit(1), 5000).unref();
+    void (async () => {
+      await stopPortLease(app.log);
+      await app.close();
+      process.exit(0);
+    })();
+  };
+  process.once('SIGTERM', onSignal);
+  process.once('SIGINT', onSignal);
 }
 
 const shutdown = (err: unknown, origin: string): void => {

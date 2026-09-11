@@ -31,8 +31,45 @@ import controllerWs from './ws/controller.js';
 // must remain available even when the DB is down. It is deliberately NOT added
 // to AUTH_EXEMPT_PATHS: it still requires the API key.
 const DB_EXEMPT_PATHS = new Set(['/health', '/ready', '/api/v1/status', '/api/v1/server-info', '/api/v1/reconnect', '/api/v1/auth/token']);
-// Routes exempt from API key auth (health probes + reconnect/status used by the UI before auth is set up)
-const AUTH_EXEMPT_PATHS = new Set(['/health', '/ready', '/api/v1/status', '/api/v1/reconnect']);
+// Routes exempt from API key auth (health probes + status used by the UI before auth is set up).
+// /api/v1/reconnect is intentionally NOT exempt (#59): it triggers DB/Strom connection attempts
+// and returns their reachability, so an unauthenticated caller could leak infrastructure status
+// or exhaust connections. It is a mutating POST and the studio calls it via its authenticated
+// api client, so requiring the API key here does not break the legitimate caller.
+const AUTH_EXEMPT_PATHS = new Set(['/health', '/ready', '/api/v1/status']);
+
+// Sentinel subprotocols used to carry the API key through the
+// Sec-WebSocket-Protocol header on browser WebSocket upgrades (#49). Browsers
+// cannot set arbitrary headers on a WS handshake but can offer subprotocols via
+// `new WebSocket(url, protocols)`, keeping the key out of the request URL (and
+// therefore out of proxy/CDN/DevTools access logs).
+//
+// The client offers TWO subprotocols:
+//   - WS_SUBPROTOCOL_MARKER            ("openlive.bearer") — a plain marker
+//   - `${WS_SUBPROTOCOL_KEY_PREFIX}<key>` — carries the actual key
+// The server reads the key from the second and echoes back only the plain
+// marker, so the secret is never reflected into the handshake *response*
+// header (which some proxies also log).
+const WS_SUBPROTOCOL_MARKER = 'openlive.bearer';
+const WS_SUBPROTOCOL_KEY_PREFIX = 'openlive.bearer.';
+
+/**
+ * Extracts the API key from a Sec-WebSocket-Protocol header value, if present.
+ * The header is a comma-separated list of client-offered subprotocols; we look
+ * for the `openlive.bearer.<key>` sentinel and return the `<key>` portion.
+ * Returns undefined when the header is absent or carries no bearer subprotocol.
+ */
+function extractSubprotocolKey(header: string | string[] | undefined): string | undefined {
+  if (!header) return undefined;
+  const values = Array.isArray(header) ? header : header.split(',');
+  for (const raw of values) {
+    const proto = raw.trim();
+    if (proto.startsWith(WS_SUBPROTOCOL_KEY_PREFIX)) {
+      return proto.slice(WS_SUBPROTOCOL_KEY_PREFIX.length);
+    }
+  }
+  return undefined;
+}
 
 export async function buildServer() {
   const fastify = Fastify({
@@ -147,7 +184,21 @@ export async function buildServer() {
     uiConfig: { docExpansion: 'list', deepLinking: true },
   });
 
-  await fastify.register(websocket);
+  // The browser WebSocket API rejects the handshake unless the server echoes
+  // one of the client-offered subprotocols back in Sec-WebSocket-Protocol. When
+  // a client authenticates by offering the `openlive.bearer.<key>` subprotocol
+  // (#49), we must select it so the connection is not torn down by the browser.
+  await fastify.register(websocket, {
+    options: {
+      handleProtocols: (protocols: Set<string>) => {
+        // Select the plain marker when offered so the response header does not
+        // reflect the secret-bearing subprotocol. Never echo the key itself.
+        if (protocols.has(WS_SUBPROTOCOL_MARKER)) return WS_SUBPROTOCOL_MARKER;
+        // No bearer subprotocol offered: don't select any (behaves as before).
+        return false;
+      },
+    },
+  });
 
   // Add basic JSON body parsing (built-in to Fastify)
   fastify.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body, done) => {
@@ -159,8 +210,20 @@ export async function buildServer() {
   });
 
   // Optional API key authentication — enabled when API_KEY env var is set.
-  // Exempt: health/ready probes and status/reconnect endpoints.
-  // WS connections: pass key via Authorization header or ?key= query param on upgrade.
+  // Exempt: health/ready probes and the read-only status endpoint.
+  //
+  // How to pass the key:
+  //   - REST / non-browser WS clients: `Authorization: Bearer <API_KEY>`.
+  //   - Browser WebSocket clients: the JS `WebSocket` API cannot set custom
+  //     headers, so the key travels in the `Sec-WebSocket-Protocol` request
+  //     header (populated from the `new WebSocket(url, protocols)` subprotocol
+  //     list) using the sentinel subprotocol `openlive.bearer.<API_KEY>`.
+  //
+  // The key is NEVER accepted via the `?key=` query string (#49): reverse
+  // proxies, CDNs, and browser DevTools log the full request URL, so a static,
+  // non-expiring key placed there leaks into access logs as permanent creds.
+  // Both the Authorization header and Sec-WebSocket-Protocol header are already
+  // redacted / omitted from request logging.
   if (config.apiKey) {
     // Captured here, outside the closure: TS narrows `config.apiKey` from
     // `string | undefined` to `string` at this `if`, but that narrowing does
@@ -189,9 +252,13 @@ export async function buildServer() {
 
       const authHeader = req.headers['authorization'];
       const keyFromHeader = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined;
-      // WS upgrade carries key in query string since JS WebSocket API doesn't support custom headers
-      const keyFromQuery = (req.query as Record<string, string>)?.['key'];
-      const provided = keyFromHeader ?? keyFromQuery;
+      // Browsers can't set the Authorization header on a WebSocket upgrade, but
+      // they can set Sec-WebSocket-Protocol via `new WebSocket(url, protocols)`.
+      // We carry the key there as the sentinel subprotocol
+      // `openlive.bearer.<API_KEY>` instead of the (proxy-logged) ?key= query
+      // string. The header is a comma-separated list of offered subprotocols.
+      const keyFromSubprotocol = extractSubprotocolKey(req.headers['sec-websocket-protocol']);
+      const provided = keyFromHeader ?? keyFromSubprotocol;
 
       const a = Buffer.from(provided ?? '');
       const b = Buffer.from(apiKey);

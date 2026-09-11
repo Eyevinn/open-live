@@ -13,6 +13,28 @@ Visit **[openlive.apps.osaas.io](https://openlive.apps.osaas.io)** to spin up a 
 - 14-day free trial, free plan available
 - 15 EUR/month (self-hosted Strom) or 69 EUR/month (shared GPU in Frankfurt)
 
+The in-app **Create New Open Live** flow provisions CouchDB for you and generates its admin
+password automatically. You do not choose or handle that password yourself on this path.
+The `COUCHDB_URL` environment variable documented under [Environment variables](#environment-variables)
+below is only for a self-hosted deployment where you run CouchDB yourself; it does not apply
+to the managed OSC flow above.
+
+**Before you start, two things that are not obvious from the pricing line above:**
+
+- **Shared Strom (the 69 EUR/month option) requires the Professional plan or above.** If your
+  account is not eligible, the app shows this up front when you open the environment, not as a
+  failed submission after you try to create one.
+- **Your own ("BYO") Strom instance has no plan requirement, but its URL must be publicly
+  reachable.** A plain local-network or loopback address is rejected, and so is any address
+  that is not reachable from OSC, including a plain Tailscale or other mesh-VPN address in the
+  `100.64.0.0/10` range even though it clears the initial check. To expose a locally hosted
+  Strom instance without port-forwarding, use a public ingress feature such as
+  [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) (opt-in, off by default; also
+  implemented by self-hosted [Headscale](https://github.com/juanfont/headscale)), which gives
+  the instance a genuinely public `ts.net` hostname. On the free plan this path is metered by
+  your one-time token allowance rather than gated by plan, so budget for that if you are
+  testing rather than running on a paid plan.
+
 ## Features
 
 - **Vision mixing** — cuts, auto transitions, DSK layers, picture-in-picture, graphics overlays, and fade-to-black
@@ -50,7 +72,11 @@ Copy `.env.example` to `.env` and fill in the values:
 | `STROM_URL` | Base URL of the Strom pipeline engine | `http://localhost:7000` |
 | `STROM_TOKEN` | OSC Personal Access Token for authenticating against an OSC-hosted Strom instance | _(empty — not needed for local Strom)_ |
 | `API_KEY` | Static API key protecting all `/api/v1` routes, the WebSocket controller, and the Swagger UI. **Required for any network-accessible deployment** (see below) | _(empty — routes unauthenticated)_ |
+| `TRUST_EXTERNAL_AUTH` | Acknowledges that `API_KEY` is intentionally unset because another layer (e.g. OSC's reverse proxy) handles auth instead. See below | `false` |
 | `LOG_LEVEL` | Fastify log level (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
+| `STROM_PORT_LEASE_SIZE` | Number of SRT listener ports to lease from a shared Strom — see [`docs/port-lease.md`](docs/port-lease.md) | `20` |
+| `STROM_PORT_LEASE_CLIENT_ID` | Stable lease client id sent to Strom | hostname of `PUBLIC_BASE_URL`, else `open-live-<hostname>` |
+| `STROM_PORT_LEASE_DISABLED` | Set to `true` to turn off port leasing | `false` |
 
 > **Never commit `.env`** — it is gitignored. Use `.env.example` as the reference.
 
@@ -70,10 +96,12 @@ request, since the browser WebSocket API does not support custom headers.
 > **`API_KEY` must be set for any network-accessible deployment.** When `API_KEY` is
 > unset, every API route is unauthenticated — any client that can reach the service can
 > create, modify, delete, and activate productions. The server **refuses to start** when
-> `NODE_ENV=production` and `API_KEY` is unset, and logs a prominent warning otherwise.
-> Leave it unset **only** when running behind a trusted external auth layer (e.g. the OSC
-> reverse proxy). The reference `docker-compose.yml` requires `API_KEY` to be set in your
-> `.env` before the stack will start — generate a strong random value with
+> `NODE_ENV=production` and `API_KEY` is unset, unless `TRUST_EXTERNAL_AUTH=true`
+> acknowledges that a trusted external auth layer (e.g. the OSC reverse proxy) is handling
+> it instead — `NODE_ENV` reflects the deployment tier, not the auth architecture, so it
+> can't be used as that signal by itself. Outside production it logs a prominent warning
+> instead of refusing to start. The reference `docker-compose.yml` requires `API_KEY` to
+> be set in your `.env` before the stack will start — generate a strong random value with
 > `openssl rand -base64 32`.
 
 ### Strom authentication
