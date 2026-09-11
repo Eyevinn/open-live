@@ -72,6 +72,7 @@ Copy `.env.example` to `.env` and fill in the values:
 | `STROM_URL` | Base URL of the Strom pipeline engine | `http://localhost:7000` |
 | `STROM_TOKEN` | OSC Personal Access Token for authenticating against an OSC-hosted Strom instance | _(empty — not needed for local Strom)_ |
 | `API_KEY` | Static API key protecting all `/api/v1` routes, the WebSocket controller, and the Swagger UI. **Required for any network-accessible deployment** (see below) | _(empty — routes unauthenticated)_ |
+| `TRUST_EXTERNAL_AUTH` | Acknowledges that `API_KEY` is intentionally unset because another layer (e.g. OSC's reverse proxy) handles auth instead. See below | `false` |
 | `LOG_LEVEL` | Fastify log level (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
 | `STROM_PORT_LEASE_SIZE` | Number of SRT listener ports to lease from a shared Strom — see [`docs/port-lease.md`](docs/port-lease.md) | `20` |
 | `STROM_PORT_LEASE_CLIENT_ID` | Stable lease client id sent to Strom | hostname of `PUBLIC_BASE_URL`, else `open-live-<hostname>` |
@@ -95,10 +96,12 @@ request, since the browser WebSocket API does not support custom headers.
 > **`API_KEY` must be set for any network-accessible deployment.** When `API_KEY` is
 > unset, every API route is unauthenticated — any client that can reach the service can
 > create, modify, delete, and activate productions. The server **refuses to start** when
-> `NODE_ENV=production` and `API_KEY` is unset, and logs a prominent warning otherwise.
-> Leave it unset **only** when running behind a trusted external auth layer (e.g. the OSC
-> reverse proxy). The reference `docker-compose.yml` requires `API_KEY` to be set in your
-> `.env` before the stack will start — generate a strong random value with
+> `NODE_ENV=production` and `API_KEY` is unset, unless `TRUST_EXTERNAL_AUTH=true`
+> acknowledges that a trusted external auth layer (e.g. the OSC reverse proxy) is handling
+> it instead — `NODE_ENV` reflects the deployment tier, not the auth architecture, so it
+> can't be used as that signal by itself. Outside production it logs a prominent warning
+> instead of refusing to start. The reference `docker-compose.yml` requires `API_KEY` to
+> be set in your `.env` before the stack will start — generate a strong random value with
 > `openssl rand -base64 32`.
 
 ### Strom authentication

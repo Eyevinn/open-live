@@ -49,6 +49,15 @@ export const config = {
    */
   apiKey: process.env['API_KEY'] ?? undefined,
   /**
+   * Explicit acknowledgement that this deployment intentionally has no
+   * API_KEY because an external layer (e.g. OSC's reverse proxy) handles
+   * authentication instead. Must be set independently of NODE_ENV — the
+   * deployment tier (NODE_ENV=production) says nothing about whether an
+   * external auth layer is present, so it cannot double as this signal.
+   * Only meaningful when API_KEY is unset; ignored otherwise.
+   */
+  trustExternalAuth: parseBoolEnv('TRUST_EXTERNAL_AUTH', false),
+  /**
    * Allowed CORS origin(s). Comma-separated list or '*' (wildcard).
    * Defaults to unset (no wildcard): when omitted, cross-origin requests are
    * not permitted rather than being opened to any origin. Set an explicit
