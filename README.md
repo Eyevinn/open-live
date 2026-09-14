@@ -48,16 +48,24 @@ Copy `.env.example` to `.env` and fill in the values:
 | `COUCHDB_NAME` | CouchDB database name | `open-live` |
 | `CORS_ORIGIN` | Allowed CORS origin (URL of the studio frontend) | `http://localhost:5173` |
 | `STROM_URL` | Base URL of the Strom pipeline engine | `http://localhost:7000` |
-| `STROM_TOKEN` | OSC Personal Access Token for authenticating against an OSC-hosted Strom instance | _(empty — not needed for local Strom)_ |
+| `STROM_AUTH_TOKEN` | Access token for the Strom instance (`STROM_TOKEN` is a legacy alias) | _(empty — not needed for local Strom)_ |
+| `STROM_AUTH_MODE` | How the token is used — `direct` or `osc`, see [Strom authentication](#strom-authentication) | `osc` |
 | `LOG_LEVEL` | Fastify log level (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
 
 > **Never commit `.env`** — it is gitignored. Use `.env.example` as the reference.
 
 ### Strom authentication
 
-When `STROM_URL` points to an OSC-hosted Strom instance, set `STROM_TOKEN` to your OSC Personal Access Token. The server automatically exchanges it for a short-lived Service Access Token (SAT) and refreshes it before expiry. No extra steps needed.
+`STROM_AUTH_MODE` selects how the server authenticates against Strom:
 
-Leave `STROM_TOKEN` unset when running Strom locally without authentication.
+| Mode | Behaviour |
+|---|---|
+| `direct` | `STROM_AUTH_TOKEN` is sent as-is as a Bearer token. Use this for the shared Eyevinn instance and any self-hosted Strom. |
+| `osc` (default) | `STROM_AUTH_TOKEN` is treated as an OSC Personal Access Token and exchanged for a short-lived Service Access Token (SAT), refreshed before expiry. Only needed for a Strom sitting behind OSC ingress. |
+
+Leave `STROM_AUTH_TOKEN` unset when running Strom locally without authentication.
+
+> `osc` mode is retained for integration testing against a catalogue `eyevinn-strom` instance — it is not a supported production backend (see [OSC deployment](#osc-deployment)).
 
 ## Commands
 
@@ -114,4 +122,6 @@ A template is a reusable Strom flow blueprint. It contains:
 
 The app is deployed on [Open Source Cloud](https://www.osaas.io). Environment variables are injected at runtime via an OSC parameter store — no `.env` file is needed on the server.
 
-Required services: CouchDB (`apache-couchdb`), Strom (`eyevinn-strom`), parameter store (`eyevinn-app-config-svc` + `valkey`).
+Required services: CouchDB (`apache-couchdb`), parameter store (`eyevinn-app-config-svc` + `valkey`).
+
+Strom is **not** deployed as an OSC service instance. `STROM_URL` points at a GPU host outside the OSC catalogue (the shared Eyevinn instance, or your own) — see [Strom authentication](#strom-authentication) above. The `eyevinn-strom` catalogue service is not a supported backend.
