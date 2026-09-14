@@ -47,7 +47,7 @@ to the managed OSC flow above.
 
 ## Requirements
 
-- Node.js 23+
+- Node.js 22
 - pnpm 10.33+
 - CouchDB instance (local or remote)
 
@@ -124,7 +124,7 @@ deployments should use `STROM_AUTH_TOKEN`.)
 - **`STROM_AUTH_MODE=osc`** (the default) — for a Strom instance behind OSC authentication. Set
   `STROM_AUTH_TOKEN` to your OSC Personal Access Token; the server automatically
   exchanges it for a short-lived Service Access Token (SAT) and refreshes it before
-  expiry. No extra steps needed. Note that a `eyevinn-strom` instance from the OSC
+  expiry. No extra steps needed. Note that an `eyevinn-strom` instance from the OSC
   catalogue is not a supported backend — see [OSC deployment](#osc-deployment).
 - **`STROM_AUTH_MODE=direct`** — for the shared Eyevinn instance and any self-hosted
   Strom. `STROM_AUTH_TOKEN` is sent directly as the `Authorization: Bearer` token with
@@ -163,8 +163,6 @@ pnpm start
 | `DELETE` | `/api/v1/productions/:id/sources/:mixerInput` | Remove a source assignment |
 | `GET/POST` | `/api/v1/sources` | List / create sources |
 | `GET/PATCH/DELETE` | `/api/v1/sources/:id` | Get / update / delete a source |
-| `GET/POST` | `/api/v1/templates` | List / create Strom flow templates |
-| `GET/PATCH/DELETE` | `/api/v1/templates/:id` | Get / update / delete a template |
 | `WS` | `/ws/productions/:id/controller` | WebSocket controller channel |
 
 The REST API is documented in `docs/openapi.yaml` (also served at `/documentation`). The
@@ -173,21 +171,17 @@ broadcasts — is documented separately in [`docs/controller-websocket.md`](docs
 
 ### Source model
 
-Sources represent individual video/audio feeds. Each source has a `streamType` (`srt` or `whip`) and an `address` (SRT URI or WHIP endpoint URL).
+Sources represent individual video/audio feeds. Each source has a `streamType` — `srt`, `efp`, `whip`, `html`, or the built-in test patterns `test1` / `test2` — and an `address` (SRT URI, WHIP endpoint URL, or page URL for `html`). The test-pattern types need no address and are useful for bringing a production up without any ingest.
 
 SRT passphrases are embedded in the source `address` and encrypted at rest before being stored in CouchDB. For rotating a passphrase or responding to a suspected compromise, see the operator runbook in [`docs/srt-passphrase-rotation.md`](docs/srt-passphrase-rotation.md).
 
-### Template model
-
-A template is a reusable Strom flow blueprint. It contains:
-- `flow` — the full Strom flow JSON (`elements[]`, `blocks[]`, `links[]`)
-- `inputs[]` — parametric input slots: `{ id, blockId, addressProperty }` — maps a logical input name to a block in the flow and the property that receives the source address
-
 ### Activation flow
 
-1. A production is given a `templateId` and source assignments (`POST /api/v1/productions/:id/sources`)
-2. `POST /api/v1/productions/:id/activate` clones the template flow, patches each assigned source's address into the matching block, creates the flow in Strom, and starts it. The `stromFlowId` is stored on the production.
+1. A production is given source assignments (`POST /api/v1/productions/:id/sources`), plus any outputs and graphics.
+2. `POST /api/v1/productions/:id/activate` builds a Strom flow from the built-in topology in [`src/lib/default-flow.ts`](src/lib/default-flow.ts) — vision mixer, audio mixer, encoders and WHEP endpoints sized to the production's config — patches each assigned source's address into the matching block, then creates and starts the flow in Strom. The `stromFlowId` is stored on the production.
 3. `POST /api/v1/productions/:id/deactivate` stops and deletes the Strom flow and clears `stromFlowId`.
+
+The flow topology is generated, not user-supplied: productions are configured through their sources, outputs, graphics and config values rather than by editing flow JSON.
 
 ## OSC deployment
 
