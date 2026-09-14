@@ -75,7 +75,7 @@ a `409` names the source or output that already holds the port.
 
 | Variable | Description | Default |
 |---|---|---|
-| `STROM_PORT_LEASE_SIZE` | Number of consecutive SRT listener ports to lease | `20` |
+| `STROM_PORT_LEASE_SIZE` | Number of consecutive SRT listener ports to lease | `10` |
 | `STROM_PORT_LEASE_CLIENT_ID` | Client id sent to Strom. Keep it stable across restarts so the instance gets its range back | hostname of `PUBLIC_BASE_URL`, else `open-live-<hostname>` |
 | `STROM_PORT_LEASE_DISABLED` | `true` turns the feature off entirely (single-tenant Strom) | `false` |
 
