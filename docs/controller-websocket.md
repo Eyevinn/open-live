@@ -44,16 +44,37 @@ server. When it is unset, all routes (including this WebSocket) are unauthentica
 When `API_KEY` is set, the upgrade request must carry the key one of two ways
 (verified against the auth hook in `src/server.ts`):
 
-- **`Authorization: Bearer <API_KEY>`** header, or
-- **`?key=<API_KEY>`** query parameter on the upgrade URL.
+- **`Authorization: Bearer <API_KEY>`** header — for non-browser clients that can set
+  request headers, or
+- the **`Sec-WebSocket-Protocol`** header, populated via the subprotocol list argument
+  of the browser `WebSocket` API — for browser clients that cannot set custom headers.
 
-The query-parameter form exists because the browser `WebSocket` API cannot set custom
-request headers; non-browser clients that can set headers may use either form. The key
-is compared with a constant-time comparison; a mismatch returns `401 Unauthorized` and
-the upgrade is rejected.
+The browser form exists because the JS `WebSocket` API cannot set arbitrary request
+headers, but it can offer subprotocols through `new WebSocket(url, protocols)`. The
+client offers **two** sentinel subprotocols:
 
-```
-wss://<host>/ws/productions/<id>/controller?key=<API_KEY>
+- `openlive.bearer` — a plain marker, and
+- `openlive.bearer.<API_KEY>` — carries the actual key.
+
+The server extracts the key from the second subprotocol (`extractSubprotocolKey()` in
+`src/server.ts`) and echoes back only the plain `openlive.bearer` marker, so the secret
+is never reflected into the handshake response header. This keeps the key out of the
+request URL — and therefore out of proxy, CDN, and browser DevTools access logs.
+
+The key is compared with a constant-time comparison; a mismatch returns
+`401 Unauthorized` and the upgrade is rejected.
+
+> The key is **never** accepted via a `?key=<API_KEY>` query parameter. That form was
+> deliberately removed (#49): reverse proxies, CDNs, and browser DevTools log the full
+> request URL, so a static, non-expiring key placed there leaks into access logs as a
+> permanent credential.
+
+```js
+// Browser client
+const ws = new WebSocket(
+  'wss://<host>/ws/productions/<id>/controller',
+  ['openlive.bearer', `openlive.bearer.${apiKey}`],
+);
 ```
 
 ## Inbound messages (client → server)
