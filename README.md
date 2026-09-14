@@ -66,13 +66,18 @@ Copy `.env.example` to `.env` and fill in the values:
 | Variable | Description | Default |
 |---|---|---|
 | `PORT` | Port the server listens on | `3000` |
-| `COUCHDB_URL` | Full CouchDB connection URL including credentials | required |
-| `COUCHDB_NAME` | CouchDB database name | `open-live` |
-| `CORS_ORIGIN` | Allowed CORS origin (URL of the studio frontend) | `http://localhost:5173` |
+| `COUCHDB_URL` | Full CouchDB connection URL. Credentials may be embedded, or supplied via `COUCHDB_USER`/`COUCHDB_PASSWORD` | required |
+| `COUCHDB_USER` | CouchDB username, injected into `COUCHDB_URL` at startup when the URL has no embedded credentials (only applied if `COUCHDB_PASSWORD` is also set) | _(empty)_ |
+| `COUCHDB_PASSWORD` | CouchDB password, injected into `COUCHDB_URL` at startup when the URL has no embedded credentials | _(empty)_ |
+| `CORS_ORIGIN` | Allowed CORS origin(s): a single origin, a comma-separated list, or `*` for wildcard. **When unset, cross-origin requests are disabled** (`origin: false`) and a `[security]` warning is logged — there is no default origin | _(empty — cross-origin disabled)_ |
+| `PUBLIC_BASE_URL` | Externally reachable base URL of this service, used to build WHIP callback URLs. **Required in production** (`NODE_ENV=production`): the server refuses to start without it, because otherwise WHIP URLs are derived from the `X-Forwarded-Host` header, enabling host-header injection. Outside production, logs a warning and falls back to request-derived URLs | _(empty)_ |
+| `TRUSTED_HOSTS` | Comma-separated allow-list of hostnames permitted when building request-derived WHIP URLs (used only when `PUBLIC_BASE_URL` is unset). A request whose derived host is not on this list is rejected rather than persisted | _(empty)_ |
 | `STROM_URL` | Base URL of the Strom pipeline engine | `http://localhost:7000` |
-| `STROM_TOKEN` | OSC Personal Access Token for authenticating against an OSC-hosted Strom instance | _(empty — not needed for local Strom)_ |
+| `STROM_AUTH_TOKEN` | Token for authenticating against Strom. See [Strom authentication](#strom-authentication) below. `STROM_TOKEN` is accepted as a legacy fallback | _(empty — not needed for local Strom)_ |
+| `STROM_AUTH_MODE` | How `STROM_AUTH_TOKEN` is used: `osc` exchanges an OSC Personal Access Token for a short-lived SAT (OSC-hosted Strom); `direct` sends the token as a Bearer key (self-hosted / non-OSC Strom) | `osc` |
 | `API_KEY` | Static API key protecting all `/api/v1` routes, the WebSocket controller, and the Swagger UI. **Required for any network-accessible deployment** (see below) | _(empty — routes unauthenticated)_ |
 | `TRUST_EXTERNAL_AUTH` | Acknowledges that `API_KEY` is intentionally unset because another layer (e.g. OSC's reverse proxy) handles auth instead. See below | `false` |
+| `SRT_PASSPHRASE_KEY` | AES-256 key (32 bytes, base64 or hex) that encrypts SRT source passphrases at rest. **Fails closed in production**: the encrypt/decrypt path throws if it is unset (or malformed) when a passphrase must be processed. Unset in non-production stores passphrases in plaintext with a warning. Generate with `openssl rand -base64 32` | _(empty)_ |
 | `LOG_LEVEL` | Fastify log level (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
 | `STROM_PORT_LEASE_SIZE` | Number of SRT listener ports to lease from a shared Strom — see [`docs/port-lease.md`](docs/port-lease.md) | `20` |
 | `STROM_PORT_LEASE_CLIENT_ID` | Stable lease client id sent to Strom | hostname of `PUBLIC_BASE_URL`, else `open-live-<hostname>` |
@@ -90,8 +95,14 @@ must send it as a bearer token:
 Authorization: Bearer <API_KEY>
 ```
 
-WebSocket clients pass the key via the `?key=<API_KEY>` query parameter on the upgrade
-request, since the browser WebSocket API does not support custom headers.
+Browser WebSocket clients cannot set custom headers, so they carry the key through the
+`Sec-WebSocket-Protocol` header instead: offer the two sentinel subprotocols
+`openlive.bearer` and `openlive.bearer.<API_KEY>` via `new WebSocket(url, protocols)`.
+The server extracts the key from the second (`extractSubprotocolKey()`) and echoes back
+only the plain `openlive.bearer` marker, keeping the secret out of the request URL and
+access logs. The `?key=<API_KEY>` query parameter is **not** accepted — it was removed
+in #49 because it leaks the key into proxy/CDN/DevTools logs. See
+[`docs/controller-websocket.md`](docs/controller-websocket.md) for details.
 
 > **`API_KEY` must be set for any network-accessible deployment.** When `API_KEY` is
 > unset, every API route is unauthenticated — any client that can reach the service can
@@ -106,9 +117,18 @@ request, since the browser WebSocket API does not support custom headers.
 
 ### Strom authentication
 
-When `STROM_URL` points to an OSC-hosted Strom instance, set `STROM_TOKEN` to your OSC Personal Access Token. The server automatically exchanges it for a short-lived Service Access Token (SAT) and refreshes it before expiry. No extra steps needed.
+Strom authentication is configured with `STROM_AUTH_TOKEN` and `STROM_AUTH_MODE`.
+(`STROM_TOKEN` is still read as a legacy fallback for `STROM_AUTH_TOKEN`, but new
+deployments should use `STROM_AUTH_TOKEN`.)
 
-Leave `STROM_TOKEN` unset when running Strom locally without authentication.
+- **`STROM_AUTH_MODE=osc`** (the default) — for an OSC-hosted Strom instance. Set
+  `STROM_AUTH_TOKEN` to your OSC Personal Access Token; the server automatically
+  exchanges it for a short-lived Service Access Token (SAT) and refreshes it before
+  expiry. No extra steps needed.
+- **`STROM_AUTH_MODE=direct`** — for a self-hosted / non-OSC Strom. `STROM_AUTH_TOKEN`
+  is sent directly as the `Authorization: Bearer` token with no exchange step.
+
+Leave `STROM_AUTH_TOKEN` unset when running Strom locally without authentication.
 
 ## Commands
 
