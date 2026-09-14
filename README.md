@@ -121,12 +121,14 @@ Strom authentication is configured with `STROM_AUTH_TOKEN` and `STROM_AUTH_MODE`
 (`STROM_TOKEN` is still read as a legacy fallback for `STROM_AUTH_TOKEN`, but new
 deployments should use `STROM_AUTH_TOKEN`.)
 
-- **`STROM_AUTH_MODE=osc`** (the default) — for an OSC-hosted Strom instance. Set
+- **`STROM_AUTH_MODE=osc`** (the default) — for a Strom instance behind OSC authentication. Set
   `STROM_AUTH_TOKEN` to your OSC Personal Access Token; the server automatically
   exchanges it for a short-lived Service Access Token (SAT) and refreshes it before
-  expiry. No extra steps needed.
-- **`STROM_AUTH_MODE=direct`** — for a self-hosted / non-OSC Strom. `STROM_AUTH_TOKEN`
-  is sent directly as the `Authorization: Bearer` token with no exchange step.
+  expiry. No extra steps needed. Note that a `eyevinn-strom` instance from the OSC
+  catalogue is not a supported backend — see [OSC deployment](#osc-deployment).
+- **`STROM_AUTH_MODE=direct`** — for the shared Eyevinn instance and any self-hosted
+  Strom. `STROM_AUTH_TOKEN` is sent directly as the `Authorization: Bearer` token with
+  no exchange step.
 
 Leave `STROM_AUTH_TOKEN` unset when running Strom locally without authentication.
 
@@ -191,4 +193,6 @@ A template is a reusable Strom flow blueprint. It contains:
 
 The app is deployed on [Open Source Cloud](https://www.osaas.io). Environment variables are injected at runtime via an OSC parameter store — no `.env` file is needed on the server.
 
-Required services: CouchDB (`apache-couchdb`), Strom (`eyevinn-strom`), parameter store (`eyevinn-app-config-svc` + `valkey`).
+Required services: CouchDB (`apache-couchdb`), parameter store (`eyevinn-app-config-svc` + `valkey`).
+
+Strom is **not** deployed as an OSC service instance. `STROM_URL` points at a GPU host outside the OSC catalogue (the shared Eyevinn instance, or your own) — see [Strom authentication](#strom-authentication) above. The `eyevinn-strom` catalogue service is not a supported backend.
