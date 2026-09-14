@@ -10,8 +10,16 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // Mock CouchDB
 // ---------------------------------------------------------------------------
 
+const sourceDocs = vi.hoisted(() => new Map<string, Record<string, unknown>>());
+
 vi.mock('../db/index.js', () => ({
-  getSourcesDb: () => ({ get: vi.fn().mockRejectedValue(new Error('not found')) }),
+  getSourcesDb: () => ({
+    get: vi.fn().mockImplementation(async (id: string) => {
+      const doc = sourceDocs.get(id);
+      if (!doc) throw new Error('not found');
+      return { ...doc };
+    }),
+  }),
   getGraphicsDb: () => ({ get: vi.fn().mockRejectedValue(new Error('not found')) }),
 }));
 
@@ -137,5 +145,51 @@ describe('activateStromFlow — test pattern sources', () => {
     await expect(activateStromFlow(production as never, strom as never)).resolves.toMatchObject({
       flowId: 'flow-test-123',
     });
+  });
+});
+
+describe('activateStromFlow — mixer min_upstream_latency', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sourceDocs.clear();
+  });
+
+  function mixerFloors(flow: Record<string, unknown>) {
+    const blocks = flow['blocks'] as Array<Record<string, unknown>>;
+    return ['builtin.vision_mixer', 'builtin.mixer'].map((defn) => {
+      const block = blocks.find((b) => b['block_definition_id'] === defn);
+      return (block!['properties'] as Record<string, unknown>)['min_upstream_latency'];
+    });
+  }
+
+  it("uses Strom's mixer default when no SRT/EFP source is assigned", async () => {
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    const strom = makeStromClient();
+
+    const production = makeProduction([
+      { sourceId: 'Whip', mixerInput: 'video_in_0' },
+      { sourceId: '__test1__', mixerInput: 'video_in_1' },
+    ]);
+
+    await activateStromFlow(production as never, strom as never);
+
+    expect(mixerFloors(strom.capturedFlows[0]!)).toEqual([30, 30]);
+  });
+
+  it('uses the highest SRT/EFP source latency when one is assigned', async () => {
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    const strom = makeStromClient();
+    sourceDocs.set('src-cam', { _id: 'src-cam', type: 'source', name: 'Cam', streamType: 'srt', address: 'srt://:5000?mode=listener', latency: 200 });
+    sourceDocs.set('src-efp', { _id: 'src-efp', type: 'source', name: 'EFP', streamType: 'efp', address: 'srt://:5001?mode=listener' });
+
+    const production = makeProduction([
+      { sourceId: 'src-cam', mixerInput: 'video_in_0' },
+      { sourceId: 'src-efp', mixerInput: 'video_in_1' },
+      { sourceId: 'Whip', mixerInput: 'video_in_2' },
+    ]);
+
+    await activateStromFlow(production as never, strom as never);
+
+    expect(mixerFloors(strom.capturedFlows[0]!)).toEqual([200, 200]);
   });
 });
