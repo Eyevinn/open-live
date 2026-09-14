@@ -118,7 +118,7 @@ and fill in the values:
 | `TRUST_EXTERNAL_AUTH` | Acknowledges that `API_KEY` is intentionally unset because another layer (e.g. OSC's reverse proxy) handles auth instead. See below | `false` |
 | `SRT_PASSPHRASE_KEY` | AES-256 key (32 bytes, base64 or hex) that encrypts SRT source passphrases at rest. **Fails closed in production**: the encrypt/decrypt path throws if it is unset (or malformed) when a passphrase must be processed. Unset in non-production stores passphrases in plaintext with a warning. Generate with `openssl rand -base64 32` | _(empty)_ |
 | `LOG_LEVEL` | Fastify log level (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
-| `STROM_PORT_LEASE_SIZE` | Number of SRT listener ports to lease from a shared Strom — see [`docs/port-lease.md`](docs/port-lease.md) | `20` |
+| `STROM_PORT_LEASE_SIZE` | Number of SRT listener ports to lease from a shared Strom — see [`docs/port-lease.md`](docs/port-lease.md) | `10` |
 | `STROM_PORT_LEASE_CLIENT_ID` | Stable lease client id sent to Strom | hostname of `PUBLIC_BASE_URL`, else `open-live-<hostname>` |
 | `STROM_PORT_LEASE_DISABLED` | Set to `true` to turn off port leasing | `false` |
 
