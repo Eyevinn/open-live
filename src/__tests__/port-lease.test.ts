@@ -144,7 +144,7 @@ describe('port lease service', () => {
     acquire.mockResolvedValueOnce(LEASE);
     await tickPortLease(log);
     expect(acquire).toHaveBeenCalledTimes(1);
-    expect(acquire.mock.calls[0]![0]).toMatchObject({ size: 20 });
+    expect(acquire.mock.calls[0]![0]).toMatchObject({ size: 10 });
     expect(getPortLease()).toEqual({ status: 'leased', lease: LEASE });
     const clientId = (acquire.mock.calls[0]![0] as { client_id: string }).client_id;
     expect(clientId).toMatch(/^open-live-/);
