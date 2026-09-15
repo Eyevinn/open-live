@@ -39,6 +39,54 @@ export interface SourceDoc {
   liveCamera?: boolean;
   /** SRT receiver buffer latency in ms. Only applies to srt/efp stream types. Default 125. */
   latency?: number;
+  /**
+   * Optional id of the Gateway (`GatewayDoc._id`) that registered this source
+   * (issue #263). Absent for manually-created sources. Enables the
+   * forget-gateway cascade and Studio's Sources chip. Additive and
+   * defaulted-absent — every existing source stays valid unchanged.
+   */
+  gatewayId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// --------------- Gateway types (issue #263, OL-5 Studio Gateways Phase 1) ---------------
+
+/**
+ * Gateway health, reusing the OL-4 vocabulary (`docs/specs/production-lifecycle-health.md`).
+ * Deliberately NO `degraded` value — matching the OL-4 decision (no verified
+ * per-signal source from an ingest box). Derived on read from `lastSeenAt`
+ * (compute-on-read); never persisted on the `GatewayDoc`.
+ */
+export type GatewayHealth = 'healthy' | 'down' | 'unknown';
+
+/** Strom FlowState vocabulary (`src/lib/strom.ts`) as reported per gateway input. */
+export type GatewayInputFlowState = 'idle' | 'playing' | 'paused';
+
+export interface GatewayInputStatus {
+  inputId: string;
+  name: string;
+  flowState: GatewayInputFlowState;
+  /** References SourceDoc._id when this input registered a source; null otherwise. */
+  sourceId: string | null;
+  uplink: { bitrateKbps: number; rtt_ms: number; dropped: number } | null;
+}
+
+export interface GatewayDoc {
+  _id: string;                     // "gw-<uuid>"
+  _rev?: string;
+  type: 'gateway';
+  name: string;
+  /** SHA-256 hash of the per-gateway bearer token. Raw token is never persisted (ADR-001). */
+  tokenHash: string;
+  /** ISO 8601 UTC time of the most recent heartbeat/online frame; null until first contact. */
+  lastSeenAt: string | null;
+  // ---- last-heartbeat snapshot (all optional; absent until first heartbeat) ----
+  host?: string;
+  stromVersion?: string;
+  deviceCount?: number;
+  streamingCount?: number;
+  inputs?: GatewayInputStatus[];
   createdAt: string;
   updatedAt: string;
 }

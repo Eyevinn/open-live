@@ -1,6 +1,6 @@
 import Nano from 'nano';
 import { config } from '../config.js';
-import type { ProductionDoc, SourceDoc, ProductionConfigDoc, GraphicDoc, OutputDoc } from './types.js';
+import type { ProductionDoc, SourceDoc, ProductionConfigDoc, GraphicDoc, OutputDoc, GatewayDoc } from './types.js';
 
 
 let db: Nano.DocumentScope<ProductionDoc>;
@@ -138,6 +138,10 @@ export function getGraphicsDb(): GuardedScope<GraphicDoc> {
 
 export function getOutputsDb(): GuardedScope<OutputDoc> {
   return withTypeGuard(db as unknown as Nano.DocumentScope<OutputDoc>, 'output');
+}
+
+export function getGatewaysDb(): GuardedScope<GatewayDoc> {
+  return withTypeGuard(db as unknown as Nano.DocumentScope<GatewayDoc>, 'gateway');
 }
 
 const DB_NAME = 'open-live';

@@ -24,7 +24,9 @@ import productionConfigsRoutes from './routes/production-configs.js';
 import graphicsRoutes from './routes/graphics.js';
 import outputsRoutes from './routes/outputs.js';
 import authRoutes from './routes/auth.js';
+import gatewaysRoutes from './routes/gateways.js';
 import controllerWs from './ws/controller.js';
+import gatewayHeartbeatWs from './ws/gateway-heartbeat.js';
 
 // Routes exempt from the DB-availability guard (don't touch the DB).
 // /api/v1/auth/token performs a SAT exchange and never touches CouchDB, so it
@@ -37,6 +39,19 @@ const DB_EXEMPT_PATHS = new Set(['/health', '/ready', '/api/v1/status', '/api/v1
 // or exhaust connections. It is a mutating POST and the studio calls it via its authenticated
 // api client, so requiring the API key here does not break the legitimate caller.
 const AUTH_EXEMPT_PATHS = new Set(['/health', '/ready', '/api/v1/status']);
+
+/**
+ * Matches the inbound gateway heartbeat WS upgrade path
+ * `/ws/gateways/:id/heartbeat` (issue #263, ADR-001). This socket is NOT gated
+ * by the shared `API_KEY`: it authenticates with a per-gateway bearer token,
+ * verified inside the WS handler (`src/ws/gateway-heartbeat.ts`). It is
+ * therefore exempted from the shared-key onRequest gate below so the shared key
+ * alone neither grants nor is required for heartbeat access. The per-gateway
+ * token does not grant access to any other route.
+ */
+function isGatewayHeartbeatPath(path: string): boolean {
+  return /^\/ws\/gateways\/[^/]+\/heartbeat$/.test(path);
+}
 
 // Sentinel subprotocols used to carry the API key through the
 // Sec-WebSocket-Protocol header on browser WebSocket upgrades (#49). Browsers
@@ -275,6 +290,10 @@ export async function buildServer() {
     fastify.addHook('onRequest', async (req, reply) => {
       const path = req.url.split('?')[0]!;
       if (AUTH_EXEMPT_PATHS.has(path)) return;
+      // The gateway heartbeat WS authenticates with a per-gateway token inside
+      // the handler (ADR-001), not the shared API key — so it must bypass this
+      // shared-key gate. The `?key=` query string is still never accepted.
+      if (isGatewayHeartbeatPath(path)) return;
       // Guard the REST API, the WebSocket controller, and the Swagger UI /
       // OpenAPI spec routes. The /ws/ prefix must be listed explicitly:
       // without it, /ws/productions/:id/controller bypasses auth entirely and
@@ -369,7 +388,9 @@ export async function buildServer() {
   await fastify.register(graphicsRoutes);
   await fastify.register(outputsRoutes);
   await fastify.register(authRoutes);
+  await fastify.register(gatewaysRoutes);
   await fastify.register(controllerWs);
+  await fastify.register(gatewayHeartbeatWs);
 
   return fastify;
 }

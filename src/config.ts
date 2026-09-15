@@ -123,4 +123,28 @@ export const config = {
   stromPortLeaseClientId: process.env['STROM_PORT_LEASE_CLIENT_ID'] || undefined,
   /** Set to true to skip port leasing entirely (single-tenant Strom setups). */
   stromPortLeaseDisabled: parseBoolEnv('STROM_PORT_LEASE_DISABLED', false),
+  // --- OL-5 Studio Gateways Phase 1 (issue #263, docs/specs/studio-gateways.md) ---
+  /**
+   * Heartbeat age (seconds) past which a gateway reads as `down`. Health is
+   * derived on read from `lastSeenAt`; there is no persisted health flag. The
+   * default tolerates two missed 5s heartbeats.
+   */
+  gatewayDownAfterSeconds: parsePositiveIntEnv('GATEWAY_DOWN_AFTER_SECONDS', 15),
+  /**
+   * Recommended heartbeat cadence (seconds) advertised to the gateway in the
+   * HELLO frame. Advisory only — the gateway drives its own timer.
+   */
+  gatewayHeartbeatIntervalSeconds: parsePositiveIntEnv('GATEWAY_HEARTBEAT_INTERVAL_SECONDS', 5),
+  /**
+   * Minimum interval (ms) between CouchDB writes of a gateway's snapshot, to
+   * cap heartbeat write amplification. Identical back-to-back heartbeats within
+   * this window debounce to at most one write.
+   */
+  gatewayHeartbeatPersistMinIntervalMs: parsePositiveIntEnv('GATEWAY_HEARTBEAT_PERSIST_MIN_INTERVAL_MS', 5000),
+  /**
+   * Minimum offline duration (seconds) before DELETE /api/v1/gateways/:id is
+   * allowed — the "zombie-sources escape hatch" that must not delete a live
+   * gateway out from under a running show.
+   */
+  gatewayForgetMinOfflineSeconds: parsePositiveIntEnv('GATEWAY_FORGET_MIN_OFFLINE_SECONDS', 300),
 } as const;
