@@ -38,6 +38,7 @@ to the managed OSC flow above.
 ## Features
 
 - **Vision mixing** — cuts, auto transitions, DSK layers, picture-in-picture, graphics overlays, and fade-to-black
+- **Graphics** — HTML/image overlays keyed onto the programme via DSK, including [OGraf](https://github.com/ebu/ograf) (EBU HTML-graphics spec) templates; see the [graphics guide](docs/graphics.md)
 - **Audio mixer** — per-channel faders with EBU R128 loudness metering
 - **Multiviewer** — sub-500ms WebRTC glass-to-glass latency
 - **Stream Deck control** — hardware button panel integration
@@ -158,6 +159,16 @@ SRT passphrases are embedded in the source `address` and encrypted at rest befor
 3. `POST /api/v1/productions/:id/deactivate` stops and deletes the Strom flow and clears `stromFlowId`.
 
 The flow topology is generated, not user-supplied: productions are configured through their sources, outputs, graphics and config values rather than by editing flow JSON.
+
+### Graphics
+
+Graphics are HTML or image overlays rendered by the pipeline and keyed onto the programme
+output through a downstream keyer (DSK). This supports standards-based HTML templates such as
+[OGraf](https://github.com/ebu/ograf) (the EBU spec, authored with the
+[OGraf Template Editor](https://github.com/Eyevinn/ograf-editor)). See the end-to-end
+[**Graphics in Open Live** guide](docs/graphics.md) for authoring, registering, assigning to a
+DSK, and taking graphics on air — including an honest note on what is not yet integrated
+(e.g. the SPX graphics controller).
 
 ## Operating in production
 
