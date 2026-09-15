@@ -677,6 +677,7 @@ export async function activateStromFlow(
   if (graphicAssignments.length > 0 && mixerBlockId) {
     const graphicsDb = getGraphicsDb();
     let maxDskIndex = -1;
+    const cefsrcDskIndexes: number[] = [];
 
     for (const assignment of graphicAssignments) {
       const dskMatch = /dsk_in_(\d+)$/.exec(assignment.dskInput);
@@ -707,6 +708,9 @@ export async function activateStromFlow(
       // negotiate, cefsrc's task pauses on not-negotiated, and the DSK renders
       // nothing at all. The source-side format blocks above already pass
       // resolution only. The mixer still emits pgm_framerate downstream.
+      // Keep this block even though the mixer can scale: resizing to program
+      // resolution here, before the mixer converts the premultiplied graphic,
+      // avoids a dark edge on the CPU mixer (Eyevinn/strom#822).
       const fmtProps: Record<string, unknown> = { resolution: pgmResolution };
       flow.blocks.push({
         id: fmtId,
@@ -719,12 +723,19 @@ export async function activateStromFlow(
         { from: `${elemId}:src`, to: `${fmtId}:video_in` },
         { from: `${fmtId}:video_out`, to: `${mixerBlockId}:${assignment.dskInput}` },
       );
+      cefsrcDskIndexes.push(dskIndex);
     }
 
     // Set num_dsk_inputs on the vision mixer so DSK pads are available
     if (maxDskIndex >= 0 && mixerBlock) {
       const props = (mixerBlock['properties'] ?? {}) as Record<string, unknown>;
       props['num_dsk_inputs'] = maxDskIndex + 1;
+      // cefsrc paints premultiplied alpha; the mixer assumes straight alpha
+      // unless told otherwise, which composites partly transparent pixels too
+      // dark. Do not also set cefsrc's `unpremultiply`: that converts twice.
+      for (const dskIndex of cefsrcDskIndexes) {
+        props[`dsk_${dskIndex}_alpha_mode`] = 'premultiplied';
+      }
       mixerBlock['properties'] = props;
     }
   }
