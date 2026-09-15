@@ -49,6 +49,20 @@ export const config = {
    */
   apiKey: process.env['API_KEY'] ?? undefined,
   /**
+   * OSC Personal Access Token, held server-side only. Exchanged for a
+   * short-lived SAT via POST /api/v1/auth/token (issue #204) so browser
+   * clients (e.g. open-live-studio) never hold the PAT. NEVER returned to a
+   * client.
+   */
+  oscPat: process.env['OSC_PAT'] ?? undefined,
+  /**
+   * The OSC serviceId that SATs minted via /api/v1/auth/token are scoped to.
+   * Fixed server-side config (never caller-supplied) so the token endpoint
+   * cannot be redirected at an arbitrary service (anti-SSRF / privilege
+   * escalation).
+   */
+  oscSatServiceId: process.env['OSC_SAT_SERVICE_ID'] ?? 'eyevinn-strom',
+  /**
    * Explicit acknowledgement that this deployment intentionally has no
    * API_KEY because an external layer (e.g. OSC's reverse proxy) handles
    * authentication instead. Must be set independently of NODE_ENV — the
