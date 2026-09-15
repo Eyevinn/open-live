@@ -5,6 +5,7 @@ import { getOutputsDb, getDb } from '../db/index.js';
 import type { OutputDoc, ProductionDoc } from '../db/types.js';
 import { updateProductionDoc } from './productions.js';
 import { srtUrl } from '../lib/url-validation.js';
+import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
 import { resolveSrtConnect } from '../lib/srt-connect.js';
 import { config } from '../config.js';
 import { getPortLease } from '../services/port-lease.js';
@@ -31,14 +32,27 @@ const OutputPatch = z.object({
   url: z.string().optional(),
 });
 
+/** Masks passphrase values in SRT URIs so credentials are never returned to clients. */
+function maskSrtPassphrase(url: string): string {
+  return url.replace(/([?&]passphrase=)[^&]*/gi, '$1***');
+}
+
 function toApi(doc: OutputDoc) {
   const { _id, _rev, type, ...rest } = doc;
   const api: Record<string, unknown> = { id: _id, ...rest };
+  // Passphrases are stored encrypted (encv1:...); decrypt before masking so the
+  // mask matches on the "passphrase=" param regardless of storage form. Legacy
+  // plaintext passphrases pass through decryption unchanged (issue #260).
+  if (doc.url) {
+    api['url'] = maskSrtPassphrase(decryptAddressPassphrase(doc.url));
+  }
   // Surface a read-only, derived dial-in address for SRT outputs so operators
   // can see the connectable host, not just the bind port (issue #176). Omitted
   // for whep outputs and for SRT outputs with no bind URL (those are inert).
+  // Derive from the decrypted URL — resolveSrtConnect only reads host/port/mode,
+  // which are cleartext, and its output never carries the passphrase param.
   if (SRT_OUTPUT_TYPES.has(doc.outputType) && doc.url) {
-    const connect = resolveSrtConnect(doc.url, {
+    const connect = resolveSrtConnect(decryptAddressPassphrase(doc.url), {
       stromUrl: config.stromUrl,
       srtPublicHost: config.srtPublicHost,
     });
@@ -83,7 +97,8 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
         type: 'output',
         name: body.name,
         outputType: body.outputType,
-        url,
+        // Encrypt any embedded SRT passphrase before it touches CouchDB (issue #260).
+        url: url !== undefined ? encryptAddressPassphrase(url) : url,
         createdAt: now,
         updatedAt: now,
       };
@@ -113,8 +128,10 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
     const body = OutputPatch.parse(req.body);
     try {
       const doc = await getOutputsDb().get(req.params.id);
-      // Validate the effective URL if output type is SRT-based
-      const effectiveUrl = body.url ?? doc.url;
+      // Validate the effective URL if output type is SRT-based. Validate against
+      // the plaintext form — a new body.url is already plaintext, while the
+      // stored doc.url may hold an encrypted passphrase.
+      const effectiveUrl = body.url ?? (doc.url ? decryptAddressPassphrase(doc.url) : doc.url);
       if (SRT_OUTPUT_TYPES.has(doc.outputType) && effectiveUrl) {
         try {
           srtUrl(effectiveUrl);
@@ -134,7 +151,12 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
           body.url = resolved.address;
         }
       }
-      const updated: OutputDoc = { ...doc, ...body, updatedAt: new Date().toISOString() };
+      // Encrypt the passphrase in an updated URL before persisting. When the
+      // patch leaves the URL untouched, keep the already-stored value as-is.
+      const urlPatch = body.url !== undefined
+        ? { url: encryptAddressPassphrase(body.url) }
+        : {};
+      const updated: OutputDoc = { ...doc, ...body, ...urlPatch, updatedAt: new Date().toISOString() };
       await getOutputsDb().insert(updated);
       return reply.send(toApi(updated));
     } catch (err: unknown) {
