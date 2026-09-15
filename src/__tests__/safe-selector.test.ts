@@ -1,5 +1,6 @@
-import { describe, it, expect } from 'vitest';
-import { safeSelector, MangoInjectionError } from '../db/index.js';
+import { describe, it, expect, vi } from 'vitest';
+import type Nano from 'nano';
+import { safeSelector, MangoInjectionError, withTypeGuard } from '../db/index.js';
 
 describe('safeSelector', () => {
   it('passes a hardcoded scalar selector through unchanged', () => {
@@ -37,5 +38,53 @@ describe('safeSelector', () => {
   it('tolerates null and undefined selectors (no-op)', () => {
     expect(() => safeSelector(null)).not.toThrow();
     expect(() => safeSelector(undefined)).not.toThrow();
+  });
+});
+
+interface TestDoc {
+  type?: string;
+}
+
+function makeScope(): { scope: Nano.DocumentScope<TestDoc>; find: ReturnType<typeof vi.fn> } {
+  const find = vi.fn().mockResolvedValue({ docs: [] });
+  const scope = {
+    get: vi.fn(),
+    find,
+  } as unknown as Nano.DocumentScope<TestDoc>;
+  return { scope, find };
+}
+
+describe('withTypeGuard find/findTrusted guarding', () => {
+  const operatorQuery: Nano.MangoQuery = {
+    selector: { type: 'production', status: { $in: ['active', 'activating'] } },
+  };
+
+  it('find() still throws MangoInjectionError on a literal $in operator', () => {
+    const { scope, find } = makeScope();
+    const guarded = withTypeGuard(scope, 'production');
+    expect(() => guarded.find(operatorQuery)).toThrow(MangoInjectionError);
+    expect(find).not.toHaveBeenCalled();
+  });
+
+  it('find() still rejects $or, $regex, and operators nested in arrays/values', () => {
+    const { scope } = makeScope();
+    const guarded = withTypeGuard(scope, 'production');
+    expect(() =>
+      guarded.find({ selector: { $or: [{ type: 'production' }] } } as Nano.MangoQuery),
+    ).toThrow(MangoInjectionError);
+    expect(() =>
+      guarded.find({ selector: { name: { $regex: '.*' } } } as Nano.MangoQuery),
+    ).toThrow(MangoInjectionError);
+    expect(() =>
+      guarded.find({ selector: { sources: { $elemMatch: { id: 'x' } } } } as Nano.MangoQuery),
+    ).toThrow(MangoInjectionError);
+  });
+
+  it('findTrusted() passes an operator selector straight through to the underlying find', async () => {
+    const { scope, find } = makeScope();
+    const guarded = withTypeGuard(scope, 'production');
+    await expect(guarded.findTrusted(operatorQuery)).resolves.toEqual({ docs: [] });
+    expect(find).toHaveBeenCalledTimes(1);
+    expect(find).toHaveBeenCalledWith(operatorQuery);
   });
 });

@@ -63,7 +63,7 @@ export function notifySubscriberJoin(productionId: string): void {
 async function seedActiveProductions(log: FastifyBaseLogger): Promise<void> {
   if (!isDbConnected()) return;
   try {
-    const result = await getDb().find({
+    const result = await getDb().findTrusted({
       selector: { type: 'production', status: { $in: ['active', 'activating'] } },
       fields: ['_id'],
     });

@@ -209,7 +209,7 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       const doc = await getSourcesDb().get(req.params.id);
 
       // Block deletion if source is used by an active/activating production
-      const activeProductions = await getDb().find({
+      const activeProductions = await getDb().findTrusted({
         selector: { type: 'production', status: { $in: ['active', 'activating'] }, 'sources': { $elemMatch: { sourceId: req.params.id } } },
         fields: ['_id', 'name'],
         limit: 1,
@@ -220,7 +220,7 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       }
 
       // Remove references from inactive productions and record a warning
-      const inactiveProductions = await getDb().find({
+      const inactiveProductions = await getDb().findTrusted({
         selector: { type: 'production', status: 'inactive', 'sources': { $elemMatch: { sourceId: req.params.id } } },
         fields: ['_id', 'name', 'sources', 'deletionWarnings'],
         limit: 100,

@@ -14,10 +14,14 @@ let db: Nano.DocumentScope<ProductionDoc>;
  * (OWASP A03 — Injection).
  *
  * This guard walks a selector recursively and throws on any `$`-prefixed key.
- * All current callers pass hardcoded, operator-free selectors (e.g.
- * `{ type: 'production' }`), so it is a no-op for them — but by wiring it onto
- * the `find()` hot path (see `withTypeGuard`) it becomes a real backstop for any
- * future endpoint that forwards user input to `db.find()` (#64).
+ * Injection risk comes from a selector's *provenance*, not from whether it
+ * contains operators: a literal `{ status: { $in: [...] } }` written in
+ * application code is harmless, whereas `{ name: req.query.name }` is dangerous
+ * even with no `$` in the source. By wiring this onto the `find()` hot path (see
+ * `withTypeGuard`) it becomes a real backstop for any endpoint that forwards
+ * user input to `db.find()` (#64). Application code that legitimately needs
+ * literal Mango operators uses the explicit, greppable `findTrusted` opt-out,
+ * which skips this guard — see `withTypeGuard`.
  */
 export class MangoInjectionError extends Error {
   constructor(key: string) {
@@ -53,10 +57,22 @@ export function safeSelector<T>(selector: T): T {
 // returned document's discriminator matches the collection it was fetched
 // from. It only throws on a genuine cross-type mismatch — documents with no
 // `type` field (legacy) are tolerated so existing data keeps working.
-function withTypeGuard<T extends { type?: string }>(
+/**
+ * A `Nano.DocumentScope<T>` extended with `findTrusted`: a `find()` variant that
+ * bypasses the Mango-injection guard. It is intended solely for selectors
+ * written as literals in application code (which may legitimately use Mango
+ * operators). NEVER call it with a selector that contains, or is built from,
+ * request data — use `find()` for anything user-derived. Every bypass is
+ * greppable (`grep -rn findTrusted src/`) so the audit surface stays explicit.
+ */
+export interface GuardedScope<T> extends Nano.DocumentScope<T> {
+  findTrusted(query: Nano.MangoQuery): Promise<Nano.MangoResponse<T>>;
+}
+
+export function withTypeGuard<T extends { type?: string }>(
   scope: Nano.DocumentScope<T>,
   expectedType: T extends { type: infer U } ? U : string,
-): Nano.DocumentScope<T> {
+): GuardedScope<T> {
   const boundGet = scope.get.bind(scope) as (...args: unknown[]) => Promise<T>;
   const boundFind = scope.find.bind(scope) as (...args: unknown[]) => Promise<unknown>;
   return new Proxy(scope, {
@@ -83,12 +99,19 @@ function withTypeGuard<T extends { type?: string }>(
           return boundFind(query, ...rest);
         };
       }
+      if (prop === 'findTrusted') {
+        // Selectors written as literals in application code, which may use Mango
+        // operators. NEVER call this with a selector that contains, or is built
+        // from, request data — use find() for anything user-derived.
+        return (query: Nano.MangoQuery, ...rest: unknown[]): Promise<unknown> =>
+          boundFind(query, ...rest);
+      }
       return Reflect.get(target, prop, receiver);
     },
-  });
+  }) as unknown as GuardedScope<T>;
 }
 
-export function getDb(): Nano.DocumentScope<ProductionDoc> {
+export function getDb(): GuardedScope<ProductionDoc> {
   return withTypeGuard(db, 'production');
 }
 
@@ -96,19 +119,19 @@ export function isDbConnected(): boolean {
   return !!db;
 }
 
-export function getSourcesDb(): Nano.DocumentScope<SourceDoc> {
+export function getSourcesDb(): GuardedScope<SourceDoc> {
   return withTypeGuard(db as unknown as Nano.DocumentScope<SourceDoc>, 'source');
 }
 
-export function getConfigsDb(): Nano.DocumentScope<ProductionConfigDoc> {
+export function getConfigsDb(): GuardedScope<ProductionConfigDoc> {
   return withTypeGuard(db as unknown as Nano.DocumentScope<ProductionConfigDoc>, 'production-config');
 }
 
-export function getGraphicsDb(): Nano.DocumentScope<GraphicDoc> {
+export function getGraphicsDb(): GuardedScope<GraphicDoc> {
   return withTypeGuard(db as unknown as Nano.DocumentScope<GraphicDoc>, 'graphic');
 }
 
-export function getOutputsDb(): Nano.DocumentScope<OutputDoc> {
+export function getOutputsDb(): GuardedScope<OutputDoc> {
   return withTypeGuard(db as unknown as Nano.DocumentScope<OutputDoc>, 'output');
 }
 
