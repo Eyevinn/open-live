@@ -103,7 +103,7 @@ describe('POST /api/v1/productions/:id/macros', () => {
         slot: 1,
         label: 'Graphic On',
         color: '#10B981',
-        actions: [{ type: 'GRAPHIC_ON', overlayId: 'overlay-1', layer: 0, visible: true }],
+        actions: [{ type: 'GRAPHIC_ON', overlayId: 'overlay-1' }],
       }),
     });
 
@@ -186,6 +186,78 @@ describe('POST /api/v1/productions/:id/macros', () => {
 
     expect(res.statusCode).toBe(400);
     expect(mockGet).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Macro action schema — discriminated union (issue #53)
+//
+// The macro action schema is a z.discriminatedUnion on `type`, mirroring the
+// WS controller's InboundMessageSchema. Each valid single-type variant must
+// still pass; any cross-type field mixing must now be rejected with 400.
+// ---------------------------------------------------------------------------
+
+describe('POST /api/v1/productions/:id/macros — action discriminated union', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  async function postActions(actions: unknown[]) {
+    mockGet.mockResolvedValue(makeProductionDoc());
+    mockInsert.mockResolvedValue({ id: 'prod-test-1', rev: '2-def', ok: true });
+    const server = await buildServer();
+    return server.inject({
+      method: 'POST',
+      url: '/api/v1/productions/prod-test-1/macros',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ slot: 0, label: 'M', color: '#3B82F6', actions }),
+    });
+  }
+
+  // --- each valid variant still passes ---
+
+  it.each([
+    ['CUT', { type: 'CUT', sourceId: 'src-cam1' }],
+    ['TRANSITION', { type: 'TRANSITION', sourceId: 'src-cam1', transitionType: 'fade', durationMs: 500 }],
+    ['TAKE', { type: 'TAKE' }],
+    ['GRAPHIC_ON', { type: 'GRAPHIC_ON', overlayId: 'overlay-1' }],
+    ['GRAPHIC_OFF', { type: 'GRAPHIC_OFF', overlayId: 'overlay-1' }],
+    ['DSK_TOGGLE', { type: 'DSK_TOGGLE', layer: 0, visible: true }],
+  ])('accepts a valid %s action (201)', async (_name, action) => {
+    const res = await postActions([action]);
+    expect(res.statusCode).toBe(201);
+  });
+
+  // --- cross-type field mixing is rejected ---
+
+  it('rejects a CUT action carrying overlayId (cross-type field, 400)', async () => {
+    const res = await postActions([{ type: 'CUT', sourceId: 'src-cam1', overlayId: 'overlay-1' }]);
+    expect(res.statusCode).toBe(400);
+    expect(mockInsert).not.toHaveBeenCalled();
+  });
+
+  it('rejects a CUT action carrying durationMs (belongs to TRANSITION, 400)', async () => {
+    const res = await postActions([{ type: 'CUT', sourceId: 'src-cam1', durationMs: 500 }]);
+    expect(res.statusCode).toBe(400);
+    expect(mockInsert).not.toHaveBeenCalled();
+  });
+
+  it('rejects a GRAPHIC_ON action carrying DSK fields (layer/visible, 400)', async () => {
+    const res = await postActions([{ type: 'GRAPHIC_ON', overlayId: 'overlay-1', layer: 0, visible: true }]);
+    expect(res.statusCode).toBe(400);
+    expect(mockInsert).not.toHaveBeenCalled();
+  });
+
+  it('rejects a TAKE action carrying any extra field (400)', async () => {
+    const res = await postActions([{ type: 'TAKE', sourceId: 'src-cam1' }]);
+    expect(res.statusCode).toBe(400);
+    expect(mockInsert).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unknown action type (400)', async () => {
+    const res = await postActions([{ type: 'BOGUS', sourceId: 'src-cam1' }]);
+    expect(res.statusCode).toBe(400);
+    expect(mockInsert).not.toHaveBeenCalled();
   });
 });
 
