@@ -603,7 +603,8 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
 
       // Guard: reject if any non-WHEP output is already active in another production
       if (doc.outputAssignments && doc.outputAssignments.length > 0) {
-        const otherActiveProds = await getDb().find({
+        // findTrusted: literal selector written here, no request data (#257)
+        const otherActiveProds = await getDb().findTrusted({
           selector: { type: 'production', status: { $in: ['active', 'activating'] } },
           fields: ['_id', 'name', 'outputAssignments'],
           limit: 200,
