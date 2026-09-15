@@ -21,6 +21,17 @@ export interface ActivationResult {
   loudnessMainBlockId: string | null;
   whepOutputEntries?: Array<{ outputId: string; endpointId: string }>;
   pgmWhepEndpointId?: string;
+  /**
+   * ID of the builtin.recorder block wired into the flow — set only when a
+   * 'recording' output is assigned. The block records local segments in Strom;
+   * open-live uploads them to MinIO after deactivate (see recording-uploader.ts).
+   */
+  recorderBlockId?: string;
+  /**
+   * Relative media directory the recorder writes into (output_dir property). Used
+   * post-deactivate to locate the recorded segments via Strom's media API.
+   */
+  recorderOutputDir?: string;
   /** WHEP endpoint ID for the mixer's monitor_out (headphone/monitor bus) — undefined if no audio mixer */
   monitorWhepEndpointId?: string;
   /** Maps mixerInput (e.g. 'video_in_1') → time_offset block ID — so the WS layer can apply live offset changes */
@@ -731,6 +742,8 @@ export async function activateStromFlow(
 
   // Inject output blocks for each assigned OutputDoc
   const whepOutputEntries: Array<{ outputId: string; endpointId: string }> = [];
+  let recorderBlockId: string | undefined;
+  let recorderOutputDir: string | undefined;
   let outputBlockIndex = 0;
   if (outputDocs && outputDocs.length > 0) {
     for (const outputDoc of outputDocs) {
@@ -739,7 +752,32 @@ export async function activateStromFlow(
       // that Strom may reject in endpoint_id.
       const idSlug = outputDoc._id.replace(/[^a-z0-9]/gi, '').slice(-8) || 'out';
       const blockId = `b-out-${idSlug}-${endpointSuffix}`;
-      if (outputDoc.outputType === 'whep') {
+      if (outputDoc.outputType === 'recording') {
+        // VOD recording: emit a single builtin.recorder block that writes local
+        // segments in Strom. open-live uploads them to MinIO after deactivate
+        // (recording-uploader.ts). Only one recorder is wired per production —
+        // extra 'recording' assignments are ignored so we never fan-out writes.
+        if (recorderBlockId) continue;
+        // Per-production output directory: recorder writes
+        // {media_path}/{output_dir}/{prefix}_%05d.{ext} (Strom recorder.rs). We key
+        // it by production id so segments are trivially locatable + uploadable.
+        const outputDir = `recordings/${production._id}`;
+        flow.blocks.push({
+          id: blockId,
+          block_definition_id: 'builtin.recorder',
+          name: outputDoc.name,
+          properties: {
+            output_dir: outputDir,
+            prefix: production._id,
+          },
+          position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
+        });
+        if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
+        if (mainAudioSource) flow.links.push({ from: mainAudioSource, to: `${blockId}:audio_in_0` });
+        recorderBlockId = blockId;
+        recorderOutputDir = outputDir;
+        outputBlockIndex++;
+      } else if (outputDoc.outputType === 'whep') {
         const endpointId = `whep-out-${idSlug}-${endpointSuffix}`;
         const auxCount = numAuxBuses ?? 0;
         flow.blocks.push({
@@ -882,7 +920,7 @@ export async function activateStromFlow(
     throw err;
   }
 
-  return { flowId, mixerBlockId, audioMixerBlockId, loudnessMainBlockId, whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined, pgmWhepEndpointId, sourceOffsetBlockIds, sourceAudioOffsetBlockIds };
+  return { flowId, mixerBlockId, audioMixerBlockId, loudnessMainBlockId, whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined, pgmWhepEndpointId, recorderBlockId, recorderOutputDir, sourceOffsetBlockIds, sourceAudioOffsetBlockIds };
 }
 
 /**

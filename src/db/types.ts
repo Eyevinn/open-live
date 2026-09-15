@@ -57,7 +57,7 @@ export interface GraphicDoc {
 
 // --------------- Output types ---------------
 
-export type OutputType = 'mpegtssrt' | 'efpsrt' | 'whep';
+export type OutputType = 'mpegtssrt' | 'efpsrt' | 'whep' | 'recording';
 
 /**
  * Output health surfaced to single-source downstream consumers (issue #255).
@@ -76,7 +76,10 @@ export interface OutputDoc {
   type: 'output';
   name: string;
   outputType: OutputType;
-  url?: string;          // SRT URI for mpegtssrt/efpsrt; undefined for whep
+  // SRT URI for mpegtssrt/efpsrt; undefined for whep. A 'recording' output
+  // carries no url — its destination is derived from the MinIO config plus the
+  // production id (spec: vod-recording-minio.md).
+  url?: string;
   /**
    * Derived output health (issue #255). Optional; when absent, read as
    * `unknown`. Computed on read from the owning production's live flow state
@@ -183,6 +186,8 @@ export interface ProductionDoc {
   pipConfigs?: PipConfig[];
   /** ID of the running Strom flow (set on activate, cleared on deactivate) */
   stromFlowId?: string;
+  /** ID of the builtin.recorder block — set on activate when a 'recording' output is assigned, cleared on deactivate */
+  recorderBlockId?: string;
   /** WHEP multiview endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */
   whepEndpoint?: string;
   /** WHEP PGM output endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */
