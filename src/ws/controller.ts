@@ -4,7 +4,8 @@ import { z } from 'zod';
 import { getDb, getSourcesDb } from '../db/index.js';
 import { updateProductionDoc } from '../routes/productions.js';
 import type { ProductionDoc } from '../db/types.js';
-import { getTally, setTally, subscribe, unsubscribe, broadcast } from '../services/tally.service.js';
+import { getTally, setTally, subscribe, unsubscribe, broadcast, nextSeq, currentSeq } from '../services/tally.service.js';
+import { CONTRACT_VERSION, computeTallyContributions } from '../services/automation-contract.js';
 import { startMeterRelay, stopMeterRelay } from '../services/meter-relay.js';
 import { StromClient, StromClientError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms, type VideoEffect, type EffectTarget, type SetVideoEffectRequest } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
@@ -69,6 +70,36 @@ function checkRateLimit(state: RateLimitState, isExpensive: boolean, now: number
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Command acknowledgement helpers (automation contract §2)
+// ---------------------------------------------------------------------------
+//
+// Two-phase ACK: clients attach an optional `cmdId` to any inbound command.
+// The server sends:
+//   ACK { cmdId, phase: 'accepted', seq, ts }  — passed validation + dispatched
+//   ACK { cmdId, phase: 'executed', seq, ts }  — Strom call returned / state persisted
+//   NACK { cmdId, error, seq, ts }             — rejected (validation or runtime error)
+//
+// Clients that omit `cmdId` see the existing behaviour unchanged.
+// ACK/NACK events go only to the originating socket, not broadcast to all subscribers.
+
+/**
+ * Send an ACK frame directly to the originating socket.
+ * `seq` and `ts` are stamped here so they are consistent with the broadcast envelope.
+ */
+function sendAck(ws: WebSocket, productionId: string, cmdId: string, phase: 'accepted' | 'executed'): void {
+  const seq = nextSeq(productionId);
+  ws.send(JSON.stringify({ type: 'ACK', cmdId, phase, seq, ts: new Date().toISOString() }));
+}
+
+/**
+ * Send a NACK frame directly to the originating socket.
+ */
+function sendNack(ws: WebSocket, productionId: string, cmdId: string, error: string): void {
+  const seq = nextSeq(productionId);
+  ws.send(JSON.stringify({ type: 'NACK', cmdId, error, seq, ts: new Date().toISOString() }));
+}
+
 // Mirror of MAX_DB_WRITE_RETRIES in routes/productions.ts — the number of
 // insert attempts a mixer write makes before giving up on a CouchDB 409.
 const MAX_DB_WRITE_RETRIES = 3;
@@ -131,36 +162,43 @@ async function persistMixerMutation(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Optional client-supplied command correlation id (automation contract §2).
+// Clients that want two-phase ACK (accepted → executed) attach a cmdId to
+// any inbound command. The server echoes it in ACK/NACK events. Additive /
+// backward-compatible: clients that do not send cmdId see unchanged behaviour.
+// ---------------------------------------------------------------------------
+
 type InboundMessage =
-  | { type: 'CUT'; mixerInput: string; afvRampUpMs?: number; afvRampDownMs?: number }
-  | { type: 'TRANSITION'; mixerInput: string; transitionType: string; durationMs?: number; afvRampUpMs?: number; afvRampDownMs?: number }
-  | { type: 'TAKE'; pip?: number; transitionType?: string; durationMs?: number; afvRampUpMs?: number; afvRampDownMs?: number }
-  | { type: 'SET_PVW'; mixerInput: string }
-  | { type: 'FTB'; active?: boolean; durationMs?: number }
-  | { type: 'SET_OVL'; alpha: number }
-  | { type: 'GO_LIVE' }
-  | { type: 'CUT_STREAM' }
-  | { type: 'GRAPHIC_ON'; overlayId: string }
-  | { type: 'GRAPHIC_OFF'; overlayId: string }
-  | { type: 'DSK_TOGGLE'; layer: number; visible?: boolean }
-  | { type: 'MACRO_EXEC'; macroId: string }
-  | { type: 'AUDIO_SET'; elementId: string; property: 'volume' | 'mute'; value: unknown; ramp_ms?: number }
-  | { type: 'AFV_SET'; mixerInput: string; enabled: boolean }
-  | { type: 'AFV_RAMP_SET'; rampUpMs: number; rampDownMs: number }
-  | { type: 'PFL_SET'; elementId: string; enabled: boolean; volume?: number }
-  | { type: 'AFL_SET'; elementId: string; enabled: boolean }
-  | { type: 'AUX_SEND_SET'; elementId: string; auxBus: number; level: number; enabled: boolean; pre?: boolean }
-  | { type: 'AUX_MASTER_SET'; auxBus: number; volume: number; muted: boolean }
-  | { type: 'GRP_SEND_SET'; elementId: string; grpBus: number; level: number; enabled: boolean }
-  | { type: 'GRP_MASTER_SET'; grpBus: number; volume: number; muted: boolean }
-  | { type: 'MONITOR_SET'; volume: number; muted: boolean }
-  | { type: 'SOURCE_OFFSET_SET'; mixerInput: string; offsetMs: number }
-  | { type: 'SOURCE_AUDIO_OFFSET_SET'; mixerInput: string; offsetMs: number }
-  | { type: 'LOUDNESS_RESET' }
-  | { type: 'SELECT_PVW_PIP'; pip: number }
-  | { type: 'SET_PIP'; pip: number; bg: number | null; zones: PipZone[]; transforms?: PipTransforms }
-  | { type: 'SET_EFFECT'; target: EffectTarget; effect: VideoEffect }
-  | { type: 'HTML_SOURCE_EVENT'; sourceId: string; params: Record<string, string>; mode?: 'replace' | 'merge' };
+  | { type: 'CUT'; mixerInput: string; afvRampUpMs?: number; afvRampDownMs?: number; cmdId?: string }
+  | { type: 'TRANSITION'; mixerInput: string; transitionType: string; durationMs?: number; afvRampUpMs?: number; afvRampDownMs?: number; cmdId?: string }
+  | { type: 'TAKE'; pip?: number; transitionType?: string; durationMs?: number; afvRampUpMs?: number; afvRampDownMs?: number; cmdId?: string }
+  | { type: 'SET_PVW'; mixerInput: string; cmdId?: string }
+  | { type: 'FTB'; active?: boolean; durationMs?: number; cmdId?: string }
+  | { type: 'SET_OVL'; alpha: number; cmdId?: string }
+  | { type: 'GO_LIVE'; cmdId?: string }
+  | { type: 'CUT_STREAM'; cmdId?: string }
+  | { type: 'GRAPHIC_ON'; overlayId: string; cmdId?: string }
+  | { type: 'GRAPHIC_OFF'; overlayId: string; cmdId?: string }
+  | { type: 'DSK_TOGGLE'; layer: number; visible?: boolean; cmdId?: string }
+  | { type: 'MACRO_EXEC'; macroId: string; cmdId?: string }
+  | { type: 'AUDIO_SET'; elementId: string; property: 'volume' | 'mute'; value: unknown; ramp_ms?: number; cmdId?: string }
+  | { type: 'AFV_SET'; mixerInput: string; enabled: boolean; cmdId?: string }
+  | { type: 'AFV_RAMP_SET'; rampUpMs: number; rampDownMs: number; cmdId?: string }
+  | { type: 'PFL_SET'; elementId: string; enabled: boolean; volume?: number; cmdId?: string }
+  | { type: 'AFL_SET'; elementId: string; enabled: boolean; cmdId?: string }
+  | { type: 'AUX_SEND_SET'; elementId: string; auxBus: number; level: number; enabled: boolean; pre?: boolean; cmdId?: string }
+  | { type: 'AUX_MASTER_SET'; auxBus: number; volume: number; muted: boolean; cmdId?: string }
+  | { type: 'GRP_SEND_SET'; elementId: string; grpBus: number; level: number; enabled: boolean; cmdId?: string }
+  | { type: 'GRP_MASTER_SET'; grpBus: number; volume: number; muted: boolean; cmdId?: string }
+  | { type: 'MONITOR_SET'; volume: number; muted: boolean; cmdId?: string }
+  | { type: 'SOURCE_OFFSET_SET'; mixerInput: string; offsetMs: number; cmdId?: string }
+  | { type: 'SOURCE_AUDIO_OFFSET_SET'; mixerInput: string; offsetMs: number; cmdId?: string }
+  | { type: 'LOUDNESS_RESET'; cmdId?: string }
+  | { type: 'SELECT_PVW_PIP'; pip: number; cmdId?: string }
+  | { type: 'SET_PIP'; pip: number; bg: number | null; zones: PipZone[]; transforms?: PipTransforms; cmdId?: string }
+  | { type: 'SET_EFFECT'; target: EffectTarget; effect: VideoEffect; cmdId?: string }
+  | { type: 'HTML_SOURCE_EVENT'; sourceId: string; params: Record<string, string>; mode?: 'replace' | 'merge'; cmdId?: string };
 
 // ---------------------------------------------------------------------------
 // Runtime schema validation for inbound WS messages
@@ -197,45 +235,51 @@ const TransitionTypeSchema = z.enum([
   'negative_flash', 'ripple',
 ]);
 
+// Optional client-supplied correlation id for two-phase ACK. UUID-like string,
+// capped at 128 chars to prevent oversized strings from reaching the handler.
+const cmdIdSchema = z.string().min(1).max(128).optional();
+
 const InboundMessageSchema = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('CUT'), mixerInput: mixerInputSchema, afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional() }),
-  z.object({ type: z.literal('TRANSITION'), mixerInput: mixerInputSchema, transitionType: TransitionTypeSchema, durationMs: rampMsSchema.optional(), afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional() }),
-  z.object({ type: z.literal('TAKE'), pip: pipIndexSchema.optional(), transitionType: TransitionTypeSchema.optional(), durationMs: rampMsSchema.optional(), afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional() }),
-  z.object({ type: z.literal('SET_PVW'), mixerInput: mixerInputSchema }),
-  z.object({ type: z.literal('FTB'), active: z.boolean().optional(), durationMs: rampMsSchema.optional() }),
-  z.object({ type: z.literal('SET_OVL'), alpha: alphaSchema }),
-  z.object({ type: z.literal('GO_LIVE') }),
-  z.object({ type: z.literal('CUT_STREAM') }),
-  z.object({ type: z.literal('GRAPHIC_ON'), overlayId: z.string().min(1).max(128) }),
-  z.object({ type: z.literal('GRAPHIC_OFF'), overlayId: z.string().min(1).max(128) }),
-  z.object({ type: z.literal('DSK_TOGGLE'), layer: layerSchema, visible: z.boolean().optional() }),
-  z.object({ type: z.literal('MACRO_EXEC'), macroId: z.string().min(1).max(128) }),
+  z.object({ type: z.literal('CUT'), mixerInput: mixerInputSchema, afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('TRANSITION'), mixerInput: mixerInputSchema, transitionType: TransitionTypeSchema, durationMs: rampMsSchema.optional(), afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('TAKE'), pip: pipIndexSchema.optional(), transitionType: TransitionTypeSchema.optional(), durationMs: rampMsSchema.optional(), afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('SET_PVW'), mixerInput: mixerInputSchema, cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('FTB'), active: z.boolean().optional(), durationMs: rampMsSchema.optional(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('SET_OVL'), alpha: alphaSchema, cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('GO_LIVE'), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('CUT_STREAM'), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('GRAPHIC_ON'), overlayId: z.string().min(1).max(128), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('GRAPHIC_OFF'), overlayId: z.string().min(1).max(128), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('DSK_TOGGLE'), layer: layerSchema, visible: z.boolean().optional(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('MACRO_EXEC'), macroId: z.string().min(1).max(128), cmdId: cmdIdSchema }),
   z.object({
     type: z.literal('AUDIO_SET'),
     elementId: elementIdSchema,
     property: z.enum(['volume', 'mute']),
     value: z.union([z.number().min(0).max(10), z.boolean()]),
     ramp_ms: rampMsSchema.optional(),
+    cmdId: cmdIdSchema,
   }),
-  z.object({ type: z.literal('AFV_SET'), mixerInput: mixerInputSchema, enabled: z.boolean() }),
-  z.object({ type: z.literal('AFV_RAMP_SET'), rampUpMs: rampMsSchema, rampDownMs: rampMsSchema }),
-  z.object({ type: z.literal('PFL_SET'), elementId: elementIdSchema, enabled: z.boolean(), volume: levelSchema.optional() }),
-  z.object({ type: z.literal('AFL_SET'), elementId: elementIdSchema, enabled: z.boolean() }),
-  z.object({ type: z.literal('AUX_SEND_SET'), elementId: elementIdSchema, auxBus: busSchema, level: levelSchema, enabled: z.boolean(), pre: z.boolean().optional() }),
-  z.object({ type: z.literal('AUX_MASTER_SET'), auxBus: busSchema, volume: faderSchema, muted: z.boolean() }),
-  z.object({ type: z.literal('GRP_SEND_SET'), elementId: elementIdSchema, grpBus: busSchema, level: levelSchema, enabled: z.boolean() }),
-  z.object({ type: z.literal('GRP_MASTER_SET'), grpBus: busSchema, volume: faderSchema, muted: z.boolean() }),
-  z.object({ type: z.literal('MONITOR_SET'), volume: faderSchema, muted: z.boolean() }),
-  z.object({ type: z.literal('SOURCE_OFFSET_SET'), mixerInput: mixerInputSchema, offsetMs: offsetMsSchema }),
-  z.object({ type: z.literal('SOURCE_AUDIO_OFFSET_SET'), mixerInput: mixerInputSchema, offsetMs: offsetMsSchema }),
-  z.object({ type: z.literal('LOUDNESS_RESET') }),
-  z.object({ type: z.literal('SELECT_PVW_PIP'), pip: pipIndexSchema }),
+  z.object({ type: z.literal('AFV_SET'), mixerInput: mixerInputSchema, enabled: z.boolean(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('AFV_RAMP_SET'), rampUpMs: rampMsSchema, rampDownMs: rampMsSchema, cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('PFL_SET'), elementId: elementIdSchema, enabled: z.boolean(), volume: levelSchema.optional(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('AFL_SET'), elementId: elementIdSchema, enabled: z.boolean(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('AUX_SEND_SET'), elementId: elementIdSchema, auxBus: busSchema, level: levelSchema, enabled: z.boolean(), pre: z.boolean().optional(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('AUX_MASTER_SET'), auxBus: busSchema, volume: faderSchema, muted: z.boolean(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('GRP_SEND_SET'), elementId: elementIdSchema, grpBus: busSchema, level: levelSchema, enabled: z.boolean(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('GRP_MASTER_SET'), grpBus: busSchema, volume: faderSchema, muted: z.boolean(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('MONITOR_SET'), volume: faderSchema, muted: z.boolean(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('SOURCE_OFFSET_SET'), mixerInput: mixerInputSchema, offsetMs: offsetMsSchema, cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('SOURCE_AUDIO_OFFSET_SET'), mixerInput: mixerInputSchema, offsetMs: offsetMsSchema, cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('LOUDNESS_RESET'), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('SELECT_PVW_PIP'), pip: pipIndexSchema, cmdId: cmdIdSchema }),
   z.object({
     type: z.literal('SET_PIP'),
     pip: pipIndexSchema,
     bg: z.number().int().min(0).max(15).nullable(),
     zones: z.array(PipZoneSchema).max(15),
     transforms: z.record(z.string(), z.object({ left: z.number().min(0).max(1), top: z.number().min(0).max(1), right: z.number().min(0).max(1), bottom: z.number().min(0).max(1) })).optional(),
+    cmdId: cmdIdSchema,
   }),
   z.object({
     type: z.literal('SET_EFFECT'),
@@ -258,6 +302,7 @@ const InboundMessageSchema = z.discriminatedUnion('type', [
       z.object({ type: z.literal('underwater'), intensity: z.number().min(0).max(1).optional() }),
       z.object({ type: z.literal('color_correct'), brightness: z.number().optional(), contrast: z.number().optional(), saturation: z.number().optional(), hue: z.number().optional(), gamma: z.number().optional(), temperature: z.number().optional(), tint: z.number().optional() }),
     ]),
+    cmdId: cmdIdSchema,
   }),
   // Generic HTML-source event-forwarding surface (issue #268, spec
   // docs/specs/html-source-event-forwarding.md). Thin transport only: params
@@ -271,6 +316,7 @@ const InboundMessageSchema = z.discriminatedUnion('type', [
       z.string().max(1024),                        // param value (opaque to Open Live)
     ),
     mode: z.enum(['replace', 'merge']).default('merge').optional(),
+    cmdId: cmdIdSchema,
   }),
 ]);
 
@@ -539,6 +585,52 @@ const pgmBgByProduction = new Map<string, string | null>()
 const pgmBgOf = (productionId: string): string | null =>
   pgmBgByProduction.get(productionId) ?? null
 
+/**
+ * Builds the contribution-based tally payload (automation contract §3).
+ *
+ * Returns the fields to spread into a TALLY broadcast — backward-compatible:
+ * the existing `pgm` / `pvw` / `pgmBg` fields are still present; the new
+ * `program` / `preview` / `contributions` fields are additive.
+ *
+ * @param productionId - the production
+ * @param tally        - current {pgm, pvw} tally
+ * @param doc          - current ProductionDoc (for graphics state)
+ */
+function buildTallyPayload(
+  productionId: string,
+  tally: { pgm: string | null; pvw: string | null },
+  doc: ProductionDoc,
+): {
+  pgm: string | null;
+  pvw: string | null;
+  pgmBg: string | null;
+  program: string[];
+  preview: string[];
+  contributions: Array<{ source: string; role: string }>;
+} {
+  const pgmBg = pgmBgOf(productionId);
+  const pgmPip = pgmPipByProduction.get(productionId) ?? null;
+  const pvwPip = pvwPipByProduction.get(productionId) ?? null;
+  const pvwBefore = pvwBeforePipByProduction.get(productionId) ?? null;
+  const pipConfigs = pipConfigsByProduction.get(productionId);
+  const dskLayers = dskLayersByProduction.get(productionId);
+  const activeGraphics = (doc.graphics ?? []).filter((g) => g.active).map((g) => g.id);
+
+  const { program, preview, contributions } = computeTallyContributions(
+    tally.pgm,
+    tally.pvw,
+    pgmPip,
+    pvwPip,
+    pgmBg,
+    pvwBefore,
+    pipConfigs,
+    dskLayers,
+    activeGraphics,
+  );
+
+  return { pgm: tally.pgm, pvw: tally.pvw, pgmBg, program, preview, contributions };
+}
+
 
 /** Wipe all per-production audio state. Called when the pipeline changes or production deactivates. */
 export function clearAudioState(productionId: string): void {
@@ -758,17 +850,33 @@ export async function handleMessage(
   // the sliding-window caps and inform the client via the standard ERROR frame.
   if (!ctx.rateLimit) ctx.rateLimit = { general: [], expensive: [] };
   if (!checkRateLimit(ctx.rateLimit, EXPENSIVE_MESSAGE_TYPES.has(msg.type), Date.now())) {
-    ws.send(JSON.stringify({ type: 'ERROR', error: 'Rate limit exceeded' }));
+    const rateLimitError = 'Rate limit exceeded';
+    if ('cmdId' in msg && msg.cmdId) {
+      sendNack(ws, productionId, msg.cmdId, rateLimitError);
+    } else {
+      ws.send(JSON.stringify({ type: 'ERROR', error: rateLimitError }));
+    }
     return;
   }
 
+  // Phase 1 ACK: command passed schema validation and is being dispatched.
+  // Sent before any async work so the automation client can record the accepted time.
+  const cmdId = 'cmdId' in msg ? (msg.cmdId as string | undefined) : undefined;
+  if (cmdId) {
+    sendAck(ws, productionId, cmdId, 'accepted');
+  }
 
   const db = getDb();
   let doc: ProductionDoc;
   try {
     doc = await db.get(productionId);
   } catch {
-    ws.send(JSON.stringify({ type: 'ERROR', error: 'Production not found' }));
+    const notFoundError = 'Production not found';
+    if (cmdId) {
+      sendNack(ws, productionId, cmdId, notFoundError);
+    } else {
+      ws.send(JSON.stringify({ type: 'ERROR', error: notFoundError }));
+    }
     return;
   }
 
@@ -797,7 +905,7 @@ export async function handleMessage(
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: null, pips: pipConfigsByProduction.get(productionId) ?? [] });
       }
       await persistMixerMutation(productionId, 'CUT', (d) => ({ ...d, tally: newTally }));
-      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId) });
+      broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
       await stromTransition(doc, fromPadCut, msg.mixerInput, 'cut');
       if (curPgmPipCut !== null && doc.stromFlowId && doc.mixerBlockId) {
         try {
@@ -810,6 +918,7 @@ export async function handleMessage(
       if (doc.stromFlowId && ctx.audioBlockId) {
         void applyAudioFollow(productionId, doc, msg.mixerInput, doc.stromFlowId, ctx.audioBlockId, await makeStromClient(), msg.afvRampUpMs, msg.afvRampDownMs);
       }
+      if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
       break;
     }
     case 'TRANSITION': {
@@ -828,7 +937,7 @@ export async function handleMessage(
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: curPgmPipTrans, pips: pipConfigsByProduction.get(productionId) ?? [] });
       }
       await persistMixerMutation(productionId, 'TRANSITION', (d) => ({ ...d, tally: newTally }));
-      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId), transitionType: msg.transitionType, durationMs: msg.durationMs });
+      broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc), transitionType: msg.transitionType, durationMs: msg.durationMs });
       await stromTransition(doc, fromPadTrans, msg.mixerInput, toStromTransition(msg.transitionType), msg.durationMs);
       if (curPgmPipTrans !== null && doc.stromFlowId && doc.mixerBlockId) {
         try {
@@ -841,6 +950,7 @@ export async function handleMessage(
       if (doc.stromFlowId && ctx.audioBlockId) {
         void applyAudioFollow(productionId, doc, msg.mixerInput, doc.stromFlowId, ctx.audioBlockId, await makeStromClient(), msg.afvRampUpMs, msg.afvRampDownMs);
       }
+      if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
       break;
     }
     case 'TAKE': {
@@ -876,7 +986,7 @@ export async function handleMessage(
       // reads this map, and it must hold the background the take just
       // broadcast even when Strom is unconfigured or its call throws.
       if (newPgmPip !== null) pgmBgByProduction.set(productionId, newPgmBg);
-      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: newPgmBg });
+      broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: newPgmPip, pvwPip: newPvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
       const takeTransition = toStromTransition(msg.transitionType ?? 'cut');
       if (curPvwPip !== null) {
@@ -936,6 +1046,7 @@ export async function handleMessage(
       if (doc.stromFlowId && ctx.audioBlockId) {
         void applyAudioFollow(productionId, doc, tally.pvw, doc.stromFlowId, ctx.audioBlockId, await makeStromClient(), msg.afvRampUpMs, msg.afvRampDownMs);
       }
+      if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
       break;
     }
     case 'SET_PVW': {
@@ -946,7 +1057,7 @@ export async function handleMessage(
       const newTally = { pgm: tally.pgm, pvw: msg.mixerInput };
       setTally(productionId, newTally);
       await persistMixerMutation(productionId, 'SET_PVW', (d) => ({ ...d, tally: newTally }));
-      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId) });
+      broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: pgmPipByProduction.get(productionId) ?? null, pvwPip: null, pips: pipConfigsByProduction.get(productionId) ?? [] });
       if (doc.stromFlowId && doc.mixerBlockId) {
         const inputIndex = padToIndex(msg.mixerInput);
@@ -959,6 +1070,7 @@ export async function handleMessage(
           }
         }
       }
+      if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
       break;
     }
     case 'SELECT_PVW_PIP': {
@@ -971,7 +1083,7 @@ export async function handleMessage(
       const newTally = { pgm: tally.pgm, pvw: null };
       setTally(productionId, newTally);
       await persistMixerMutation(productionId, 'SELECT_PVW_PIP', (d) => ({ ...d, tally: newTally }));
-      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId) });
+      broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: pgmPipByProduction.get(productionId) ?? null, pvwPip: msg.pip, pips: pipConfigsByProduction.get(productionId) ?? [] });
       if (doc.stromFlowId && doc.mixerBlockId) {
         try {
@@ -982,6 +1094,7 @@ export async function handleMessage(
           console.warn('[controller] Strom selectPreview (pip) error:', err);
         }
       }
+      if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
       break;
     }
     case 'SET_PIP': {
@@ -1794,6 +1907,20 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
         activeFlowIdByProduction.set(id, connectDoc.stromFlowId)
       }
 
+      // -----------------------------------------------------------------------
+      // Automation contract §4: Connect-time snapshot (spec §4).
+      // Emit HELLO first so clients know the contract version before any state.
+      // All snapshot frames are single-socket sends (not broadcast) because they
+      // are point-to-point resync, not production-wide state changes.
+      // -----------------------------------------------------------------------
+      socket.send(JSON.stringify({
+        type: 'HELLO',
+        contractVersion: CONTRACT_VERSION,
+        productionId: id,
+        seq: nextSeq(id),
+        ts: new Date().toISOString(),
+      }));
+
       // Restore tally from DB if not already in memory (e.g. after server restart)
       let tally = getTally(id);
       if (tally.pgm === null && tally.pvw === null && connectDoc?.tally) {
@@ -1802,7 +1929,15 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
           setTally(id, tally);
         }
       }
-      socket.send(JSON.stringify({ type: 'TALLY', ...tally, pgmBg: pgmBgOf(id) }));
+      // Send TALLY with full contribution-based fields (spec §3 + §4).
+      // The helper reads from in-memory maps which are already populated above.
+      {
+        const tallyPayload = connectDoc
+          ? buildTallyPayload(id, tally, connectDoc)
+          : { pgm: tally.pgm, pvw: tally.pvw, pgmBg: pgmBgOf(id), program: tally.pgm ? [tally.pgm] : [], preview: tally.pvw ? [tally.pvw] : [], contributions: [] as Array<{ source: string; role: string }> };
+        const seq = nextSeq(id);
+        socket.send(JSON.stringify({ type: 'TALLY', ...tallyPayload, seq, ts: new Date().toISOString() }));
+      }
 
       // Connect snapshot for the production lifecycle (issue #255, spec §3):
       // emit one PRODUCTION_STATUS with the current status + per-output health so a
@@ -2087,6 +2222,38 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
           console.warn('[controller] audio sync error:', err);
         }
       }
+
+      // -----------------------------------------------------------------------
+      // Automation contract §4: GRAPHIC_STATE snapshot (spec §4).
+      // This was the one piece missing from the original connect sync.
+      // Emits the active state of each graphics overlay so automation clients
+      // get the full picture on connect (not just changes thereafter).
+      // -----------------------------------------------------------------------
+      if (connectDoc) {
+        const graphicsState = (connectDoc.graphics ?? []).map((g) => ({
+          overlayId: g.id,
+          name: g.name,
+          active: g.active,
+        }));
+        socket.send(JSON.stringify({
+          type: 'GRAPHIC_STATE',
+          graphics: graphicsState,
+          seq: nextSeq(id),
+          ts: new Date().toISOString(),
+        }));
+      }
+
+      // -----------------------------------------------------------------------
+      // Automation contract §4: SNAPSHOT_END (spec §4).
+      // Signals to reconnecting automation clients that the resync is complete.
+      // seq echoes the last event seq emitted during this snapshot so the client
+      // can resume applying live broadcast events with seq > snapshotEnd.seq.
+      // -----------------------------------------------------------------------
+      socket.send(JSON.stringify({
+        type: 'SNAPSHOT_END',
+        seq: currentSeq(id),
+        ts: new Date().toISOString(),
+      }));
     }
   );
 };
