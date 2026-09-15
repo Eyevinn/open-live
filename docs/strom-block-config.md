@@ -14,6 +14,7 @@ Video vision mixer with DSK overlay support.
 |---|---|---|
 | `num_inputs` | string (enum) | `"2"`, `"4"`, `"6"`, `"8"`, `"10"` — **non-live**, set at creation |
 | `num_dsk_inputs` | string (enum) | `"0"`, `"1"`, `"2"` — number of downstream keyer inputs, **non-live** |
+| `dsk_N_alpha_mode` | string (enum) | `"straight"` (default), `"premultiplied"` — alpha of the source on `dsk_in_N`, **non-live**. Open Live sets `"premultiplied"` for every DSK input fed by `cefsrc`. Requires Eyevinn/strom#809; older Strom ignores it |
 | `pgm_resolution` | string (enum) | `"3840x2160"`, `"1920x1080"`, `"1280x720"`, `"720x576"`, `"720x480"` |
 | `multiview_resolution` | string (enum) | same values as `pgm_resolution` |
 | `pgm_framerate` | string (enum) | `"24000/1001"`, `"24/1"`, `"25/1"`, `"30000/1001"`, `"30/1"`, `"50/1"`, `"60000/1001"`, `"60/1"` |
