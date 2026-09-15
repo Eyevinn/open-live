@@ -8,6 +8,8 @@ import { getTally, setTally, subscribe, unsubscribe, broadcast } from '../servic
 import { startMeterRelay, stopMeterRelay } from '../services/meter-relay.js';
 import { StromClient, StromClientError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms, type VideoEffect, type EffectTarget, type SetVideoEffectRequest } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
+import { graphicUrl } from '../lib/url-validation.js';
+import { decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
 import { config } from '../config.js';
 import { notifySubscriberJoin } from '../services/idle-watchdog.js';
 import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
@@ -37,7 +39,7 @@ const RATE_LIMIT_EXPENSIVE_MAX = 5;
 const RATE_LIMIT_WINDOW_MS = 1000;
 
 /** Message types whose processing is expensive enough to warrant a tighter cap. */
-const EXPENSIVE_MESSAGE_TYPES = new Set(['MACRO_EXEC', 'GO_LIVE', 'CUT_STREAM']);
+const EXPENSIVE_MESSAGE_TYPES = new Set(['MACRO_EXEC', 'GO_LIVE', 'CUT_STREAM', 'HTML_SOURCE_EVENT']);
 
 /** Per-connection sliding-window timestamps. Lives on the connection ctx so it
  * is garbage-collected when the socket closes (no global registry to leak). */
@@ -157,7 +159,8 @@ type InboundMessage =
   | { type: 'LOUDNESS_RESET' }
   | { type: 'SELECT_PVW_PIP'; pip: number }
   | { type: 'SET_PIP'; pip: number; bg: number | null; zones: PipZone[]; transforms?: PipTransforms }
-  | { type: 'SET_EFFECT'; target: EffectTarget; effect: VideoEffect };
+  | { type: 'SET_EFFECT'; target: EffectTarget; effect: VideoEffect }
+  | { type: 'HTML_SOURCE_EVENT'; sourceId: string; params: Record<string, string>; mode?: 'replace' | 'merge' };
 
 // ---------------------------------------------------------------------------
 // Runtime schema validation for inbound WS messages
@@ -256,6 +259,19 @@ const InboundMessageSchema = z.discriminatedUnion('type', [
       z.object({ type: z.literal('color_correct'), brightness: z.number().optional(), contrast: z.number().optional(), saturation: z.number().optional(), hue: z.number().optional(), gamma: z.number().optional(), temperature: z.number().optional(), tint: z.number().optional() }),
     ]),
   }),
+  // Generic HTML-source event-forwarding surface (issue #268, spec
+  // docs/specs/html-source-event-forwarding.md). Thin transport only: params
+  // are opaque key/value query parameters — Open Live never interprets graphic
+  // semantics. The resulting effective URL is re-validated with graphicUrl().
+  z.object({
+    type: z.literal('HTML_SOURCE_EVENT'),
+    sourceId: z.string().min(1).max(128),          // references SourceDoc._id ("src-<uuid>")
+    params: z.record(
+      z.string().min(1).max(64),                   // param key
+      z.string().max(1024),                        // param value (opaque to Open Live)
+    ),
+    mode: z.enum(['replace', 'merge']).default('merge').optional(),
+  }),
 ]);
 
 // ---------------------------------------------------------------------------
@@ -269,6 +285,49 @@ const InboundMessageSchema = z.discriminatedUnion('type', [
 function padToIndex(mixerInput: string): number | null {
   const match = /video_in_(\d+)$/.exec(mixerInput);
   return match ? parseInt(match[1], 10) : null;
+}
+
+/**
+ * Computes the effective HTML-source URL from a base address and forwarded
+ * params (issue #268). `merge` updates/adds the given keys on the base URL's
+ * current query; `replace` sets the query to exactly `params`. The resulting
+ * URL is re-validated with `graphicUrl()` — the same SSRF/scheme gate that
+ * guards source creation — so event-forwarding cannot smuggle a private-IP
+ * host, a `javascript:`/`file:` scheme, or a `data:text/html` target past it.
+ *
+ * Exported for tests. Throws on an unparseable base address, an oversized
+ * query, or a `graphicUrl()` rejection.
+ */
+export function buildHtmlSourceUrl(
+  baseAddress: string,
+  currentParams: Record<string, string>,
+  params: Record<string, string>,
+  mode: 'replace' | 'merge',
+): { effectiveUrl: string; params: Record<string, string> } {
+  let parsed: URL;
+  try {
+    parsed = new URL(baseAddress);
+  } catch {
+    throw new Error('HTML source address is not a valid URL');
+  }
+  // Effective params: 'replace' uses exactly the incoming params; 'merge'
+  // layers the incoming params over the current effective set.
+  const effective: Record<string, string> =
+    mode === 'replace' ? { ...params } : { ...currentParams, ...params };
+
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(effective)) {
+    search.set(key, value);
+  }
+  const query = search.toString();
+  if (query.length > HTML_SOURCE_MAX_QUERY_LENGTH) {
+    throw new Error('HTML source query too long');
+  }
+  parsed.search = query;
+  const effectiveUrl = parsed.toString();
+  // Re-validate the resulting URL — non-negotiable SSRF guard (spec Risks).
+  graphicUrl(effectiveUrl);
+  return { effectiveUrl, params: effective };
 }
 
 function toStromTransition(type: string): StromTransitionType {
@@ -437,6 +496,22 @@ const overlayAlphaByProduction = new Map<string, number>()
 const dskLayersByProduction    = new Map<string, Record<number, boolean>>()
 
 /**
+ * Effective HTML-source query parameters per production, keyed by sourceId
+ * (SourceDoc._id). Transient in-memory operator state — mirrors
+ * `overlayAlphaByProduction` (issue #268, ADR-002): replayed on connect,
+ * reset on server restart, never persisted to CouchDB.
+ */
+interface HtmlSourceState {
+  params: Record<string, string>;
+  effectiveUrl: string;
+  updatedAt: string;
+}
+const htmlSourceParamsByProduction = new Map<string, Map<string, HtmlSourceState>>()
+
+/** Max serialized query length applied to a forwarded HTML-source URL. Bounds cefsrc URL size. */
+const HTML_SOURCE_MAX_QUERY_LENGTH = 4096;
+
+/**
  * PVW mixer-input pad that was on PVW immediately before SELECT_PVW_PIP was
  * received.  Stored so the PiP TAKE can pass it as `to_input` to Strom,
  * which becomes Strom's `pgm_input` (real background behind the PiP) after
@@ -500,6 +575,7 @@ export function clearPipState(productionId: string): void {
   pgmBgByProduction.delete(productionId)
   overlayAlphaByProduction.delete(productionId)
   dskLayersByProduction.delete(productionId)
+  htmlSourceParamsByProduction.delete(productionId)
   broadcast(productionId, {
     type: 'PIP_STATE',
     pgmPip: null,
@@ -1578,6 +1654,93 @@ export async function handleMessage(
       }
       break;
     }
+    case 'HTML_SOURCE_EVENT': {
+      // Thin, generic event-forwarding surface for HTML sources (issue #268,
+      // spec docs/specs/html-source-event-forwarding.md). Open Live stays a
+      // transport: it only mutates the source's effective URL query string and
+      // reloads the running cefsrc — no per-graphic logic.
+      const mode: 'replace' | 'merge' = msg.mode ?? 'merge';
+
+      // The production must be active (a running flow) for a live reload.
+      if (!doc.stromFlowId) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Production is not activated' }));
+        break;
+      }
+
+      // Resolve the source assignment (sourceId → mixerInput) on this production.
+      const assignment = doc.sources.find((s) => s.sourceId === msg.sourceId);
+      if (!assignment) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Source not found in production' }));
+        break;
+      }
+
+      // Fetch the SourceDoc to confirm it is an HTML source and get its base URL.
+      let sourceDoc;
+      try {
+        sourceDoc = await getSourcesDb().get(msg.sourceId);
+      } catch {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Source not found' }));
+        break;
+      }
+      if (sourceDoc.streamType !== 'html') {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Source is not an HTML source' }));
+        break;
+      }
+      // HTML addresses are stored plaintext (only SRT passphrases are encrypted),
+      // but decrypt defensively for parity with the flow generator.
+      const baseAddress = decryptAddressPassphrase(sourceDoc.address);
+
+      // Compute effective params + URL, re-validating through graphicUrl().
+      const bySource = htmlSourceParamsByProduction.get(productionId);
+      const currentParams = bySource?.get(msg.sourceId)?.params ?? {};
+      let effectiveUrl: string;
+      let effectiveParams: Record<string, string>;
+      try {
+        const built = buildHtmlSourceUrl(baseAddress, currentParams, msg.params, mode);
+        effectiveUrl = built.effectiveUrl;
+        effectiveParams = built.params;
+      } catch (err) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: err instanceof Error ? err.message : 'Invalid HTML source URL' }));
+        break;
+      }
+
+      // Reload the running cefsrc element by updating its `url` property live.
+      // The element id is deterministic (flow-generator.ts:527):
+      //   e-html-<padIndex>-<endpointSuffix>
+      // where padIndex derives from the mixerInput (video_in_N) and
+      // endpointSuffix from the production id.
+      const padIndex = padToIndex(assignment.mixerInput);
+      if (padIndex === null) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Source has no mixer input' }));
+        break;
+      }
+      const endpointSuffix = productionId.replace(/^prod-/, '').slice(0, 8);
+      const elementId = `e-html-${padIndex}-${endpointSuffix}`;
+      try {
+        const strom = await makeStromClient();
+        await strom.properties.updateElement(doc.stromFlowId, elementId, {
+          property_name: 'url',
+          value: effectiveUrl,
+        });
+      } catch (err) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: `HTML source reload failed: ${stromErrorMessage(err)}` }));
+        break;
+      }
+
+      // Persist effective state in the per-production in-memory registry and echo.
+      const updatedAt = new Date().toISOString();
+      const map = htmlSourceParamsByProduction.get(productionId) ?? new Map<string, HtmlSourceState>();
+      map.set(msg.sourceId, { params: effectiveParams, effectiveUrl, updatedAt });
+      htmlSourceParamsByProduction.set(productionId, map);
+      broadcast(productionId, {
+        type: 'HTML_SOURCE_STATE',
+        sourceId: msg.sourceId,
+        params: effectiveParams,
+        effectiveUrl,
+        updatedAt,
+      });
+      break;
+    }
     default: {
       ws.send(JSON.stringify({ type: 'ERROR', error: 'Unknown message type' }));
     }
@@ -1664,6 +1827,21 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
       const cachedAlpha = overlayAlphaByProduction.get(id);
       if (cachedAlpha !== undefined) {
         socket.send(JSON.stringify({ type: 'OVL_STATE', alpha: cachedAlpha }));
+      }
+
+      // Replay current HTML-source forwarded params so a freshly-connected
+      // Studio/Companion client shows the effective parameters (issue #268).
+      const cachedHtmlParams = htmlSourceParamsByProduction.get(id);
+      if (cachedHtmlParams) {
+        for (const [sourceId, state] of cachedHtmlParams) {
+          socket.send(JSON.stringify({
+            type: 'HTML_SOURCE_STATE',
+            sourceId,
+            params: state.params,
+            effectiveUrl: state.effectiveUrl,
+            updatedAt: state.updatedAt,
+          }));
+        }
       }
 
       // Sync PiP state from in-memory server cache (populated by SET_PIP / SELECT_PVW_PIP).
