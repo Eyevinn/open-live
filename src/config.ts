@@ -101,7 +101,7 @@ export const config = {
    * Number of consecutive SRT listener ports to lease from the shared Strom
    * instance at startup. Listener sources must use a port inside the leased range.
    */
-  stromPortLeaseSize: parsePositiveIntEnv('STROM_PORT_LEASE_SIZE', 20),
+  stromPortLeaseSize: parsePositiveIntEnv('STROM_PORT_LEASE_SIZE', 10),
   /**
    * Optional override for the lease client id sent to Strom. Defaults to the
    * hostname of PUBLIC_BASE_URL, or `open-live-<hostname>` when that is unset.
