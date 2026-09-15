@@ -67,6 +67,48 @@ function extractSubprotocolKey(header: string | string[] | undefined): string | 
   return undefined;
 }
 
+// How a request presented its API key, for forensic audit logging (#51). This
+// mirrors the two transports the auth hook accepts: the `Authorization: Bearer`
+// header (REST / non-browser clients) and the `openlive.bearer.<key>`
+// Sec-WebSocket-Protocol subprotocol (browser WS clients, #49). 'none' means no
+// credential was presented on the request.
+type AuthMethod = 'bearer' | 'ws-subprotocol' | 'none';
+
+/**
+ * Masks an API key for audit logging so a suspected-compromise investigation
+ * can correlate which key was used WITHOUT ever persisting the secret itself.
+ * Only a short suffix survives: `key_***<last4>`. Keys too short to safely
+ * reveal a suffix (<8 chars) are fully masked as `key_***`.
+ */
+function maskCredential(key: string): string {
+  if (key.length < 8) return 'key_***';
+  return `key_***${key.slice(-4)}`;
+}
+
+/**
+ * Derives the authentication context for an audit entry from the request
+ * headers, truthfully reflecting how THIS server authenticates (#51):
+ *   - `Authorization: Bearer <key>`            -> 'bearer'
+ *   - `openlive.bearer.<key>` WS subprotocol   -> 'ws-subprotocol'
+ *   - neither present                          -> 'none'
+ * `maskedCred` is only set when a credential was actually presented, and never
+ * contains the raw key — only the `maskCredential` suffix form.
+ */
+function deriveAuthContext(
+  authorization: string | undefined,
+  subprotocol: string | string[] | undefined
+): { authMethod: AuthMethod; maskedCred?: string } {
+  const bearerKey = authorization?.startsWith('Bearer ') ? authorization.slice(7) : undefined;
+  if (bearerKey) {
+    return { authMethod: 'bearer', maskedCred: maskCredential(bearerKey) };
+  }
+  const subprotocolKey = extractSubprotocolKey(subprotocol);
+  if (subprotocolKey) {
+    return { authMethod: 'ws-subprotocol', maskedCred: maskCredential(subprotocolKey) };
+  }
+  return { authMethod: 'none' };
+}
+
 export async function buildServer() {
   const fastify = Fastify({
     logger: {
@@ -269,12 +311,21 @@ export async function buildServer() {
     if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return;
     if (!req.url.startsWith('/api/v1')) return;
     const ip = req.ip ?? '';
+    // Record which credential authenticated the request (#51) so a suspected
+    // key compromise can be traced. maskedCred only ever carries a masked
+    // suffix — the raw key is never logged.
+    const { authMethod, maskedCred } = deriveAuthContext(
+      req.headers['authorization'],
+      req.headers['sec-websocket-protocol']
+    );
     fastify.log.info({
       audit: true,
       method: req.method,
       url: req.url.split('?')[0],
       status: reply.statusCode,
       ip,
+      authMethod,
+      ...(maskedCred ? { maskedCred } : {}),
     }, 'audit');
   });
 
