@@ -113,6 +113,7 @@ otherwise ignored. The inbound type union (`src/ws/controller.ts`):
 | `SELECT_PVW_PIP` | `pip: number` | Select a PiP slot into preview |
 | `SET_PIP` | `pip: number`, `bg: number \| null`, `zones: PipZone[]`, `transforms?: PipTransforms` | Configure a PiP slot |
 | `SET_EFFECT` | `target: EffectTarget`, `effect: VideoEffect` | Set a video effect on an input or master |
+| `HTML_SOURCE_EVENT` | `sourceId: string`, `params: Record<string,string>`, `mode?: 'merge' \| 'replace'` | Forward operator params into an HTML source's URL query and reload the running `cefsrc`. `merge` (default) updates/adds keys on the current effective query; `replace` sets it to exactly `params`. The resulting URL is re-validated with `graphicUrl()` (SSRF/scheme gate). |
 
 `VideoEffect` (the `effect` field of `SET_EFFECT`) is itself a discriminated union on
 its own `type`: `none`, `chroma_key`, `pixelate`, `blur`, `duotone`, `vignette`, `vhs`,
@@ -152,6 +153,7 @@ are emitted from `src/ws/controller.ts` and `src/services/meter-relay.ts`:
 | `SOURCE_OFFSET_STATE` | `mixerInput: string`, `offsetMs: number` | A per-source video offset changes; also replayed on connect |
 | `SOURCE_AUDIO_OFFSET_STATE` | `mixerInput: string`, `offsetMs: number` | A per-source audio offset changes; also replayed on connect |
 | `FX_STATE` | `fxAvailable: boolean`, `inputEffects: VideoEffect[]`, `masterEffect: VideoEffect` | Video-effect state changes; also sent on connect |
+| `HTML_SOURCE_STATE` | `sourceId: string`, `params: Record<string,string>`, `effectiveUrl: string`, `updatedAt: string` | An HTML source's forwarded params changed (after a successful `HTML_SOURCE_EVENT`); also replayed on connect. In-memory only — resets on server restart. |
 | `METER_DATA` | `elementId: string`, `peak`, `rms` | Audio meter tick (relayed from Strom); `elementId` is `main`, `monitor`, `ch{N}`, `aux{N}`, or `grp{N}` |
 | `LOUDNESS_DATA` | `elementId: 'main'`, `momentary`, `shortterm`, `integrated`, `loudness_range`, `true_peak` | EBU R128 loudness tick (relayed from Strom) |
 | `ERROR` | `error: string` | An inbound frame was invalid or an operation failed (sent to originating socket) |
@@ -169,7 +171,8 @@ state to the new socket before any further broadcasts: `TALLY`, `OVL_STATE` (if 
 `PIP_STATE`, any `DSK_STATE` layers, per-channel and master `AUDIO_STATE` /
 `AUX_MASTER_STATE` / `GRP_MASTER_STATE` / `MONITOR_STATE`, `AUX_SEND_STATE`,
 `GRP_SEND_STATE` (or `GRP_STATE_RESET`), `AFV_STATE`, `PFL_STATE` / `AFL_STATE`,
-`SOURCE_OFFSET_STATE` / `SOURCE_AUDIO_OFFSET_STATE`, `AFV_RAMP_STATE`, and `FX_STATE`.
+`SOURCE_OFFSET_STATE` / `SOURCE_AUDIO_OFFSET_STATE`, `AFV_RAMP_STATE`, `FX_STATE`, and
+`HTML_SOURCE_STATE` (per HTML source with forwarded params).
 This lets a freshly-connected client rebuild the full control state without sending
 any inbound messages. See the connect handler in `src/ws/controller.ts` for the exact
 ordering.
