@@ -40,6 +40,9 @@ export interface ActivationResult {
   sourceAudioOffsetBlockIds: Record<string, string>;
 }
 
+/** `builtin.mixer`'s own `min_upstream_latency` default (strom `types/src/mixer.rs`). */
+const STROM_MIXER_MIN_UPSTREAM_LATENCY_MS = 30;
+
 function findPgmFeedPad(flow: FlowTopology): string | null {
   const existingOutput = flow.blocks.find(
     (b) => (b as Record<string, unknown>)['block_definition_id'] === 'builtin.mpegtssrt_output',
@@ -426,11 +429,16 @@ export async function activateStromFlow(
   // Compute the highest latency across all SRT/EFP sources. Each source keeps its
   // own configured latency; the max is used only to set min_upstream_latency on the
   // mixers so the aggregators never starve waiting for the slowest source.
+  //
+  // min_upstream_latency is a floor: program delay pays for it whenever it is above
+  // what the mixer inputs report. Without SRT/EFP sources the inputs report next to
+  // nothing (a WHIP slot's jitterbuffer runs before Strom restamps its buffers), so
+  // a 125 ms floor would be pure added delay. Use Strom's own mixer default instead.
   const srtLatencies = sortedAssignments
     .map((a) => sourceMap.get(a.sourceId) ?? (VIRTUAL_SOURCES[a.sourceId] as SourceDoc | undefined))
     .filter((s): s is SourceDoc => !!s && s.streamType !== 'test1' && s.streamType !== 'test2' && s.streamType !== 'whip' && s.streamType !== 'html')
     .map((s) => s.latency ?? 125);
-  const maxSourceLatency = srtLatencies.length > 0 ? Math.max(...srtLatencies) : 125;
+  const maxSourceLatency = srtLatencies.length > 0 ? Math.max(...srtLatencies) : STROM_MIXER_MIN_UPSTREAM_LATENCY_MS;
 
   if (mixerBlock) {
     const props = (mixerBlock['properties'] ?? {}) as Record<string, unknown>;
