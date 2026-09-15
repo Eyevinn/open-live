@@ -5,6 +5,8 @@ import { getOutputsDb, getDb } from '../db/index.js';
 import type { OutputDoc, ProductionDoc } from '../db/types.js';
 import { updateProductionDoc } from './productions.js';
 import { srtUrl } from '../lib/url-validation.js';
+import { resolveSrtConnect } from '../lib/srt-connect.js';
+import { config } from '../config.js';
 import { getPortLease } from '../services/port-lease.js';
 import { clashesAfterWrite, listenerPortRequest, resolveListenerAddress, usedListenerPorts } from '../services/listener-ports.js';
 
@@ -31,7 +33,18 @@ const OutputPatch = z.object({
 
 function toApi(doc: OutputDoc) {
   const { _id, _rev, type, ...rest } = doc;
-  return { id: _id, ...rest };
+  const api: Record<string, unknown> = { id: _id, ...rest };
+  // Surface a read-only, derived dial-in address for SRT outputs so operators
+  // can see the connectable host, not just the bind port (issue #176). Omitted
+  // for whep outputs and for SRT outputs with no bind URL (those are inert).
+  if (SRT_OUTPUT_TYPES.has(doc.outputType) && doc.url) {
+    const connect = resolveSrtConnect(doc.url, {
+      stromUrl: config.stromUrl,
+      srtPublicHost: config.srtPublicHost,
+    });
+    if (connect) api['connect'] = connect;
+  }
+  return api;
 }
 
 const outputsRoutes: FastifyPluginAsync = async (fastify) => {
