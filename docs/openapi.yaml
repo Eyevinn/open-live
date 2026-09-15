@@ -178,12 +178,50 @@ components:
           $ref: '#/components/schemas/OutputType'
         url:
           type: string
+          description: >-
+            Operator-authored SRT bind/listen URI (e.g. srt://:43524?mode=listener).
+            Undefined for whep outputs. Round-tripped by POST/PATCH.
+        connect:
+          $ref: '#/components/schemas/SrtConnect'
         createdAt:
           type: string
           format: date-time
         updatedAt:
           type: string
           format: date-time
+
+    SrtConnect:
+      type: object
+      description: >-
+        Read-only, server-derived dial-in address an external SRT caller uses to
+        reach this output. Present only on mpegtssrt/efpsrt outputs that have a
+        well-formed bind URL. `uri`/`host` are null (with a `reason`) when the
+        Strom SRT host cannot be resolved server-side; `port` is always present.
+      required: [uri, host, port, mode, source]
+      properties:
+        uri:
+          type: string
+          nullable: true
+          description: Assembled srt://host:port?mode=… dial-in string, or null when host is unresolved.
+        host:
+          type: string
+          nullable: true
+          description: Resolved SRT host external callers dial, or null when unresolved.
+        port:
+          type: integer
+          description: SRT port parsed from the authored bind URI.
+        mode:
+          type: string
+          enum: [caller, listener]
+          description: The SRT mode the EXTERNAL side should use (inverse of the authored mode).
+        source:
+          type: string
+          enum: [authored-host, srt-public-host, strom-host, unknown]
+          description: Provenance of the resolved host.
+        reason:
+          type: string
+          enum: [srt-host-not-configured, srt-host-not-loopback-reachable, strom-url-not-parseable]
+          description: Present only when `uri` is null — why the host could not be resolved.
 
     OutputInput:
       type: object

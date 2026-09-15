@@ -72,6 +72,20 @@ export const config = {
    */
   publicBaseUrl: process.env['PUBLIC_BASE_URL'] ?? undefined,
   /**
+   * Optional public hostname on which the shared Strom instance's SRT listener
+   * ports are reachable from external SRT callers. Used to build the read-only
+   * `connect` dial-in address surfaced on `mpegtssrt`/`efpsrt` outputs.
+   *
+   * The SRT-facing host is conceptually independent of the HTTP API host
+   * (`STROM_URL`): the SRT listener is a separate raw transport port, and in
+   * NATed / shared-GPU topologies it may be published on a different hostname.
+   * When unset, the host is derived from the `STROM_URL` hostname; when that is
+   * loopback/private the `connect` address is returned as `null` with a reason
+   * rather than emitting a misleading address. Set this to override for
+   * deployments where the SRT port is reachable on a distinct public host.
+   */
+  srtPublicHost: process.env['SRT_PUBLIC_HOST'] || undefined,
+  /**
    * Optional allow-list of hostnames that may be used to build request-derived
    * WHIP callback URLs when PUBLIC_BASE_URL is not set. Comma-separated
    * (e.g. "live.example.com,live2.example.com"). When set, a request whose
