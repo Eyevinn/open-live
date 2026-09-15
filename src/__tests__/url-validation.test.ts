@@ -217,7 +217,43 @@ describe('srtUrl', () => {
   });
 
   it('accepts safe query params', () => {
-    expect(() => srtUrl('srt://example.com:9999?passphrase=abc123&mode=caller')).not.toThrow();
+    expect(() => srtUrl('srt://example.com:9999?passphrase=abcdef1234&mode=caller')).not.toThrow();
+  });
+
+  describe('passphrase length (issue #261)', () => {
+    // Build an SRT URL with a passphrase of exactly `len` chars.
+    const withPass = (len: number) => `srt://example.com:9999?passphrase=${'a'.repeat(len)}&mode=caller`;
+
+    it('rejects a passphrase shorter than 10 chars with an actionable message', () => {
+      // 6 chars — the reproduction from the issue ("hejsan").
+      expect(() => srtUrl('srt://example.com:9999?passphrase=hejsan')).toThrow(/passphrase must be 10–79 characters/i);
+      expect(() => srtUrl(withPass(9))).toThrow(/passphrase must be 10–79 characters/i);
+    });
+
+    it('accepts a passphrase at the lower boundary (10 chars)', () => {
+      expect(() => srtUrl(withPass(10))).not.toThrow();
+    });
+
+    it('accepts a passphrase at the upper boundary (79 chars)', () => {
+      expect(() => srtUrl(withPass(79))).not.toThrow();
+    });
+
+    it('rejects a passphrase longer than 79 chars', () => {
+      expect(() => srtUrl(withPass(80))).toThrow(/passphrase must be 10–79 characters/i);
+    });
+
+    it('allows an SRT URL with no passphrase param', () => {
+      expect(() => srtUrl('srt://example.com:9999?mode=caller')).not.toThrow();
+    });
+
+    it('allows an empty passphrase param (treated as no encryption)', () => {
+      expect(() => srtUrl('srt://example.com:9999?passphrase=&mode=caller')).not.toThrow();
+    });
+
+    it('applies the same rule to the listener form used by outputs', () => {
+      expect(() => srtUrl('srt://:47110?mode=listener&passphrase=short')).toThrow(/passphrase must be 10–79 characters/i);
+      expect(() => srtUrl('srt://:47110?mode=listener&passphrase=longenough1')).not.toThrow();
+    });
   });
 
   it('rejects CR/LF injection in the query string', () => {
