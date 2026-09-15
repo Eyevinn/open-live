@@ -45,9 +45,25 @@ components:
         it is only accepted when MinIO/S3 is configured, otherwise creating a
         recording output returns 400.
 
+    OutputStatus:
+      type: string
+      description: >-
+        Derived output health (issue #255). `healthy` = the owning production is
+        active with a running flow; `down` = not running; `unknown` = health
+        could not be determined (or field absent, which is equivalent to
+        `unknown`). `degraded` is reserved in the enum for a future per-output
+        signal and is never emitted today. Clients must ignore unknown enum
+        values (forward-compat).
+      enum: [healthy, degraded, down, unknown]
+
     ProductionStatus:
       type: string
-      enum: [active, inactive, activating]
+      description: >-
+        Production lifecycle status. `ended` (issue #255) means the production
+        ran a broadcast that has finished, distinct from `inactive` (never
+        started / clean idle). Clients must ignore unknown enum values
+        (forward-compat).
+      enum: [active, inactive, activating, ended]
 
     MacroActionType:
       type: string
@@ -188,6 +204,13 @@ components:
             Undefined for whep outputs. Round-tripped by POST/PATCH.
         connect:
           $ref: '#/components/schemas/SrtConnect'
+        status:
+          allOf:
+            - $ref: '#/components/schemas/OutputStatus'
+          description: >-
+            Derived output health (issue #255). Read-only; computed on read from
+            the owning production's live flow state, not persisted. Optional —
+            an absent value is equivalent to `unknown`.
         createdAt:
           type: string
           format: date-time

@@ -12,6 +12,7 @@ import { clearPipState, clearAudioState, clearFxState } from '../ws/controller.j
 import { config, isRecordingEnabled } from '../config.js';
 import { minioTargetFromConfig, uploadRecordings } from '../lib/recording-uploader.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
+import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type OutputStatusEntry } from '../lib/production-health.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -138,6 +139,41 @@ export async function updateProductionDoc(
       throw err;
     }
   }
+}
+
+/**
+ * Derive the per-output health snapshot for a production from its own state
+ * (issue #255). The signal is flow-level, so every assigned output shares the
+ * same derived status. A production reads as running when it is `active` with a
+ * live `stromFlowId`; the caller passes `stromKnown` (false only when Strom
+ * state genuinely could not be observed — e.g. reconcile lost contact).
+ */
+export function outputSnapshotForProduction(
+  doc: Pick<ProductionDoc, 'status' | 'stromFlowId' | 'outputAssignments'>,
+  opts: { stromKnown?: boolean } = {},
+): OutputStatusEntry[] {
+  const productionActive = doc.status === 'active';
+  return deriveOutputSnapshot({
+    outputIds: (doc.outputAssignments ?? []).map((a) => a.outputId),
+    stromKnown: opts.stromKnown ?? true,
+    productionActive,
+    flowRunning: productionActive && !!doc.stromFlowId,
+  });
+}
+
+/**
+ * Broadcast the `PRODUCTION_STATUS` lifecycle event (spec §3) to the production's
+ * WS subscriber set. Reuses the existing `broadcast()` fan-out (which stamps
+ * `ts`). Emitted whenever the production's `ProductionStatus` changes.
+ */
+export function emitProductionStatus(
+  doc: Pick<ProductionDoc, '_id' | 'status' | 'stromFlowId' | 'outputAssignments'>,
+  opts: { stromKnown?: boolean } = {},
+): void {
+  broadcast(
+    doc._id,
+    buildProductionStatusEvent(doc._id, doc.status, outputSnapshotForProduction(doc, opts)),
+  );
 }
 
 /**
@@ -343,6 +379,14 @@ async function runActivationFlow(
         });
 
         notifyProductionActivated(productionId);
+        // Emit the PRODUCTION_STATUS lifecycle event for the active transition
+        // (spec §3). Flow is playing, so all assigned outputs derive as healthy.
+        emitProductionStatus({
+          _id: productionId,
+          status: 'active',
+          stromFlowId,
+          outputAssignments: doc.outputAssignments,
+        });
         log.info({ productionId, stromFlowId, whepEndpoint, initialTally, audioMixerBlockId }, 'Production activated — flow playing');
         return;
       }
@@ -640,16 +684,20 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       // does not leave the production stuck mid-activation.
       const publicBaseUrl = resolvePublicBaseUrl(req);
 
-      // Transition to 'activating' immediately and respond; clear any deletion warnings
+      // Transition to 'activating' immediately and respond; clear any deletion
+      // warnings and any prior ended/auto-deactivated markers (cleared on next
+      // activation, spec §Data Model).
       const activatingDoc: ProductionDoc = {
         ...doc,
         status: 'activating',
         deletionWarnings: undefined,
         autoDeactivated: undefined,
+        endedReason: undefined,
         updatedAt: new Date().toISOString(),
       };
       const insertResponse = await getDb().insert(activatingDoc);
       notifyProductionActivated(doc._id);
+      emitProductionStatus(activatingDoc);
 
       // Set up AbortController so deactivate can cancel the polling loop
       const abortController = new AbortController();
@@ -735,9 +783,15 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         await deactivateStromFlow(doc.stromFlowId, strom);
       }
 
+      // Transition rule (spec §1): a production that was `active` (reached a live
+      // broadcast) and is now explicitly deactivated becomes `ended`; one that
+      // never reached `active` (still `activating`) becomes `inactive` — it never
+      // broadcast, so there is nothing to "end".
+      const nextStatus = stoppedStatus(doc.status);
       const updated: ProductionDoc = {
         ...doc,
-        status: 'inactive',
+        status: nextStatus,
+        endedReason: nextStatus === 'ended' ? 'deactivated' : undefined,
         stromFlowId: undefined,
         mixerBlockId: undefined,
         audioMixerBlockId: undefined,
@@ -755,6 +809,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       };
       const response = await getDb().insert(updated);
       notifyProductionDeactivated(doc._id);
+      emitProductionStatus(updated);
       return reply.send({ id: updated._id, name: updated.name, status: updated.status, _rev: response.rev });
     } catch (err) {
       req.log.error({ err }, 'Deactivation failed');

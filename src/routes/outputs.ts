@@ -2,8 +2,9 @@ import type { FastifyPluginAsync } from 'fastify';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { getOutputsDb, getDb } from '../db/index.js';
-import type { OutputDoc, ProductionDoc } from '../db/types.js';
+import type { OutputDoc, ProductionDoc, OutputStatus } from '../db/types.js';
 import { updateProductionDoc } from './productions.js';
+import { deriveOutputStatus } from '../lib/production-health.js';
 import { srtUrl } from '../lib/url-validation.js';
 import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
 import { resolveSrtConnect } from '../lib/srt-connect.js';
@@ -12,6 +13,46 @@ import { getPortLease } from '../services/port-lease.js';
 import { clashesAfterWrite, listenerPortRequest, resolveListenerAddress, usedListenerPorts } from '../services/listener-ports.js';
 
 const SRT_OUTPUT_TYPES = new Set(['mpegtssrt', 'efpsrt']);
+
+/**
+ * Set of output IDs that are currently live: assigned to a production that is
+ * `active` with a running Strom flow. Used to derive `Output.status` (issue
+ * #255). Returns `null` when the production DB is unreachable, so callers can
+ * surface `unknown` rather than incorrectly reporting `down`.
+ */
+async function liveOutputIds(
+  log: { warn: (obj: unknown, msg: string) => void },
+): Promise<Set<string> | null> {
+  try {
+    // findTrusted: literal selector written here, no request data (#257)
+    const result = await getDb().findTrusted({
+      selector: { type: 'production', status: 'active' },
+      fields: ['stromFlowId', 'outputAssignments'],
+      limit: 200,
+    });
+    const live = new Set<string>();
+    for (const p of result.docs as unknown as ProductionDoc[]) {
+      if (!p.stromFlowId) continue; // active but no live flow → not healthy
+      for (const a of p.outputAssignments ?? []) live.add(a.outputId);
+    }
+    return live;
+  } catch (err) {
+    log.warn({ err }, 'outputs — could not query productions for health derivation');
+    return null;
+  }
+}
+
+/**
+ * Derive an output's health from the live-output set (issue #255). `null` means
+ * the production DB was unreachable → `unknown`; otherwise membership decides
+ * `healthy` vs `down`. The signal is flow-level, so all outputs of a running,
+ * playing production read `healthy` uniformly.
+ */
+function outputStatusFor(outputId: string, live: Set<string> | null): OutputStatus {
+  if (live === null) return deriveOutputStatus({ stromKnown: false, productionActive: false, flowRunning: false });
+  const isLive = live.has(outputId);
+  return deriveOutputStatus({ stromKnown: true, productionActive: isLive, flowRunning: isLive });
+}
 
 const OutputInput = z.object({
   name: z.string().min(1).max(256),
@@ -37,8 +78,8 @@ function maskSrtPassphrase(url: string): string {
   return url.replace(/([?&]passphrase=)[^&]*/gi, '$1***');
 }
 
-function toApi(doc: OutputDoc) {
-  const { _id, _rev, type, ...rest } = doc;
+function toApi(doc: OutputDoc, status?: OutputStatus) {
+  const { _id, _rev, type, status: _persistedStatus, ...rest } = doc;
   const api: Record<string, unknown> = { id: _id, ...rest };
   // Passphrases are stored encrypted (encv1:...); decrypt before masking so the
   // mask matches on the "passphrase=" param regardless of storage form. Legacy
@@ -58,6 +99,9 @@ function toApi(doc: OutputDoc) {
     });
     if (connect) api['connect'] = connect;
   }
+  // Derived output health (issue #255). Computed on read from the owning
+  // production's live flow state, not persisted, so it is always current.
+  if (status !== undefined) api['status'] = status;
   return api;
 }
 
@@ -71,7 +115,12 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       fastify.log.warn({ err }, 'GET /api/v1/outputs — DB query failed');
       return reply.status(503).send({ error: 'Database unavailable' });
     }
-    return reply.send((Array.isArray(result?.docs) ? result.docs : []).map(toApi));
+    const live = await liveOutputIds(fastify.log);
+    return reply.send(
+      (Array.isArray(result?.docs) ? result.docs : []).map((doc) =>
+        toApi(doc, outputStatusFor(doc._id, live)),
+      ),
+    );
   });
 
   fastify.post('/api/v1/outputs', async (req, reply) => {
@@ -125,7 +174,8 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get<{ Params: { id: string } }>('/api/v1/outputs/:id', async (req, reply) => {
     try {
       const doc = await getOutputsDb().get(req.params.id);
-      return reply.send(toApi(doc));
+      const live = await liveOutputIds(fastify.log);
+      return reply.send(toApi(doc, outputStatusFor(doc._id, live)));
     } catch {
       return reply.status(404).send({ error: 'Output not found', statusCode: 404 });
     }
