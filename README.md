@@ -11,7 +11,11 @@ The fastest way to try Open Live — no Kubernetes required.
 Visit **[openlive.apps.osaas.io](https://openlive.apps.osaas.io)** to spin up a managed Open Live instance on Open Source Cloud. Start for an event, tear down after. No infrastructure to manage and no monthly minimum.
 
 - 14-day free trial, free plan available
-- 15 EUR/month (self-hosted Strom) or 69 EUR/month (shared GPU in Frankfurt)
+- 15 EUR/month (self-hosted Strom) or 69 EUR/month (shared GPU in Frankfurt — **demo purposes
+  only**; the Frankfurt GPU is shared between all users on this plan, capacity is not guaranteed
+  and performance varies with load, so it is not suitable for live production)
+- For guaranteed capacity and live production, add a **Hosted GPU** add-on (from 750 EUR/month) —
+  see the pricing card on [openlive.apps.osaas.io](https://openlive.apps.osaas.io)
 
 The in-app **Create New Open Live** flow provisions CouchDB for you and generates its admin
 password automatically. You do not choose or handle that password yourself on this path.
