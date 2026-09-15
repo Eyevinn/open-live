@@ -123,4 +123,40 @@ export const config = {
   stromPortLeaseClientId: process.env['STROM_PORT_LEASE_CLIENT_ID'] || undefined,
   /** Set to true to skip port leasing entirely (single-tenant Strom setups). */
   stromPortLeaseDisabled: parseBoolEnv('STROM_PORT_LEASE_DISABLED', false),
+  /**
+   * MinIO / S3 object storage for VOD recordings (epic #5, issue #41).
+   *
+   * Strom's recorder writes local files only ({media_path}/{output_dir}/{prefix}_%05d.{ext},
+   * backend/src/blocks/builtin/recorder.rs) — it has no native S3/MinIO sink. So open-live
+   * uploads the recorder's local segments to object storage after a production deactivates,
+   * fetching them via Strom's existing media download API (`GET /api/media/file/:path`).
+   *
+   * When these vars are unset the `recording` output type is rejected at assignment time
+   * (400 — recording disabled), mirroring how STROM_URL / API_KEY degrade cleanly.
+   * `MINIO_ENDPOINT` falls back to `S3_ENDPOINT` for S3-compatible naming.
+   */
+  minioEndpoint: process.env['MINIO_ENDPOINT'] ?? process.env['S3_ENDPOINT'] ?? undefined,
+  minioAccessKey: process.env['MINIO_ACCESS_KEY'] ?? undefined,
+  minioSecretKey: process.env['MINIO_SECRET_KEY'] ?? undefined,
+  minioBucket: process.env['MINIO_BUCKET'] ?? undefined,
+  minioRegion: process.env['MINIO_REGION'] ?? 'us-east-1',
+  minioUseSsl: parseBoolEnv('MINIO_USE_SSL', true),
+  /** Optional prefix prepended to every recording object key. */
+  recordingKeyPrefix: process.env['RECORDING_KEY_PREFIX'] ?? '',
+  /** Presigned playback URL TTL in seconds (used by #42's listing endpoint). */
+  recordingPresignTtlS: parsePositiveIntEnv('RECORDING_PRESIGN_TTL_S', 3600),
 } as const;
+
+/**
+ * True when all required MinIO vars are present, i.e. VOD recording is enabled.
+ * The `recording` output type is only accepted, and the recorder block only
+ * wired into the flow, when this returns true (spec: config-gated feature).
+ */
+export function isRecordingEnabled(): boolean {
+  return Boolean(
+    config.minioEndpoint &&
+      config.minioAccessKey &&
+      config.minioSecretKey &&
+      config.minioBucket,
+  );
+}

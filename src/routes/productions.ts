@@ -9,7 +9,8 @@ import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js
 import { setTally, broadcast, getSubscriberCount } from '../services/tally.service.js';
 import { clearProductionPflState } from '../services/pfl-state.js';
 import { clearPipState, clearAudioState, clearFxState } from '../ws/controller.js';
-import { config } from '../config.js';
+import { config, isRecordingEnabled } from '../config.js';
+import { minioTargetFromConfig, uploadRecordings } from '../lib/recording-uploader.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
 
 // ---------------------------------------------------------------------------
@@ -207,6 +208,7 @@ async function runActivationFlow(
       ...(mixerBlockId !== undefined && { mixerBlockId }),
       ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
       ...(loudnessMainBlockId !== undefined && { loudnessMainBlockId }),
+      ...(activation.recorderBlockId !== undefined && { recorderBlockId: activation.recorderBlockId }),
       ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
       ...(Object.keys(activation.sourceAudioOffsetBlockIds).length > 0 && { sourceAudioOffsetBlockIds: activation.sourceAudioOffsetBlockIds }),
     });
@@ -701,6 +703,35 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       if (doc.stromFlowId) {
         const stromToken = await getStromToken(config.stromToken).catch((err) => { req.log.error({ errMsg: err instanceof Error ? err.message : String(err) }, "SAT exchange failed — proceeding without auth"); return undefined; });
         const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
+
+        // VOD recording (issue #41): when a recorder block is active, finalise
+        // the current segment (recorder.splitNow) then upload Strom's local
+        // recordings to MinIO — Strom's recorder has no native S3 sink, so
+        // open-live pulls the segments and pushes them to object storage.
+        // Best-effort: a failed upload must not block deactivation/teardown.
+        if (doc.recorderBlockId && isRecordingEnabled()) {
+          const target = minioTargetFromConfig();
+          if (target) {
+            try {
+              await strom.recorder.splitNow(doc.stromFlowId, doc.recorderBlockId).catch(() => undefined);
+              const uploadRes = await uploadRecordings({
+                strom,
+                stromUrl: config.stromUrl,
+                stromToken,
+                outputDir: `recordings/${doc._id}`,
+                productionId: doc._id,
+                target,
+              });
+              req.log.info(
+                { productionId: doc._id, uploaded: uploadRes.uploaded.length, failed: uploadRes.failed.length },
+                'VOD recordings uploaded to object storage',
+              );
+            } catch (err) {
+              req.log.error({ err, productionId: doc._id }, 'VOD recording upload failed — continuing deactivation');
+            }
+          }
+        }
+
         await deactivateStromFlow(doc.stromFlowId, strom);
       }
 
@@ -711,6 +742,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         mixerBlockId: undefined,
         audioMixerBlockId: undefined,
         loudnessMainBlockId: undefined,
+        recorderBlockId: undefined,
         sourceOffsetBlockIds: undefined,
         sourceAudioOffsetBlockIds: undefined,
         whepEndpoint: undefined,
