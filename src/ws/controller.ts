@@ -11,6 +11,7 @@ import { StromClient, StromClientError, type TransitionType as StromTransitionTy
 import { getStromToken } from '../lib/strom-token.js';
 import { graphicUrl } from '../lib/url-validation.js';
 import { decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
+import { loadAudioChannels } from '../lib/audio-channels.js';
 import { config } from '../config.js';
 import { notifySubscriberJoin } from '../services/idle-watchdog.js';
 import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
@@ -732,33 +733,10 @@ export function clearFxState(productionId: string): void {
   fxAvailableByProduction.delete(productionId)
 }
 
-/**
- * Returns the 0-based audio channel index for a given mixerInput, or null if
- * the source has no audio channel (test sources are skipped).
- * WHIP and HTML sources carry audio and are included.
- */
+/** Returns the 0-based audio channel index for a given mixerInput, or null if it has no channel. */
 async function resolveAudioChannelIndex(doc: ProductionDoc, mixerInput: string): Promise<number | null> {
-  const sorted = [...doc.sources].sort((a, b) => a.mixerInput.localeCompare(b.mixerInput));
-  const sourcesDb = getSourcesDb();
-  let audioIdx = 0;
-  for (const assignment of sorted) {
-    let streamType: string | undefined;
-    try {
-      const src = await sourcesDb.get(assignment.sourceId);
-      streamType = src.streamType;
-    } catch {
-      // "Whip" is a virtual WHIP source that carries audio — treat it as 'whip'
-      if (assignment.sourceId === 'Whip') {
-        streamType = 'whip';
-      } else {
-        continue; // other virtual sources (test1, test2) have no audio
-      }
-    }
-    if (streamType === 'test1' || streamType === 'test2') continue;
-    if (assignment.mixerInput === mixerInput) return audioIdx;
-    audioIdx++;
-  }
-  return null;
+  const channels = await loadAudioChannels(doc.sources);
+  return channels.find((c) => c.assignment.mixerInput === mixerInput)?.channel ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -784,34 +762,15 @@ async function applyAudioFollow(
 ): Promise<void> {
   // Default to empty set — an uninitialised registry never routes all channels.
   const afvChannels = afvChannelsByProduction.get(productionId) ?? new Set<string>();
-  const sorted = [...doc.sources].sort((a, b) => a.mixerInput.localeCompare(b.mixerInput));
-  const sourcesDb = getSourcesDb();
-
-  let audioIdx = 0;
   const properties: Record<string, unknown> = {};
   const ramp_ms_overrides: Record<string, number> = {};
-  for (const assignment of sorted) {
-    let streamType: string | undefined;
-    try {
-      const src = await sourcesDb.get(assignment.sourceId);
-      streamType = src.streamType;
-    } catch {
-      // "Whip" is a virtual WHIP source that carries audio — treat it as 'whip'
-      if (assignment.sourceId === 'Whip') {
-        streamType = 'whip';
-      } else {
-        continue; // other virtual sources (test1, test2) have no audio
-      }
-    }
-    if (streamType === 'test1' || streamType === 'test2') continue;
-
-    const chIdx = ++audioIdx;
+  for (const { channel, assignment } of await loadAudioChannels(doc.sources)) {
     // Only update routing for channels the operator has opted into AFV.
     // Channels with AFV off are never touched by the switcher.
     if (!afvChannels.has(assignment.mixerInput)) continue;
 
     const routed = newPgmMixerInput === null || assignment.mixerInput === newPgmMixerInput;
-    const key = `ch${chIdx}_to_main`;
+    const key = `ch${channel + 1}_to_main`;
     properties[key] = routed;
     ramp_ms_overrides[key] = routed ? rampUpMs : rampDownMs;
   }
