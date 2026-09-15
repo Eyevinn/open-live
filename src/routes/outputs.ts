@@ -8,7 +8,7 @@ import { deriveOutputStatus } from '../lib/production-health.js';
 import { srtUrl } from '../lib/url-validation.js';
 import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
 import { resolveSrtConnect } from '../lib/srt-connect.js';
-import { config } from '../config.js';
+import { config, isRecordingEnabled } from '../config.js';
 import { getPortLease } from '../services/port-lease.js';
 import { clashesAfterWrite, listenerPortRequest, resolveListenerAddress, usedListenerPorts } from '../services/listener-ports.js';
 
@@ -56,7 +56,7 @@ function outputStatusFor(outputId: string, live: Set<string> | null): OutputStat
 
 const OutputInput = z.object({
   name: z.string().min(1).max(256),
-  outputType: z.enum(['mpegtssrt', 'efpsrt', 'whep']),
+  outputType: z.enum(['mpegtssrt', 'efpsrt', 'whep', 'recording']),
   url: z.string().optional(),
 }).superRefine((data, ctx) => {
   if (SRT_OUTPUT_TYPES.has(data.outputType) && data.url) {
@@ -125,6 +125,13 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
 
   fastify.post('/api/v1/outputs', async (req, reply) => {
     const body = OutputInput.parse(req.body);
+    // A 'recording' output only makes sense when MinIO/S3 is configured — Strom's
+    // recorder writes local files that open-live uploads to object storage. Reject
+    // the type at creation time when recording is disabled so the feature degrades
+    // cleanly (spec: vod-recording-minio.md, issue #41).
+    if (body.outputType === 'recording' && !isRecordingEnabled()) {
+      return reply.status(400).send({ error: 'Recording is disabled — MinIO/S3 is not configured', statusCode: 400 });
+    }
     const isSrt = SRT_OUTPUT_TYPES.has(body.outputType) && !!body.url;
     const id = `output-${randomUUID()}`;
     // A listener output binds a port on the shared Strom, like a listener source
