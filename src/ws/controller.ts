@@ -11,6 +11,7 @@ import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
 import { notifySubscriberJoin } from '../services/idle-watchdog.js';
 import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
+import { buildProductionStatusEvent, deriveOutputSnapshot } from '../lib/production-health.js';
 
 function stromErrorMessage(err: unknown): string {
   if (err instanceof StromClientError) return err.message;
@@ -1639,6 +1640,26 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
         }
       }
       socket.send(JSON.stringify({ type: 'TALLY', ...tally, pgmBg: pgmBgOf(id) }));
+
+      // Connect snapshot for the production lifecycle (issue #255, spec §3):
+      // emit one PRODUCTION_STATUS with the current status + per-output health so a
+      // single-source downstream consumer attaching mid-broadcast learns the state
+      // immediately without a REST round-trip. Sent directly to this socket (not
+      // broadcast), so we stamp `ts` here to match the broadcast() envelope; `seq`
+      // rides the #209 envelope once it lands (not yet — carries `ts` only for now).
+      if (connectDoc) {
+        const productionActive = connectDoc.status === 'active';
+        const outputs = deriveOutputSnapshot({
+          outputIds: (connectDoc.outputAssignments ?? []).map((a) => a.outputId),
+          stromKnown: true,
+          productionActive,
+          flowRunning: productionActive && !!connectDoc.stromFlowId,
+        });
+        socket.send(JSON.stringify({
+          ts: new Date().toISOString(),
+          ...buildProductionStatusEvent(id, connectDoc.status, outputs),
+        }));
+      }
 
       const cachedAlpha = overlayAlphaByProduction.get(id);
       if (cachedAlpha !== undefined) {

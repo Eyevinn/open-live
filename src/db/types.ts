@@ -59,6 +59,17 @@ export interface GraphicDoc {
 
 export type OutputType = 'mpegtssrt' | 'efpsrt' | 'whep';
 
+/**
+ * Output health surfaced to single-source downstream consumers (issue #255).
+ *
+ * The enum shape is future-proofed to include `degraded`, but only
+ * `healthy | down | unknown` are ever derived/emitted today — Strom exposes no
+ * per-output liveness signal to populate `degraded` truthfully (spec §2 / OQ-2).
+ * `unknown` is also the absent-value semantics: an omitted `status` is
+ * equivalent to `unknown`.
+ */
+export type OutputStatus = 'healthy' | 'degraded' | 'down' | 'unknown';
+
 export interface OutputDoc {
   _id: string;           // "output-{uuid}"
   _rev?: string;
@@ -66,6 +77,12 @@ export interface OutputDoc {
   name: string;
   outputType: OutputType;
   url?: string;          // SRT URI for mpegtssrt/efpsrt; undefined for whep
+  /**
+   * Derived output health (issue #255). Optional; when absent, read as
+   * `unknown`. Computed on read from the owning production's live flow state
+   * rather than persisted (see `src/lib/production-health.ts`).
+   */
+  status?: OutputStatus;
   createdAt: string;
   updatedAt: string;
 }
@@ -124,7 +141,24 @@ export interface Tally {
   pvw: string | null;
 }
 
-export type ProductionStatus = 'active' | 'inactive' | 'activating';
+/**
+ * Production lifecycle status (issue #255).
+ *
+ * - `inactive`   — not currently running (never started, or reset to a clean
+ *   idle state). Also the status of a failed/aborted activation that never
+ *   reached `active`.
+ * - `activating` — activation in progress (flow created, not yet `playing`).
+ * - `active`     — reached a live broadcast (flow `playing`).
+ * - `ended`      — ran a broadcast and that broadcast has finished (an `active`
+ *   production that then stopped via deactivate, idle auto-deactivate, or
+ *   reconcile finding its Strom flow gone). Distinct from `inactive` so a
+ *   single-source downstream consumer can tell "never started" from "finished".
+ *   Not terminal: re-activating moves back through `activating` → `active`.
+ */
+export type ProductionStatus = 'active' | 'inactive' | 'activating' | 'ended';
+
+/** Machine-readable reason a production reached `ended` (issue #255, optional). */
+export type EndedReason = 'deactivated' | 'idle' | 'flow-lost';
 
 export interface ProductionDoc {
   _id: string;
@@ -177,6 +211,13 @@ export interface ProductionDoc {
   deletionWarnings?: Array<{ type: 'source' | 'graphic' | 'output'; name: string }>;
   /** Set when the idle watchdog auto-deactivated this production; cleared on next activation */
   autoDeactivated?: boolean;
+  /**
+   * Why this production reached `status: 'ended'` (issue #255). Optional,
+   * defaulted-absent; disambiguates the `ended` transition (explicit deactivate
+   * vs. idle auto-deactivate vs. reconcile losing the flow) without a separate
+   * status value. Cleared on next activation.
+   */
+  endedReason?: EndedReason;
   createdAt: string;
   updatedAt: string;
 }

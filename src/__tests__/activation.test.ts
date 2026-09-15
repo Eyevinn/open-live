@@ -213,7 +213,9 @@ describe('POST /api/v1/productions/:id/deactivate', () => {
 
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.body);
-    expect(body.status).toBe('inactive');
+    // Deactivating an *active* production now yields `ended` (issue #255): it ran
+    // a broadcast that has finished, distinct from a never-started `inactive`.
+    expect(body.status).toBe('ended');
 
     // Verify the doc written to CouchDB cleared the fields
     const insertedDoc = mockInsert.mock.calls[0][0];
