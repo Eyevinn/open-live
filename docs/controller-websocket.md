@@ -162,6 +162,7 @@ are emitted from `src/ws/controller.ts` and `src/services/meter-relay.ts`:
 | `CLIP_STATE` | `mixerInput: string`, `state: 'idle' \| 'cued' \| 'playing' \| 'paused' \| 'stopped' \| 'completed' \| 'error'`, `clipId?: string`, `positionMs?: number`, `durationMs?: number`, `error?: string` | A clip transitions on `mixerInput` (cue/play/pause/stop/seek), reaches end-of-media (`completed`), or a clip operation fails (`error`); also sent on connect for each clip source |
 | `METER_DATA` | `elementId: string`, `peak`, `rms` | Audio meter tick (relayed from Strom); `elementId` is `main`, `monitor`, `ch{N}`, `aux{N}`, or `grp{N}` |
 | `LOUDNESS_DATA` | `elementId: 'main'`, `momentary`, `shortterm`, `integrated`, `loudness_range`, `true_peak` | EBU R128 loudness tick (relayed from Strom) |
+| `IDLE_WARNING` | `secondsRemaining: number`, `deadline: string` (ISO 8601 UTC), `reason: 'idle'` | The idle watchdog is about to auto-deactivate the production. Emitted once per idle cycle when the countdown crosses into the warning window (`IDLE_WARNING_LEAD_SECONDS` before the `IDLE_TIMEOUT_SECONDS` deadline). Reconnecting / any activity that repopulates a controller socket resets the timer and cancels the pending warning. See "Idle auto-deactivation warning" below. |
 | `ERROR` | `error: string` | An inbound frame was invalid or an operation failed (sent to originating socket) |
 
 `pgmBg` is the mixer input a PiP on program is composited over. It is `null` unless
@@ -189,6 +190,46 @@ The `CLIP_STATE` snapshot prefers the in-memory clip-state registry
 cannot itself report (`cued`, `completed`, `error`). If the registry has no entry for
 an input (cold start after a server restart), the server restores it from Strom's live
 `player.getState` (mapping `playing`/`paused`/`stopped`).
+
+## Idle auto-deactivation warning
+
+A running production with **zero connected controller sockets** is auto-deactivated
+by the idle watchdog (`src/services/idle-watchdog.ts`) once it has been idle for the
+configured timeout — it is marked `ended` with `endedReason: 'idle'` and
+`autoDeactivated: true` (see `docs/specs/production-lifecycle-health.md`).
+
+Before that deadline the watchdog emits a single **`IDLE_WARNING`** broadcast so a
+still-connected client (e.g. a backgrounded Studio tab whose socket is still open)
+can surface a "keep the show up" countdown (issue #290; frontend consumption tracked
+in open-live-studio#130):
+
+```json
+{ "type": "IDLE_WARNING", "secondsRemaining": 60, "deadline": "2026-09-16T08:27:39.000Z", "reason": "idle", "seq": 42, "ts": "2026-09-16T08:26:39.000Z" }
+```
+
+- `secondsRemaining` — whole seconds until auto-deactivation at emit time.
+- `deadline` — absolute ISO 8601 UTC instant the production will be deactivated if
+  nothing resets the timer. Prefer this over `secondsRemaining` for an accurate
+  live countdown, since it is immune to client clock drift accumulated after receipt
+  (subtract it from a server-synced `ts`).
+- `reason` — currently always `'idle'`; reserved for future auto-deactivation causes.
+- `seq` / `ts` — the standard envelope stamped on every broadcast.
+
+**Emission semantics.** The warning fires **once per idle cycle**, on the first
+watchdog tick where the remaining time crosses into the warning window
+(`0 < remaining ≤ IDLE_WARNING_LEAD_SECONDS`). Any activity that repopulates a
+controller socket (a client (re)connecting to `/ws/productions/:id/controller`)
+resets the idle timer and cancels the pending warning, so a subsequent idle period
+emits a fresh warning. Because the timer only runs while the subscriber count is
+zero, `broadcast()` is a no-op when nobody is connected — the warning reaches only
+sockets that are still attached.
+
+### Configuration
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `IDLE_TIMEOUT_SECONDS` | `300` | Idle deadline after which a zero-subscriber production is auto-deactivated. |
+| `IDLE_WARNING_LEAD_SECONDS` | `60` | Lead time before the deadline at which `IDLE_WARNING` is emitted. Clamped to `IDLE_TIMEOUT_SECONDS` so it never exceeds the deadline. |
 
 ## Clip / story playback
 

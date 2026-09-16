@@ -21,11 +21,19 @@ import { activationAbortControllers, updateProductionDoc, emitProductionStatus }
 import { stoppedStatus } from '../lib/production-health.js';
 import type { ProductionDoc } from '../db/types.js';
 
-const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+const IDLE_TIMEOUT_MS = config.idleTimeoutSeconds * 1000;
 const POLL_INTERVAL_MS = 10 * 1000;    // 10 seconds
+// Warning lead time before the idle deadline (issue #290). Clamped so it can
+// never exceed the deadline itself (a lead >= timeout would fire at t=0).
+const WARNING_LEAD_MS = Math.min(config.idleWarningLeadSeconds, config.idleTimeoutSeconds) * 1000;
 
 /** productionId → timestamp when subscriber count first dropped to 0 */
 const idleSince = new Map<string, number>();
+
+/** Production IDs for which an IDLE_WARNING has already been broadcast in the
+ *  current idle cycle. Cleared when the timer resets (subscriber joins /
+ *  reactivation / deactivation) so the warning fires exactly once per cycle. */
+const warned = new Set<string>();
 
 /** Set of production IDs currently known to be active or activating */
 const activeProductionIds = new Set<string>();
@@ -53,12 +61,17 @@ export function notifyProductionActivated(productionId: string): void {
 export function notifyProductionDeactivated(productionId: string): void {
   activeProductionIds.delete(productionId);
   idleSince.delete(productionId);
+  warned.delete(productionId);
 }
 
 /** Call immediately when a subscriber connects — clears the idle timer so the
- *  watchdog cannot deactivate the production while someone is connected. */
+ *  watchdog cannot deactivate the production while someone is connected. This is
+ *  the "activity resets the countdown" path (issue #290): it also cancels any
+ *  pending idle warning so a reconnect within the warning window is not left
+ *  showing a stale countdown. */
 export function notifySubscriberJoin(productionId: string): void {
   idleSince.delete(productionId);
+  warned.delete(productionId);
 }
 
 async function seedActiveProductions(log: FastifyBaseLogger): Promise<void> {
@@ -88,7 +101,7 @@ async function seedActiveProductions(log: FastifyBaseLogger): Promise<void> {
 export function startIdleWatchdog(log: FastifyBaseLogger): void {
   if (watchdogInterval !== null) return;
 
-  log.info(`[idle-watchdog] Idle auto-deactivation enabled (timeout: ${IDLE_TIMEOUT_MS / 1000}s, poll: ${POLL_INTERVAL_MS / 1000}s)`);
+  log.info(`[idle-watchdog] Idle auto-deactivation enabled (timeout: ${IDLE_TIMEOUT_MS / 1000}s, warning lead: ${WARNING_LEAD_MS / 1000}s, poll: ${POLL_INTERVAL_MS / 1000}s)`);
 
   void seedActiveProductions(log);
 
@@ -100,7 +113,10 @@ export function startIdleWatchdog(log: FastifyBaseLogger): void {
   watchdogInterval.unref();
 }
 
-async function tick(log: FastifyBaseLogger): Promise<void> {
+/** Exported for tests (issue #290) — runs a single watchdog pass so the
+ *  pre-deactivation warning and auto-deactivate logic can be exercised without
+ *  the interval timer. */
+export async function tick(log: FastifyBaseLogger): Promise<void> {
   if (activeProductionIds.size === 0) return;
 
   const now = Date.now();
@@ -110,6 +126,7 @@ async function tick(log: FastifyBaseLogger): Promise<void> {
 
     if (count > 0) {
       idleSince.delete(productionId);
+      warned.delete(productionId);
       continue;
     }
 
@@ -120,6 +137,28 @@ async function tick(log: FastifyBaseLogger): Promise<void> {
     }
 
     const idleMs = now - idleSince.get(productionId)!;
+    const remainingMs = IDLE_TIMEOUT_MS - idleMs;
+
+    // Pre-deactivation warning (issue #290): once the countdown crosses into the
+    // warning window (but before the deadline) emit a single IDLE_WARNING to any
+    // still-connected controller sockets so a client can surface a countdown.
+    // broadcast() is a no-op when there are no subscribers, so this is safe.
+    if (remainingMs > 0 && remainingMs <= WARNING_LEAD_MS && !warned.has(productionId)) {
+      warned.add(productionId);
+      const deadlineAt = idleSince.get(productionId)! + IDLE_TIMEOUT_MS;
+      const secondsRemaining = Math.max(0, Math.round(remainingMs / 1000));
+      log.info(
+        { productionId, secondsRemaining },
+        '[idle-watchdog] Emitting pre-deactivation idle warning',
+      );
+      broadcast(productionId, {
+        type: 'IDLE_WARNING',
+        secondsRemaining,
+        deadline: new Date(deadlineAt).toISOString(),
+        reason: 'idle',
+      });
+    }
+
     if (idleMs < IDLE_TIMEOUT_MS) continue;
 
     log.info(
