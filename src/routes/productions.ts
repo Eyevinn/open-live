@@ -247,6 +247,7 @@ async function runActivationFlow(
       ...(activation.recorderBlockId !== undefined && { recorderBlockId: activation.recorderBlockId }),
       ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
       ...(Object.keys(activation.sourceAudioOffsetBlockIds).length > 0 && { sourceAudioOffsetBlockIds: activation.sourceAudioOffsetBlockIds }),
+      ...(Object.keys(activation.clipPlayerBlockIds).length > 0 && { clipPlayerBlockIds: activation.clipPlayerBlockIds }),
     });
 
     // Step 3: Poll until flow reaches 'playing' or we time out
@@ -376,6 +377,7 @@ async function runActivationFlow(
           ...(loudnessMainBlockId !== undefined && { loudnessMainBlockId }),
           ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
           ...(Object.keys(activation.sourceAudioOffsetBlockIds).length > 0 && { sourceAudioOffsetBlockIds: activation.sourceAudioOffsetBlockIds }),
+          ...(Object.keys(activation.clipPlayerBlockIds).length > 0 && { clipPlayerBlockIds: activation.clipPlayerBlockIds }),
         });
 
         notifyProductionActivated(productionId);
@@ -799,6 +801,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         recorderBlockId: undefined,
         sourceOffsetBlockIds: undefined,
         sourceAudioOffsetBlockIds: undefined,
+        clipPlayerBlockIds: undefined,
         whepEndpoint: undefined,
         pgmWhepEndpoint: undefined,
         whipEndpoints: undefined,

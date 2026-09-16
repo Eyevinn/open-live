@@ -224,6 +224,35 @@ describe('POST /api/v1/productions/:id/deactivate', () => {
     expect(insertedDoc.mixerBlockId).toBeUndefined();
   });
 
+  it('clears clipPlayerBlockIds on deactivate (issue #276)', async () => {
+    // A production with an active clip source carries a clipPlayerBlockIds map
+    // (mixerInput → builtin.media_player block ID) set at activation. Deactivate
+    // must clear it, mirroring sourceOffsetBlockIds / sourceAudioOffsetBlockIds.
+    const doc = makeProductionDoc({
+      status: 'active',
+      stromFlowId: 'flow-clip',
+      mixerBlockId: 'mixer-1',
+      clipPlayerBlockIds: { video_in_1: 'b-clip-1-flowclip' },
+      sourceOffsetBlockIds: { video_in_1: 'b-offset-1-flowclip' },
+      sourceAudioOffsetBlockIds: { video_in_1: 'b-audio-offset-1-flowclip' },
+    });
+    mockGet.mockResolvedValue(doc);
+    mockDeactivateStromFlow.mockResolvedValue(undefined);
+    mockInsert.mockResolvedValue({ rev: '3-cde', ok: true, id: doc._id });
+
+    const app = await buildServer();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/productions/prod-test-1/deactivate',
+    });
+
+    expect(res.statusCode).toBe(200);
+    const insertedDoc = mockInsert.mock.calls[0][0];
+    expect(insertedDoc.clipPlayerBlockIds).toBeUndefined();
+    expect(insertedDoc.sourceOffsetBlockIds).toBeUndefined();
+    expect(insertedDoc.sourceAudioOffsetBlockIds).toBeUndefined();
+  });
+
   it('returns 200 even if production has no stromFlowId', async () => {
     const doc = makeProductionDoc({ status: 'inactive' });
     mockGet.mockResolvedValue(doc);
