@@ -5,6 +5,7 @@ import { StromClient } from './strom.js';
 import { DEFAULT_FLOW, type FlowTopology } from './default-flow.js';
 import { decryptAddressPassphrase } from './srt-passphrase-crypto.js';
 import { safeFlowProjection } from './log-redact.js';
+import { VIRTUAL_SOURCES, assignAudioChannels } from './audio-channels.js';
 
 /**
  * Generates a Strom flow from a template + source assignments,
@@ -67,13 +68,6 @@ export async function activateStromFlow(
   stromUrl?: string,
   outputDocs?: OutputDoc[],
 ): Promise<ActivationResult> {
-  // Virtual source IDs for test streams — no DB lookup needed
-  const VIRTUAL_SOURCES: Record<string, Pick<SourceDoc, 'streamType' | 'address' | 'name'>> = {
-    'Whip': { streamType: 'whip', address: '', name: 'WHIP Input' },
-    '__test1__': { streamType: 'test1', address: '', name: 'Test - Pinwheel' },
-    '__test2__': { streamType: 'test2', address: '', name: 'Test - Colors' },
-  };
-
   // Load all assigned real sources — skip any whose source doc no longer exists
   // (e.g. source was deleted while assigned to this production).
   const sourcesDb = getSourcesDb();
@@ -445,7 +439,10 @@ export async function activateStromFlow(
     audioMixerBlock['properties'] = props;
   }
 
-  let audioChannelIndex = 0;
+  const audioChannelByAssignment = new Map(
+    assignAudioChannels(sortedAssignments, (id) => sourceMap.get(id) ?? (VIRTUAL_SOURCES[id] as SourceDoc | undefined))
+      .map(({ assignment, channel }) => [assignment, channel]),
+  );
   const ROW_H = 150;        // vertical spacing between rows
   const ROW_START = 50;     // y of first input row
   const COL_ELEM = -500;    // col 1: cefsrc / videotestsrc elements
@@ -464,6 +461,7 @@ export async function activateStromFlow(
 
     const source = sourceMap.get(assignment.sourceId) ?? (VIRTUAL_SOURCES[assignment.sourceId] as SourceDoc | undefined);
     if (!source) continue;
+    const audioChannel = audioChannelByAssignment.get(assignment)!;
 
     const yPos = ROW_START + padIndex * ROW_H;
     const inputId = `b-input-${padIndex}-${endpointSuffix}`;
@@ -484,7 +482,6 @@ export async function activateStromFlow(
 
     const TEST_PATTERNS: Record<string, string> = { test1: 'Pinwheel', test2: 'Colors' }
     if (source.streamType === 'test1' || source.streamType === 'test2') {
-      const audioChannel = audioChannelIndex++;
       const elemId = `e-test-${padIndex}-${endpointSuffix}`;
       const fmtId = `b-fmt-${padIndex}-${endpointSuffix}`;
       const audioElemId = `e-test-audio-${padIndex}-${endpointSuffix}`;
@@ -534,7 +531,6 @@ export async function activateStromFlow(
         }
       }
     } else if (source.streamType === 'html') {
-      const audioChannel = audioChannelIndex++;
       const elemId = `e-html-${padIndex}-${endpointSuffix}`;
       const demuxId = `e-cefdemux-${padIndex}-${endpointSuffix}`;
       flow.elements.push({
@@ -575,7 +571,6 @@ export async function activateStromFlow(
         }
       }
     } else if (source.streamType === 'whip') {
-      const audioChannel = audioChannelIndex++;
       const endpointId = `whip-${padIndex}-${endpointSuffix}`;
       flow.blocks.push({
         id: inputId,
@@ -606,7 +601,6 @@ export async function activateStromFlow(
       }
     } else {
       // srt → builtin.mpegtssrt_input, efp → builtin.efpsrt_input
-      const audioChannel = audioChannelIndex++;
       flow.blocks.push({
         id: inputId,
         block_definition_id: source.streamType === 'efp' ? 'builtin.efpsrt_input' : 'builtin.mpegtssrt_input',

@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
-import { getDb, getSourcesDb } from '../db/index.js';
+import { getDb } from '../db/index.js';
+import { loadAudioChannels } from '../lib/audio-channels.js';
 import { StromClient } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
@@ -55,32 +56,13 @@ const audioRoutes: FastifyPluginAsync = async (fastify) => {
           : 0;
         if (!numChannels || isNaN(numChannels)) return reply.send([]);
 
-        // Build audio-channel-index → source name map.
-        // Audio channels are assigned to SRT/EFP/WHIP/HTML sources (not test),
-        // in mixerInput order — matching the flow-generator audioChannelIndex logic exactly.
-        // Virtual source IDs (__test1__, __test2__) are not in the sources DB and are
-        // silently skipped via the catch block.
+        // Build audio-channel-index → source name / mixerInput maps.
         const audioChannelNameMap = new Map<number, string>();
         const audioChannelMixerInputMap = new Map<number, string>();
         try {
-          const sourcesDb = getSourcesDb();
-          const sortedAssignments = [...(doc.sources ?? [])].sort((a, b) =>
-            a.mixerInput.localeCompare(b.mixerInput),
-          );
-          const VIRTUAL_SOURCES: Record<string, { streamType: string; name: string }> = {
-            'Whip': { streamType: 'whip', name: 'WHIP Input' },
-            '__test1__': { streamType: 'test1', name: 'Test - Pinwheel' },
-            '__test2__': { streamType: 'test2', name: 'Test - Colors' },
-          };
-          let audioIdx = 0;
-          for (const assignment of sortedAssignments) {
-            try {
-              const src = VIRTUAL_SOURCES[assignment.sourceId] ?? await sourcesDb.get(assignment.sourceId);
-              if (src.streamType === 'test1' || src.streamType === 'test2') continue;
-              audioChannelNameMap.set(audioIdx, src.name);
-              audioChannelMixerInputMap.set(audioIdx, assignment.mixerInput);
-              audioIdx++;
-            } catch { /* missing source — no audio channel */ }
+          for (const { channel, assignment, source } of await loadAudioChannels(doc.sources ?? [])) {
+            audioChannelNameMap.set(channel, source.name);
+            audioChannelMixerInputMap.set(channel, assignment.mixerInput);
           }
         } catch { /* sources DB unavailable */ }
 
