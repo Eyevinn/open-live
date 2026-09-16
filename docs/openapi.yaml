@@ -30,7 +30,91 @@ components:
 
     StreamType:
       type: string
-      enum: [srt, efp, whip, html]
+      enum: [srt, efp, whip, html, clip]
+      description: >-
+        Source stream kind. `clip` (epic #206) is a cue-then-play file/story
+        source whose typed `ClipReference` is stored serialized in the source's
+        `address` field. Clients must ignore unknown enum values (forward-compat).
+
+    ClipReference:
+      description: >-
+        Typed, versioned reference for a `clip` source (epic #206, issue #275).
+        A discriminated union on `type`; stored serialized as a JSON string in
+        `SourceDoc.address`. v1 implements `url` and `s3`; `tams` is reserved and
+        rejected at runtime (501). Any variant may carry an optional `timerange`
+        — nothing assumes a fixed media length.
+      oneOf:
+        - $ref: '#/components/schemas/ClipReferenceUrl'
+        - $ref: '#/components/schemas/ClipReferenceS3'
+        - $ref: '#/components/schemas/ClipReferenceTams'
+      discriminator:
+        propertyName: type
+
+    ClipReferenceUrl:
+      type: object
+      required: [type, url]
+      properties:
+        type:
+          type: string
+          enum: [url]
+        url:
+          type: string
+          description: Any fetchable file / object-storage URL (a presigned URL reduces to this).
+        timerange:
+          type: string
+          description: Optional; no fixed-length assumption.
+
+    ClipReferenceS3:
+      type: object
+      required: [type, bucket, key]
+      properties:
+        type:
+          type: string
+          enum: [s3]
+        bucket:
+          type: string
+        key:
+          type: string
+        timerange:
+          type: string
+
+    ClipReferenceTams:
+      type: object
+      description: BBC Time-Addressable Media Store. Reserved — rejected (501) in v1.
+      required: [type, store, flowId, timerange]
+      properties:
+        type:
+          type: string
+          enum: [tams]
+        store:
+          type: string
+        flowId:
+          type: string
+        timerange:
+          type: string
+
+    ClipState:
+      type: object
+      description: >-
+        Live clip playback state for a `clip` source assigned to a mixer input
+        (epic #206, issues #277/#278). CamelCased mirror of Strom's media-player
+        state plus the cue/play/completed clip state machine.
+      required: [mixerInput, state]
+      properties:
+        mixerInput:
+          type: string
+          example: video_in_0
+        state:
+          type: string
+          enum: [idle, cued, playing, paused, stopped, completed, error]
+        clipId:
+          type: string
+        positionMs:
+          type: integer
+        durationMs:
+          type: integer
+        error:
+          type: string
 
     SourceStatus:
       type: string
@@ -1338,6 +1422,168 @@ paths:
           description: Removed
         '404':
           description: Not found
+
+  # Production — Clip cue/play control (epic #206, issue #277)
+
+  /api/v1/productions/{id}/clips/{mixerInput}/cue:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^video_in_\d{1,2}$'
+        description: Mixer input the clip source is assigned to, e.g. `video_in_0`
+    post:
+      summary: Cue a clip into the ready state
+      description: >-
+        Loads the clip's resolved playlist entry into the media-player block and
+        seeks to index 0, leaving it paused/ready. Maps to Strom
+        `player.setPlaylist({files:[clip]}) + player.goto({index:0})`.
+      operationId: cueClip
+      tags: [Productions]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                clipId:
+                  type: string
+                  minLength: 1
+                  maxLength: 256
+      responses:
+        '200':
+          description: Clip cued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClipState'
+        '400':
+          description: Invalid body or mixerInput
+        '401':
+          description: Missing/invalid API key (when configured)
+        '404':
+          description: Production or clip source not found
+        '409':
+          description: Production is not activated
+        '502':
+          description: Strom returned an error
+        '503':
+          description: Strom is unreachable
+
+  /api/v1/productions/{id}/clips/{mixerInput}/play:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^video_in_\d{1,2}$'
+    post:
+      summary: Play the currently cued clip
+      description: Maps to Strom `player.control({action:'play'})`.
+      operationId: playClip
+      tags: [Productions]
+      responses:
+        '200':
+          description: Clip playing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClipState'
+        '401':
+          description: Missing/invalid API key (when configured)
+        '404':
+          description: Production or clip source not found
+        '409':
+          description: Production is not activated, or no clip cued
+        '502':
+          description: Strom returned an error
+        '503':
+          description: Strom is unreachable
+
+  /api/v1/productions/{id}/clips/{mixerInput}/stop:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^video_in_\d{1,2}$'
+    post:
+      summary: Stop clip playback
+      description: Maps to Strom `player.control({action:'stop'})`.
+      operationId: stopClip
+      tags: [Productions]
+      responses:
+        '200':
+          description: Clip stopped
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClipState'
+        '401':
+          description: Missing/invalid API key (when configured)
+        '404':
+          description: Production or clip source not found
+        '409':
+          description: Production is not activated
+        '502':
+          description: Strom returned an error
+        '503':
+          description: Strom is unreachable
+
+  /api/v1/productions/{id}/clips/{mixerInput}/state:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^video_in_\d{1,2}$'
+    get:
+      summary: Get current clip state
+      operationId: getClipState
+      tags: [Productions]
+      responses:
+        '200':
+          description: Current clip state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClipState'
+        '401':
+          description: Missing/invalid API key (when configured)
+        '404':
+          description: Production or clip source not found
+        '409':
+          description: Production is not activated
+        '502':
+          description: Strom returned an error
+        '503':
+          description: Strom is unreachable
 
   # Production — Graphic assignments
 

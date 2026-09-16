@@ -25,6 +25,7 @@ import graphicsRoutes from './routes/graphics.js';
 import outputsRoutes from './routes/outputs.js';
 import authRoutes from './routes/auth.js';
 import gatewaysRoutes from './routes/gateways.js';
+import clipsRoutes from './routes/clips.js';
 import controllerWs from './ws/controller.js';
 import gatewayHeartbeatWs from './ws/gateway-heartbeat.js';
 
@@ -389,6 +390,7 @@ export async function buildServer() {
   await fastify.register(outputsRoutes);
   await fastify.register(authRoutes);
   await fastify.register(gatewaysRoutes);
+  await fastify.register(clipsRoutes);
   await fastify.register(controllerWs);
   await fastify.register(gatewayHeartbeatWs);
 
