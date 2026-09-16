@@ -24,9 +24,52 @@ export interface Macro {
 
 // --------------- Source types ---------------
 
-export type StreamType = 'srt' | 'efp' | 'whip' | 'test1' | 'test2' | 'html';
+export type StreamType = 'srt' | 'efp' | 'whip' | 'test1' | 'test2' | 'html' | 'clip';
 
 export type SourceStatus = 'active' | 'inactive';
+
+// --------------- Clip reference types (issue #275, epic #206) ---------------
+
+/**
+ * Typed, versioned clip reference for `streamType: 'clip'` sources.
+ *
+ * A discriminated union so new byte sources can be added without breaking the
+ * contract or overloading a bare `address` string (per PM direction on #206).
+ * The reference is a *contract-level* (API/zod) concern; it is stored serialized
+ * as a JSON string in the existing optional `SourceDoc.address` field, so no
+ * persisted schema migration is introduced. See
+ * `docs/specs/clip-story-playback.md` §"Clip source model" / §"Migration".
+ *
+ * v1 implements `url` and `s3`; `tams` is accepted at the type level but rejected
+ * at runtime (501/not-implemented). No variant assumes a fixed media length — any
+ * reference may carry an optional `timerange`.
+ */
+
+/** Any fetchable file / object-storage URL. A presigned URL reduces to this. */
+export interface ClipReferenceUrl {
+  type: 'url';
+  url: string;
+  /** Optional; nothing in the model assumes a fixed file length. */
+  timerange?: string;
+}
+
+/** Object storage (MinIO / S3 objects from epic #5). */
+export interface ClipReferenceS3 {
+  type: 's3';
+  bucket: string;
+  key: string;
+  timerange?: string;
+}
+
+/** BBC Time-Addressable Media Store (flow + timerange). Reserved — not v1. */
+export interface ClipReferenceTams {
+  type: 'tams';
+  store: string;
+  flowId: string;
+  timerange: string;
+}
+
+export type ClipReference = ClipReferenceUrl | ClipReferenceS3 | ClipReferenceTams;
 
 export interface SourceDoc {
   _id: string;
