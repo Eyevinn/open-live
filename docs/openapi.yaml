@@ -678,6 +678,142 @@ components:
         statusCode:
           type: integer
 
+    # ── Guest calling (epic #208, issue #299) ─────────────────────────────────────
+
+    GuestInviteCreate:
+      type: object
+      properties:
+        label:
+          type: string
+          minLength: 1
+          maxLength: 256
+        expiresInS:
+          type: integer
+          minimum: 60
+          maximum: 604800
+          description: Override the default invite TTL (GUEST_INVITE_TTL_S). Bounded so invites stay short-lived.
+        mixerInput:
+          type: string
+          description: Optional pre-allocated input the guest will occupy (e.g. `video_in_1`); allocated on join if absent.
+
+    GuestInviteCreated:
+      type: object
+      required: [id, productionId, joinUrl, token, expiresAt]
+      properties:
+        id:
+          type: string
+        productionId:
+          type: string
+        joinUrl:
+          type: string
+        token:
+          type: string
+          description: The raw HMAC-signed invite token. Returned exactly once and NEVER stored — only its SHA-256 hash is persisted.
+        expiresAt:
+          type: string
+          format: date-time
+        mixerInput:
+          type: string
+
+    GuestInvite:
+      type: object
+      required: [id, productionId, expiresAt, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+        productionId:
+          type: string
+        label:
+          type: string
+        mixerInput:
+          type: string
+        expiresAt:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    GuestSession:
+      type: object
+      required: [id, productionId, inviteId, mixerInput, state, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+        productionId:
+          type: string
+        inviteId:
+          type: string
+        mixerInput:
+          type: string
+        state:
+          type: string
+          enum: [joined, previewing, on-air, left, error]
+        intercomLineId:
+          type: string
+        whipSessionId:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    GuestReturnMode:
+      type: object
+      required: [key, label, synced, delivery]
+      properties:
+        key:
+          type: string
+          enum: [program, program-minus, low-latency-minus]
+        label:
+          type: string
+        synced:
+          type: boolean
+        excludesMixerInput:
+          type: string
+        delivery:
+          type: object
+
+    GuestJoinResult:
+      type: object
+      required: [guestId, whipUrl, feeds, modes, defaultMode, returnMode]
+      properties:
+        guestId:
+          type: string
+        whipUrl:
+          type: string
+          description: WHIP publish URL on the EXISTING `/api/v1/productions/{id}/whip/{mixerInput}` contract.
+        feeds:
+          type: array
+          description: Per-guest return feeds. Empty in v1 — return-feed routes are wired by a later sub-issue.
+          items:
+            type: object
+            required: [id, url, video]
+            properties:
+              id:
+                type: string
+              url:
+                type: string
+              video:
+                type: boolean
+        modes:
+          type: array
+          items:
+            $ref: '#/components/schemas/GuestReturnMode'
+        defaultMode:
+          type: string
+        returnMode:
+          type: string
+          enum: [program, program-minus]
+        intercomLine:
+          type: object
+          description: Present only when an Open Intercom talkback line is provisioned (later sub-issue).
+
 paths:
   # ── Health ──────────────────────────────────────────────────────────────────
 
@@ -2286,3 +2422,253 @@ paths:
       responses:
         '204':
           description: Session closed
+
+  # ── Guest calling (epic #208, issue #299) ─────────────────────────────────────
+
+  /api/v1/productions/{id}/guests/invites:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Create a production-scoped guest invite
+      description: |
+        Mints an HMAC-signed, expiring invite token. The raw token is returned
+        exactly once; only its SHA-256 hash is persisted. Requires the shared
+        API key. Returns 503 when `GUEST_INVITE_SECRET` is unset (feature disabled).
+      operationId: createGuestInvite
+      tags: [Guests]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GuestInviteCreate'
+      responses:
+        '201':
+          description: Invite created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GuestInviteCreated'
+        '400':
+          description: Invalid body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Production not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Guest calling disabled or database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    get:
+      summary: List guest invites for a production
+      operationId: listGuestInvites
+      tags: [Guests]
+      responses:
+        '200':
+          description: Invites
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/GuestInvite'
+        '404':
+          description: Production not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Guest calling disabled or database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/productions/{id}/guests/invites/{inviteId}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: inviteId
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      summary: Revoke a guest invite
+      operationId: deleteGuestInvite
+      tags: [Guests]
+      responses:
+        '204':
+          description: Invite revoked
+        '403':
+          description: Invite belongs to a different production
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Invite not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/guests/{inviteId}/join:
+    parameters:
+      - name: inviteId
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Guest join (token-authed)
+      description: |
+        Called by the guest browser via the invite link. Authenticates with the
+        per-invite HMAC token in `Authorization: Bearer <token>` — NOT the shared
+        API key. `whipUrl` reuses the existing WHIP proxy contract.
+      operationId: guestJoin
+      tags: [Guests]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Join accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GuestJoinResult'
+        '401':
+          description: Missing, invalid, or revoked invite token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Production not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Invite expired or capacity reached
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Guest calling disabled or database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/guests/{inviteId}/session:
+    parameters:
+      - name: inviteId
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      summary: Guest leaves (token-authed)
+      operationId: guestLeave
+      tags: [Guests]
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Session ended
+        '401':
+          description: Missing, invalid, or revoked invite token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Guest calling disabled or database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/productions/{id}/guests:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: List live guest sessions for a production
+      operationId: listGuestSessions
+      tags: [Guests]
+      responses:
+        '200':
+          description: Guest sessions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/GuestSession'
+        '404':
+          description: Production not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Guest calling disabled or database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/productions/{id}/guests/{guestId}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: guestId
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      summary: Kick a guest
+      description: Marks the guest session `left`. Take-to-air/preview reuse the existing vision-mixer `SET_PVW`/`TAKE`; no new switching commands are introduced.
+      operationId: kickGuest
+      tags: [Guests]
+      responses:
+        '204':
+          description: Guest kicked
+        '403':
+          description: Guest is in a different production
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Guest not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'

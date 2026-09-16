@@ -224,7 +224,40 @@ export const config = {
    * `getIdleWarningLeadMs()` so it can never exceed `idleTimeoutSec`.
    */
   idleWarningLeadSec: parsePositiveIntEnv('IDLE_WARNING_LEAD_SEC', 60),
+  // --- Guest calling (epic #208, issue #299, docs/specs/guest-calling-intercom.md) ---
+  /**
+   * HMAC secret used to sign production-scoped guest invite tokens. REQUIRED to
+   * enable guest calling: when unset, the invite/join routes reject with 503
+   * (feature disabled) rather than minting unsigned tokens. Only the SHA-256
+   * hash of each token is persisted (`GuestInviteDoc.tokenHash`); the raw token
+   * is returned to the operator once and never stored (spec §Risks). Redacted in
+   * `src/lib/log-redact.ts` and the Fastify logger's redact paths.
+   */
+  guestInviteSecret: process.env['GUEST_INVITE_SECRET'] ?? undefined,
+  /** Default guest invite lifetime in seconds. */
+  guestInviteTtlS: parsePositiveIntEnv('GUEST_INVITE_TTL_S', 86400),
+  /**
+   * Base URL of the Open Intercom manager (Eyevinn/intercom-manager). Optional:
+   * when unset, guest calling still works with WHIP video + WHEP return but no
+   * talkback line (the fallback is first-class by design — spec §Configuration).
+   * Consumed by a later sub-issue (intercom line provisioning).
+   */
+  intercomManagerUrl: process.env['INTERCOM_MANAGER_URL'] ?? undefined,
+  /**
+   * Auth token for the Open Intercom manager. Optional; held server-side only
+   * and redacted in `src/lib/log-redact.ts`. Consumed by a later sub-issue.
+   */
+  intercomManagerToken: process.env['INTERCOM_MANAGER_TOKEN'] ?? undefined,
 } as const;
+
+/**
+ * True when guest calling is enabled, i.e. the HMAC signing secret is present.
+ * The invite/join/guest-management routes degrade to 503 when this is false,
+ * mirroring how VOD recording gates on its MinIO config.
+ */
+export function isGuestCallingEnabled(): boolean {
+  return Boolean(config.guestInviteSecret);
+}
 
 /**
  * True when all required MinIO vars are present, i.e. VOD recording is enabled.

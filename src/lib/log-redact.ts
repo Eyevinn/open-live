@@ -1,5 +1,12 @@
 /**
  * Redacts sensitive values from log objects to prevent credential leakage.
+ *
+ * The `secret` / `token` sub-patterns intentionally match by substring, so the
+ * guest-calling credentials `GUEST_INVITE_SECRET` (HMAC signing key) and
+ * `INTERCOM_MANAGER_TOKEN` — as well as their camelCase config keys
+ * `guestInviteSecret` / `intercomManagerToken` — are redacted here without a
+ * dedicated rule (epic #208, issue #299, spec §Risks: "Redact
+ * INTERCOM_MANAGER_TOKEN and GUEST_INVITE_SECRET in logs").
  */
 
 const SENSITIVE_KEYS =
