@@ -209,6 +209,21 @@ export const config = {
    * one poll interval (≤ this value). Default 250 ms.
    */
   clipStatePollMs: parsePositiveIntEnv('CLIP_STATE_POLL_MS', 250),
+  /**
+   * Idle auto-deactivation deadline in seconds (issue #290). A production with
+   * zero subscribers for this long is auto-deactivated with
+   * `endedReason: 'idle'` / `autoDeactivated: true`. Defaults to 300s, matching
+   * the previous hardcoded `IDLE_TIMEOUT_MS` — do not change runtime behavior.
+   */
+  idleTimeoutSec: parsePositiveIntEnv('IDLE_TIMEOUT_SEC', 300),
+  /**
+   * Lead time in seconds before the idle deadline at which the watchdog emits a
+   * single `IDLE_WARNING` over the controller WS so clients can keep the show
+   * up (issue #290). The frontend (open-live-studio#130/#131) surfaces the
+   * remaining-seconds countdown. Clamped to the deadline at read time via
+   * `getIdleWarningLeadMs()` so it can never exceed `idleTimeoutSec`.
+   */
+  idleWarningLeadSec: parsePositiveIntEnv('IDLE_WARNING_LEAD_SEC', 60),
 } as const;
 
 /**

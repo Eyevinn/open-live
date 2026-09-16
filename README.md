@@ -127,6 +127,8 @@ and fill in the values:
 | `STROM_PORT_LEASE_SIZE` | Number of SRT listener ports to lease from a shared Strom — see [`docs/port-lease.md`](docs/port-lease.md) | `10` |
 | `STROM_PORT_LEASE_CLIENT_ID` | Stable lease client id sent to Strom | hostname of `PUBLIC_BASE_URL`, else `open-live-<hostname>` |
 | `STROM_PORT_LEASE_DISABLED` | Set to `true` to turn off port leasing | `false` |
+| `IDLE_TIMEOUT_SEC` | Seconds a production may have zero connected clients before it is auto-deactivated (`endedReason: 'idle'`). A `KEEP_ALIVE` from any client resets this timer | `300` |
+| `IDLE_WARNING_LEAD_SEC` | Lead time before the idle deadline at which the backend emits a single `IDLE_WARNING` (with `remainingSec` + `deadlineMs`) over the controller WS so clients can keep the show up. Clamped to `IDLE_TIMEOUT_SEC` | `60` |
 
 > **Never commit `.env`** — it is gitignored. Use `.env.example` as the reference.
 

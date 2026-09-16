@@ -119,6 +119,7 @@ otherwise ignored. The inbound type union (`src/ws/controller.ts`):
 | `CLIP_PAUSE` | `mixerInput: string` | Pause playback (`control pause`). Broadcasts `CLIP_STATE` `paused` and stops the completion poll. |
 | `CLIP_STOP` | `mixerInput: string` | Stop playback (`control stop`). Broadcasts `CLIP_STATE` `stopped` and stops the completion poll. |
 | `CLIP_SEEK` | `mixerInput: string`, `positionMs: number` | Seek within the clip (`seek position_ms`); `positionMs` is a non-negative integer (0 … 24 h). Broadcasts the resulting `CLIP_STATE`. |
+| `KEEP_ALIVE` | — | Client activity / liveness signal (issue #290). Resets the production's idle timer and cancels any pending idle warning; when a warning was outstanding this broadcasts `IDLE_WARNING_CLEARED`. Needs no production doc, so it is handled before the doc fetch the other commands require. |
 
 `VideoEffect` (the `effect` field of `SET_EFFECT`) is itself a discriminated union on
 its own `type`: `none`, `chroma_key`, `pixelate`, `blur`, `duotone`, `vignette`, `vhs`,
@@ -162,6 +163,8 @@ are emitted from `src/ws/controller.ts` and `src/services/meter-relay.ts`:
 | `CLIP_STATE` | `mixerInput: string`, `state: 'idle' \| 'cued' \| 'playing' \| 'paused' \| 'stopped' \| 'completed' \| 'error'`, `clipId?: string`, `positionMs?: number`, `durationMs?: number`, `error?: string` | A clip transitions on `mixerInput` (cue/play/pause/stop/seek), reaches end-of-media (`completed`), or a clip operation fails (`error`); also sent on connect for each clip source |
 | `METER_DATA` | `elementId: string`, `peak`, `rms` | Audio meter tick (relayed from Strom); `elementId` is `main`, `monitor`, `ch{N}`, `aux{N}`, or `grp{N}` |
 | `LOUDNESS_DATA` | `elementId: 'main'`, `momentary`, `shortterm`, `integrated`, `loudness_range`, `true_peak` | EBU R128 loudness tick (relayed from Strom) |
+| `IDLE_WARNING` | `productionId: string`, `remainingSec: number`, `deadlineMs: number` | The idle watchdog (`src/services/idle-watchdog.ts`) crossed the warning threshold (T-minus `IDLE_WARNING_LEAD_SEC`, default 60s) before an idle auto-deactivation (issue #290). `remainingSec` is the integer countdown to the deadline; `deadlineMs` is the absolute epoch-ms deadline. Emitted once per idle cycle. |
+| `IDLE_WARNING_CLEARED` | `productionId: string` | A pending idle warning was cancelled because activity reset the idle timer (a subscriber joined or a `KEEP_ALIVE` was received). |
 | `ERROR` | `error: string` | An inbound frame was invalid or an operation failed (sent to originating socket) |
 
 `pgmBg` is the mixer input a PiP on program is composited over. It is `null` unless
