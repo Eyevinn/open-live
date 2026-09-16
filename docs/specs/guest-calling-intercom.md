@@ -1,13 +1,18 @@
 # Spec: Integrated guest calling — browser guest join (WHIP/WHEP) + Open Intercom talkback
 
-**Status: Proposed** (architect draft for epic #208)
+**Status: Accepted** (architect draft for epic #208; blocking topology/return/picture-source
+questions resolved by @svensson00 on #208, 2026-09-16 —
+https://github.com/Eyevinn/open-live/issues/208#issuecomment-5696583364)
 **Author:** architect agent
 **Related issues:** #208 (epic); relates to #206 (clip), #209 (automation contract),
 Eyevinn/intercom-manager (Open Intercom)
 
-> Proposed spec, not an accepted decision. This is a very large, cross-product epic. Several
-> Open Questions below are genuine product/topology decisions that a maintainer must make — this
-> spec deliberately does not invent answers to them.
+> **Accepted.** The three blocking product/topology calls (OQ1 guest-video topology, OQ2 return
+> feed, OQ7 guest picture source) were decided by the PM decision authority @svensson00 on the
+> #208 epic thread (2026-09-16); their resolutions are recorded inline below. The remaining Open
+> Questions (OQ2-low-latency-mix / OQ3 / OQ4 / OQ5 / OQ6, renumbered/clarified below) are
+> implementation-detail or dependent-ticket calls that do not block accepting this spec or
+> breaking the epic into sub-issues.
 
 ## Problem Statement
 
@@ -84,7 +89,8 @@ guests who only listen.
 - **Fixed at build time.** Aux bus count and WHEP endpoints cannot change on a running flow, so a
   guest joining an active production needs a spare return (Open Question 5).
 
-**Picture source** (Open Question 7):
+**Picture source** (OQ7 — RESOLVED by @svensson00, #208 2026-09-16: v1 guests see **program
+output via WHEP**; per-guest return video is a later enhancement):
 
 | Source | Cost | Adapts to the guest's link |
 |--------|------|----------------------------|
@@ -92,7 +98,10 @@ guests who only listen.
 | (ii) raw program video, encoded per guest | one encode per guest | yes, where the encoder supports bitrate control (not macOS VideoToolbox) |
 | (iii) one shared low-bitrate program encode | one encode | no, but bounded low, with a GOP chosen for fast joins |
 
-Proposed: (iii) for v1.
+**Decision (OQ7):** v1 ships program output over WHEP — option (iii), a single shared low-bitrate
+program encode, is the recommended realisation of "program output via WHEP" (falling back to (i)
+where a dedicated shared encode isn't warranted). Per-guest encoded return video (option (ii)) is
+explicitly a later enhancement.
 
 ### Low-latency mode (after v1)
 
@@ -108,7 +117,8 @@ only `returnFeed.lowLatency: false`. Before it ships:
   `min_upstream_latency` set to the slowest SRT source, `src/lib/flow-generator.ts:148-153,418-435`)
   may be released early with a negative WHEP `ts_offset_ms`. Unverified on Open Live's flow; must
   be measured.
-- **Which mix feeds it** — Open Question 2.
+- **Which mix feeds it** — see the "Mix for the low-latency return (after v1)" remaining open
+  question below (an implementation-time call, not a v1 blocker).
 
 ## API Design
 
@@ -346,34 +356,59 @@ Reuses existing `STROM_URL`, `PUBLIC_BASE_URL` (for building `joinUrl`/WHIP call
 When intercom vars are unset, guest calling still works with WHIP video + WHEP return but no
 talkback line (feature degrades cleanly — the fallback is first-class by design).
 
-## Open Questions (genuine product/topology decisions — must go to a maintainer)
+## Open Questions
 
-1. **Guest-video topology (the core decision):** video over the intercom line (requires the SVT
-   video work to be merged upstream — confirm *where that work lives and its timeline*) vs. video
-   over Open Live's existing WHIP source path with intercom carrying talkback audio only. This
-   spec's baseline is WHIP-video + audio-talkback; confirm that is acceptable for v1.
-2. **Mix for the low-latency return:** an aux bus on `builtin.mixer` (keeps each guest's channel
-   processing, carries the audio mixer's latency) vs. `builtin.liveaudiorouter` fed before the
-   mixer (lower latency, raw microphones, no limiter unless Eyevinn/strom#795 lands). Measure path
-   headroom and per-guest jitter on real links first; see
-   [Low-latency mode](#low-latency-mode-after-v1).
-3. **Guest auth model for invite links:** production-scoped, expiring, single-use vs reusable?
-   This spec proposes signed (HMAC) expiring tokens stored as hashes; confirm.
-4. **Intercom line provisioning:** automated per production via the intercom-manager API (this
-   spec's `intercomProductionId` assumes this is feasible) vs manually configured in v1. Requires
-   confirming intercom-manager's line/session API shape.
-5. **Capacity / limits:** max simultaneous guests per production and its effect on Strom flow
-   sizing and mixer input allocation.
-6. **Where does the green-room preview live** — Studio multiviewer only, or a dedicated preview
-   surface? (Studio UI scope, defers to a dependent `open-live-studio` ticket.)
-7. **Guest picture source:** passed-through program encode, a per-guest encode, or one shared
-   low-bitrate encode for all guests. This spec proposes the shared encode for v1; confirm. See
-   [Return feed design](#return-feed-design).
+### Resolved by @svensson00 (#208, 2026-09-16)
+
+These three blocking calls were decided by the PM decision authority on the epic thread
+(https://github.com/Eyevinn/open-live/issues/208#issuecomment-5696583364), unblocking this spec
+from Proposed → Accepted.
+
+1. **OQ1 — Guest-video topology (the core decision): RESOLVED — WHIP-video + audio-only talkback.**
+   Guest video goes through **Open Live's own WHIP-in path**; Open Intercom carries **talkback
+   audio only**. @svensson00: "Production media belongs in Open Live per the reference
+   architecture, and I don't want this epic gated on intercom-side video upstreaming." This matches
+   the spec's baseline topology (see [Design principle](#design-principle-whip-video--intercom-audio-fallback-is-first-class));
+   video-over-intercom is not a v1 dependency and the SVT-merge risk below is now closed.
+2. **OQ2 — Return feed: RESOLVED — per-guest mix-minus.** The default return is **`program-minus`**
+   (per-guest mix-minus), not program-with-delay. @svensson00: "Program-with-delay returns the
+   guest's own voice delayed and is unusable in conversation; `builtin.audiorouter`'s routing matrix
+   should make N-1 feasible." This is exactly what the [Return feed design](#return-feed-design)
+   already specifies (one post-fader aux bus per guest, `program-minus` default).
+7. **OQ7 — Guest picture source: RESOLVED — program output via WHEP for v1.** v1 guests see
+   **program output via WHEP**; per-guest return video is a later enhancement. This confirms the
+   spec's proposed shared/program-based picture feed for v1 (see
+   [Return feed design](#return-feed-design), picture-source option (iii)/(i)); per-guest encode is
+   deferred.
+
+### Remaining (implementation-detail / dependent-ticket — do not block acceptance)
+
+These do not gate accepting the spec or cutting sub-issues; they are resolved during
+implementation or in a dependent `open-live-studio` ticket.
+
+- **Mix for the low-latency return (after v1):** an aux bus on `builtin.mixer` (keeps each guest's
+  channel processing, carries the audio mixer's latency) vs. `builtin.liveaudiorouter` fed before
+  the mixer (lower latency, raw microphones, no limiter unless Eyevinn/strom#795 lands). Measure
+  path headroom and per-guest jitter on real links first; see
+  [Low-latency mode](#low-latency-mode-after-v1). Only relevant once `low-latency-minus` ships;
+  v1 is `lowLatency: false`.
+- **Guest auth model for invite links:** production-scoped, expiring, single-use vs reusable? This
+  spec proposes signed (HMAC) expiring tokens stored as hashes — adopted as the implementation
+  default.
+- **Intercom line provisioning:** automated per production via the intercom-manager API (this
+  spec's `intercomProductionId` assumes this is feasible) vs manually configured in v1. Requires
+  confirming intercom-manager's line/session API shape during implementation.
+- **Capacity / limits:** max simultaneous guests per production and its effect on Strom flow
+  sizing and mixer input allocation — an implementation-time sizing call.
+- **Where does the green-room preview live** — Studio multiviewer only, or a dedicated preview
+  surface? Studio UI scope; defers to a dependent `open-live-studio` ticket.
 
 ## Risks
 
-- **Dependency on unmerged SVT intercom-video work** — mitigated by making WHIP-video the
-  baseline; do not let the epic block on the merge.
+- **Dependency on unmerged SVT intercom-video work** — **closed by OQ1** (@svensson00, #208
+  2026-09-16): guest video goes through Open Live's own WHIP-in path and Open Intercom carries
+  talkback audio only, so the epic no longer touches intercom-side video and cannot block on that
+  merge. Video-over-intercom is out of scope for this epic.
 - **Accurate on-air state for guests** depends on #209's contribution-tally model; without it,
   a guest shown as a PiP inset would report `tally.pgm = null` and the `on-air` derivation would
   be wrong. Sequence #209 (or its tally sub-work) before the `on-air` guest state is trusted.
