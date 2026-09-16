@@ -11,6 +11,7 @@ import { clearProductionPflState } from '../services/pfl-state.js';
 import { clearPipState, clearAudioState, clearFxState, clearClipStateForProduction } from '../ws/controller.js';
 import { config, isRecordingEnabled } from '../config.js';
 import { minioTargetFromConfig, uploadRecordings } from '../lib/recording-uploader.js';
+import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type OutputStatusEntry } from '../lib/production-health.js';
 
@@ -853,6 +854,15 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         await deactivateStromFlow(doc.stromFlowId, strom);
       }
 
+      // Tear down the Open Intercom talkback grouping (all its lines) with the
+      // production lifecycle (issue #302). Best-effort: a failed teardown must not
+      // block deactivation, mirroring the Strom/recording teardown contract.
+      if (doc.intercomProductionId && isIntercomEnabled()) {
+        await teardownIntercomProduction(doc.intercomProductionId).catch((err) => {
+          req.log.warn({ err, productionId: doc._id }, 'intercom teardown failed — continuing deactivation');
+        });
+      }
+
       // Transition rule (spec §1): a production that was `active` (reached a live
       // broadcast) and is now explicitly deactivated becomes `ended`; one that
       // never reached `active` (still `activating`) becomes `inactive` — it never
@@ -877,6 +887,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         whepOutputUrls: undefined,
         returnBuses: undefined,
         returnWhepUrls: undefined,
+        intercomProductionId: undefined,
         tally: { pgm: null, pvw: null },
         updatedAt: new Date().toISOString(),
       };

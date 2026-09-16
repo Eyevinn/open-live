@@ -18,6 +18,12 @@ import {
 } from '../lib/guest-invite-token.js';
 import { config, isGuestCallingEnabled } from '../config.js';
 import { resolvePublicBaseUrl, updateProductionDoc } from './productions.js';
+import {
+  isIntercomEnabled,
+  provisionGuestLine,
+  IntercomManagerError,
+  type IntercomLine,
+} from '../lib/intercom-manager.js';
 
 /**
  * Guest calling — production-scoped invites + token-authed guest join
@@ -318,7 +324,7 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
       }
 
-      // 5. Ensure the guest's assignment carries a return feed (issue #300). The
+      // 5a. Ensure the guest's assignment carries a return feed (issue #300). The
       //    return belongs to the assignment, so a rejoin keeps it; default is
       //    program-minus (OQ2). Only persist when an assignment on this input
       //    already exists — the operator assigns the WHIP source to the input.
@@ -336,6 +342,47 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         } catch (err) {
           // Non-fatal: the guest can still join; the return is built on next activate.
           fastify.log.warn({ err }, 'POST guests/:id/join — return-feed persist failed');
+        }
+      }
+
+      // 5b. Provision an Open Intercom talkback line (audio only, OQ1). Degrades
+      //    cleanly: when the intercom vars are unset this is silently skipped and
+      //    join succeeds with `intercomLine` absent. When the vars ARE set the
+      //    talkback line is explicitly enabled, so a failure to reach the manager
+      //    is a 502 — an operator asked for talkback and it could not be
+      //    delivered (spec §Configuration, §"Error codes").
+      let intercomLine: IntercomLine | undefined;
+      if (isIntercomEnabled()) {
+        try {
+          intercomLine = await provisionGuestLine({
+            intercomProductionId: production.intercomProductionId,
+            productionId: production._id,
+            lineName: invite.label ?? mixerInput,
+          });
+        } catch (err) {
+          if (err instanceof IntercomManagerError) {
+            fastify.log.warn({ err }, 'POST guests/:id/join — intercom-manager unreachable');
+            return reply.status(502).send({ error: 'Intercom manager unreachable', statusCode: 502 });
+          }
+          throw err;
+        }
+
+        // Record the intercom refs on the session and (first time only) on the
+        // production so lines tear down with the production lifecycle. The
+        // production write goes through updateProductionDoc (get-modify-put with
+        // 409 retry) so it composes with the return-feed persist above instead of
+        // clobbering it with a stale revision.
+        try {
+          session = { ...session, intercomLineId: intercomLine.id, updatedAt: new Date().toISOString() };
+          await getGuestSessionsDb().insert(session);
+          if (production.intercomProductionId !== intercomLine.productionId) {
+            await updateProductionDoc(production._id, {
+              intercomProductionId: intercomLine.productionId,
+            });
+          }
+        } catch (err) {
+          fastify.log.warn({ err }, 'POST guests/:id/join — intercom ref persist failed');
+          return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
         }
       }
 
@@ -363,8 +410,9 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         modes: returnModesFor(mixerInput),
         defaultMode: 'program-minus',
         returnMode,
-        // intercomLine omitted until intercom provisioning lands (feature degrades
-        // cleanly to WHIP video + WHEP return, no talkback — spec §Configuration).
+        // intercomLine absent when intercom is unconfigured — join still works with
+        // WHIP video + WHEP return, no talkback (fallback is first-class — spec §Configuration).
+        ...(intercomLine ? { intercomLine } : {}),
       });
     },
   );
