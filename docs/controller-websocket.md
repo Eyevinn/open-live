@@ -165,6 +165,7 @@ are emitted from `src/ws/controller.ts` and `src/services/meter-relay.ts`:
 | `LOUDNESS_DATA` | `elementId: 'main'`, `momentary`, `shortterm`, `integrated`, `loudness_range`, `true_peak` | EBU R128 loudness tick (relayed from Strom) |
 | `IDLE_WARNING` | `productionId: string`, `remainingSec: number`, `deadlineMs: number` | The idle watchdog (`src/services/idle-watchdog.ts`) crossed the warning threshold (T-minus `IDLE_WARNING_LEAD_SEC`, default 60s) before an idle auto-deactivation (issue #290). `remainingSec` is the integer countdown to the deadline; `deadlineMs` is the absolute epoch-ms deadline. Emitted once per idle cycle. |
 | `IDLE_WARNING_CLEARED` | `productionId: string` | A pending idle warning was cancelled because activity reset the idle timer (a subscriber joined or a `KEEP_ALIVE` was received). |
+| `RETURN_STATE` | `mixerInput: string`, `mode: 'program' \| 'program-minus'` | A per-guest return feed's mix-minus mode changed on `mixerInput` (crew via `PUT .../returns/{mixerInput}/mode`, or the guest via `PUT /api/v1/guests/{inviteId}/session/return`). `program-minus` closes that guest's own send; `program` opens it (epic #208, issue #300). |
 | `ERROR` | `error: string` | An inbound frame was invalid or an operation failed (sent to originating socket) |
 
 `pgmBg` is the mixer input a PiP on program is composited over. It is `null` unless
