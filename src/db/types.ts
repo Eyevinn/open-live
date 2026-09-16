@@ -203,6 +203,34 @@ export interface ProductionOutputAssignment {
   outputId: string;      // references OutputDoc._id
 }
 
+// --------------- Recording (VOD) types ---------------
+
+/**
+ * A recorded VOD asset archived to object storage (epic #5, issue #42).
+ *
+ * Written on production deactivate: after open-live uploads Strom's local
+ * recorder segments to MinIO/S3 (issue #41), one `RecordingDoc` is persisted
+ * per uploaded object so the listing/playback endpoint can enumerate and
+ * presign recordings without round-tripping the bucket on every request. The
+ * listing endpoint still reconciles against the bucket prefix so a crash
+ * between upload and persist does not permanently hide an object (spec §Risks).
+ */
+export interface RecordingDoc {
+  _id: string;            // "recording-<uuid>"
+  _rev?: string;
+  type: 'recording';
+  productionId: string;   // references ProductionDoc._id
+  outputId?: string;      // the 'recording' OutputDoc that produced it, when known
+  bucket: string;
+  key: string;            // object key, e.g. "<productionId>/<segment>.mp4"
+  sizeBytes?: number;
+  durationMs?: number;
+  startedAt: string;      // ISO 8601 — when the recording session began
+  endedAt?: string;       // ISO 8601 — when the segment was finalized/uploaded
+  createdAt: string;
+  updatedAt: string;
+}
+
 // --------------- Production config types ---------------
 
 export interface ProductionConfigDoc {

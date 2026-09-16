@@ -169,6 +169,62 @@ export async function putObject(
   }
 }
 
+/**
+ * Builds a presigned GET URL for an object, so a private bucket's recordings can
+ * be played back without exposing the MinIO credentials (spec §API Design:
+ * `playbackUrl` is a time-boxed presigned GET). Uses the same dependency-free
+ * SigV4 signer (node `crypto`) as `putObject` — query-string signing
+ * (`X-Amz-*` params) rather than an Authorization header, path-style addressing.
+ */
+export function presignGetUrl(
+  target: MinioTarget,
+  key: string,
+  expiresInSeconds: number,
+  now: Date = new Date(),
+): string {
+  const scheme = target.useSsl ? 'https' : 'http';
+  const host = target.endpoint;
+  const canonicalUri = `/${encodeKey(target.bucket)}/${encodeKey(key)}`;
+
+  const amzDate = now.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+  const dateStamp = amzDate.slice(0, 8);
+  const algorithm = 'AWS4-HMAC-SHA256';
+  const credentialScope = `${dateStamp}/${target.region}/s3/aws4_request`;
+  const signedHeaders = 'host';
+
+  // SigV4 requires the query params to be sorted; build them in canonical order.
+  const query =
+    `X-Amz-Algorithm=${algorithm}` +
+    `&X-Amz-Credential=${encodeURIComponent(`${target.accessKey}/${credentialScope}`)}` +
+    `&X-Amz-Date=${amzDate}` +
+    `&X-Amz-Expires=${expiresInSeconds}` +
+    `&X-Amz-SignedHeaders=${signedHeaders}`;
+
+  const canonicalRequest = [
+    'GET',
+    canonicalUri,
+    query,
+    `host:${host}\n`,
+    signedHeaders,
+    'UNSIGNED-PAYLOAD',
+  ].join('\n');
+
+  const stringToSign = [
+    algorithm,
+    amzDate,
+    credentialScope,
+    sha256Hex(canonicalRequest),
+  ].join('\n');
+
+  const kDate = hmac(`AWS4${target.secretKey}`, dateStamp);
+  const kRegion = hmac(kDate, target.region);
+  const kService = hmac(kRegion, 's3');
+  const kSigning = hmac(kService, 'aws4_request');
+  const signature = createHmac('sha256', kSigning).update(stringToSign, 'utf8').digest('hex');
+
+  return `${scheme}://${host}${canonicalUri}?${query}&X-Amz-Signature=${signature}`;
+}
+
 function contentTypeForFile(name: string): string {
   const ext = name.slice(name.lastIndexOf('.') + 1).toLowerCase();
   switch (ext) {

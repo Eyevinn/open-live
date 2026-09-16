@@ -302,6 +302,49 @@ components:
           type: string
           format: date-time
 
+    RecordingAsset:
+      type: object
+      description: >-
+        A recorded VOD asset archived to MinIO/S3 (epic #5, issue #42). One asset
+        is persisted per uploaded object when a production with a `recording`
+        output deactivates. `playbackUrl` is a time-boxed presigned GET URL
+        (TTL = RECORDING_PRESIGN_TTL_S) so a private bucket's recordings can be
+        played without exposing storage credentials; it is omitted when a
+        presigned URL cannot be produced (e.g. bucket reconfigured).
+      required: [id, productionId, bucket, key, startedAt, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+        productionId:
+          type: string
+        outputId:
+          type: string
+          description: The 'recording' output that produced this asset, when known.
+        bucket:
+          type: string
+        key:
+          type: string
+          description: Object key within the bucket.
+        sizeBytes:
+          type: integer
+        durationMs:
+          type: integer
+        startedAt:
+          type: string
+          format: date-time
+        endedAt:
+          type: string
+          format: date-time
+        playbackUrl:
+          type: string
+          description: Presigned GET URL for playback. Omitted when unavailable.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
     SrtConnect:
       type: object
       description: >-
@@ -1119,6 +1162,93 @@ paths:
           description: Deleted
         '404':
           description: Not found
+
+  # ── Recordings (VOD) ─────────────────────────────────────────────────────────
+
+  /api/v1/productions/{id}/recordings:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: List a production's recordings
+      operationId: listProductionRecordings
+      tags: [Recordings]
+      responses:
+        '200':
+          description: Array of recording assets, each with a presigned playbackUrl
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RecordingAsset'
+        '404':
+          description: Production not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Object storage or database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/recordings:
+    get:
+      summary: List recordings across all productions
+      operationId: listRecordings
+      tags: [Recordings]
+      responses:
+        '200':
+          description: Array of recording assets
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RecordingAsset'
+        '503':
+          description: Object storage or database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/recordings/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Get a single recording
+      operationId: getRecording
+      tags: [Recordings]
+      responses:
+        '200':
+          description: Recording asset
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordingAsset'
+        '404':
+          description: Recording not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Object storage unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   # ── Production Configs ───────────────────────────────────────────────────────
 
