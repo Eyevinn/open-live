@@ -20,9 +20,42 @@ function parsePositiveIntEnv(name: string, defaultValue: number): number {
   return value;
 }
 
-function buildCouchdbUrl(): string {
+/**
+ * Redact any `user:pass@` userinfo segment from a URL-ish string so a malformed
+ * value can be safely echoed in an error message without leaking credentials.
+ * Operates on the raw string (the value may not be parseable), replacing the
+ * password — and, defensively, the username — with `***`.
+ */
+function redactUrlCredentials(raw: string): string {
+  // Match an authority userinfo segment: scheme://[user[:pass]]@host...
+  return raw.replace(
+    /(^[^:/?#\s]+:\/\/)([^/?#@]*)@/,
+    (_full, scheme: string, userinfo: string) => {
+      const user = userinfo.split(':', 1)[0];
+      return `${scheme}${user ? `${user}:***` : '***'}@`;
+    },
+  );
+}
+
+/**
+ * Parse `COUCHDB_URL`. On OSC the value is derived by osc-entrypoint.sh, which
+ * can produce a truncated string like `https:/` when the operator's DatabaseUrl
+ * has no `/dbname` path (issue #288). `new URL()` then throws an opaque
+ * `TypeError: Invalid URL` that is very hard to diagnose. Wrap the parse so the
+ * failure names the env var and shows the (credential-redacted) value plus the
+ * expected form.
+ */
+export function buildCouchdbUrl(): string {
   const raw = requireEnv('COUCHDB_URL');
-  const url = new URL(raw);
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(
+      `Invalid COUCHDB_URL: "${redactUrlCredentials(raw)}" is not a valid URL. ` +
+        `Expected the form http(s)://[user:pass@]host[:port]/dbname.`,
+    );
+  }
   // If credentials are already embedded in the URL, leave them as-is.
   if (url.password) return raw;
   const user = process.env['COUCHDB_USER'];
