@@ -71,6 +71,24 @@ export interface ClipReferenceTams {
 
 export type ClipReference = ClipReferenceUrl | ClipReferenceS3 | ClipReferenceTams;
 
+/**
+ * Live clip playback state for a `clip` source assigned to a mixer input
+ * (epic #206, issues #277/#278). CamelCased mirror of Strom's
+ * `PlayerStateResponse` plus the cue/play/completed clip state machine
+ * (spec `docs/specs/clip-story-playback.md` §"State machine").
+ *
+ * Held only in the in-memory `clip-state` service (mirroring tally) — never
+ * persisted on a doc for v1. Restored from `player.getState` on connect.
+ */
+export interface ClipState {
+  mixerInput: string;
+  state: 'idle' | 'cued' | 'playing' | 'paused' | 'stopped' | 'completed' | 'error';
+  clipId?: string;
+  positionMs?: number;
+  durationMs?: number;
+  error?: string;
+}
+
 export interface SourceDoc {
   _id: string;
   _rev?: string;
