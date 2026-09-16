@@ -17,6 +17,7 @@ import {
   hashGuestInviteToken,
 } from '../lib/guest-invite-token.js';
 import { config, isGuestCallingEnabled } from '../config.js';
+import { broadcast } from '../services/tally.service.js';
 import { resolvePublicBaseUrl, updateProductionDoc } from './productions.js';
 import {
   isIntercomEnabled,
@@ -42,9 +43,9 @@ import {
  *
  * Take-to-air / preview is NOT implemented here: a guest is a WHIP source on a
  * mixer input, so the existing vision-mixer `SET_PVW` / `TAKE` already switch it.
- * Return-feed wiring, guest WS lifecycle events and intercom provisioning are
- * separate sub-issues; `feeds` is therefore returned empty in v1 while the
- * `modes`/`defaultMode`/`returnMode` metadata (a stable contract) is present.
+ * Guest lifecycle WS events (`GUEST_STATE`) are broadcast from here on the
+ * persisted join/leave/kick transitions (issue #301); return-feed mode changes
+ * and the connect-time snapshot live in the WS controller.
  */
 
 // ---------------------------------------------------------------------------
@@ -104,6 +105,23 @@ function sessionToApi(doc: GuestSessionDoc) {
   void _rev;
   void type;
   return { id: _id, ...rest };
+}
+
+/**
+ * Broadcast a GUEST_STATE lifecycle event to a production's controller
+ * subscribers (epic #208, issue #301). Emitted on the persisted transitions
+ * (`joined` on join, `left` on leave/kick). previewing/on-air are derived on
+ * the WS controller connect snapshot from the live tally, not re-derived here.
+ */
+function broadcastGuestState(session: GuestSessionDoc, label?: string): void {
+  broadcast(session.productionId, {
+    type: 'GUEST_STATE',
+    guestId: session._id,
+    mixerInput: session.mixerInput,
+    state: session.state,
+    ...(label ? { label } : {}),
+    ...(session.intercomLineId ? { intercomLine: session.intercomLineId } : {}),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +404,10 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         }
       }
 
+      // 5c. Announce the guest to controller subscribers (issue #301). Broadcast
+      //     the final persisted session (state `joined`, intercom ref if any).
+      broadcastGuestState(session, invite.label);
+
       // 6. Build the response. whipUrl reuses the EXISTING WHIP proxy contract
       //    (`/api/v1/productions/:id/whip/:mixerInput`) — never a new WHIP path.
       //    The return picture feed URL is server-issued and scoped to this input;
@@ -449,11 +471,13 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
           (s) => s.state !== 'left',
         );
         if (live) {
-          await getGuestSessionsDb().insert({
+          const leftSession: GuestSessionDoc = {
             ...live,
             state: 'left',
             updatedAt: new Date().toISOString(),
-          });
+          };
+          await getGuestSessionsDb().insert(leftSession);
+          broadcastGuestState(leftSession, invite.label);
         }
       } catch (err) {
         fastify.log.warn({ err }, 'DELETE guests/:id/session — DB write failed');
@@ -507,11 +531,13 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         return reply.status(403).send({ error: 'Guest is in a different production', statusCode: 403 });
       }
       try {
-        await getGuestSessionsDb().insert({
+        const leftSession: GuestSessionDoc = {
           ...session,
           state: 'left',
           updatedAt: new Date().toISOString(),
-        });
+        };
+        await getGuestSessionsDb().insert(leftSession);
+        broadcastGuestState(leftSession);
       } catch (err) {
         fastify.log.warn({ err }, 'DELETE guests/:guestId — DB write failed');
         return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });

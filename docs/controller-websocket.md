@@ -119,6 +119,7 @@ otherwise ignored. The inbound type union (`src/ws/controller.ts`):
 | `CLIP_PAUSE` | `mixerInput: string` | Pause playback (`control pause`). Broadcasts `CLIP_STATE` `paused` and stops the completion poll. |
 | `CLIP_STOP` | `mixerInput: string` | Stop playback (`control stop`). Broadcasts `CLIP_STATE` `stopped` and stops the completion poll. |
 | `CLIP_SEEK` | `mixerInput: string`, `positionMs: number` | Seek within the clip (`seek position_ms`); `positionMs` is a non-negative integer (0 … 24 h). Broadcasts the resulting `CLIP_STATE`. |
+| `RETURN_SET` | `mixerInput: string`, `mode: 'program' \| 'program-minus'` | Crew switch a guest's synced return mode (epic #208, issue #301). Shares `applyReturnMode` with the crew REST route and the guest token route: persist + apply the send matrix live + broadcast `RETURN_STATE`. `NACK`/`ERROR` when the input has no return feed, the mode is invalid, or the production is not active. |
 | `KEEP_ALIVE` | — | Client activity / liveness signal (issue #290). Resets the production's idle timer and cancels any pending idle warning; when a warning was outstanding this broadcasts `IDLE_WARNING_CLEARED`. Needs no production doc, so it is handled before the doc fetch the other commands require. |
 
 `VideoEffect` (the `effect` field of `SET_EFFECT`) is itself a discriminated union on
@@ -165,7 +166,8 @@ are emitted from `src/ws/controller.ts` and `src/services/meter-relay.ts`:
 | `LOUDNESS_DATA` | `elementId: 'main'`, `momentary`, `shortterm`, `integrated`, `loudness_range`, `true_peak` | EBU R128 loudness tick (relayed from Strom) |
 | `IDLE_WARNING` | `productionId: string`, `remainingSec: number`, `deadlineMs: number` | The idle watchdog (`src/services/idle-watchdog.ts`) crossed the warning threshold (T-minus `IDLE_WARNING_LEAD_SEC`, default 60s) before an idle auto-deactivation (issue #290). `remainingSec` is the integer countdown to the deadline; `deadlineMs` is the absolute epoch-ms deadline. Emitted once per idle cycle. |
 | `IDLE_WARNING_CLEARED` | `productionId: string` | A pending idle warning was cancelled because activity reset the idle timer (a subscriber joined or a `KEEP_ALIVE` was received). |
-| `RETURN_STATE` | `mixerInput: string`, `mode: 'program' \| 'program-minus'` | A per-guest return feed's mix-minus mode changed on `mixerInput` (crew via `PUT .../returns/{mixerInput}/mode`, or the guest via `PUT /api/v1/guests/{inviteId}/session/return`). `program-minus` closes that guest's own send; `program` opens it (epic #208, issue #300). |
+| `RETURN_STATE` | `mixerInput: string`, `mode: 'program' \| 'program-minus'` | A per-guest return feed's mix-minus mode changed on `mixerInput` (crew via `PUT .../returns/{mixerInput}/mode`, the `RETURN_SET` WS command, or the guest via `PUT /api/v1/guests/{inviteId}/session/return`). `program-minus` closes that guest's own send; `program` opens it (epic #208, issue #300). Also emitted once per configured return during the connect-time snapshot. |
+| `GUEST_STATE` | `guestId: string`, `mixerInput: string`, `state: 'invited' \| 'joined' \| 'previewing' \| 'on-air' \| 'left' \| 'error'`, `label?`, `intercomLine?` | A guest's lifecycle state changed (epic #208, issue #301). Broadcast on the persisted join/leave/kick transitions and emitted once per live guest in the connect-time snapshot. `previewing`/`on-air` are **derived** from the live vision-mixer contribution set (#209); a guest composited only as a PiP *inset* reads `joined` until the PiP-inset tally gap #209 raises is closed. |
 | `ERROR` | `error: string` | An inbound frame was invalid or an operation failed (sent to originating socket) |
 
 `pgmBg` is the mixer input a PiP on program is composited over. It is `null` unless
@@ -182,8 +184,10 @@ state to the new socket before any further broadcasts: `TALLY`, `OVL_STATE` (if 
 `AUX_MASTER_STATE` / `GRP_MASTER_STATE` / `MONITOR_STATE`, `AUX_SEND_STATE`,
 `GRP_SEND_STATE` (or `GRP_STATE_RESET`), `AFV_STATE`, `PFL_STATE` / `AFL_STATE`,
 `SOURCE_OFFSET_STATE` / `SOURCE_AUDIO_OFFSET_STATE`, `AFV_RAMP_STATE`, `FX_STATE`,
-`HTML_SOURCE_STATE` (per HTML source with forwarded params), and `CLIP_STATE` (one per
-clip source — a `mixerInput` present in `clipPlayerBlockIds`).
+`HTML_SOURCE_STATE` (per HTML source with forwarded params), `CLIP_STATE` (one per
+clip source — a `mixerInput` present in `clipPlayerBlockIds`), `GUEST_STATE` (one per
+live guest session, `left` excluded) and `RETURN_STATE` (one per configured return
+feed — epic #208, issue #301).
 This lets a freshly-connected client rebuild the full control state without sending
 any inbound messages. See the connect handler in `src/ws/controller.ts` for the exact
 ordering.

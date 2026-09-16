@@ -1,9 +1,9 @@
 import type { FastifyPluginAsync } from 'fastify';
 import type { WebSocket } from '@fastify/websocket';
 import { z } from 'zod';
-import { getDb, getSourcesDb } from '../db/index.js';
+import { getDb, getSourcesDb, getGuestSessionsDb, getGuestInvitesDb } from '../db/index.js';
 import { updateProductionDoc } from '../routes/productions.js';
-import type { ProductionDoc, ClipState, SourceDoc } from '../db/types.js';
+import type { ProductionDoc, ClipState, SourceDoc, GuestSessionState } from '../db/types.js';
 import { getTally, setTally, subscribe, unsubscribe, broadcast, nextSeq, currentSeq } from '../services/tally.service.js';
 import {
   cueClip, playClip, stopClip, pauseClip, seekClip,
@@ -217,6 +217,7 @@ type InboundMessage =
   | { type: 'CLIP_STOP'; mixerInput: string; cmdId?: string }
   | { type: 'CLIP_PAUSE'; mixerInput: string; cmdId?: string }
   | { type: 'CLIP_SEEK'; mixerInput: string; positionMs: number; cmdId?: string }
+  | { type: 'RETURN_SET'; mixerInput: string; mode: ReturnMode; cmdId?: string }
   | { type: 'KEEP_ALIVE'; cmdId?: string };
 
 // ---------------------------------------------------------------------------
@@ -344,6 +345,10 @@ const InboundMessageSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('CLIP_STOP'), mixerInput: mixerInputSchema, cmdId: cmdIdSchema }),
   z.object({ type: z.literal('CLIP_PAUSE'), mixerInput: mixerInputSchema, cmdId: cmdIdSchema }),
   z.object({ type: z.literal('CLIP_SEEK'), mixerInput: mixerInputSchema, positionMs: z.number().int().min(0).max(24 * 60 * 60 * 1000), cmdId: cmdIdSchema }),
+  // Crew switches a guest's synced return mode (epic #208, issue #301). Shares
+  // applyReturnMode with the crew REST route and guest token route: persist +
+  // apply live + broadcast RETURN_STATE. v1 only program/program-minus.
+  z.object({ type: z.literal('RETURN_SET'), mixerInput: mixerInputSchema, mode: z.enum(['program', 'program-minus']), cmdId: cmdIdSchema }),
   z.object({ type: z.literal('KEEP_ALIVE'), cmdId: cmdIdSchema }),
 ]);
 
@@ -2095,10 +2100,52 @@ export async function handleMessage(
       }
       break;
     }
+    case 'RETURN_SET': {
+      // Delegate to the single shared mode-change entry point (issue #300); it
+      // persists, applies the send matrix live, and broadcasts RETURN_STATE to
+      // all subscribers — so no extra broadcast is needed here.
+      const result = await applyReturnMode(productionId, msg.mixerInput, msg.mode);
+      if (!result.ok) {
+        const errText =
+          result.code === 'invalid_mode' ? 'Invalid return mode'
+          : result.code === 'inactive' ? 'Production is not activated'
+          : 'No return feed on that input';
+        if (cmdId) sendNack(ws, productionId, cmdId, errText);
+        else ws.send(JSON.stringify({ type: 'ERROR', error: errText }));
+        break;
+      }
+      if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
+      break;
+    }
     default: {
       ws.send(JSON.stringify({ type: 'ERROR', error: 'Unknown message type' }));
     }
   }
+}
+
+/**
+ * Best-effort display state for a guest (epic #208, issue #301). `previewing`/
+ * `on-air` are DERIVED from the live vision-mixer contribution set (#209): a
+ * guest whose mixerInput contributes to program reads `on-air`, to preview
+ * `previewing`, otherwise the persisted `joined`. `left`/`error` are
+ * authoritative and pass through unchanged.
+ *
+ * LIMITATION (per issue #301): a guest composited as a PiP *inset* contributes
+ * to the tally set as its source id, not its `video_in_N` pad, so this derives
+ * `joined` rather than `on-air`/`previewing` for that case until the PiP-inset
+ * tally gap #209 raises is closed. It also re-derives only at connect-time and
+ * on lifecycle events, not continuously on every mixer take.
+ */
+export function deriveGuestDisplayState(
+  persisted: GuestSessionState,
+  mixerInput: string,
+  program: string[],
+  preview: string[],
+): GuestSessionState {
+  if (persisted === 'left' || persisted === 'error') return persisted;
+  if (program.includes(mixerInput)) return 'on-air';
+  if (preview.includes(mixerInput)) return 'previewing';
+  return 'joined';
 }
 
 const controllerWs: FastifyPluginAsync = async (fastify) => {
@@ -2516,6 +2563,65 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
           } catch (err) {
             console.warn(`[controller] clip state connect sync error (${mixerInput}):`, String(err));
           }
+        }
+      }
+
+      // -----------------------------------------------------------------------
+      // Guest-calling snapshot (epic #208, issue #301). Emits the current guest
+      // set (GUEST_STATE per live session) and per-input return-feed modes
+      // (RETURN_STATE) so a controller attaching mid-production learns them
+      // without a REST round-trip. previewing/on-air are DERIVED from the live
+      // tally contribution set; `left` sessions are excluded.
+      // -----------------------------------------------------------------------
+      if (connectDoc) {
+        try {
+          const sessionsResult = await getGuestSessionsDb().find({
+            selector: { type: 'guest-session', productionId: id },
+          });
+          const sessions = (Array.isArray(sessionsResult?.docs) ? sessionsResult.docs : [])
+            .filter((s) => s.state !== 'left');
+          if (sessions.length > 0) {
+            const invitesResult = await getGuestInvitesDb().find({
+              selector: { type: 'guest-invite', productionId: id },
+            });
+            const labelByInvite = new Map(
+              (Array.isArray(invitesResult?.docs) ? invitesResult.docs : [])
+                .map((inv) => [inv._id, inv.label] as const),
+            );
+            const tallyNow = getTally(id);
+            const { program, preview } = buildTallyPayload(id, tallyNow, connectDoc);
+            for (const s of sessions) {
+              const label = labelByInvite.get(s.inviteId);
+              socket.send(JSON.stringify({
+                type: 'GUEST_STATE',
+                guestId: s._id,
+                mixerInput: s.mixerInput,
+                state: deriveGuestDisplayState(s.state, s.mixerInput, program, preview),
+                ...(label ? { label } : {}),
+                ...(s.intercomLineId ? { intercomLine: s.intercomLineId } : {}),
+                seq: nextSeq(id),
+                ts: new Date().toISOString(),
+              }));
+            }
+          }
+          // Return-feed modes. Prefer the resolved returnBuses cache; fall back
+          // to the modes persisted on the source assignments' returnFeed.
+          const returnModes = connectDoc.returnBuses?.length
+            ? connectDoc.returnBuses.map((rb) => ({ mixerInput: rb.mixerInput, mode: rb.mode }))
+            : (connectDoc.sources ?? [])
+                .filter((src) => src.returnFeed)
+                .map((src) => ({ mixerInput: src.mixerInput, mode: src.returnFeed!.synced }));
+          for (const r of returnModes) {
+            socket.send(JSON.stringify({
+              type: 'RETURN_STATE',
+              mixerInput: r.mixerInput,
+              mode: r.mode,
+              seq: nextSeq(id),
+              ts: new Date().toISOString(),
+            }));
+          }
+        } catch (err) {
+          console.warn('[controller] guest snapshot connect sync error:', String(err));
         }
       }
 
