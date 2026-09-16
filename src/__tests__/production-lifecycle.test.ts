@@ -37,6 +37,7 @@ vi.mock('../ws/controller.js', () => ({
   clearAudioState: vi.fn(),
   clearPipState: vi.fn(),
   clearFxState: vi.fn(),
+  clearClipStateForProduction: vi.fn(),
 }));
 
 const mockDeactivateStromFlow = vi.fn();

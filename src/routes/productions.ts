@@ -8,7 +8,7 @@ import { getStromToken } from '../lib/strom-token.js';
 import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js';
 import { setTally, broadcast, getSubscriberCount } from '../services/tally.service.js';
 import { clearProductionPflState } from '../services/pfl-state.js';
-import { clearPipState, clearAudioState, clearFxState } from '../ws/controller.js';
+import { clearPipState, clearAudioState, clearFxState, clearClipStateForProduction } from '../ws/controller.js';
 import { config, isRecordingEnabled } from '../config.js';
 import { minioTargetFromConfig, uploadRecordings } from '../lib/recording-uploader.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
@@ -746,6 +746,9 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       clearAudioState(doc._id);
       clearPipState(doc._id);
       clearFxState(doc._id);
+      // Stop any clip completion-poll timers and wipe the in-memory clip-state
+      // registry — live-only clip state must not survive deactivation (#278).
+      clearClipStateForProduction(doc._id);
       // Broadcast group-state reset so all connected clients clear their ephemeral
       // group assignments — these are live-only and must not survive deactivation.
       broadcast(doc._id, { type: 'GRP_STATE_RESET' });
