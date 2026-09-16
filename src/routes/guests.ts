@@ -18,6 +18,12 @@ import {
 } from '../lib/guest-invite-token.js';
 import { config, isGuestCallingEnabled } from '../config.js';
 import { resolvePublicBaseUrl } from './productions.js';
+import {
+  isIntercomEnabled,
+  provisionGuestLine,
+  IntercomManagerError,
+  type IntercomLine,
+} from '../lib/intercom-manager.js';
 
 /**
  * Guest calling — production-scoped invites + token-authed guest join
@@ -318,7 +324,47 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
       }
 
-      // 5. Build the response. whipUrl reuses the EXISTING WHIP proxy contract
+      // 5. Provision an Open Intercom talkback line (audio only, OQ1). Degrades
+      //    cleanly: when the intercom vars are unset this is silently skipped and
+      //    join succeeds with `intercomLine` absent. When the vars ARE set the
+      //    talkback line is explicitly enabled, so a failure to reach the manager
+      //    is a 502 — an operator asked for talkback and it could not be
+      //    delivered (spec §Configuration, §"Error codes").
+      let intercomLine: IntercomLine | undefined;
+      if (isIntercomEnabled()) {
+        try {
+          intercomLine = await provisionGuestLine({
+            intercomProductionId: production.intercomProductionId,
+            productionId: production._id,
+            lineName: invite.label ?? mixerInput,
+          });
+        } catch (err) {
+          if (err instanceof IntercomManagerError) {
+            fastify.log.warn({ err }, 'POST guests/:id/join — intercom-manager unreachable');
+            return reply.status(502).send({ error: 'Intercom manager unreachable', statusCode: 502 });
+          }
+          throw err;
+        }
+
+        // Record the intercom refs on the session and (first time only) on the
+        // production so lines tear down with the production lifecycle.
+        try {
+          session = { ...session, intercomLineId: intercomLine.id, updatedAt: new Date().toISOString() };
+          await getGuestSessionsDb().insert(session);
+          if (production.intercomProductionId !== intercomLine.productionId) {
+            await getDb().insert({
+              ...production,
+              intercomProductionId: intercomLine.productionId,
+              updatedAt: new Date().toISOString(),
+            });
+          }
+        } catch (err) {
+          fastify.log.warn({ err }, 'POST guests/:id/join — intercom ref persist failed');
+          return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
+        }
+      }
+
+      // 6. Build the response. whipUrl reuses the EXISTING WHIP proxy contract
       //    (`/api/v1/productions/:id/whip/:mixerInput`) — never a new WHIP path.
       const base = resolvePublicBaseUrl(req);
       const whipUrl = `${base}/api/v1/productions/${invite.productionId}/whip/${encodeURIComponent(mixerInput)}`;
@@ -331,8 +377,9 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         modes: returnModesFor(mixerInput),
         defaultMode: 'program-minus',
         returnMode: 'program-minus',
-        // intercomLine omitted until intercom provisioning lands (feature degrades
-        // cleanly to WHIP video + WHEP return, no talkback — spec §Configuration).
+        // Absent when intercom is unconfigured — join still works with WHIP video
+        // + WHEP return, no talkback (fallback is first-class — spec §Configuration).
+        ...(intercomLine ? { intercomLine } : {}),
       });
     },
   );
