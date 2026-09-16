@@ -150,6 +150,33 @@ Receives a WebRTC stream via WHIP protocol.
 
 ---
 
+## `builtin.media_player`
+
+File/object-storage media player used for `streamType: 'clip'` sources. Served by Strom's
+`backend/src/api/mediaplayer.rs`. The flow-generator injects one media_player block per clip
+source (`src/lib/flow-generator.ts`), and the clip cue/play control surface (issues #277/#278)
+drives it through Strom's player API (`src/lib/strom.ts` `player.*`).
+
+| Property | Type | Notes |
+|---|---|---|
+| `decode` | boolean | Decode media on load. flow-generator sets `true` |
+| `sync` | boolean | Sync playback to the pipeline clock. flow-generator sets `true` |
+| `loop_playlist` | boolean | Loop the playlist when it reaches the end. flow-generator sets `false` (cue-then-play stories play once) |
+| `position_update_interval` | integer (ms) | How often the block emits position updates. flow-generator sets `500` |
+
+**Pads**: outputs `video_out`, `audio_out` (wired through the same `builtin.time_offset` /
+audio-mixer path as every other source, so lipsync trims and audio channels behave identically).
+
+**Player control endpoints** (used via the generated client, never raw `fetch`):
+`GET .../player/state`, `POST .../player/control` (`play`/`pause`/`stop`/`next`/`previous`),
+`POST .../player/playlist`, `POST .../player/seek`, `POST .../player/goto`.
+
+> Confirm the exact property set and enum values against `GET /api/blocks`
+> (`BlockDefinition[].exposed_properties`) on the deployed Strom version — the OpenAPI schema is
+> authoritative at runtime and this table may lag it.
+
+---
+
 ## `builtin.loudness`
 
 EBU R128 loudness meter. Audio passes through unchanged — use as an in-line measurement tap.
