@@ -27,6 +27,7 @@ import recordingsRoutes from './routes/recordings.js';
 import authRoutes from './routes/auth.js';
 import gatewaysRoutes from './routes/gateways.js';
 import clipsRoutes from './routes/clips.js';
+import guestsRoutes from './routes/guests.js';
 import controllerWs from './ws/controller.js';
 import gatewayHeartbeatWs from './ws/gateway-heartbeat.js';
 
@@ -53,6 +54,23 @@ const AUTH_EXEMPT_PATHS = new Set(['/health', '/ready', '/api/v1/status']);
  */
 function isGatewayHeartbeatPath(path: string): boolean {
   return /^\/ws\/gateways\/[^/]+\/heartbeat$/.test(path);
+}
+
+/**
+ * Matches the token-authed guest-join / guest-session routes
+ * (`POST /api/v1/guests/:inviteId/join`, `DELETE /api/v1/guests/:inviteId/session`;
+ * epic #208, issue #299). These are called by the guest browser via the invite
+ * link and authenticate with a per-invite HMAC bearer token verified INSIDE the
+ * handler (`src/routes/guests.ts`), NOT the shared `API_KEY`. They are therefore
+ * exempted from the shared-key onRequest gate — mirroring the gateway heartbeat
+ * exemption — so the shared key alone neither grants nor is required for guest
+ * join. The invite token grants only that guest's WHIP input + session; it does
+ * not grant access to any other route. The production-scoped invite-management
+ * routes (`/api/v1/productions/:id/guests/...`) are deliberately NOT exempt: they
+ * are operator/automation surfaces behind the shared key.
+ */
+function isGuestTokenAuthedPath(path: string): boolean {
+  return /^\/api\/v1\/guests\/[^/]+\/(join|session)$/.test(path);
 }
 
 // Sentinel subprotocols used to carry the API key through the
@@ -296,6 +314,10 @@ export async function buildServer() {
       // the handler (ADR-001), not the shared API key — so it must bypass this
       // shared-key gate. The `?key=` query string is still never accepted.
       if (isGatewayHeartbeatPath(path)) return;
+      // The guest join/session routes authenticate with a per-invite HMAC token
+      // inside the handler (issue #299), not the shared API key — so they must
+      // bypass this shared-key gate. The invite token is scoped to that guest.
+      if (isGuestTokenAuthedPath(path)) return;
       // Guard the REST API, the WebSocket controller, and the Swagger UI /
       // OpenAPI spec routes. The /ws/ prefix must be listed explicitly:
       // without it, /ws/productions/:id/controller bypasses auth entirely and
@@ -393,6 +415,7 @@ export async function buildServer() {
   await fastify.register(authRoutes);
   await fastify.register(gatewaysRoutes);
   await fastify.register(clipsRoutes);
+  await fastify.register(guestsRoutes);
   await fastify.register(controllerWs);
   await fastify.register(gatewayHeartbeatWs);
 

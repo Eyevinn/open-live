@@ -231,6 +231,55 @@ export interface RecordingDoc {
   updatedAt: string;
 }
 
+// --------------- Guest calling types (issue #299, epic #208) ---------------
+
+/**
+ * A production-scoped, expiring invite for a remote guest to join via a browser
+ * (epic #208, issue #299, `docs/specs/guest-calling-intercom.md` §"Data Model").
+ *
+ * Lives in its own logical collection (`type: 'guest-invite'`). Only the SHA-256
+ * hash of the HMAC-signed invite token is persisted — the raw token is returned
+ * to the operator exactly once on create and NEVER stored, so a database read
+ * can never recover a live token (spec §Risks: "hashed storage … mandatory").
+ */
+export interface GuestInviteDoc {
+  _id: string;              // "guest-invite-<uuid>"
+  _rev?: string;
+  type: 'guest-invite';
+  productionId: string;
+  tokenHash: string;        // SHA-256 hash of the raw token; raw token never persisted
+  label?: string;
+  /** Input the guest will occupy; allocated on join if absent. */
+  mixerInput?: string;
+  expiresAt: string;        // ISO 8601
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Lifecycle state of a joined guest. `invited`/`left`/`error` are transient. */
+export type GuestSessionState = 'joined' | 'previewing' | 'on-air' | 'left' | 'error';
+
+/**
+ * A live guest session created when a guest redeems an invite (epic #208,
+ * issue #299, `docs/specs/guest-calling-intercom.md` §"Data Model").
+ * `previewing`/`on-air` are DERIVED from the vision mixer's PVW/PGM
+ * contribution in a later sub-issue; v1 persists `joined`/`left`/`error`.
+ */
+export interface GuestSessionDoc {
+  _id: string;              // "guest-session-<uuid>"
+  _rev?: string;
+  type: 'guest-session';
+  productionId: string;
+  inviteId: string;
+  mixerInput: string;
+  state: GuestSessionState;
+  /** Reference into intercom-manager, when a talkback line is provisioned (later sub-issue). */
+  intercomLineId?: string;
+  whipSessionId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 // --------------- Production config types ---------------
 
 export interface ProductionConfigDoc {
@@ -251,6 +300,16 @@ export interface ProductionConfigDoc {
 export interface ProductionSourceAssignment {
   sourceId: string;   // references SourceDoc._id
   mixerInput: string; // references TemplateInputSlot.id (e.g. 'video_in_0')
+  /**
+   * Optional per-guest return feed (mix-minus) for guest-calling (epic #208,
+   * issue #299, `docs/specs/guest-calling-intercom.md` §"Return feed design").
+   * The return belongs to the assignment, not the guest session, so a rejoin on
+   * the same `mixerInput` keeps it and crew-added contributors can have one.
+   * Additive and defaulted-absent; POPULATED BY A LATER SUB-ISSUE (return /
+   * mix-minus wiring) — declared here only so the data model is stable.
+   * v1 accepts `lowLatency: false` only.
+   */
+  returnFeed?: { synced: 'program' | 'program-minus'; lowLatency?: boolean };
 }
 
 /**
@@ -351,6 +410,15 @@ export interface ProductionDoc {
   sourceAudioOffsetBlockIds?: Record<string, string>;
   /** Maps mixerInput → media-player (builtin.media_player) block ID for clip sources — set on activate, cleared on deactivate */
   clipPlayerBlockIds?: Record<string, string>;
+  /**
+   * Open Intercom production/line grouping id — set when guest calling is
+   * enabled for this production (epic #208, issue #299,
+   * `docs/specs/guest-calling-intercom.md` §"Data Model"). Lets talkback lines
+   * be provisioned / torn down with the production lifecycle. Additive and
+   * defaulted-absent; POPULATED BY A LATER SUB-ISSUE (intercom provisioning) —
+   * declared here only so the data model is stable.
+   */
+  intercomProductionId?: string;
   /** Warnings accumulated when a referenced source/graphic/output was deleted while production was inactive */
   deletionWarnings?: Array<{ type: 'source' | 'graphic' | 'output'; name: string }>;
   /** Set when the idle watchdog auto-deactivated this production; cleared on next activation */
