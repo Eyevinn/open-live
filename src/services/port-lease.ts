@@ -19,6 +19,7 @@ import { getStromToken } from '../lib/strom-token.js';
 
 const TICK_INTERVAL_MS = 60 * 1000;                 // renew / retry cadence
 const UNSUPPORTED_RETRY_MS = 10 * 60 * 1000;        // re-probe an old Strom every 10 min
+const MAX_ACQUIRE_FAILURES = 3;                     // consecutive non-404 acquire failures before giving up on a lease
 
 export type PortLeaseState =
   | { status: 'leased'; lease: PortLease }
@@ -37,6 +38,7 @@ export interface PortLeaseConfig {
 
 let state: PortLeaseState = config.stromPortLeaseDisabled ? { status: 'disabled' } : { status: 'pending' };
 let unsupportedSince: number | null = null;
+let consecutiveAcquireFailures = 0;
 let leaseInterval: NodeJS.Timeout | null = null;
 let inflightTick: Promise<void> | null = null;
 
@@ -116,6 +118,7 @@ async function acquire(log: FastifyBaseLogger): Promise<void> {
     const wasLeased = state.status === 'leased';
     state = { status: 'leased', lease };
     unsupportedSince = null;
+    consecutiveAcquireFailures = 0;
     if (!wasLeased) {
       log.info(
         { clientId, leaseId: lease.id, firstPort: lease.first_port, lastPort: lease.last_port, expiresAt: lease.expires_at },
@@ -133,10 +136,36 @@ async function acquire(log: FastifyBaseLogger): Promise<void> {
       }
       state = { status: 'unsupported' };
       unsupportedSince = Date.now();
+      consecutiveAcquireFailures = 0;
+      return;
+    }
+    // A non-404 failure is ambiguous: a proxy 502/503, a gateway 405/501, a 401/403,
+    // a timeout, DNS, or a client-construction error. Unlike a clean 404 it does not
+    // prove there is no broker, so we do not switch restriction off on the first try.
+    // But `pending` blocks all listener writes, so it must not persist indefinitely
+    // (#294): after MAX_ACQUIRE_FAILURES consecutive non-404 failures, fall back to
+    // `unsupported` — manual ports, no restriction — which the 10-min re-probe can
+    // still recover from once a broker answers cleanly. Failures while already
+    // `unsupported` (a failed re-probe) stay `unsupported` rather than dropping into
+    // the write-blocking `pending` state.
+    consecutiveAcquireFailures += 1;
+    if (state.status === 'unsupported' || consecutiveAcquireFailures >= MAX_ACQUIRE_FAILURES) {
+      if (state.status !== 'unsupported') {
+        log.warn(
+          { err, clientId, failures: consecutiveAcquireFailures },
+          '[port-lease] Giving up acquiring an SRT port range after repeated non-404 failures — falling back to unenforced (manual) ports. Will re-check every 10 min',
+        );
+      }
+      state = { status: 'unsupported' };
+      unsupportedSince = Date.now();
+      consecutiveAcquireFailures = 0;
       return;
     }
     state = { status: 'pending' };
-    log.warn({ err, clientId, size: config.stromPortLeaseSize }, '[port-lease] Failed to acquire SRT port range — will retry');
+    log.warn(
+      { err, clientId, size: config.stromPortLeaseSize, failures: consecutiveAcquireFailures },
+      '[port-lease] Failed to acquire SRT port range — will retry',
+    );
   }
 }
 
@@ -250,5 +279,6 @@ export function _resetPortLeaseState(initial: PortLeaseState = { status: 'pendin
   }
   state = initial;
   unsupportedSince = null;
+  consecutiveAcquireFailures = 0;
   inflightTick = null;
 }
