@@ -114,6 +114,11 @@ otherwise ignored. The inbound type union (`src/ws/controller.ts`):
 | `SET_PIP` | `pip: number`, `bg: number \| null`, `zones: PipZone[]`, `transforms?: PipTransforms` | Configure a PiP slot |
 | `SET_EFFECT` | `target: EffectTarget`, `effect: VideoEffect` | Set a video effect on an input or master |
 | `HTML_SOURCE_EVENT` | `sourceId: string`, `params: Record<string,string>`, `mode?: 'merge' \| 'replace'` | Forward operator params into an HTML source's URL query and reload the running `cefsrc`. `merge` (default) updates/adds keys on the current effective query; `replace` sets it to exactly `params`. The resulting URL is re-validated with `graphicUrl()` (SSRF/scheme gate). |
+| `CLIP_CUE` | `mixerInput: string`, `clipId?: string` | Load the clip source assigned to `mixerInput` into its media-player block and hold it ready (`setPlaylist` + `goto index 0`, leaving the player paused at the start). Broadcasts `CLIP_STATE` `cued`. |
+| `CLIP_PLAY` | `mixerInput: string` | Start playback of the cued clip (`control play`). Rejected (`ERROR` + `CLIP_STATE` `error`) if nothing is cued on that input. Broadcasts `CLIP_STATE` `playing` and starts the completion poll. |
+| `CLIP_PAUSE` | `mixerInput: string` | Pause playback (`control pause`). Broadcasts `CLIP_STATE` `paused` and stops the completion poll. |
+| `CLIP_STOP` | `mixerInput: string` | Stop playback (`control stop`). Broadcasts `CLIP_STATE` `stopped` and stops the completion poll. |
+| `CLIP_SEEK` | `mixerInput: string`, `positionMs: number` | Seek within the clip (`seek position_ms`); `positionMs` is a non-negative integer (0 … 24 h). Broadcasts the resulting `CLIP_STATE`. |
 
 `VideoEffect` (the `effect` field of `SET_EFFECT`) is itself a discriminated union on
 its own `type`: `none`, `chroma_key`, `pixelate`, `blur`, `duotone`, `vignette`, `vhs`,
@@ -154,6 +159,7 @@ are emitted from `src/ws/controller.ts` and `src/services/meter-relay.ts`:
 | `SOURCE_AUDIO_OFFSET_STATE` | `mixerInput: string`, `offsetMs: number` | A per-source audio offset changes; also replayed on connect |
 | `FX_STATE` | `fxAvailable: boolean`, `inputEffects: VideoEffect[]`, `masterEffect: VideoEffect` | Video-effect state changes; also sent on connect |
 | `HTML_SOURCE_STATE` | `sourceId: string`, `params: Record<string,string>`, `effectiveUrl: string`, `updatedAt: string` | An HTML source's forwarded params changed (after a successful `HTML_SOURCE_EVENT`); also replayed on connect. In-memory only — resets on server restart. |
+| `CLIP_STATE` | `mixerInput: string`, `state: 'idle' \| 'cued' \| 'playing' \| 'paused' \| 'stopped' \| 'completed' \| 'error'`, `clipId?: string`, `positionMs?: number`, `durationMs?: number`, `error?: string` | A clip transitions on `mixerInput` (cue/play/pause/stop/seek), reaches end-of-media (`completed`), or a clip operation fails (`error`); also sent on connect for each clip source |
 | `METER_DATA` | `elementId: string`, `peak`, `rms` | Audio meter tick (relayed from Strom); `elementId` is `main`, `monitor`, `ch{N}`, `aux{N}`, or `grp{N}` |
 | `LOUDNESS_DATA` | `elementId: 'main'`, `momentary`, `shortterm`, `integrated`, `loudness_range`, `true_peak` | EBU R128 loudness tick (relayed from Strom) |
 | `ERROR` | `error: string` | An inbound frame was invalid or an operation failed (sent to originating socket) |
@@ -171,8 +177,42 @@ state to the new socket before any further broadcasts: `TALLY`, `OVL_STATE` (if 
 `PIP_STATE`, any `DSK_STATE` layers, per-channel and master `AUDIO_STATE` /
 `AUX_MASTER_STATE` / `GRP_MASTER_STATE` / `MONITOR_STATE`, `AUX_SEND_STATE`,
 `GRP_SEND_STATE` (or `GRP_STATE_RESET`), `AFV_STATE`, `PFL_STATE` / `AFL_STATE`,
-`SOURCE_OFFSET_STATE` / `SOURCE_AUDIO_OFFSET_STATE`, `AFV_RAMP_STATE`, `FX_STATE`, and
-`HTML_SOURCE_STATE` (per HTML source with forwarded params).
+`SOURCE_OFFSET_STATE` / `SOURCE_AUDIO_OFFSET_STATE`, `AFV_RAMP_STATE`, `FX_STATE`,
+`HTML_SOURCE_STATE` (per HTML source with forwarded params), and `CLIP_STATE` (one per
+clip source — a `mixerInput` present in `clipPlayerBlockIds`).
 This lets a freshly-connected client rebuild the full control state without sending
 any inbound messages. See the connect handler in `src/ws/controller.ts` for the exact
 ordering.
+
+The `CLIP_STATE` snapshot prefers the in-memory clip-state registry
+(`src/services/clip-state.service.ts`), which is authoritative for the states Strom
+cannot itself report (`cued`, `completed`, `error`). If the registry has no entry for
+an input (cold start after a server restart), the server restores it from Strom's live
+`player.getState` (mapping `playing`/`paused`/`stopped`).
+
+## Clip / story playback
+
+Clip playback drives a Strom `builtin.media_player` block that is injected per clip
+source at activation and recorded on the production document as
+`clipPlayerBlockIds[mixerInput] → blockId`. The WebSocket `CLIP_*` commands above and
+the equivalent REST endpoints (`/api/v1/productions/:id/clips/:mixerInput/{cue,play,stop}`,
+`GET .../state`) share the same control logic in `src/lib/clip-control.ts`, so both
+surfaces observe and mutate the same player and registry. See
+`docs/specs/clip-story-playback.md` for the authoritative contract.
+
+### Completion detection and timing envelope
+
+Strom's media player does not push player-state transitions, so end-of-media
+(`completed`) is detected by a **poll fallback**: while a clip is `playing`, the server
+polls `player.getState` every `CLIP_STATE_POLL_MS` (config `clipStatePollMs`, default
+`250` ms). On the first poll that observes `stopped`, the server records and broadcasts
+a single `CLIP_STATE` `completed`, then stops the poll. The poll timer is
+production-scoped (shared across all sockets watching the production) and is torn down
+on stop/pause, on deactivate, and when a new cue supersedes it.
+
+Consequently the **completion latency** — the delay between Strom reaching end-of-media
+and clients receiving `CLIP_STATE` `completed` — is bounded by one poll interval, i.e.
+**≤ `CLIP_STATE_POLL_MS` (default 250 ms)**, plus the round-trip of a single
+`player.getState` call. Empirical measurement of the tail latency requires a live Strom
+instance and is not asserted here; lowering `CLIP_STATE_POLL_MS` tightens the bound at
+the cost of more polling traffic.
