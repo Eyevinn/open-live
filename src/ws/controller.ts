@@ -19,7 +19,7 @@ import { graphicUrl } from '../lib/url-validation.js';
 import { decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
 import { loadAudioChannels } from '../lib/audio-channels.js';
 import { config } from '../config.js';
-import { notifySubscriberJoin } from '../services/idle-watchdog.js';
+import { notifySubscriberJoin, resetIdleTimer } from '../services/idle-watchdog.js';
 import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot } from '../lib/production-health.js';
 
@@ -210,7 +210,8 @@ type InboundMessage =
   | { type: 'CLIP_PLAY'; mixerInput: string; cmdId?: string }
   | { type: 'CLIP_STOP'; mixerInput: string; cmdId?: string }
   | { type: 'CLIP_PAUSE'; mixerInput: string; cmdId?: string }
-  | { type: 'CLIP_SEEK'; mixerInput: string; positionMs: number; cmdId?: string };
+  | { type: 'CLIP_SEEK'; mixerInput: string; positionMs: number; cmdId?: string }
+  | { type: 'KEEP_ALIVE'; cmdId?: string };
 
 // ---------------------------------------------------------------------------
 // Runtime schema validation for inbound WS messages
@@ -337,6 +338,7 @@ const InboundMessageSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('CLIP_STOP'), mixerInput: mixerInputSchema, cmdId: cmdIdSchema }),
   z.object({ type: z.literal('CLIP_PAUSE'), mixerInput: mixerInputSchema, cmdId: cmdIdSchema }),
   z.object({ type: z.literal('CLIP_SEEK'), mixerInput: mixerInputSchema, positionMs: z.number().int().min(0).max(24 * 60 * 60 * 1000), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('KEEP_ALIVE'), cmdId: cmdIdSchema }),
 ]);
 
 // ---------------------------------------------------------------------------
@@ -920,6 +922,17 @@ export async function handleMessage(
   const cmdId = 'cmdId' in msg ? (msg.cmdId as string | undefined) : undefined;
   if (cmdId) {
     sendAck(ws, productionId, cmdId, 'accepted');
+  }
+
+  // KEEP_ALIVE is a pure liveness/activity signal (issue #290): it resets the
+  // idle timer and cancels any pending idle warning (triggering an
+  // IDLE_WARNING_CLEARED broadcast when a warning was outstanding). It needs no
+  // production doc and touches no Strom flow, so handle it before the DB fetch
+  // that the mixer/audio/clip commands below require.
+  if (msg.type === 'KEEP_ALIVE') {
+    resetIdleTimer(productionId);
+    if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
+    return;
   }
 
   const db = getDb();
