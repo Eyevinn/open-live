@@ -5,39 +5,66 @@ import { getSourcesDb, getDb } from '../db/index.js';
 import type { SourceDoc, ProductionDoc } from '../db/types.js';
 import { updateProductionDoc } from './productions.js';
 import { graphicUrl, srtUrl } from '../lib/url-validation.js';
+import { deserializeClipReference } from '../lib/clip-reference.js';
 import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
 import { getPortLease } from '../services/port-lease.js';
 import { clashesAfterWrite, listenerPortRequest, resolveListenerAddress, usedListenerPorts } from '../services/listener-ports.js';
 
+/**
+ * Cross-field validation for a source's `address` given its effective
+ * `streamType`. Adds a zod issue on `['address']` on failure. Shared by the
+ * create and patch schemas so all stream types (including `clip`) validate
+ * identically.
+ *
+ * `clip` sources store a serialized `ClipReference` (JSON) in `address`; it is
+ * deserialized, shape-validated and semantically validated here (url → SSRF
+ * checks, s3 → bucket/key, tams → 501/not-implemented) — no persisted schema
+ * change (issue #275, spec: clip-story-playback.md §"Migration").
+ */
+function validateSourceAddress(
+  streamType: string,
+  address: string,
+  ctx: z.RefinementCtx,
+): void {
+  if (streamType === 'html') {
+    // html sources use a browser URL — validate for SSRF (file://, javascript:, private IPs, etc.)
+    try {
+      graphicUrl(address);
+    } catch (err) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['address'], message: err instanceof Error ? err.message : 'Invalid HTML source URL' });
+    }
+  } else if (streamType === 'srt' || streamType === 'efp') {
+    // SRT/EFP sources: must be a valid srt:// URI pointing to a non-private host
+    try {
+      srtUrl(address);
+    } catch (err) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['address'], message: err instanceof Error ? err.message : 'Invalid SRT source address' });
+    }
+  } else if (streamType === 'clip') {
+    // clip sources carry a serialized typed ClipReference (url/s3/tams) as JSON.
+    try {
+      deserializeClipReference(address);
+    } catch (err) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['address'], message: err instanceof Error ? err.message : 'Invalid clip reference' });
+    }
+  }
+}
+
 const SourceInput = z.object({
   name: z.string().min(1).max(256),
   address: z.string(),
-  streamType: z.enum(['srt', 'efp', 'whip', 'html']),
+  streamType: z.enum(['srt', 'efp', 'whip', 'html', 'clip']),
   status: z.enum(['active', 'inactive']).default('inactive'),
   liveCamera: z.boolean().optional(),
   latency: z.number().int().min(20).max(8000).optional(),
 }).superRefine((data, ctx) => {
-  if (data.streamType === 'html') {
-    // html sources use a browser URL — validate for SSRF (file://, javascript:, private IPs, etc.)
-    try {
-      graphicUrl(data.address);
-    } catch (err) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['address'], message: err instanceof Error ? err.message : 'Invalid HTML source URL' });
-    }
-  } else if (data.streamType === 'srt' || data.streamType === 'efp') {
-    // SRT/EFP sources: must be a valid srt:// URI pointing to a non-private host
-    try {
-      srtUrl(data.address);
-    } catch (err) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['address'], message: err instanceof Error ? err.message : 'Invalid SRT source address' });
-    }
-  }
+  validateSourceAddress(data.streamType, data.address, ctx);
 });
 
 const SourcePatch = z.object({
   name: z.string().min(1).max(256).optional(),
   address: z.string().optional(),
-  streamType: z.enum(['srt', 'efp', 'whip', 'html']).optional(),
+  streamType: z.enum(['srt', 'efp', 'whip', 'html', 'clip']).optional(),
   status: z.enum(['active', 'inactive']).optional(),
   liveCamera: z.boolean().optional(),
   latency: z.number().int().min(20).max(8000).optional(),
@@ -48,21 +75,7 @@ const SourcePatch = z.object({
   if (data.address === undefined || data.streamType === undefined) {
     return;
   }
-  if (data.streamType === 'html') {
-    // html sources use a browser URL — validate for SSRF (file://, javascript:, private IPs, etc.)
-    try {
-      graphicUrl(data.address);
-    } catch (err) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['address'], message: err instanceof Error ? err.message : 'Invalid HTML source URL' });
-    }
-  } else if (data.streamType === 'srt' || data.streamType === 'efp') {
-    // SRT/EFP sources: must be a valid srt:// URI pointing to a non-private host
-    try {
-      srtUrl(data.address);
-    } catch (err) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['address'], message: err instanceof Error ? err.message : 'Invalid SRT source address' });
-    }
-  }
+  validateSourceAddress(data.streamType, data.address, ctx);
 });
 
 /** Masks passphrase values in SRT URIs so credentials are never returned to clients. */
@@ -165,6 +178,9 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
             graphicUrl(effectiveAddress);
           } else if (effectiveStreamType === 'srt' || effectiveStreamType === 'efp') {
             srtUrl(effectiveAddress);
+          } else if (effectiveStreamType === 'clip') {
+            // clip sources carry a serialized typed ClipReference (JSON) in address.
+            deserializeClipReference(effectiveAddress);
           }
         } catch (err) {
           return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid source address' });
@@ -209,7 +225,9 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       const doc = await getSourcesDb().get(req.params.id);
 
       // Block deletion if source is used by an active/activating production
-      const activeProductions = await getDb().find({
+      // findTrusted: operators are literals here; req.params.id is only ever a
+      // scalar value inside $elemMatch, never a selector fragment (#257)
+      const activeProductions = await getDb().findTrusted({
         selector: { type: 'production', status: { $in: ['active', 'activating'] }, 'sources': { $elemMatch: { sourceId: req.params.id } } },
         fields: ['_id', 'name'],
         limit: 1,
@@ -220,7 +238,9 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       }
 
       // Remove references from inactive productions and record a warning
-      const inactiveProductions = await getDb().find({
+      // findTrusted: operators are literals here; req.params.id is only ever a
+      // scalar value inside $elemMatch, never a selector fragment (#257)
+      const inactiveProductions = await getDb().findTrusted({
         selector: { type: 'production', status: 'inactive', 'sources': { $elemMatch: { sourceId: req.params.id } } },
         fields: ['_id', 'name', 'sources', 'deletionWarnings'],
         limit: 100,

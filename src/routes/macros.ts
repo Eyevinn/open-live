@@ -4,15 +4,35 @@ import { z } from 'zod';
 import { getDb } from '../db/index.js';
 import type { Macro, ProductionDoc } from '../db/types.js';
 
-const MacroActionSchema = z.object({
-  type: z.enum(['CUT', 'TRANSITION', 'TAKE', 'GRAPHIC_ON', 'GRAPHIC_OFF', 'DSK_TOGGLE']),
-  sourceId: z.string().optional(),
-  transitionType: z.string().optional(),
-  durationMs: z.number().int().positive().optional(),
-  overlayId: z.string().optional(),
-  layer: z.number().int().min(0).optional(),
-  visible: z.boolean().optional(),
-});
+// Discriminated union on `type`, mirroring the pattern used by
+// InboundMessageSchema in src/ws/controller.ts. Each action variant only
+// declares the fields its MACRO_EXEC replay path actually consumes, so a
+// stored/replayed macro can no longer smuggle cross-type fields (e.g. a CUT
+// carrying an overlayId/durationMs). Per-field constraints are preserved
+// exactly from the previous flat schema — this narrows the accepted shape
+// without loosening any existing validation.
+//
+// Each variant is `.strict()`: Zod otherwise silently strips unknown keys, so
+// a `CUT` bearing an `overlayId` would parse (with the field dropped) rather
+// than being rejected. Strict mode makes cross-type field mixing a hard 400,
+// which is the whole point of this hardening (issue #53).
+const MacroActionSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('CUT'), sourceId: z.string().optional() }).strict(),
+  z.object({
+    type: z.literal('TRANSITION'),
+    sourceId: z.string().optional(),
+    transitionType: z.string().optional(),
+    durationMs: z.number().int().positive().optional(),
+  }).strict(),
+  z.object({ type: z.literal('TAKE') }).strict(),
+  z.object({ type: z.literal('GRAPHIC_ON'), overlayId: z.string().optional() }).strict(),
+  z.object({ type: z.literal('GRAPHIC_OFF'), overlayId: z.string().optional() }).strict(),
+  z.object({
+    type: z.literal('DSK_TOGGLE'),
+    layer: z.number().int().min(0).optional(),
+    visible: z.boolean().optional(),
+  }).strict(),
+]);
 
 const MacroInput = z.object({
   slot: z.number().int().min(0).max(7),

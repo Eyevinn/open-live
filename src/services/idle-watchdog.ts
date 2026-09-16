@@ -17,7 +17,8 @@ import { getSubscriberCount } from './tally.service.js';
 import { clearProductionPflState } from './pfl-state.js';
 import { clearAudioState, clearPipState, clearFxState } from '../ws/controller.js';
 import { broadcast } from './tally.service.js';
-import { activationAbortControllers, updateProductionDoc } from '../routes/productions.js';
+import { activationAbortControllers, updateProductionDoc, emitProductionStatus } from '../routes/productions.js';
+import { stoppedStatus } from '../lib/production-health.js';
 import type { ProductionDoc } from '../db/types.js';
 
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
@@ -63,7 +64,8 @@ export function notifySubscriberJoin(productionId: string): void {
 async function seedActiveProductions(log: FastifyBaseLogger): Promise<void> {
   if (!isDbConnected()) return;
   try {
-    const result = await getDb().find({
+    // findTrusted: literal selector written here, no request data (#257)
+    const result = await getDb().findTrusted({
       selector: { type: 'production', status: { $in: ['active', 'activating'] } },
       fields: ['_id'],
     });
@@ -136,7 +138,8 @@ async function tick(log: FastifyBaseLogger): Promise<void> {
   }
 }
 
-async function deactivateProduction(productionId: string, log: FastifyBaseLogger): Promise<void> {
+/** Exported for tests (issue #255) — exercises the idle-auto-deactivate stop path. */
+export async function deactivateProduction(productionId: string, log: FastifyBaseLogger): Promise<void> {
   if (!isDbConnected()) {
     log.warn({ productionId }, '[idle-watchdog] DB not connected — cannot deactivate');
     return;
@@ -174,8 +177,13 @@ async function deactivateProduction(productionId: string, log: FastifyBaseLogger
     }
   }
 
+  // Transition rule (spec §1): an `active` production auto-deactivated for idle
+  // becomes `ended` (it broadcast and then stopped); one still `activating`
+  // becomes `inactive` (it never reached a live broadcast).
+  const nextStatus = stoppedStatus(doc.status);
   await updateProductionDoc(doc._id, {
-    status: 'inactive',
+    status: nextStatus,
+    endedReason: nextStatus === 'ended' ? 'idle' : undefined,
     autoDeactivated: true,
     stromFlowId: undefined,
     mixerBlockId: undefined,
@@ -191,5 +199,8 @@ async function deactivateProduction(productionId: string, log: FastifyBaseLogger
     tally: { pgm: null, pvw: null },
   });
   broadcast(doc._id, { type: 'PRODUCTION_DEACTIVATED' });
+  // Emit the typed lifecycle event (spec §3). Flow is torn down, so all assigned
+  // outputs derive as down.
+  emitProductionStatus({ _id: doc._id, status: nextStatus, stromFlowId: undefined, outputAssignments: doc.outputAssignments });
   log.info({ productionId: doc._id, name: doc.name }, '[idle-watchdog] Production deactivated');
 }

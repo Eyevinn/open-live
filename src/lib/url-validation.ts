@@ -201,6 +201,15 @@ export function graphicUrl(url: string): void {
 // Query: alphanumeric and safe URL chars only — no control characters, no quotes, no backslash
 const SRT_URL_RE = /^srt:\/\/(([A-Za-z0-9.\-]|\[[0-9a-fA-F:]+\])*:\d{1,5})(\?[A-Za-z0-9._\-=&%+]+)?$/;
 
+// SRT (libsrt) requires the stream-encryption passphrase to be 10–79 characters.
+// Enforcing this at the API boundary turns a generic GStreamer "Pipeline state
+// change failed" 500 at activation into a clear 400 at create/patch (issue #261).
+const SRT_PASSPHRASE_MIN = 10;
+const SRT_PASSPHRASE_MAX = 79;
+
+/** Matches the passphrase param in an SRT URI query string (case-insensitive). */
+const SRT_PASSPHRASE_RE = /[?&]passphrase=([^&]*)/i;
+
 /**
  * Throws if the value is not a valid SRT URL.
  *
@@ -236,5 +245,19 @@ export function srtUrl(url: string): void {
 
   if (hostname && isPrivateHost(hostname)) {
     throw new Error('SRT URL must not target private, loopback, or link-local addresses');
+  }
+
+  // Enforce the SRT passphrase length at the edge. An absent or empty passphrase
+  // means "no encryption" and is allowed (mirrors the crypto helpers, which skip
+  // an empty value); only a present, non-empty value is range-checked.
+  const passphraseMatch = url.match(SRT_PASSPHRASE_RE);
+  if (passphraseMatch) {
+    const passphrase = passphraseMatch[1] ?? '';
+    if (passphrase.length > 0 && (passphrase.length < SRT_PASSPHRASE_MIN || passphrase.length > SRT_PASSPHRASE_MAX)) {
+      throw new Error(
+        `SRT passphrase must be ${SRT_PASSPHRASE_MIN}–${SRT_PASSPHRASE_MAX} characters ` +
+          `(got ${passphrase.length}); shorter values are silently rejected by SRT at activation`,
+      );
+    }
   }
 }

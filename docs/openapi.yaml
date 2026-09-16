@@ -30,7 +30,91 @@ components:
 
     StreamType:
       type: string
-      enum: [srt, efp, whip, html]
+      enum: [srt, efp, whip, html, clip]
+      description: >-
+        Source stream kind. `clip` (epic #206) is a cue-then-play file/story
+        source whose typed `ClipReference` is stored serialized in the source's
+        `address` field. Clients must ignore unknown enum values (forward-compat).
+
+    ClipReference:
+      description: >-
+        Typed, versioned reference for a `clip` source (epic #206, issue #275).
+        A discriminated union on `type`; stored serialized as a JSON string in
+        `SourceDoc.address`. v1 implements `url` and `s3`; `tams` is reserved and
+        rejected at runtime (501). Any variant may carry an optional `timerange`
+        — nothing assumes a fixed media length.
+      oneOf:
+        - $ref: '#/components/schemas/ClipReferenceUrl'
+        - $ref: '#/components/schemas/ClipReferenceS3'
+        - $ref: '#/components/schemas/ClipReferenceTams'
+      discriminator:
+        propertyName: type
+
+    ClipReferenceUrl:
+      type: object
+      required: [type, url]
+      properties:
+        type:
+          type: string
+          enum: [url]
+        url:
+          type: string
+          description: Any fetchable file / object-storage URL (a presigned URL reduces to this).
+        timerange:
+          type: string
+          description: Optional; no fixed-length assumption.
+
+    ClipReferenceS3:
+      type: object
+      required: [type, bucket, key]
+      properties:
+        type:
+          type: string
+          enum: [s3]
+        bucket:
+          type: string
+        key:
+          type: string
+        timerange:
+          type: string
+
+    ClipReferenceTams:
+      type: object
+      description: BBC Time-Addressable Media Store. Reserved — rejected (501) in v1.
+      required: [type, store, flowId, timerange]
+      properties:
+        type:
+          type: string
+          enum: [tams]
+        store:
+          type: string
+        flowId:
+          type: string
+        timerange:
+          type: string
+
+    ClipState:
+      type: object
+      description: >-
+        Live clip playback state for a `clip` source assigned to a mixer input
+        (epic #206, issues #277/#278). CamelCased mirror of Strom's media-player
+        state plus the cue/play/completed clip state machine.
+      required: [mixerInput, state]
+      properties:
+        mixerInput:
+          type: string
+          example: video_in_0
+        state:
+          type: string
+          enum: [idle, cued, playing, paused, stopped, completed, error]
+        clipId:
+          type: string
+        positionMs:
+          type: integer
+        durationMs:
+          type: integer
+        error:
+          type: string
 
     SourceStatus:
       type: string
@@ -38,11 +122,32 @@ components:
 
     OutputType:
       type: string
-      enum: [mpegtssrt, efpsrt, whep]
+      enum: [mpegtssrt, efpsrt, whep, recording]
+      description: >
+        Output kind. 'recording' archives the programme to MinIO/S3 as a VOD via
+        Strom's builtin recorder (uploaded from local segments post-deactivate);
+        it is only accepted when MinIO/S3 is configured, otherwise creating a
+        recording output returns 400.
+
+    OutputStatus:
+      type: string
+      description: >-
+        Derived output health (issue #255). `healthy` = the owning production is
+        active with a running flow; `down` = not running; `unknown` = health
+        could not be determined (or field absent, which is equivalent to
+        `unknown`). `degraded` is reserved in the enum for a future per-output
+        signal and is never emitted today. Clients must ignore unknown enum
+        values (forward-compat).
+      enum: [healthy, degraded, down, unknown]
 
     ProductionStatus:
       type: string
-      enum: [active, inactive, activating]
+      description: >-
+        Production lifecycle status. `ended` (issue #255) means the production
+        ran a broadcast that has finished, distinct from `inactive` (never
+        started / clean idle). Clients must ignore unknown enum values
+        (forward-compat).
+      enum: [active, inactive, activating, ended]
 
     MacroActionType:
       type: string
@@ -178,12 +283,57 @@ components:
           $ref: '#/components/schemas/OutputType'
         url:
           type: string
+          description: >-
+            Operator-authored SRT bind/listen URI (e.g. srt://:43524?mode=listener).
+            Undefined for whep outputs. Round-tripped by POST/PATCH.
+        connect:
+          $ref: '#/components/schemas/SrtConnect'
+        status:
+          allOf:
+            - $ref: '#/components/schemas/OutputStatus'
+          description: >-
+            Derived output health (issue #255). Read-only; computed on read from
+            the owning production's live flow state, not persisted. Optional —
+            an absent value is equivalent to `unknown`.
         createdAt:
           type: string
           format: date-time
         updatedAt:
           type: string
           format: date-time
+
+    SrtConnect:
+      type: object
+      description: >-
+        Read-only, server-derived dial-in address an external SRT caller uses to
+        reach this output. Present only on mpegtssrt/efpsrt outputs that have a
+        well-formed bind URL. `uri`/`host` are null (with a `reason`) when the
+        Strom SRT host cannot be resolved server-side; `port` is always present.
+      required: [uri, host, port, mode, source]
+      properties:
+        uri:
+          type: string
+          nullable: true
+          description: Assembled srt://host:port?mode=… dial-in string, or null when host is unresolved.
+        host:
+          type: string
+          nullable: true
+          description: Resolved SRT host external callers dial, or null when unresolved.
+        port:
+          type: integer
+          description: SRT port parsed from the authored bind URI.
+        mode:
+          type: string
+          enum: [caller, listener]
+          description: The SRT mode the EXTERNAL side should use (inverse of the authored mode).
+        source:
+          type: string
+          enum: [authored-host, srt-public-host, strom-host, unknown]
+          description: Provenance of the resolved host.
+        reason:
+          type: string
+          enum: [srt-host-not-configured, srt-host-not-loopback-reachable, strom-url-not-parseable]
+          description: Present only when `uri` is null — why the host could not be resolved.
 
     OutputInput:
       type: object
@@ -1272,6 +1422,168 @@ paths:
           description: Removed
         '404':
           description: Not found
+
+  # Production — Clip cue/play control (epic #206, issue #277)
+
+  /api/v1/productions/{id}/clips/{mixerInput}/cue:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^video_in_\d{1,2}$'
+        description: Mixer input the clip source is assigned to, e.g. `video_in_0`
+    post:
+      summary: Cue a clip into the ready state
+      description: >-
+        Loads the clip's resolved playlist entry into the media-player block and
+        seeks to index 0, leaving it paused/ready. Maps to Strom
+        `player.setPlaylist({files:[clip]}) + player.goto({index:0})`.
+      operationId: cueClip
+      tags: [Productions]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                clipId:
+                  type: string
+                  minLength: 1
+                  maxLength: 256
+      responses:
+        '200':
+          description: Clip cued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClipState'
+        '400':
+          description: Invalid body or mixerInput
+        '401':
+          description: Missing/invalid API key (when configured)
+        '404':
+          description: Production or clip source not found
+        '409':
+          description: Production is not activated
+        '502':
+          description: Strom returned an error
+        '503':
+          description: Strom is unreachable
+
+  /api/v1/productions/{id}/clips/{mixerInput}/play:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^video_in_\d{1,2}$'
+    post:
+      summary: Play the currently cued clip
+      description: Maps to Strom `player.control({action:'play'})`.
+      operationId: playClip
+      tags: [Productions]
+      responses:
+        '200':
+          description: Clip playing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClipState'
+        '401':
+          description: Missing/invalid API key (when configured)
+        '404':
+          description: Production or clip source not found
+        '409':
+          description: Production is not activated, or no clip cued
+        '502':
+          description: Strom returned an error
+        '503':
+          description: Strom is unreachable
+
+  /api/v1/productions/{id}/clips/{mixerInput}/stop:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^video_in_\d{1,2}$'
+    post:
+      summary: Stop clip playback
+      description: Maps to Strom `player.control({action:'stop'})`.
+      operationId: stopClip
+      tags: [Productions]
+      responses:
+        '200':
+          description: Clip stopped
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClipState'
+        '401':
+          description: Missing/invalid API key (when configured)
+        '404':
+          description: Production or clip source not found
+        '409':
+          description: Production is not activated
+        '502':
+          description: Strom returned an error
+        '503':
+          description: Strom is unreachable
+
+  /api/v1/productions/{id}/clips/{mixerInput}/state:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^video_in_\d{1,2}$'
+    get:
+      summary: Get current clip state
+      operationId: getClipState
+      tags: [Productions]
+      responses:
+        '200':
+          description: Current clip state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClipState'
+        '401':
+          description: Missing/invalid API key (when configured)
+        '404':
+          description: Production or clip source not found
+        '409':
+          description: Production is not activated
+        '502':
+          description: Strom returned an error
+        '503':
+          description: Strom is unreachable
 
   # Production — Graphic assignments
 
