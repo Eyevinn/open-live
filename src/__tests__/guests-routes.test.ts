@@ -215,6 +215,10 @@ describe('POST /api/v1/guests/:inviteId/join', () => {
     expect(body.modes.map((m: { key: string }) => m.key)).toContain('program-minus');
     // A session doc was persisted.
     expect(sessionsStore.get(body.guestId)?.state).toBe('joined');
+    // Intercom is unconfigured in this suite, so talkback degrades cleanly: join
+    // succeeds and `intercomLine` is absent (spec §Configuration, OQ1).
+    expect(body.intercomLine).toBeUndefined();
+    expect(sessionsStore.get(body.guestId)?.intercomLineId).toBeUndefined();
   });
 
   it('honours a pinned mixerInput from the invite', async () => {
