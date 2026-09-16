@@ -169,6 +169,13 @@ export const config = {
   recordingKeyPrefix: process.env['RECORDING_KEY_PREFIX'] ?? '',
   /** Presigned playback URL TTL in seconds (used by #42's listing endpoint). */
   recordingPresignTtlS: parsePositiveIntEnv('RECORDING_PRESIGN_TTL_S', 3600),
+  /**
+   * Interval (ms) at which the WS layer polls `player.getState` to detect clip
+   * completion when Strom does not push player-state changes (epic #206,
+   * issues #277/#278; spec §"Configuration"). Completion latency is bounded by
+   * one poll interval (≤ this value). Default 250 ms.
+   */
+  clipStatePollMs: parsePositiveIntEnv('CLIP_STATE_POLL_MS', 250),
 } as const;
 
 /**
