@@ -3,8 +3,14 @@ import type { WebSocket } from '@fastify/websocket';
 import { z } from 'zod';
 import { getDb, getSourcesDb } from '../db/index.js';
 import { updateProductionDoc } from '../routes/productions.js';
-import type { ProductionDoc } from '../db/types.js';
+import type { ProductionDoc, ClipState, SourceDoc } from '../db/types.js';
 import { getTally, setTally, subscribe, unsubscribe, broadcast, nextSeq, currentSeq } from '../services/tally.service.js';
+import {
+  cueClip, playClip, stopClip, pauseClip, seekClip,
+  resolveClipSource, resolveClipTarget,
+  ClipNotFoundError, ClipNotActivatedError, ClipNotCuedError,
+} from '../lib/clip-control.js';
+import { getClipStateEntry, getAllClipStates, setClipStateEntry, clearClipState } from '../services/clip-state.service.js';
 import { CONTRACT_VERSION, computeTallyContributions } from '../services/automation-contract.js';
 import { startMeterRelay, stopMeterRelay } from '../services/meter-relay.js';
 import { StromClient, StromClientError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms, type VideoEffect, type EffectTarget, type SetVideoEffectRequest } from '../lib/strom.js';
@@ -199,7 +205,12 @@ type InboundMessage =
   | { type: 'SELECT_PVW_PIP'; pip: number; cmdId?: string }
   | { type: 'SET_PIP'; pip: number; bg: number | null; zones: PipZone[]; transforms?: PipTransforms; cmdId?: string }
   | { type: 'SET_EFFECT'; target: EffectTarget; effect: VideoEffect; cmdId?: string }
-  | { type: 'HTML_SOURCE_EVENT'; sourceId: string; params: Record<string, string>; mode?: 'replace' | 'merge'; cmdId?: string };
+  | { type: 'HTML_SOURCE_EVENT'; sourceId: string; params: Record<string, string>; mode?: 'replace' | 'merge'; cmdId?: string }
+  | { type: 'CLIP_CUE'; mixerInput: string; clipId?: string; cmdId?: string }
+  | { type: 'CLIP_PLAY'; mixerInput: string; cmdId?: string }
+  | { type: 'CLIP_STOP'; mixerInput: string; cmdId?: string }
+  | { type: 'CLIP_PAUSE'; mixerInput: string; cmdId?: string }
+  | { type: 'CLIP_SEEK'; mixerInput: string; positionMs: number; cmdId?: string };
 
 // ---------------------------------------------------------------------------
 // Runtime schema validation for inbound WS messages
@@ -319,6 +330,13 @@ const InboundMessageSchema = z.discriminatedUnion('type', [
     mode: z.enum(['replace', 'merge']).default('merge').optional(),
     cmdId: cmdIdSchema,
   }),
+  // Clip cue/play control (epic #206, issue #278). Reuses mixerInputSchema;
+  // handlers delegate to the shared src/lib/clip-control.ts module.
+  z.object({ type: z.literal('CLIP_CUE'), mixerInput: mixerInputSchema, clipId: z.string().min(1).max(256).optional(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('CLIP_PLAY'), mixerInput: mixerInputSchema, cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('CLIP_STOP'), mixerInput: mixerInputSchema, cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('CLIP_PAUSE'), mixerInput: mixerInputSchema, cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('CLIP_SEEK'), mixerInput: mixerInputSchema, positionMs: z.number().int().min(0).max(24 * 60 * 60 * 1000), cmdId: cmdIdSchema }),
 ]);
 
 // ---------------------------------------------------------------------------
@@ -731,6 +749,85 @@ export function clearFxState(productionId: string): void {
   inputEffectsByProduction.delete(productionId)
   masterEffectByProduction.delete(productionId)
   fxAvailableByProduction.delete(productionId)
+}
+
+// ---------------------------------------------------------------------------
+// Clip completion polling (epic #206, issue #278).
+//
+// Strom's media_player does not push player-state transitions, so while a clip
+// is `playing` we poll `player.getState` every CLIP_STATE_POLL_MS. When Strom
+// reports `stopped` (end-of-media) we transition the clip to `completed` and
+// broadcast CLIP_STATE once. Completion latency is therefore bounded by one
+// poll interval (≤ CLIP_STATE_POLL_MS, default 250 ms) — documented in
+// docs/controller-websocket.md. Timers are keyed `productionId:mixerInput` and
+// cleaned up on stop/disconnect/deactivate.
+// ---------------------------------------------------------------------------
+const clipPollTimers = new Map<string, ReturnType<typeof setInterval>>()
+
+function clipPollKey(productionId: string, mixerInput: string): string {
+  return `${productionId}:${mixerInput}`
+}
+
+/** Stops (and forgets) the completion poll timer for a clip, if one is running. */
+function stopClipPoll(productionId: string, mixerInput: string): void {
+  const key = clipPollKey(productionId, mixerInput)
+  const timer = clipPollTimers.get(key)
+  if (timer) {
+    clearInterval(timer)
+    clipPollTimers.delete(key)
+  }
+}
+
+/**
+ * Starts (or restarts) the completion poll for a playing clip. On each tick it
+ * reads the player state; when Strom reports `stopped` it records/broadcasts a
+ * `completed` CLIP_STATE and stops the timer. Errors are logged and stop the
+ * poll (a subsequent play restarts it).
+ */
+function startClipPoll(productionId: string, mixerInput: string, clipId?: string): void {
+  stopClipPoll(productionId, mixerInput)
+  const key = clipPollKey(productionId, mixerInput)
+  const timer = setInterval(() => {
+    void (async () => {
+      try {
+        const doc = await getDb().get(productionId)
+        const { flowId, blockId } = resolveClipTarget(doc, mixerInput)
+        const strom = await makeStromClient()
+        const player = await strom.player.getState(flowId, blockId)
+        if (player.state === 'stopped') {
+          const state: ClipState = {
+            mixerInput,
+            state: 'completed',
+            ...(clipId !== undefined ? { clipId } : {}),
+            ...(player.position_ms !== undefined ? { positionMs: player.position_ms } : {}),
+            ...(player.duration_ms !== undefined ? { durationMs: player.duration_ms } : {}),
+          }
+          setClipStateEntry(productionId, state)
+          broadcast(productionId, { type: 'CLIP_STATE', ...state })
+          stopClipPoll(productionId, mixerInput)
+        }
+      } catch (err) {
+        console.warn(`[controller] clip poll error (${mixerInput}):`, String(err))
+        stopClipPoll(productionId, mixerInput)
+      }
+    })()
+  }, config.clipStatePollMs)
+  clipPollTimers.set(key, timer)
+}
+
+/**
+ * Clears all clip state for a production: stops every completion poll timer and
+ * wipes the in-memory registry. Called on deactivate (mirrors clearPipState /
+ * clearAudioState / clearFxState).
+ */
+export function clearClipStateForProduction(productionId: string): void {
+  for (const key of clipPollTimers.keys()) {
+    if (key.startsWith(`${productionId}:`)) {
+      clearInterval(clipPollTimers.get(key)!)
+      clipPollTimers.delete(key)
+    }
+  }
+  clearClipState(productionId)
 }
 
 /** Returns the 0-based audio channel index for a given mixerInput, or null if it has no channel. */
@@ -1813,6 +1910,68 @@ export async function handleMessage(
       });
       break;
     }
+    case 'CLIP_CUE':
+    case 'CLIP_PLAY':
+    case 'CLIP_STOP':
+    case 'CLIP_PAUSE':
+    case 'CLIP_SEEK': {
+      const mixerInput = msg.mixerInput;
+      try {
+        const strom = await makeStromClient();
+        let state: ClipState;
+        switch (msg.type) {
+          case 'CLIP_CUE': {
+            const source = await resolveClipSource(doc, mixerInput, (sid) => getSourcesDb().get(sid) as Promise<SourceDoc>);
+            // A new cue supersedes any in-flight completion poll.
+            stopClipPoll(productionId, mixerInput);
+            state = await cueClip(strom, doc, source, mixerInput, msg.clipId);
+            break;
+          }
+          case 'CLIP_PLAY': {
+            const tracked = getClipStateEntry(productionId, mixerInput);
+            if (!tracked || tracked.state === 'idle') throw new ClipNotCuedError();
+            state = await playClip(strom, doc, mixerInput, tracked.clipId);
+            // Begin (or restart) polling for end-of-media completion.
+            startClipPoll(productionId, mixerInput, state.clipId ?? tracked.clipId);
+            break;
+          }
+          case 'CLIP_PAUSE': {
+            const tracked = getClipStateEntry(productionId, mixerInput);
+            state = await pauseClip(strom, doc, mixerInput, tracked?.clipId);
+            stopClipPoll(productionId, mixerInput);
+            break;
+          }
+          case 'CLIP_STOP': {
+            const tracked = getClipStateEntry(productionId, mixerInput);
+            state = await stopClip(strom, doc, mixerInput, tracked?.clipId);
+            stopClipPoll(productionId, mixerInput);
+            break;
+          }
+          case 'CLIP_SEEK': {
+            const tracked = getClipStateEntry(productionId, mixerInput);
+            state = await seekClip(strom, doc, mixerInput, msg.positionMs, tracked?.clipId);
+            break;
+          }
+        }
+        setClipStateEntry(productionId, state);
+        broadcast(productionId, { type: 'CLIP_STATE', ...state });
+      } catch (err) {
+        // Typed clip errors carry a human-readable message; Strom transport
+        // errors are surfaced via stromErrorMessage (502/503-style text).
+        let errText: string;
+        if (err instanceof ClipNotFoundError || err instanceof ClipNotActivatedError || err instanceof ClipNotCuedError) {
+          errText = err.message;
+        } else {
+          errText = `Clip: ${stromErrorMessage(err)}`;
+        }
+        // Also record + broadcast the error transition so subscribers converge.
+        const errorState: ClipState = { mixerInput, state: 'error', error: errText };
+        setClipStateEntry(productionId, errorState);
+        broadcast(productionId, { type: 'CLIP_STATE', ...errorState });
+        ws.send(JSON.stringify({ type: 'ERROR', error: errText }));
+      }
+      break;
+    }
     default: {
       ws.send(JSON.stringify({ type: 'ERROR', error: 'Unknown message type' }));
     }
@@ -2200,6 +2359,41 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
           seq: nextSeq(id),
           ts: new Date().toISOString(),
         }));
+      }
+
+      // -----------------------------------------------------------------------
+      // Clip state snapshot (epic #206, issue #278). For each clip source (a
+      // mixerInput present in clipPlayerBlockIds) send the current CLIP_STATE,
+      // alongside the TALLY / PIP_STATE / DSK_STATE / OVL_STATE sync. Prefer the
+      // in-memory registry (authoritative for cued/completed/error, which Strom
+      // cannot report); otherwise restore from Strom's live player.getState.
+      // -----------------------------------------------------------------------
+      if (connectDoc?.clipPlayerBlockIds) {
+        const clipInputs = Object.keys(connectDoc.clipPlayerBlockIds);
+        let clipStrom: StromClient | null = null;
+        for (const mixerInput of clipInputs) {
+          const tracked = getClipStateEntry(id, mixerInput);
+          if (tracked) {
+            socket.send(JSON.stringify({ type: 'CLIP_STATE', ...tracked }));
+            continue;
+          }
+          // Cold registry (server restart / first connect): restore from Strom.
+          try {
+            if (!clipStrom) clipStrom = await makeStromClient();
+            const { flowId, blockId } = resolveClipTarget(connectDoc, mixerInput);
+            const player = await clipStrom.player.getState(flowId, blockId);
+            const state: ClipState = {
+              mixerInput,
+              state: player.state === 'playing' ? 'playing' : player.state === 'paused' ? 'paused' : 'stopped',
+              ...(player.position_ms !== undefined ? { positionMs: player.position_ms } : {}),
+              ...(player.duration_ms !== undefined ? { durationMs: player.duration_ms } : {}),
+            };
+            setClipStateEntry(id, state);
+            socket.send(JSON.stringify({ type: 'CLIP_STATE', ...state }));
+          } catch (err) {
+            console.warn(`[controller] clip state connect sync error (${mixerInput}):`, String(err));
+          }
+        }
       }
 
       // -----------------------------------------------------------------------
