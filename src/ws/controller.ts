@@ -18,6 +18,12 @@ import { getStromToken } from '../lib/strom-token.js';
 import { graphicUrl } from '../lib/url-validation.js';
 import { decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
 import { loadAudioChannels } from '../lib/audio-channels.js';
+import {
+  mirrorToMainForPersistedReturns,
+  returnSendMatrix,
+  type PersistedReturnBus,
+  type ReturnMode,
+} from '../lib/return-feeds.js';
 import { config } from '../config.js';
 import { notifySubscriberJoin, resetIdleTimer } from '../services/idle-watchdog.js';
 import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
@@ -863,6 +869,7 @@ async function applyAudioFollow(
   const afvChannels = afvChannelsByProduction.get(productionId) ?? new Set<string>();
   const properties: Record<string, unknown> = {};
   const ramp_ms_overrides: Record<string, number> = {};
+  const toMainChanges = new Map<number, boolean>();
   for (const { channel, assignment } of await loadAudioChannels(doc.sources)) {
     // Only update routing for channels the operator has opted into AFV.
     // Channels with AFV off are never touched by the switcher.
@@ -872,11 +879,100 @@ async function applyAudioFollow(
     const key = `ch${channel + 1}_to_main`;
     properties[key] = routed;
     ramp_ms_overrides[key] = routed ? rampUpMs : rampDownMs;
+    toMainChanges.set(channel, routed);
   }
+  // Mirror the AFV routing into every guest return in the same update so a return
+  // never keeps a channel AFV just took off program (spec §"Mirror `to_main`").
+  Object.assign(properties, mirrorToMainForPersistedReturns(
+    (doc.returnBuses ?? []) as PersistedReturnBus[],
+    toMainChanges,
+  ));
   if (Object.keys(properties).length > 0) {
     await strom.flows.updateBlockProperties(stromFlowId, audioBlockId, { properties, ramp_ms_overrides })
       .catch((err) => console.warn('[controller] audio follow error:', String(err)));
   }
+}
+
+// ---------------------------------------------------------------------------
+// Guest return feeds — shared mode handler (epic #208, issue #300)
+// ---------------------------------------------------------------------------
+
+/** Result of a return-mode change request. */
+export type ReturnModeResult =
+  | { ok: true; mixerInput: string; mode: ReturnMode }
+  | { ok: false; code: 'not_found' | 'invalid_mode' | 'inactive' };
+
+/**
+ * The single mode-change entry point shared by the crew REST route, the guest
+ * token route and the WS `RETURN_SET` command (issue #301 calls this). It:
+ *   1. validates the input has a return bus (v1 only `program`/`program-minus`),
+ *   2. persists the mode on the assignment's `returnFeed` and `doc.returnBuses`,
+ *   3. applies the send matrix live if the flow is active — respecting channels
+ *      the crew has currently muted so a switch to `program` never reopens a
+ *      muted channel, and
+ *   4. broadcasts `RETURN_STATE` (the WS surface #301 completes; this is a
+ *      minimal, correct hook — persist + apply + broadcast).
+ *
+ * NOTE: AFV-driven closures are re-mirrored continuously by applyAudioFollow, so
+ * a channel AFV has taken off program self-corrects on the next cut; this switch
+ * factors in operator mutes (the persistent off-program state) precisely.
+ */
+export async function applyReturnMode(
+  productionId: string,
+  mixerInput: string,
+  mode: ReturnMode,
+): Promise<ReturnModeResult> {
+  if (mode !== 'program' && mode !== 'program-minus') {
+    return { ok: false, code: 'invalid_mode' };
+  }
+  let doc: ProductionDoc;
+  try {
+    doc = await getDb().get(productionId);
+  } catch {
+    return { ok: false, code: 'not_found' };
+  }
+  const assignment = doc.sources.find((s) => s.mixerInput === mixerInput);
+  if (!assignment || !assignment.returnFeed) {
+    return { ok: false, code: 'not_found' };
+  }
+
+  // Persist the mode on the assignment and on the resolved return-bus cache.
+  const nextSources = doc.sources.map((s) =>
+    s.mixerInput === mixerInput
+      ? { ...s, returnFeed: { ...s.returnFeed!, synced: mode } }
+      : s,
+  );
+  const nextReturnBuses = (doc.returnBuses ?? []).map((rb) =>
+    rb.mixerInput === mixerInput ? { ...rb, mode } : rb,
+  );
+  await updateProductionDoc(productionId, {
+    sources: nextSources,
+    ...(nextReturnBuses.length > 0 && { returnBuses: nextReturnBuses }),
+  }).catch((err) => console.warn('[controller] persist return mode error:', err));
+
+  // Apply live if the flow is active and this input has a resolved return bus.
+  const rb = nextReturnBuses.find((r) => r.mixerInput === mixerInput);
+  if (rb && doc.stromFlowId && doc.audioMixerBlockId) {
+    const numChannels = numAudioChannelsByProduction.get(productionId)
+      ?? (await loadAudioChannels(doc.sources)).length;
+    // Honour operator mutes: a muted channel (element ch{N}) stays closed even in
+    // program mode. AFV self-corrects on the next cut via applyAudioFollow.
+    const muted = mutedElementsByProduction.get(productionId) ?? new Set<string>();
+    const toMainByChannel = new Map<number, boolean>();
+    for (let ch = 0; ch < numChannels; ch++) {
+      toMainByChannel.set(ch, !muted.has(`ch${ch + 1}`));
+    }
+    const props = returnSendMatrix(rb.auxBus, rb.ownChannel, mode, numChannels, toMainByChannel);
+    try {
+      const strom = await makeStromClient();
+      await strom.flows.updateBlockProperties(doc.stromFlowId, doc.audioMixerBlockId, { properties: props });
+    } catch (err) {
+      console.warn('[controller] apply return mode error:', err);
+    }
+  }
+
+  broadcast(productionId, { type: 'RETURN_STATE', mixerInput, mode });
+  return { ok: true, mixerInput, mode };
 }
 
 // ---------------------------------------------------------------------------
@@ -1425,6 +1521,13 @@ export async function handleMessage(
             const ch = parseInt(chMatch[1], 10);
             // to_main = !mute (true=ON routing, false=OFF routing)
             props = { [`ch${ch}_to_main`]: !msg.value };
+            // Mirror the routing change into every guest return in the SAME update
+            // (spec §"Mirror `to_main` into return sends") so a return never keeps
+            // a channel the crew just muted. ch is 1-based here; returns are 0-based.
+            Object.assign(props, mirrorToMainForPersistedReturns(
+              (doc.returnBuses ?? []) as PersistedReturnBus[],
+              new Map([[ch - 1, !msg.value]]),
+            ));
           }
           await strom.flows.updateBlockProperties(doc.stromFlowId, ctx.audioBlockId, {
             properties: props,
@@ -1462,7 +1565,14 @@ export async function handleMessage(
             broadcast(productionId, { type: 'AUDIO_STATE', elementId, property: 'mute', value: false });
             const strom = await makeStromClient();
             await strom.flows.updateBlockProperties(doc.stromFlowId, `${ctx.audioBlockId}`, {
-              properties: { [`ch${chIdx + 1}_to_main`]: isOnPgm },
+              properties: {
+                [`ch${chIdx + 1}_to_main`]: isOnPgm,
+                // Mirror into returns in the same update (spec §"Mirror `to_main`").
+                ...mirrorToMainForPersistedReturns(
+                  (doc.returnBuses ?? []) as PersistedReturnBus[],
+                  new Map([[chIdx, isOnPgm]]),
+                ),
+              },
             }).catch((err) => console.warn('[controller] AFV_SET routing error:', err));
           }
         }

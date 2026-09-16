@@ -11,6 +11,7 @@ import { clearProductionPflState } from '../services/pfl-state.js';
 import { clearPipState, clearAudioState, clearFxState, clearClipStateForProduction } from '../ws/controller.js';
 import { config, isRecordingEnabled } from '../config.js';
 import { minioTargetFromConfig, uploadRecordings } from '../lib/recording-uploader.js';
+import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type OutputStatusEntry } from '../lib/production-health.js';
 
@@ -271,6 +272,7 @@ async function runActivationFlow(
       ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
       ...(Object.keys(activation.sourceAudioOffsetBlockIds).length > 0 && { sourceAudioOffsetBlockIds: activation.sourceAudioOffsetBlockIds }),
       ...(Object.keys(activation.clipPlayerBlockIds).length > 0 && { clipPlayerBlockIds: activation.clipPlayerBlockIds }),
+      ...(activation.returnBuses.length > 0 && { returnBuses: activation.returnBuses }),
     });
 
     // Step 3: Poll until flow reaches 'playing' or we time out
@@ -388,6 +390,18 @@ async function runActivationFlow(
               }))
             : undefined;
 
+        // Per-guest return WHEP endpoints (issue #300). Store the internal Strom
+        // URL + endpointId; the return REST routes derive the guest-scoped,
+        // endpoint-path-checked URL from these (never `/whep-proxy?target=`).
+        const returnWhepUrls: Array<{ mixerInput: string; url: string; endpointId: string }> | undefined =
+          activation.returnWhepEntries.length > 0
+            ? activation.returnWhepEntries.map(({ mixerInput, endpointId }) => ({
+                mixerInput,
+                url: `${config.stromUrl}/whep/${endpointId}`,
+                endpointId,
+              }))
+            : undefined;
+
         await updateProductionDoc(productionId, {
           status: 'active',
           whepEndpoint,
@@ -395,6 +409,8 @@ async function runActivationFlow(
           whipEndpoints: whipEndpoints.length > 0 ? whipEndpoints : undefined,
           srtOutputUri: undefined,
           whepOutputUrls: whepOutputUrls && whepOutputUrls.length > 0 ? whepOutputUrls : undefined,
+          ...(returnWhepUrls && returnWhepUrls.length > 0 && { returnWhepUrls }),
+          ...(activation.returnBuses.length > 0 && { returnBuses: activation.returnBuses }),
           tally: initialTally,
           ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
           ...(loudnessMainBlockId !== undefined && { loudnessMainBlockId }),
@@ -838,6 +854,15 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         await deactivateStromFlow(doc.stromFlowId, strom);
       }
 
+      // Tear down the Open Intercom talkback grouping (all its lines) with the
+      // production lifecycle (issue #302). Best-effort: a failed teardown must not
+      // block deactivation, mirroring the Strom/recording teardown contract.
+      if (doc.intercomProductionId && isIntercomEnabled()) {
+        await teardownIntercomProduction(doc.intercomProductionId).catch((err) => {
+          req.log.warn({ err, productionId: doc._id }, 'intercom teardown failed — continuing deactivation');
+        });
+      }
+
       // Transition rule (spec §1): a production that was `active` (reached a live
       // broadcast) and is now explicitly deactivated becomes `ended`; one that
       // never reached `active` (still `activating`) becomes `inactive` — it never
@@ -860,6 +885,9 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         whipEndpoints: undefined,
         srtOutputUri: undefined,
         whepOutputUrls: undefined,
+        returnBuses: undefined,
+        returnWhepUrls: undefined,
+        intercomProductionId: undefined,
         tally: { pgm: null, pvw: null },
         updatedAt: new Date().toISOString(),
       };

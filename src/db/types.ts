@@ -411,6 +411,15 @@ export interface ProductionDoc {
   /** Maps mixerInput → media-player (builtin.media_player) block ID for clip sources — set on activate, cleared on deactivate */
   clipPlayerBlockIds?: Record<string, string>;
   /**
+   * Per-guest return feed topology (epic #208, issue #300) — set on activate,
+   * cleared on deactivate. Each entry maps a guest's mixerInput to its return aux
+   * bus, its own audio channel (excluded in `program-minus`) and the live mode,
+   * so the WS layer can drive send-level changes and mirror `to_main` into returns.
+   */
+  returnBuses?: Array<{ mixerInput: string; auxBus: number; ownChannel: number; mode: 'program' | 'program-minus' }>;
+  /** Per-guest return WHEP output URLs — set when flow reaches 'playing', cleared on deactivate */
+  returnWhepUrls?: Array<{ mixerInput: string; url: string; endpointId: string }>;
+  /**
    * Open Intercom production/line grouping id — set when guest calling is
    * enabled for this production (epic #208, issue #299,
    * `docs/specs/guest-calling-intercom.md` §"Data Model"). Lets talkback lines

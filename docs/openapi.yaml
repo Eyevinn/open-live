@@ -779,6 +779,28 @@ components:
         delivery:
           type: object
 
+    ReturnModeBody:
+      type: object
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [program, program-minus, low-latency-minus]
+          description: >-
+            `program` opens the guest's own send; `program-minus` (default) closes it
+            for mix-minus. `low-latency-minus` is a client-side feed choice not built in
+            v1 and returns 400.
+
+    ReturnModeResult:
+      type: object
+      required: [mixerInput, mode]
+      properties:
+        mixerInput:
+          type: string
+        mode:
+          type: string
+          enum: [program, program-minus]
+
     GuestJoinResult:
       type: object
       required: [guestId, whipUrl, feeds, modes, defaultMode, returnMode]
@@ -790,7 +812,10 @@ components:
           description: WHIP publish URL on the EXISTING `/api/v1/productions/{id}/whip/{mixerInput}` contract.
         feeds:
           type: array
-          description: Per-guest return feeds. Empty in v1 — return-feed routes are wired by a later sub-issue.
+          description: >-
+            Per-guest return feeds. In v1 this carries the `picture` feed (program
+            video over WHEP with a single mix-minus audio track) when the production
+            is active and a return aux bus exists for the guest's input; otherwise empty.
           items:
             type: object
             required: [id, url, video]
@@ -2606,6 +2631,211 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+
+  /api/v1/guests/{inviteId}/session/return:
+    parameters:
+      - name: inviteId
+        in: path
+        required: true
+        schema:
+          type: string
+    put:
+      summary: Guest switches their own return mode (token-authed)
+      description: >-
+        Switches the guest's return feed between `program` and `program-minus`
+        (mix-minus). The mixerInput is pinned server-side to the invite's scoped
+        input. `low-latency-minus` is not built in v1 and returns 400.
+      operationId: guestSetReturnMode
+      tags: [Guests]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReturnModeBody'
+      responses:
+        '200':
+          description: Return mode applied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReturnModeResult'
+        '400':
+          description: Invalid or unsupported mode (`low-latency-minus`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing, invalid, or revoked invite token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No return on that input, or production not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Guest calling disabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/productions/{id}/returns/{mixerInput}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Get the crew/guest join-shape view of a return on an input
+      operationId: getReturn
+      tags: [Returns]
+      responses:
+        '200':
+          description: Return join shape (publish input, modes, current mode, feeds)
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: Production not found, or no assignment on that input
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/productions/{id}/returns/{mixerInput}/mode:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+    put:
+      summary: Crew sets the return mode for an input (persist + apply live + broadcast RETURN_STATE)
+      operationId: setReturnMode
+      tags: [Returns]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReturnModeBody'
+      responses:
+        '200':
+          description: Return mode applied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReturnModeResult'
+        '400':
+          description: Invalid or unsupported mode (`low-latency-minus`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No return on that input
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/productions/{id}/returns/{mixerInput}/picture/whep:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Establish the return picture WHEP session (server-scoped signaling proxy)
+      description: >-
+        Proxies a WHEP offer to the Strom return output derived SERVER-SIDE from the
+        production's persisted `returnWhepUrls` (scoped to the input). Returns a
+        `Location` header rewritten to a session subpath under this route so a guest
+        can only tear down their own session.
+      operationId: startReturnPictureWhep
+      tags: [Returns]
+      requestBody:
+        required: true
+        content:
+          application/sdp:
+            schema:
+              type: string
+      responses:
+        '201':
+          description: WHEP answer SDP
+          content:
+            application/sdp:
+              schema:
+                type: string
+        '404':
+          description: Production not found, or feed unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Production inactive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Upstream Strom unreachable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/productions/{id}/returns/{mixerInput}/picture/whep/{sessionId}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: sessionId
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      summary: Tear down the return picture WHEP session
+      operationId: stopReturnPictureWhep
+      tags: [Returns]
+      responses:
+        '204':
+          description: Session torn down (idempotent)
 
   /api/v1/productions/{id}/guests:
     parameters:

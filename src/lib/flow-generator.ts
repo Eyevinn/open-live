@@ -7,6 +7,7 @@ import { DEFAULT_FLOW, type FlowTopology } from './default-flow.js';
 import { decryptAddressPassphrase } from './srt-passphrase-crypto.js';
 import { safeFlowProjection } from './log-redact.js';
 import { VIRTUAL_SOURCES, assignAudioChannels } from './audio-channels.js';
+import { assignReturnBuses, returnSendMatrix } from './return-feeds.js';
 
 /**
  * Generates a Strom flow from a template + source assignments,
@@ -42,6 +43,15 @@ export interface ActivationResult {
   sourceAudioOffsetBlockIds: Record<string, string>;
   /** Maps mixerInput → builtin.media_player block ID (one per 'clip' source) — used by the clip cue/play control surface */
   clipPlayerBlockIds: Record<string, string>;
+  /**
+   * Per-guest return feed topology (epic #208, issue #300). Maps a guest's
+   * mixerInput → the return's aux bus index + own audio channel, so the WS layer
+   * can drive live send-level changes (mode switch + `to_main` mirroring). Only
+   * assignments carrying a `returnFeed` (that resolve to an audio channel) appear.
+   */
+  returnBuses: Array<{ mixerInput: string; auxBus: number; ownChannel: number; mode: 'program' | 'program-minus' }>;
+  /** WHEP endpoint IDs for per-guest return outputs, keyed by the guest's mixerInput. */
+  returnWhepEntries: Array<{ mixerInput: string; endpointId: string }>;
 }
 
 function findPgmFeedPad(flow: FlowTopology): string | null {
@@ -161,6 +171,20 @@ export async function activateStromFlow(
   })();
   const clockType = typeof production.values?.clock === 'string' && production.values.clock !== '' ? production.values.clock : undefined;
 
+  // Per-guest return feeds (epic #208, issue #300). Crew aux buses come first;
+  // return buses are numbered strictly AFTER them so the every-aux→every-WHEP
+  // loops (below) can cap at numCrewAuxBuses and never fan a return out to every
+  // viewer — a return goes to exactly one guest's own WHEP output.
+  const numCrewAuxBuses = numAuxBuses ?? 0;
+  const returnBuses = assignReturnBuses(
+    production.sources,
+    (id) => sourceMap.get(id) ?? (VIRTUAL_SOURCES[id] as SourceDoc | undefined),
+    numCrewAuxBuses,
+  );
+  const numReturnBuses = returnBuses.length;
+  // Total aux buses the mixer must allocate: crew buses + one per return.
+  const totalAuxBuses = numCrewAuxBuses + numReturnBuses;
+
   for (const block of flow.blocks) {
     const b = block as Record<string, unknown>;
     const props = (b['properties'] ?? {}) as Record<string, unknown>;
@@ -195,7 +219,9 @@ export async function activateStromFlow(
     }
 
     if (b['block_definition_id'] === 'builtin.mixer') {
-      if (numAuxBuses !== undefined) props['num_aux_buses'] = numAuxBuses;
+      // num_aux_buses now covers crew aux buses PLUS one per guest return bus.
+      // Set it whenever there are returns even if the crew configured none.
+      if (numAuxBuses !== undefined || numReturnBuses > 0) props['num_aux_buses'] = totalAuxBuses;
       if (numGroups !== undefined) props['num_groups'] = numGroups;
       b['properties'] = props;
     }
@@ -289,7 +315,9 @@ export async function activateStromFlow(
       (l) => !((l['to'] as string | undefined) ?? '').startsWith(`${whepId}:audio`),
     );
     if (mainAudioSource) {
-      const auxCount = numAuxBuses ?? 0;
+      // Crew aux buses only — return buses are excluded from the every-aux→every-WHEP
+      // fan-out (they carry one guest's mix-minus to that guest's own output).
+      const auxCount = numCrewAuxBuses;
       props['num_audio_tracks'] = 1 + (monitorAudioSource ? 1 : 0) + auxCount;
       b['properties'] = props;
       flow.links.push({ from: mainAudioSource, to: `${whepId}:audio_in` });
@@ -416,6 +444,15 @@ export async function activateStromFlow(
           props[`ch${ch}_aux${aux}_pre`] = isPre;
         }
       }
+    }
+    // Guest return buses are post-fader (spec §"Return feed design": sends follow
+    // the crew's faders and mutes) and start with their mode's send matrix so a
+    // program-minus guest never hears their own channel from the very first frame.
+    for (const rb of returnBuses) {
+      for (let ch = 1; ch <= numChannels; ch++) {
+        props[`ch${ch}_aux${rb.auxBus}_pre`] = false;
+      }
+      Object.assign(props, returnSendMatrix(rb.auxBus, rb.ownChannel, rb.mode, numChannels));
     }
     audioMixerBlock['properties'] = props;
   }
@@ -839,7 +876,8 @@ export async function activateStromFlow(
         outputBlockIndex++;
       } else if (outputDoc.outputType === 'whep') {
         const endpointId = `whep-out-${idSlug}-${endpointSuffix}`;
-        const auxCount = numAuxBuses ?? 0;
+        // Crew aux buses only — return buses stay off the shared WHEP outputs.
+        const auxCount = numCrewAuxBuses;
         flow.blocks.push({
           id: blockId,
           block_definition_id: 'builtin.whep_output',
@@ -887,6 +925,31 @@ export async function activateStromFlow(
         if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
         if (mainAudioSource) flow.links.push({ from: mainAudioSource, to: `${blockId}:audio_in_0` });
       }
+    }
+  }
+
+  // Per-guest return WHEP outputs (epic #208, issue #300). One builtin.whep_output
+  // per guest carrying the program video (v1 picture source = program output over
+  // WHEP, OQ7) plus exactly one audio track — that guest's return aux bus. A mode
+  // change is a single live send-level update on the mixer, never a re-wire here.
+  const returnWhepEntries: Array<{ mixerInput: string; endpointId: string }> = [];
+  if (audioMixerBlockId) {
+    for (const rb of returnBuses) {
+      const padMatch = /video_in_(\d+)$/.exec(rb.assignment.mixerInput);
+      const padIndex = padMatch ? parseInt(padMatch[1], 10) : returnWhepEntries.length;
+      const endpointId = `whep-return-${padIndex}-${endpointSuffix}`;
+      const blockId = `b-return-${padIndex}-${endpointSuffix}`;
+      flow.blocks.push({
+        id: blockId,
+        block_definition_id: 'builtin.whep_output',
+        name: `Return (${rb.assignment.mixerInput})`,
+        properties: { endpoint_id: endpointId, low_latency: true, mode: 'audio_video', num_audio_tracks: 1 },
+        position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
+      });
+      if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
+      flow.links.push({ from: `${audioMixerBlockId}:aux_out_${rb.auxBus}`, to: `${blockId}:audio_in` });
+      returnWhepEntries.push({ mixerInput: rb.assignment.mixerInput, endpointId });
+      outputBlockIndex++;
     }
   }
 
@@ -980,7 +1043,26 @@ export async function activateStromFlow(
     throw err;
   }
 
-  return { flowId, mixerBlockId, audioMixerBlockId, loudnessMainBlockId, whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined, pgmWhepEndpointId, recorderBlockId, recorderOutputDir, sourceOffsetBlockIds, sourceAudioOffsetBlockIds, clipPlayerBlockIds };
+  return {
+    flowId,
+    mixerBlockId,
+    audioMixerBlockId,
+    loudnessMainBlockId,
+    whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined,
+    pgmWhepEndpointId,
+    recorderBlockId,
+    recorderOutputDir,
+    sourceOffsetBlockIds,
+    sourceAudioOffsetBlockIds,
+    clipPlayerBlockIds,
+    returnBuses: returnBuses.map((rb) => ({
+      mixerInput: rb.assignment.mixerInput,
+      auxBus: rb.auxBus,
+      ownChannel: rb.ownChannel,
+      mode: rb.mode,
+    })),
+    returnWhepEntries,
+  };
 }
 
 /**
