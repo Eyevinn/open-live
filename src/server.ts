@@ -23,6 +23,7 @@ import whipRoutes from './routes/whip.js';
 import productionConfigsRoutes from './routes/production-configs.js';
 import graphicsRoutes from './routes/graphics.js';
 import outputsRoutes from './routes/outputs.js';
+import recordingsRoutes from './routes/recordings.js';
 import authRoutes from './routes/auth.js';
 import gatewaysRoutes from './routes/gateways.js';
 import controllerWs from './ws/controller.js';
@@ -387,6 +388,7 @@ export async function buildServer() {
   await fastify.register(productionConfigsRoutes);
   await fastify.register(graphicsRoutes);
   await fastify.register(outputsRoutes);
+  await fastify.register(recordingsRoutes);
   await fastify.register(authRoutes);
   await fastify.register(gatewaysRoutes);
   await fastify.register(controllerWs);

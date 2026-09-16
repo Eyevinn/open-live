@@ -1,8 +1,8 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
-import { getDb, getOutputsDb } from '../db/index.js';
-import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc } from '../db/types.js';
+import { getDb, getOutputsDb, getRecordingsDb } from '../db/index.js';
+import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc, RecordingDoc } from '../db/types.js';
 import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js';
@@ -139,6 +139,29 @@ export async function updateProductionDoc(
       throw err;
     }
   }
+}
+
+/**
+ * Returns the id of the first `recording` output assigned to a production, if
+ * any — used to stamp `RecordingDoc.outputId` at deactivate. Best-effort: a DB
+ * read failure returns undefined rather than blocking teardown, since the field
+ * is optional.
+ */
+async function firstRecordingOutputId(
+  doc: ProductionDoc,
+  log: { warn: (obj: unknown, msg: string) => void },
+): Promise<string | undefined> {
+  const assignedIds = (doc.outputAssignments ?? []).map((a) => a.outputId);
+  if (assignedIds.length === 0) return undefined;
+  for (const outputId of assignedIds) {
+    try {
+      const output = await getOutputsDb().get(outputId);
+      if (output.outputType === 'recording') return output._id;
+    } catch (err) {
+      log.warn({ err, outputId }, 'could not resolve output while stamping RecordingDoc');
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -770,6 +793,33 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
                 productionId: doc._id,
                 target,
               });
+              // Persist one RecordingDoc per uploaded object so #42's listing/
+              // playback endpoint can enumerate and presign recordings without
+              // round-tripping the bucket. Best-effort: a failed persist must not
+              // block teardown, mirroring the upload's non-fatal contract.
+              const recordingOutputId = await firstRecordingOutputId(doc, req.log);
+              const finalizedAt = new Date().toISOString();
+              for (const seg of uploadRes.uploaded) {
+                try {
+                  const recId = `recording-${randomUUID()}`;
+                  const recDoc: RecordingDoc = {
+                    _id: recId,
+                    type: 'recording',
+                    productionId: doc._id,
+                    ...(recordingOutputId ? { outputId: recordingOutputId } : {}),
+                    bucket: target.bucket,
+                    key: seg.key,
+                    sizeBytes: seg.sizeBytes,
+                    startedAt: doc.updatedAt,
+                    endedAt: finalizedAt,
+                    createdAt: finalizedAt,
+                    updatedAt: finalizedAt,
+                  };
+                  await getRecordingsDb().insert(recDoc);
+                } catch (persistErr) {
+                  req.log.error({ persistErr, productionId: doc._id, key: seg.key }, 'RecordingDoc persist failed — object uploaded but unlisted');
+                }
+              }
               req.log.info(
                 { productionId: doc._id, uploaded: uploadRes.uploaded.length, failed: uploadRes.failed.length },
                 'VOD recordings uploaded to object storage',

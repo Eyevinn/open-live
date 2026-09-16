@@ -211,3 +211,38 @@ describe('recording-uploader — SigV4 PutObject + upload-from-local (#41)', () 
     expect(res.failed[0]!.file).toBe('recordings/prod-rec-1/seg_00002.mp4');
   });
 });
+
+describe('recording-uploader — presignGetUrl (#42)', () => {
+  const target = {
+    endpoint: 'minio.example.com',
+    useSsl: true,
+    region: 'us-east-1',
+    accessKey: 'AKIAEXAMPLE',
+    secretKey: 'secretexamplekey',
+    bucket: 'openlive-vod',
+  };
+
+  it('produces a path-style, SigV4-query-signed GET URL for the object', async () => {
+    const { presignGetUrl } = await import('../lib/recording-uploader.js');
+    const now = new Date('2026-09-16T10:00:00.000Z');
+    const url = presignGetUrl(target, 'prod-1/seg_00001.mp4', 3600, now);
+
+    expect(url.startsWith('https://minio.example.com/openlive-vod/prod-1/seg_00001.mp4?')).toBe(true);
+    expect(url).toContain('X-Amz-Algorithm=AWS4-HMAC-SHA256');
+    expect(url).toContain('X-Amz-Expires=3600');
+    expect(url).toContain('X-Amz-Date=20260916T100000Z');
+    expect(url).toMatch(/X-Amz-Signature=[0-9a-f]{64}$/);
+    // Credential is scoped to the date/region/service.
+    expect(url).toContain(encodeURIComponent('AKIAEXAMPLE/20260916/us-east-1/s3/aws4_request'));
+  });
+
+  it('is deterministic for a fixed clock and encodes key path segments', async () => {
+    const { presignGetUrl } = await import('../lib/recording-uploader.js');
+    const now = new Date('2026-09-16T10:00:00.000Z');
+    const a = presignGetUrl(target, 'prod 1/seg 1.mp4', 600, now);
+    const b = presignGetUrl(target, 'prod 1/seg 1.mp4', 600, now);
+    expect(a).toBe(b);
+    // Spaces in the key are percent-encoded per-segment (slash preserved).
+    expect(a).toContain('/openlive-vod/prod%201/seg%201.mp4?');
+  });
+});
