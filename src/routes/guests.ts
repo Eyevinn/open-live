@@ -17,7 +17,7 @@ import {
   hashGuestInviteToken,
 } from '../lib/guest-invite-token.js';
 import { config, isGuestCallingEnabled } from '../config.js';
-import { resolvePublicBaseUrl } from './productions.js';
+import { resolvePublicBaseUrl, updateProductionDoc } from './productions.js';
 
 /**
  * Guest calling — production-scoped invites + token-authed guest join
@@ -63,7 +63,7 @@ const CreateInviteBody = z.object({
  * declared but gated off (spec §"Return feed design", §"Low-latency mode").
  * `defaultMode` is `program-minus` per OQ2 (@svensson00, #208).
  */
-function returnModesFor(mixerInput: string) {
+export function returnModesFor(mixerInput: string) {
   return [
     {
       key: 'program' as const,
@@ -318,19 +318,51 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
       }
 
-      // 5. Build the response. whipUrl reuses the EXISTING WHIP proxy contract
+      // 5. Ensure the guest's assignment carries a return feed (issue #300). The
+      //    return belongs to the assignment, so a rejoin keeps it; default is
+      //    program-minus (OQ2). Only persist when an assignment on this input
+      //    already exists — the operator assigns the WHIP source to the input.
+      const guestAssignment = production.sources.find((s) => s.mixerInput === mixerInput);
+      const returnMode = guestAssignment?.returnFeed?.synced ?? 'program-minus';
+      if (guestAssignment && !guestAssignment.returnFeed) {
+        try {
+          await updateProductionDoc(invite.productionId, {
+            sources: production.sources.map((s) =>
+              s.mixerInput === mixerInput
+                ? { ...s, returnFeed: { synced: 'program-minus', lowLatency: false } }
+                : s,
+            ),
+          });
+        } catch (err) {
+          // Non-fatal: the guest can still join; the return is built on next activate.
+          fastify.log.warn({ err }, 'POST guests/:id/join — return-feed persist failed');
+        }
+      }
+
+      // 6. Build the response. whipUrl reuses the EXISTING WHIP proxy contract
       //    (`/api/v1/productions/:id/whip/:mixerInput`) — never a new WHIP path.
+      //    The return picture feed URL is server-issued and scoped to this input;
+      //    it is only live once the production is active (spec §"Return feeds").
       const base = resolvePublicBaseUrl(req);
       const whipUrl = `${base}/api/v1/productions/${invite.productionId}/whip/${encodeURIComponent(mixerInput)}`;
+      const returnLive =
+        production.status === 'active' &&
+        !!production.stromFlowId &&
+        (production.returnWhepUrls ?? []).some((r) => r.mixerInput === mixerInput);
+      const feeds = returnLive
+        ? [{
+            id: 'picture',
+            url: `${base}/api/v1/productions/${invite.productionId}/returns/${encodeURIComponent(mixerInput)}/picture/whep`,
+            video: true,
+          }]
+        : [];
       return reply.status(200).send({
         guestId: session._id,
         whipUrl,
-        // Return-feed routes are wired by a later sub-issue; the mode metadata is
-        // a stable contract now so the guest client can render mode choices.
-        feeds: [] as Array<{ id: string; url: string; video: boolean }>,
+        feeds,
         modes: returnModesFor(mixerInput),
         defaultMode: 'program-minus',
-        returnMode: 'program-minus',
+        returnMode,
         // intercomLine omitted until intercom provisioning lands (feature degrades
         // cleanly to WHIP video + WHEP return, no talkback — spec §Configuration).
       });
