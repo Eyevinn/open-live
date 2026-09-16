@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
-import type { ProductionDoc, SourceDoc, GraphicDoc, OutputDoc } from '../db/types.js';
+import type { ProductionDoc, SourceDoc, GraphicDoc, OutputDoc, ClipReference } from '../db/types.js';
 import { getSourcesDb, getGraphicsDb } from '../db/index.js';
+import { deserializeClipReference } from './clip-reference.js';
 import { StromClient } from './strom.js';
 import { DEFAULT_FLOW, type FlowTopology } from './default-flow.js';
 import { decryptAddressPassphrase } from './srt-passphrase-crypto.js';
@@ -39,6 +40,8 @@ export interface ActivationResult {
   sourceOffsetBlockIds: Record<string, string>;
   /** Maps mixerInput → audio time_offset block ID (one per source with audio, keyed same as sourceOffsetBlockIds) */
   sourceAudioOffsetBlockIds: Record<string, string>;
+  /** Maps mixerInput → builtin.media_player block ID (one per 'clip' source) — used by the clip cue/play control surface */
+  clipPlayerBlockIds: Record<string, string>;
 }
 
 function findPgmFeedPad(flow: FlowTopology): string | null {
@@ -453,6 +456,9 @@ export async function activateStromFlow(
   // Maps mixerInput → time_offset block ID — returned so the WS layer can apply live changes.
   const sourceOffsetBlockIds: Record<string, string> = {};
   const sourceAudioOffsetBlockIds: Record<string, string> = {};
+  // Maps mixerInput → builtin.media_player block ID for 'clip' sources — returned so the
+  // clip cue/play control surface (#277/#278) can target the player block by mixer input.
+  const clipPlayerBlockIds: Record<string, string> = {};
 
   for (const assignment of sortedAssignments) {
     const padMatch = /video_in_(\d+)$/.exec(assignment.mixerInput);
@@ -564,6 +570,66 @@ export async function activateStromFlow(
       flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
       if (audioMixerBlock && audioMixerBlockId) {
         flow.links.push({ from: `${audioOffsetId}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
+        if (source.name) {
+          const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
+          props[`ch${audioChannel + 1}_label`] = source.name;
+          audioMixerBlock['properties'] = props;
+        }
+      }
+    } else if (source.streamType === 'clip') {
+      // Clip source: inject a builtin.media_player block (block_definition_id
+      // 'builtin.media_player') that the clip cue/play control surface (#277/#278)
+      // drives via Strom's player API. The block's playlist is empty at activation;
+      // the ClipReference resolved from SourceDoc.address is loaded on `cue`.
+      // Properties mirror the media_player definition (decode / sync / loop_playlist
+      // / position_update_interval). Video and audio pads feed the same offset/mixer
+      // wiring every other source type uses, so lipsync trims and audio-mixer
+      // channels behave identically regardless of byte source.
+      //
+      // The clip's ClipReference (serialized in SourceDoc.address) is validated here so
+      // an unresolvable reference is surfaced as an activation warning, but the playlist
+      // itself is loaded later on `cue` (#277) — the block is injected with an empty
+      // playlist regardless so cue/play has a target that avoids the prior 409/502.
+      let clipRef: ClipReference | undefined;
+      if (source.address) {
+        try {
+          clipRef = deserializeClipReference(source.address);
+        } catch {
+          // A malformed/unresolvable reference must not abort activation of the whole
+          // production — the player block is still injected (empty playlist) and the
+          // clip simply fails to cue later. Validation happens at the REST/WS layer.
+          clipRef = undefined;
+        }
+      }
+      const playerId = `b-clip-${padIndex}-${endpointSuffix}`;
+      flow.blocks.push({
+        id: playerId,
+        block_definition_id: 'builtin.media_player',
+        name: `Clip Player (V${padIndex})`,
+        properties: {
+          decode: true,
+          sync: true,
+          loop_playlist: false,
+          position_update_interval: 500,
+        },
+        position: { x: COL_INPUT, y: yPos },
+      });
+      clipPlayerBlockIds[assignment.mixerInput] = playerId;
+      void clipRef;
+      flow.links.push({ from: `${playerId}:video_out`, to: `${offsetId}:in` });
+      const audioOffsetIdClip = `b-audio-offset-${padIndex}-${endpointSuffix}`;
+      flow.blocks.push({
+        id: audioOffsetIdClip,
+        block_definition_id: 'builtin.time_offset',
+        name: `Offset A${padIndex}`,
+        properties: { offset_ms: 0.0 },
+        position: { x: COL_OFFSET, y: yPos + 80 },
+      });
+      sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetIdClip;
+      flow.links.push({ from: `${playerId}:audio_out`, to: `${audioOffsetIdClip}:in` });
+      flow.links.push({ from: `${audioOffsetIdClip}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      if (audioMixerBlock && audioMixerBlockId) {
+        flow.links.push({ from: `${audioOffsetIdClip}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
         if (source.name) {
           const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
           props[`ch${audioChannel + 1}_label`] = source.name;
@@ -914,7 +980,7 @@ export async function activateStromFlow(
     throw err;
   }
 
-  return { flowId, mixerBlockId, audioMixerBlockId, loudnessMainBlockId, whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined, pgmWhepEndpointId, recorderBlockId, recorderOutputDir, sourceOffsetBlockIds, sourceAudioOffsetBlockIds };
+  return { flowId, mixerBlockId, audioMixerBlockId, loudnessMainBlockId, whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined, pgmWhepEndpointId, recorderBlockId, recorderOutputDir, sourceOffsetBlockIds, sourceAudioOffsetBlockIds, clipPlayerBlockIds };
 }
 
 /**
