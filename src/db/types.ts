@@ -331,6 +331,8 @@ export interface ProductionDoc {
   sourceOffsetBlockIds?: Record<string, string>;
   /** Maps mixerInput → audio time_offset block ID — set on activate, cleared on deactivate */
   sourceAudioOffsetBlockIds?: Record<string, string>;
+  /** Maps mixerInput → media-player (builtin.media_player) block ID for clip sources — set on activate, cleared on deactivate */
+  clipPlayerBlockIds?: Record<string, string>;
   /** Warnings accumulated when a referenced source/graphic/output was deleted while production was inactive */
   deletionWarnings?: Array<{ type: 'source' | 'graphic' | 'output'; name: string }>;
   /** Set when the idle watchdog auto-deactivated this production; cleared on next activation */
