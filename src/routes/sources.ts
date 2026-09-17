@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
-import { getSourcesDb, getDb } from '../db/index.js';
+import { getSourcesDb, getGatewaysDb, getDb } from '../db/index.js';
 import type { SourceDoc, ProductionDoc } from '../db/types.js';
 import { updateProductionDoc } from './productions.js';
 import { graphicUrl, srtUrl } from '../lib/url-validation.js';
@@ -57,6 +57,10 @@ const SourceInput = z.object({
   status: z.enum(['active', 'inactive']).default('inactive'),
   liveCamera: z.boolean().optional(),
   latency: z.number().int().min(20).max(8000).optional(),
+  // Optional id of the Gateway that registered this source (OL-5, spec
+  // studio-gateways.md). Absent for manually-created sources; when present it
+  // must name an existing gateway (validated in the route handler).
+  gatewayId: z.string().optional(),
 }).superRefine((data, ctx) => {
   validateSourceAddress(data.streamType, data.address, ctx);
 });
@@ -68,6 +72,9 @@ const SourcePatch = z.object({
   status: z.enum(['active', 'inactive']).optional(),
   liveCamera: z.boolean().optional(),
   latency: z.number().int().min(20).max(8000).optional(),
+  // A gateway can re-tag or clear a source's gateway link. `null` clears the
+  // link (unlinks the source); a string re-links it to an (existing) gateway.
+  gatewayId: z.string().nullable().optional(),
 }).superRefine((data, ctx) => {
   // Cross-field validation only applies when both address and streamType are present in
   // the same patch body. The combined-with-existing-document case is validated procedurally
@@ -81,6 +88,26 @@ const SourcePatch = z.object({
 /** Masks passphrase values in SRT URIs so credentials are never returned to clients. */
 function maskSrtPassphrase(address: string): string {
   return address.replace(/([?&]passphrase=)[^&]*/gi, '$1***');
+}
+
+/**
+ * Confirms `gatewayId` names an existing gateway. A typo would otherwise create
+ * an unreachable link (the forget-gateway cascade would never find the source),
+ * so an unknown id is rejected with 400. Looks the gateway up the same way the
+ * gateways route does (`getGatewaysDb().get`, `src/routes/gateways.ts`).
+ * Returns true when the gateway exists, false on a 404, and rethrows other DB
+ * errors so they surface as a 503 like elsewhere in this module.
+ */
+async function gatewayExists(gatewayId: string): Promise<boolean> {
+  try {
+    await getGatewaysDb().get(gatewayId);
+    return true;
+  } catch (err: unknown) {
+    if (err && typeof err === 'object' && 'statusCode' in err && (err as { statusCode: number }).statusCode === 404) {
+      return false;
+    }
+    throw err;
+  }
 }
 
 function toApi(doc: SourceDoc) {
@@ -108,6 +135,12 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
   // Create a source
   fastify.post('/api/v1/sources', async (req, reply) => {
     const body = SourceInput.parse(req.body);
+    // A provided gatewayId must name an existing gateway — reject a typo so the
+    // source is never linked to a gateway that can never reach it (spec
+    // studio-gateways.md, forget-cascade selector `{ type: 'source', gatewayId }`).
+    if (body.gatewayId !== undefined && !(await gatewayExists(body.gatewayId))) {
+      return reply.status(400).send({ error: `Gateway "${body.gatewayId}" not found`, statusCode: 400 });
+    }
     const isSrt = body.streamType === 'srt' || body.streamType === 'efp';
     const id = `src-${randomUUID()}`;
     // A listener source binds a port on the shared Strom: it must lie inside this
@@ -136,6 +169,9 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
         status: body.status,
         liveCamera: body.liveCamera,
         latency: body.latency,
+        // Only persist gatewayId when supplied — existing clients omit it and
+        // the field stays absent, keeping the doc backward-compatible.
+        ...(body.gatewayId !== undefined ? { gatewayId: body.gatewayId } : {}),
         createdAt: now,
         updatedAt: now,
       };
@@ -165,6 +201,11 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
   // Update a source
   fastify.patch<{ Params: { id: string } }>('/api/v1/sources/:id', async (req, reply) => {
     const body = SourcePatch.parse(req.body);
+    // A non-null gatewayId in the patch must name an existing gateway (same
+    // guard as create). `null` clears the link and needs no lookup.
+    if (typeof body.gatewayId === 'string' && !(await gatewayExists(body.gatewayId))) {
+      return reply.status(400).send({ error: `Gateway "${body.gatewayId}" not found`, statusCode: 400 });
+    }
     try {
       const doc = await getSourcesDb().get(req.params.id);
       // Determine effective streamType and address after the patch. Validate
@@ -208,7 +249,17 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       const addressPatch = body.address !== undefined
         ? { address: encryptAddressPassphrase(body.address) }
         : {};
-      const updated: SourceDoc = { ...doc, ...body, ...addressPatch, updatedAt: new Date().toISOString() };
+      // gatewayId is handled explicitly: a string re-links, `null` clears the
+      // link (the field is removed so `findTrusted({ gatewayId })` no longer
+      // matches), and an absent value leaves the stored link untouched. Strip
+      // it from the spread so a raw `null` never lands in the persisted doc.
+      const { gatewayId: patchGatewayId, ...bodyRest } = body;
+      const updated: SourceDoc = { ...doc, ...bodyRest, ...addressPatch, updatedAt: new Date().toISOString() };
+      if (patchGatewayId === null) {
+        delete updated.gatewayId;
+      } else if (typeof patchGatewayId === 'string') {
+        updated.gatewayId = patchGatewayId;
+      }
       await getSourcesDb().insert(updated);
       return reply.send(toApi(updated));
     } catch (err: unknown) {
