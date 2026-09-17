@@ -1,11 +1,12 @@
 # Spec: Video clip ("story") playback — cue and play via API and WebSocket
 
-**Status: Proposed** (architect draft for epic #206)
+**Status: Accepted** (OQ1–OQ4 decided on #206/#278 by @svensson00, 2026-09-16; amended for
+issue #307 to reflect the reactive-state + cue-persistence rework as implemented)
 **Author:** architect agent
-**Related issues:** #206 (epic), #209 (automation contract — consumes this)
+**Related issues:** #206 (epic), #209 (automation contract — consumes this), #307 (OQ2/OQ3 reconciliation)
 
-> Proposed spec, not an accepted decision. Resolve the Open Questions with a maintainer
-> before implementation sub-issues are cut.
+> Accepted. The four Open Questions are resolved below (see "Resolved Open Questions"); the
+> data-model and completion-signalling sections are amended to match what shipped for #307.
 
 ## Problem Statement
 
@@ -202,10 +203,19 @@ deactivate-cleared map from mixer input to Strom player block id, matching the e
 clipPlayerBlockIds?: Record<string, string>;
 ```
 
-No persisted cue/play state on the doc for v1: like tally, live clip state is held in an
+**Live** clip state (`playing`/`paused`/`completed`/`error` and playhead position) is held in an
 in-memory per-production registry in a small `clip-state` service (mirroring
-`src/services/tally.service.ts`) and restored to Strom's actual player state on connect via
-`player.getState`. (Open Question 3: whether cued clip should survive deactivate/reactivate.)
+`src/services/tally.service.ts`) and is driven reactively from Strom's pushed media_player
+events (see Completion signalling, below).
+
+**Cue points are persisted** (issue #307 / OQ3): `ProductionDoc` gains a
+`clipCues?: Record<string, PersistedClipCue>` map (mixerInput → `{ clipId, positionMs?,
+durationMs? }`), written on `CLIP_CUE` and cleared on `CLIP_STOP`/completion via
+`src/services/clip-cue-store.ts` (read-merge-write, 409-safe, mirroring the `pipConfigs`
+persistence pattern). A cued clip therefore **survives deactivate/reactivate and server
+restart**: on the next controller connect a cold registry re-cues Strom to the cue point and
+restores the clip to `cued`, and it **never auto-plays on restore**. `clearClipStateForProduction`
+(deactivate) deliberately clears only the in-memory registry + poll timers, never `clipCues`.
 
 ### Migration
 
@@ -216,8 +226,9 @@ in-memory per-production registry in a small `clip-state` service (mirroring
   a contract-level (API/zod) concern; the stored representation stays a string. Because the
   reference may carry a `timerange` and imposes no fixed-length assumption, no length field is
   persisted either.
-- The new `clipPlayerBlockIds` field is optional; existing docs are unaffected. CouchDB is
-  schemaless — no data migration. OpenAPI (`docs/openapi.yaml`) and the WS reference
+- The new `clipPlayerBlockIds` and `clipCues` fields are optional; existing docs are unaffected.
+  CouchDB is schemaless — no data migration. `clipCues` values use the `PersistedClipCue` shape
+  (`{ clipId, positionMs?, durationMs? }`). OpenAPI (`docs/openapi.yaml`) and the WS reference
   (`docs/controller-websocket.md`) must be updated in lockstep, including the `ClipReference`
   discriminated union and its v1-implemented (`url`, `s3`) vs reserved (`tams`) variants.
 
@@ -237,10 +248,32 @@ sequenceDiagram
     WS->>Strom: player.control({action:'play'})
     WS-->>Auto: CLIP_STATE { state: 'playing', positionMs, durationMs }
 
-    Note over WS,Strom: WS polls/receives player state
-    Strom-->>WS: player state = stopped (end of media)
+    Note over WS,Strom: WS subscribes to media_player push events (primary)
+    Strom-->>WS: MediaPlayerPosition { position_ms } (while playing)
+    WS-->>Auto: CLIP_STATE { state: 'playing', positionMs }
+    Strom-->>WS: MediaPlayerStateChanged { state: 'stopped' } (end of media)
     WS-->>Auto: CLIP_STATE { state: 'completed' }
+    Note over WS,Strom: player.getState poll is a reconciliation fallback only
 ```
+
+### Completion signalling (issue #307 / OQ2 — reactive, poll as fallback)
+
+`CLIP_STATE` — including playhead position while playing — is emitted **reactively** from Strom's
+pushed media_player events. Strom broadcasts `MediaPlayerStateChanged` and `MediaPlayerPosition`
+over its flow WebSocket (`backend/src/blocks/builtin/mediaplayer/bridge.rs:555,577` and
+`builder.rs:389`, relayed by `backend/src/api/websocket.rs`). `open-live` adds those two variants
+to the `FlowEvent` union (`src/lib/strom.ts`) and consumes them in a reactive clip-relay
+(`src/services/clip-relay.ts`, modelled on `meter-relay.ts`): one WS per production, ref-counted
+across controller connections, translating each event to a `CLIP_STATE` broadcast keyed back to
+the owning `mixerInput`. The relay never downgrades a controller-owned `cued`/`completed`/`error`
+state (which Strom cannot represent) on a raw `stopped`/`paused` push.
+
+`CLIP_STATE_POLL_MS` polling of `player.getState` is retained **only as a reconciliation
+fallback** for the window when the push channel is briefly unavailable (relay reconnecting). It is
+resilient to a transient tick error — a single failure is logged and swallowed, and the poll is
+NEVER self-terminated (the old behaviour stranded the clip as `playing`, fixed under #307). It
+self-stops once it has reconciled a `playing` clip to `completed`, or once the clip is no longer
+locally `playing`.
 
 ## Configuration (env vars)
 
@@ -249,22 +282,29 @@ No new env vars strictly required — clip playback reuses the existing `STROM_U
 
 | Env var | Default | Purpose |
 |---------|---------|---------|
-| `CLIP_STATE_POLL_MS` | `250` | Interval at which the WS layer polls `player.getState` to detect completion (if Strom does not push player state changes — see Open Question 2) |
+| `CLIP_STATE_POLL_MS` | `250` | Interval of the `player.getState` **reconciliation-fallback** poll (issue #307 / OQ2). The primary path is reactive push events; this poll only converges a `playing` clip to `completed` if the push channel is briefly unavailable. |
 
-## Open Questions (need a human/maintainer decision)
+## Resolved Open Questions
 
-1. **Clip source shape:** extend `StreamType` with `'clip'` (proposed) vs a dedicated clip
-   resource decoupled from the sources catalogue. Affects Studio and the automation contract (#209).
-2. **Completion signalling:** does Strom push player state transitions (so `open-live` can emit
-   `CLIP_STATE completed` reactively), or must `open-live` poll `player.getState`? If polling,
-   the timing accuracy of `completed` is bounded by `CLIP_STATE_POLL_MS` — #209 asks for a
-   documented timing envelope, so this must be measured.
-3. **Cue persistence:** should a cued clip survive deactivate/reactivate and server restart
-   (like PiP layout and tally do), or reset to `idle`?
-4. **Cue semantics vs on-air:** "cued/preview-ready" — does cueing route the clip to the
-   preview bus (so it shows in the multiviewer before play), or is cue purely a preload with the
-   operator using the normal `SET_PVW`/`TAKE` switching to put it on air? This determines how
-   clip cue/play interacts with the existing tally/switching model.
+All four were answered by @svensson00 on #206 (2026-09-16); OQ2/OQ3 were reconciled with the
+shipped code under #307.
+
+1. **OQ1 — Clip source shape → `StreamType` extension.** Extend `StreamType` with `'clip'` and
+   reuse the existing source-assignment and tally machinery; a dedicated resource isn't worth the
+   parallel plumbing. (Implemented in #275.)
+2. **OQ2 — Completion signalling → reactive push, poll as fallback only.** Strom pushes player
+   state (`MediaPlayerStateChanged`) and playhead position (`MediaPlayerPosition`) over its WS
+   API. `open-live` subscribes and emits `CLIP_STATE` (including position while playing)
+   reactively; `CLIP_STATE_POLL_MS` polling is retained only as a reconciliation fallback. See
+   **Completion signalling** above. (Implemented in #307 — the original #278 shipped poll-only.)
+3. **OQ3 — Cue persistence → a cued clip survives.** A cued clip survives deactivate/reactivate
+   and server restart, restored to `cued` at the cue point, never auto-playing on restore — same
+   persistence rule as PiP layout and tally. Persisted on `ProductionDoc.clipCues` via
+   `clip-cue-store.ts`. See **Data Model** above. (Implemented in #307 — the original #278 was
+   in-memory and wiped the cue on deactivate.)
+4. **OQ4 — Cue semantics vs on-air → cue is a pure preload, orthogonal to tally.** Cueing does
+   NOT seize the preview bus; the cued clip shows in its own source tile and goes on air via the
+   normal `SET_PVW`/`TAKE` path. #209 automation owns switching explicitly.
 
 > **Resolved (formerly Open Question 5 — clip ingest/storage / accepted address forms).** The PM
 > answered this on #206: the clip reference is the typed, versioned `ClipReference` union defined

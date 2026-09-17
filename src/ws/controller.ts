@@ -11,6 +11,8 @@ import {
   ClipNotFoundError, ClipNotActivatedError, ClipNotCuedError,
 } from '../lib/clip-control.js';
 import { getClipStateEntry, getAllClipStates, setClipStateEntry, clearClipState } from '../services/clip-state.service.js';
+import { persistClipCue, clearPersistedClipCue } from '../services/clip-cue-store.js';
+import { startClipRelay, stopClipRelay } from '../services/clip-relay.js';
 import { CONTRACT_VERSION, computeTallyContributions } from '../services/automation-contract.js';
 import { startMeterRelay, stopMeterRelay } from '../services/meter-relay.js';
 import { StromClient, StromClientError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms, type VideoEffect, type EffectTarget, type SetVideoEffectRequest } from '../lib/strom.js';
@@ -765,15 +767,19 @@ export function clearFxState(productionId: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Clip completion polling (epic #206, issue #278).
+// Clip completion polling — reconciliation fallback only (epic #206, issue #307 / OQ2).
 //
-// Strom's media_player does not push player-state transitions, so while a clip
-// is `playing` we poll `player.getState` every CLIP_STATE_POLL_MS. When Strom
-// reports `stopped` (end-of-media) we transition the clip to `completed` and
-// broadcast CLIP_STATE once. Completion latency is therefore bounded by one
-// poll interval (≤ CLIP_STATE_POLL_MS, default 250 ms) — documented in
-// docs/controller-websocket.md. Timers are keyed `productionId:mixerInput` and
-// cleaned up on stop/disconnect/deactivate.
+// Strom's media_player DOES push player-state transitions and playhead position
+// over its WS API (`MediaPlayerStateChanged` / `MediaPlayerPosition`), which the
+// reactive clip-relay (services/clip-relay.ts) consumes to emit CLIP_STATE — the
+// primary mechanism. This poll is retained ONLY as a reconciliation safety net:
+// if the push channel is briefly unavailable (relay reconnecting) a slow
+// `player.getState` tick still converges a `playing` clip to `completed` when
+// Strom reports end-of-media. It is therefore tolerant of transient tick errors
+// and does NOT self-terminate on a single failure — that stuck-state bug
+// (a poll error stranding the clip as `playing`) is exactly what OQ2 called out.
+// Timers are keyed `productionId:mixerInput` and cleaned up on
+// stop/disconnect/deactivate.
 // ---------------------------------------------------------------------------
 const clipPollTimers = new Map<string, ReturnType<typeof setInterval>>()
 
@@ -792,16 +798,30 @@ function stopClipPoll(productionId: string, mixerInput: string): void {
 }
 
 /**
- * Starts (or restarts) the completion poll for a playing clip. On each tick it
- * reads the player state; when Strom reports `stopped` it records/broadcasts a
- * `completed` CLIP_STATE and stops the timer. Errors are logged and stop the
- * poll (a subsequent play restarts it).
+ * Starts (or restarts) the completion reconciliation poll for a playing clip.
+ * The reactive clip-relay is the primary path; this is the safety net. On each
+ * tick it reads the player state; when Strom reports `stopped` (and the clip is
+ * still locally `playing`, i.e. the relay didn't already converge it) it
+ * records/broadcasts a `completed` CLIP_STATE and stops the timer.
+ *
+ * A transient tick error (Strom hiccup, token refresh) is logged and SWALLOWED —
+ * the timer keeps running so the clip is not stranded as `playing` on a single
+ * failure (the stuck-state bug OQ2 called out). The poll self-stops only when it
+ * has done its job (converged to `completed`) or when the clip is no longer
+ * locally `playing` (relay/stop/pause already took it out of the playing state).
  */
 function startClipPoll(productionId: string, mixerInput: string, clipId?: string): void {
   stopClipPoll(productionId, mixerInput)
   const key = clipPollKey(productionId, mixerInput)
   const timer = setInterval(() => {
     void (async () => {
+      // If the reactive relay (or an explicit stop/pause) already moved the clip
+      // out of `playing`, the reconciliation poll has nothing left to do.
+      const current = getClipStateEntry(productionId, mixerInput)
+      if (current && current.state !== 'playing') {
+        stopClipPoll(productionId, mixerInput)
+        return
+      }
       try {
         const doc = await getDb().get(productionId)
         const { flowId, blockId } = resolveClipTarget(doc, mixerInput)
@@ -818,10 +838,13 @@ function startClipPoll(productionId: string, mixerInput: string, clipId?: string
           setClipStateEntry(productionId, state)
           broadcast(productionId, { type: 'CLIP_STATE', ...state })
           stopClipPoll(productionId, mixerInput)
+          // A completed clip is no longer cued — drop the persisted cue point.
+          await clearPersistedClipCue(productionId, mixerInput)
         }
       } catch (err) {
-        console.warn(`[controller] clip poll error (${mixerInput}):`, String(err))
-        stopClipPoll(productionId, mixerInput)
+        // Transient error: log and keep polling. Never self-terminate on a single
+        // failure — that would strand the clip as `playing` (issue #307 / OQ2).
+        console.warn(`[controller] clip poll error (${mixerInput}), continuing:`, String(err))
       }
     })()
   }, config.clipStatePollMs)
@@ -829,9 +852,13 @@ function startClipPoll(productionId: string, mixerInput: string, clipId?: string
 }
 
 /**
- * Clears all clip state for a production: stops every completion poll timer and
- * wipes the in-memory registry. Called on deactivate (mirrors clearPipState /
+ * Clears the LIVE clip state for a production: stops every completion poll timer
+ * and wipes the in-memory registry. Called on deactivate (mirrors clearPipState /
  * clearAudioState / clearFxState).
+ *
+ * Deliberately does NOT touch the persisted `ProductionDoc.clipCues` — a cued
+ * clip must survive deactivate/reactivate (issue #307 / OQ3), so the cue point is
+ * left on the doc to be restored on the next connect.
  */
 export function clearClipStateForProduction(productionId: string): void {
   for (const key of clipPollTimers.keys()) {
@@ -2053,6 +2080,19 @@ export async function handleMessage(
             // A new cue supersedes any in-flight completion poll.
             stopClipPoll(productionId, mixerInput);
             state = await cueClip(strom, doc, source, mixerInput, msg.clipId);
+            // Persist the cue point so it survives deactivate/reactivate and
+            // server restart, restored to `cued` and never auto-played
+            // (issue #307 / OQ3). Mirrors the pipConfigs persistence pattern:
+            // in-memory registry is authoritative for the write, and
+            // updateProductionDoc is 409-safe. Best-effort — a failed persist
+            // must not fail the cue itself.
+            if (state.clipId) {
+              await persistClipCue(productionId, mixerInput, {
+                clipId: state.clipId,
+                ...(state.positionMs !== undefined ? { positionMs: state.positionMs } : {}),
+                ...(state.durationMs !== undefined ? { durationMs: state.durationMs } : {}),
+              });
+            }
             break;
           }
           case 'CLIP_PLAY': {
@@ -2073,6 +2113,8 @@ export async function handleMessage(
             const tracked = getClipStateEntry(productionId, mixerInput);
             state = await stopClip(strom, doc, mixerInput, tracked?.clipId);
             stopClipPoll(productionId, mixerInput);
+            // A stop clears the cue — there is nothing left cued to restore.
+            await clearPersistedClipCue(productionId, mixerInput);
             break;
           }
           case 'CLIP_SEEK': {
@@ -2172,6 +2214,7 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
       socket.on('close', () => {
         unsubscribe(id, socket);
         stopMeterRelay(id);
+        stopClipRelay(id);
         // Audio state registries are kept in memory so other connected clients
         // and future reconnects inherit the current AFV/mute configuration.
         // State is only wiped when the pipeline changes (new stromFlowId).
@@ -2532,11 +2575,15 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
       }
 
       // -----------------------------------------------------------------------
-      // Clip state snapshot (epic #206, issue #278). For each clip source (a
-      // mixerInput present in clipPlayerBlockIds) send the current CLIP_STATE,
-      // alongside the TALLY / PIP_STATE / DSK_STATE / OVL_STATE sync. Prefer the
-      // in-memory registry (authoritative for cued/completed/error, which Strom
-      // cannot report); otherwise restore from Strom's live player.getState.
+      // Clip state snapshot + reactive relay (epic #206, issues #278/#307).
+      // For each clip source (a mixerInput present in clipPlayerBlockIds) send the
+      // current CLIP_STATE alongside the TALLY / PIP_STATE / DSK_STATE / OVL_STATE
+      // sync. Restore order for a cold registry (server restart / first connect):
+      //   1. a PERSISTED cue (ProductionDoc.clipCues, OQ3) — re-cue Strom to the
+      //      cue point and restore to `cued`, NEVER auto-playing;
+      //   2. otherwise Strom's live player.getState.
+      // Then start the reactive clip-relay (OQ2) so subsequent transitions/
+      // position are pushed, with the poll only as a reconciliation fallback.
       // -----------------------------------------------------------------------
       if (connectDoc?.clipPlayerBlockIds) {
         const clipInputs = Object.keys(connectDoc.clipPlayerBlockIds);
@@ -2547,7 +2594,36 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             socket.send(JSON.stringify({ type: 'CLIP_STATE', ...tracked }));
             continue;
           }
-          // Cold registry (server restart / first connect): restore from Strom.
+          // Cold registry: prefer restoring a persisted cue (OQ3) before falling
+          // back to Strom's live state. A restored cue is put back into `cued` at
+          // the cue point and MUST NOT auto-play.
+          const persistedCue = connectDoc.clipCues?.[mixerInput];
+          if (persistedCue) {
+            try {
+              if (!clipStrom) clipStrom = await makeStromClient();
+              const source = await resolveClipSource(connectDoc, mixerInput, (sid) => getSourcesDb().get(sid) as Promise<SourceDoc>);
+              // Re-cue Strom (setPlaylist + goto) so the player is actually ready
+              // at the cue point, then seek to a non-zero cue position if any.
+              await cueClip(clipStrom, connectDoc, source, mixerInput, persistedCue.clipId);
+              if (persistedCue.positionMs && persistedCue.positionMs > 0) {
+                await clipStrom.player.seek(connectDoc.stromFlowId!, resolveClipTarget(connectDoc, mixerInput).blockId, { position_ms: persistedCue.positionMs });
+              }
+              const state: ClipState = {
+                mixerInput,
+                state: 'cued',
+                clipId: persistedCue.clipId,
+                ...(persistedCue.positionMs !== undefined ? { positionMs: persistedCue.positionMs } : {}),
+                ...(persistedCue.durationMs !== undefined ? { durationMs: persistedCue.durationMs } : {}),
+              };
+              setClipStateEntry(id, state);
+              socket.send(JSON.stringify({ type: 'CLIP_STATE', ...state }));
+              continue;
+            } catch (err) {
+              console.warn(`[controller] clip cue restore error (${mixerInput}):`, String(err));
+              // Fall through to Strom live-state restore below.
+            }
+          }
+          // No persisted cue (or restore failed): restore from Strom's live state.
           try {
             if (!clipStrom) clipStrom = await makeStromClient();
             const { flowId, blockId } = resolveClipTarget(connectDoc, mixerInput);
@@ -2563,6 +2639,17 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
           } catch (err) {
             console.warn(`[controller] clip state connect sync error (${mixerInput}):`, String(err));
           }
+        }
+
+        // Start the reactive clip-relay for this production's clip player blocks
+        // (OQ2). blockToInput is the inverse of clipPlayerBlockIds. Ref-counted:
+        // one WS per production, stopped on the last controller disconnect.
+        if (connectDoc.stromFlowId) {
+          const blockToInput = new Map<string, string>();
+          for (const [mixerInput, blockId] of Object.entries(connectDoc.clipPlayerBlockIds)) {
+            blockToInput.set(blockId, mixerInput);
+          }
+          startClipRelay(id, connectDoc.stromFlowId, blockToInput);
         }
       }
 

@@ -655,6 +655,15 @@ export type FlowEvent =
   | { type: 'flow_stopped'; flow_id: string }
   | { type: 'MeterData'; data: { flow_id: string; element_id: string; rms: number[]; peak: number[]; decay: number[] } }
   | { type: 'LoudnessData'; data: { flow_id: string; element_id: string; momentary: number; shortterm: number | null; integrated: number | null; loudness_range: number | null; true_peak: number[] } }
+  // Strom's media_player block pushes player-state transitions and playhead
+  // position over the same WS channel (backend
+  // src/blocks/builtin/mediaplayer/bridge.rs:555,577 and builder.rs:389,
+  // verified on strom main 2026-09-17). open-live consumes these to emit
+  // CLIP_STATE reactively (epic #206, issue #307 / OQ2) instead of polling.
+  // The player block is identified by `block_id`; `element_id` is carried too
+  // for parity with the meter/loudness envelope.
+  | { type: 'MediaPlayerStateChanged'; data: { flow_id: string; block_id: string; element_id?: string; state: 'playing' | 'paused' | 'stopped'; position_ms?: number; duration_ms?: number; current_file?: string } }
+  | { type: 'MediaPlayerPosition'; data: { flow_id: string; block_id: string; element_id?: string; position_ms: number; duration_ms?: number } }
   | { type: 'ping' }
 
 // ---------------------------------------------------------------------------

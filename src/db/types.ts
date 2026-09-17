@@ -77,8 +77,12 @@ export type ClipReference = ClipReferenceUrl | ClipReferenceS3 | ClipReferenceTa
  * `PlayerStateResponse` plus the cue/play/completed clip state machine
  * (spec `docs/specs/clip-story-playback.md` §"State machine").
  *
- * Held only in the in-memory `clip-state` service (mirroring tally) — never
- * persisted on a doc for v1. Restored from `player.getState` on connect.
+ * Live playback state (`playing`/`paused`/`completed`/`error` and playhead
+ * position) is held in the in-memory `clip-state` service (mirroring tally) and
+ * driven reactively from Strom's pushed media_player events (issue #307 / OQ2).
+ * The CUE POINT, however, is persisted on the doc (`ProductionDoc.clipCues`) so a
+ * cued clip survives deactivate/reactivate and server restart, restored to
+ * `cued` and never auto-playing (issue #307 / OQ3).
  */
 export interface ClipState {
   mixerInput: string;
@@ -87,6 +91,20 @@ export interface ClipState {
   positionMs?: number;
   durationMs?: number;
   error?: string;
+}
+
+/**
+ * A persisted clip cue (epic #206, issue #307 / OQ3). Records which clip is cued
+ * on a mixerInput and where its cue point sits, so the cue can be restored to the
+ * `cued` state (never auto-playing) after deactivate/reactivate or a restart.
+ */
+export interface PersistedClipCue {
+  /** The cued clip source id. */
+  clipId: string;
+  /** Cue-point position in ms (defaults to 0 — start of media). */
+  positionMs?: number;
+  /** Media duration in ms, when known at cue time (for connect-time snapshot). */
+  durationMs?: number;
 }
 
 export interface SourceDoc {
@@ -410,6 +428,16 @@ export interface ProductionDoc {
   sourceAudioOffsetBlockIds?: Record<string, string>;
   /** Maps mixerInput → media-player (builtin.media_player) block ID for clip sources — set on activate, cleared on deactivate */
   clipPlayerBlockIds?: Record<string, string>;
+  /**
+   * Persisted clip cue points (epic #206, issue #307 / OQ3). Maps a clip source's
+   * mixerInput to the currently-cued clip and its cue position. A cued clip
+   * survives deactivate/reactivate AND server restart — on restore it is put back
+   * into the `cued` state at the cue point and NEVER auto-plays, matching the
+   * persistence rule for `pipConfigs` (PiP layout). Written on CLIP_CUE, cleared
+   * on CLIP_STOP / completion. Additive and defaulted-absent; unlike the
+   * activate-set block-id maps, it is deliberately NOT cleared on deactivate.
+   */
+  clipCues?: Record<string, PersistedClipCue>;
   /**
    * Per-guest return feed topology (epic #208, issue #300) — set on activate,
    * cleared on deactivate. Each entry maps a guest's mixerInput to its return aux

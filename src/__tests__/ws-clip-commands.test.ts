@@ -40,8 +40,14 @@ vi.mock('../db/index.js', () => ({
   isDbReady: vi.fn().mockResolvedValue(true),
 }));
 
+const updateProductionDoc = vi.fn(async (id: string, patch: Record<string, unknown>) => {
+  // Emulate the real read-merge-write so clipCues accumulate on the doc mock,
+  // letting the cue-persistence assertions observe the persisted map.
+  const doc = productionDocs.get(id);
+  if (doc) productionDocs.set(id, { ...doc, ...patch });
+});
 vi.mock('../routes/productions.js', () => ({
-  updateProductionDoc: vi.fn().mockResolvedValue(undefined),
+  updateProductionDoc: (id: string, patch: Record<string, unknown>) => updateProductionDoc(id, patch),
 }));
 
 vi.mock('../lib/strom-token.js', () => ({
@@ -151,6 +157,7 @@ beforeEach(() => {
   stromRequests.length = 0;
   playerState = { state: 'stopped' };
   (ws.send as unknown as ReturnType<typeof vi.fn>).mockClear();
+  updateProductionDoc.mockClear();
   productionDocs.clear();
   sourceDocs.clear();
   productionDocs.set(PROD, makeProductionDoc());
@@ -229,6 +236,30 @@ describe('CLIP_CUE / PLAY / PAUSE / STOP transitions', () => {
     await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
     expect(errorFrames().length).toBeGreaterThan(0);
     expect(playerReqs('playlist')).toHaveLength(0);
+  });
+});
+
+describe('cue persistence (issue #307 / OQ3)', () => {
+  function clipCuesCalls() {
+    return updateProductionDoc.mock.calls.filter((c) => 'clipCues' in (c[1] as Record<string, unknown>));
+  }
+
+  it('CLIP_CUE persists the cue point to the production doc', async () => {
+    playerState = { state: 'paused', duration_ms: 12000, position_ms: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+    const call = clipCuesCalls().at(-1);
+    expect(call).toBeDefined();
+    const clipCues = (call![1] as { clipCues: Record<string, unknown> }).clipCues;
+    expect(clipCues['video_in_0']).toMatchObject({ clipId: 'src-clip' });
+  });
+
+  it('CLIP_STOP clears the persisted cue', async () => {
+    playerState = { state: 'paused', duration_ms: 12000, position_ms: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+    playerState = { state: 'stopped', position_ms: 0 };
+    await send({ type: 'CLIP_STOP', mixerInput: 'video_in_0' });
+    const lastClipCues = (clipCuesCalls().at(-1)![1] as { clipCues: Record<string, unknown> }).clipCues;
+    expect(lastClipCues['video_in_0']).toBeUndefined();
   });
 });
 
