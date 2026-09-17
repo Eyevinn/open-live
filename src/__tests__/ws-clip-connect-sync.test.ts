@@ -192,6 +192,25 @@ describe('WS connect snapshot — CLIP_STATE (spec §3)', () => {
     expect(clip).toMatchObject({ mixerInput: 'video_in_0', state: 'cued' });
   });
 
+  it('restores a persisted cue to CLIP_STATE cued without auto-playing (issue #307 / OQ3)', async () => {
+    // A cued clip survives a restart: the cold registry restore path must prefer
+    // the persisted cue (ProductionDoc.clipCues) and put it back to `cued` at the
+    // cue point, never `playing`.
+    productionDocs.set(PROD, makeProductionDoc({
+      clipCues: { video_in_0: { clipId: 'src-clip', positionMs: 4000, durationMs: 12000 } },
+    }));
+    // Strom would report the re-cued player as paused/ready; the restore must
+    // still surface `cued`, not the raw Strom state.
+    playerState = { state: 'paused', position_ms: 4000, duration_ms: 12000 };
+
+    const messages = await connectAndCollect(PROD);
+    const clip = messages.find((m) => m.type === 'CLIP_STATE');
+
+    expect(clip).toBeDefined();
+    expect(clip).toMatchObject({ mixerInput: 'video_in_0', state: 'cued', clipId: 'src-clip', positionMs: 4000 });
+    expect(clip!.state).not.toBe('playing');
+  });
+
   it('emits no CLIP_STATE for a production with no clip sources', async () => {
     productionDocs.set(PROD, makeProductionDoc({ clipPlayerBlockIds: undefined }));
 

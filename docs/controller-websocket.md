@@ -114,10 +114,10 @@ otherwise ignored. The inbound type union (`src/ws/controller.ts`):
 | `SET_PIP` | `pip: number`, `bg: number \| null`, `zones: PipZone[]`, `transforms?: PipTransforms` | Configure a PiP slot |
 | `SET_EFFECT` | `target: EffectTarget`, `effect: VideoEffect` | Set a video effect on an input or master |
 | `HTML_SOURCE_EVENT` | `sourceId: string`, `params: Record<string,string>`, `mode?: 'merge' \| 'replace'` | Forward operator params into an HTML source's URL query and reload the running `cefsrc`. `merge` (default) updates/adds keys on the current effective query; `replace` sets it to exactly `params`. The resulting URL is re-validated with `graphicUrl()` (SSRF/scheme gate). |
-| `CLIP_CUE` | `mixerInput: string`, `clipId?: string` | Load the clip source assigned to `mixerInput` into its media-player block and hold it ready (`setPlaylist` + `goto index 0`, leaving the player paused at the start). Broadcasts `CLIP_STATE` `cued`. |
-| `CLIP_PLAY` | `mixerInput: string` | Start playback of the cued clip (`control play`). Rejected (`ERROR` + `CLIP_STATE` `error`) if nothing is cued on that input. Broadcasts `CLIP_STATE` `playing` and starts the completion poll. |
-| `CLIP_PAUSE` | `mixerInput: string` | Pause playback (`control pause`). Broadcasts `CLIP_STATE` `paused` and stops the completion poll. |
-| `CLIP_STOP` | `mixerInput: string` | Stop playback (`control stop`). Broadcasts `CLIP_STATE` `stopped` and stops the completion poll. |
+| `CLIP_CUE` | `mixerInput: string`, `clipId?: string` | Load the clip source assigned to `mixerInput` into its media-player block and hold it ready (`setPlaylist` + `goto index 0`, leaving the player paused at the start). Broadcasts `CLIP_STATE` `cued`. The cue point is persisted on `ProductionDoc.clipCues`, surviving deactivate/reactivate and server restart (restored to `cued`, never auto-playing). |
+| `CLIP_PLAY` | `mixerInput: string` | Start playback of the cued clip (`control play`). Rejected (`ERROR` + `CLIP_STATE` `error`) if nothing is cued on that input. Broadcasts `CLIP_STATE` `playing`; subsequent transitions/position arrive reactively (with the poll as a reconciliation fallback). |
+| `CLIP_PAUSE` | `mixerInput: string` | Pause playback (`control pause`). Broadcasts `CLIP_STATE` `paused` and stops the reconciliation poll. |
+| `CLIP_STOP` | `mixerInput: string` | Stop playback (`control stop`). Broadcasts `CLIP_STATE` `stopped`, stops the reconciliation poll, and clears the persisted cue. |
 | `CLIP_SEEK` | `mixerInput: string`, `positionMs: number` | Seek within the clip (`seek position_ms`); `positionMs` is a non-negative integer (0 … 24 h). Broadcasts the resulting `CLIP_STATE`. |
 | `RETURN_SET` | `mixerInput: string`, `mode: 'program' \| 'program-minus'` | Crew switch a guest's synced return mode (epic #208, issue #301). Shares `applyReturnMode` with the crew REST route and the guest token route: persist + apply the send matrix live + broadcast `RETURN_STATE`. `NACK`/`ERROR` when the input has no return feed, the mode is invalid, or the production is not active. |
 | `KEEP_ALIVE` | — | Client activity / liveness signal (issue #290). Resets the production's idle timer and cancels any pending idle warning; when a warning was outstanding this broadcasts `IDLE_WARNING_CLEARED`. Needs no production doc, so it is handled before the doc fetch the other commands require. |
@@ -195,7 +195,9 @@ ordering.
 The `CLIP_STATE` snapshot prefers the in-memory clip-state registry
 (`src/services/clip-state.service.ts`), which is authoritative for the states Strom
 cannot itself report (`cued`, `completed`, `error`). If the registry has no entry for
-an input (cold start after a server restart), the server restores it from Strom's live
+an input (cold start after a server restart), the server restores it in this order:
+first a **persisted cue** (`ProductionDoc.clipCues`, issue #307 / OQ3) — re-cueing Strom
+to the cue point and surfacing `cued`, never `playing`; otherwise Strom's live
 `player.getState` (mapping `playing`/`paused`/`stopped`).
 
 ## Clip / story playback
@@ -210,17 +212,24 @@ surfaces observe and mutate the same player and registry. See
 
 ### Completion detection and timing envelope
 
-Strom's media player does not push player-state transitions, so end-of-media
-(`completed`) is detected by a **poll fallback**: while a clip is `playing`, the server
-polls `player.getState` every `CLIP_STATE_POLL_MS` (config `clipStatePollMs`, default
-`250` ms). On the first poll that observes `stopped`, the server records and broadcasts
-a single `CLIP_STATE` `completed`, then stops the poll. The poll timer is
-production-scoped (shared across all sockets watching the production) and is torn down
+Strom's media player **pushes** player-state transitions (`MediaPlayerStateChanged`) and
+playhead position (`MediaPlayerPosition`) over its flow WebSocket. `open-live` subscribes
+to those events in a reactive clip-relay (`src/services/clip-relay.ts`, one WS per
+production, modelled on the meter relay) and emits `CLIP_STATE` — including position while
+playing — **reactively** (issue #307 / OQ2). End-of-media (`completed`) and live position
+therefore reach clients as soon as Strom pushes them, with no polling latency, and a clip
+paused/stopped directly through Strom (or by an automation system) is reflected too.
+
+The `player.getState` poll (`CLIP_STATE_POLL_MS`, config `clipStatePollMs`, default
+`250` ms) is retained **only as a reconciliation fallback** for the brief window when the
+push channel is unavailable (relay reconnecting). It is resilient to a transient tick
+error — a single failure is logged and the poll keeps running, so a clip is never stranded
+as `playing`. It self-stops once it has reconciled a `playing` clip to `completed`, or once
+the clip is no longer locally `playing`. The poll timer is production-scoped and torn down
 on stop/pause, on deactivate, and when a new cue supersedes it.
 
-Consequently the **completion latency** — the delay between Strom reaching end-of-media
-and clients receiving `CLIP_STATE` `completed` — is bounded by one poll interval, i.e.
-**≤ `CLIP_STATE_POLL_MS` (default 250 ms)**, plus the round-trip of a single
-`player.getState` call. Empirical measurement of the tail latency requires a live Strom
-instance and is not asserted here; lowering `CLIP_STATE_POLL_MS` tightens the bound at
-the cost of more polling traffic.
+Consequently the **completion latency** in the normal (push) path is bounded by the WS
+push round-trip; in the degraded fallback path it is bounded by one poll interval
+(**≤ `CLIP_STATE_POLL_MS`, default 250 ms**) plus a single `player.getState` round-trip.
+Empirical measurement of the tail latency requires a live Strom instance and is not
+asserted here.
