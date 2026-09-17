@@ -1,6 +1,6 @@
 # Spec: Authenticated HTML sources
 
-**Status: Proposed** (architect draft — spec-only, no implementation)
+**Status: Accepted** (2026-09-17) — spec-only; implementation begins per the resolved v1 scope below
 **Author:** architect agent
 **Related issues:** Eyevinn/open-live-studio#129 (driving need — interactive login / MFA for HTML
 sources; contributed proposal by @markusnygard). Distinct from, and **not** superseded by, the
@@ -8,10 +8,12 @@ event-forwarding surface (`docs/specs/html-source-event-forwarding.md` / ADR-002
 #268) — @svensson00 confirmed on 2026-09-16 that authenticated HTML sources are a separate need
 that "event-forwarding" does not cover.
 
-> Proposed spec, not an accepted decision. The Open Questions below need a product/security call
-> from @svensson00 before implementation sub-issues are cut. A **`security-engineer` review of the
-> chosen session-handling flow is a hard gate** (see ADR-003 and the Risks section) — this spec
-> may not proceed to Phase 2 without it.
+> **Accepted (2026-09-17).** All five Open Questions are resolved (see "Resolved Decisions" below,
+> which supersedes the original "Open Questions" list) and the mandatory `security-engineer` review
+> (ADR-003 Decision 4) has PASSED with conditional sign-off. **v1 ships Design D (token-in-URL)
+> only**; Designs B and C are deferred as an upstream-gated fast-follow because the `cefsrc`
+> capability check (OQ2) came back CONFIRMED-NO. The security-review conditions are carried into
+> Phase 2 (see ADR-003 Decision 4).
 
 ## Problem Statement
 
@@ -158,17 +160,27 @@ today through the existing sources CRUD.
 
 ### Recommendation
 
-Ship a **decision ladder**, not one mechanism:
+The long-term target is a **decision ladder** (D → B → C, A rejected). But the OQ2 `cefsrc`
+capability check came back **CONFIRMED-NO** (stock upstream gstcefsrc exposes neither a per-navigation
+request header nor a per-source isolated user-data dir), so the ladder is delivered in two waves:
 
-1. **D (token-in-URL)** if the provider supports it — already works, nothing to build.
-2. **B (per-source stored credential)** as the default new mechanism — a scoped, encrypted,
-   rotatable header/token applied server-side. This is the primary design detailed below.
-3. **C (persisted isolated renderer profile)** as the companion for interactive-login/MFA-only
-   providers — gated on Open Question 1 and the security review.
-4. **A (live cookie-forwarding) is rejected** as the primary mechanism for the reasons above.
+**v1 (ships now):**
+1. **D (token-in-URL)** — already works on today's `cefsrc` (uses the existing `url` property, no new
+   code); documented as the recommended first thing to try, with the operator trade-off that the token
+   sits in the `address` (short-TTL + revocable, redacted in logs — see ADR-003 Decision 4 conditions).
 
-Both B and C **must** render inside an **isolated per-source browser profile** so one source's
-credentials never leak into another's context in the shared server-side browser.
+**Upstream-gated fast-follow (deferred until gstcefsrc gains per-element headers + per-source
+request-context/user-data-dir):**
+2. **B (per-source stored credential)** — the intended default new mechanism; blocked on the header
+   property.
+3. **C (persisted isolated renderer profile)** — companion for interactive-login/MFA-only providers;
+   blocked on the per-source user-data-dir property **and** a fresh security re-review (higher blast
+   radius).
+
+**A (live cookie-forwarding) is rejected outright** (not deferred) for the reasons above.
+
+When B and C do land, both **must** render inside an **isolated per-source browser profile** so one
+source's credentials never leak into another's context in the shared server-side browser.
 
 ## API Design
 
@@ -315,29 +327,39 @@ isolated, persistable user-data dir is Open Question 2** — it must be verified
 `cefsrc` capabilities before B/C are committed (same "verify the transport primitive with the Strom
 maintainers" discipline ADR-002 applied).
 
-## Open Questions (for @svensson00 / security-engineer)
+## Resolved Decisions (supersedes the original Open Questions)
 
-1. **Interactive-login provisioning channel (Design C).** The renderer is `cefsrc` inside Strom on a
-   GPU host — there is **no** browser the operator can see to log into. So *where* does the one-time
-   interactive login for a persisted profile actually happen? Candidate answers: (a) a short-lived
-   remote-interactive session into the server-side profile (VNC/CDP-style, heavy, sensitive);
-   (b) a headless scripted login using stored credentials (collapses C into B, only works without
-   real MFA); (c) declare interactive-only-MFA providers **out of scope for v1** and ship B+D only.
-   This is the single biggest product/security decision and blocks Design C. **Recommend (c) for v1.**
-2. **`cefsrc` capability check.** Can the Strom `cefsrc` element (i) set a request header on the
-   top-level navigation and (ii) use an isolated, persistable per-source user-data dir? If not, Design
-   B's header path and Design C's profile path both need a Strom change (like ADR-002's element-PATCH
-   gap). Needs confirmation with the Strom maintainers before Phase 2.
-3. **Encryption key: dedicated `HTML_AUTH_KEY` vs reuse `SRT_PASSPHRASE_KEY`.** Dedicated key =
-   cleaner blast-radius isolation + independent rotation, but one more secret to provision. Reuse =
-   already wired + fail-closed. Recommend a dedicated key with fallback — security call.
-4. **Session expiry UX.** Stored tokens (B) and persisted profiles (C) expire server-side. Should
-   Open Live actively detect/probe expiry and surface "re-authenticate this source" before it drops
-   to a login wall on air, or is a passive `expired` status + operator responsibility acceptable for
-   v1? Affects scope materially.
-5. **Do we accept live cookie-forwarding (Design A) at all, ever?** This spec rejects it as primary.
-   Confirm it is rejected outright (not merely deferred), so the #129 contribution can be redirected
-   toward B/C/D rather than left implying A is on the table.
+All five were resolved on Eyevinn/open-live#291 by @svensson00 (product/PM decision authority) and
+the pipeline's `cefsrc` investigation; the security-engineer review PASSED. Original question text is
+retained for traceability.
+
+1. **Interactive-login provisioning channel (Design C) → RESOLVED (a)/(b), net: out of v1.**
+   @svensson00 chose to ship **B + D** and keep interactive-only-MFA providers (Design C) out of v1
+   scope, tracked as a fast-follow gated on OQ2 and a provisioning-channel decision. Combined with
+   OQ2 below, **v1 ships Design D only**; B and C are the upstream-gated fast-follow. A short-lived
+   remote-interactive session into the render host is explicitly *not* a v1 surface.
+2. **`cefsrc` capability check → RESOLVED: CONFIRMED-NO.** Strom builds stock, unpatched upstream
+   `centricular/gstcefsrc` (`docker/gstcefsrc/Dockerfile`, pinned SHA `b633408`). Its installed
+   properties are `url, gpu, chromium-debug-port, chrome-extra-flags, sandbox, listen-for-js-signals,
+   js-flags, log-severity, cef-cache-location, max-video-framerate` — **no** per-navigation
+   request-header property and **no** isolated persistable per-source user-data dir (only the
+   deprecated *global* `cef-cache-location`; PR #671 adds a per-*instance*, not per-source, cache
+   path). So Design B's header path and Design C's profile isolation both need an **upstream gstcefsrc
+   change** first (a per-element request header + a per-source request-context/user-data-dir). Design D
+   is unaffected — it uses the existing `url` property and works on today's `cefsrc`.
+3. **Encryption key → RESOLVED: dedicated `HTML_AUTH_KEY`.** Falls back to `SRT_PASSPHRASE_KEY` when
+   unset; fail-closed in production if neither is set and any `auth` secret exists. (Applies when B
+   lands; D stores no separate secret.)
+4. **Session-expiry UX → RESOLVED: passive `expired` status for v1.** Surface an `expired` status
+   (e.g. on `GET .../auth/profile/status`, and on failed render for stored-header sources) so Studio
+   can warn before activation; operator re-authenticates. Active/probing expiry detection is a later
+   enhancement, not a v1 blocker.
+5. **Live cookie-forwarding (Design A) → RESOLVED: rejected outright**, not merely deferred. The #129
+   contribution is redirected toward the D (v1) and B/C (fast-follow) designs; A is not on the table.
+
+**Security gate (ADR-003 Decision 4) → SATISFIED.** The `security-engineer` review of the B+D
+session-handling flow returned PASS with conditional sign-off; the conditions are enumerated in
+ADR-003 Decision 4 and carried into Phase 2.
 
 ## Risks
 

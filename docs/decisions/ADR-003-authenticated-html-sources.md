@@ -1,7 +1,23 @@
 # ADR-003: Authenticated HTML sources use scoped, encrypted per-source credentials — not live cookie-forwarding
 
-**Date**: 2026-09-16
-**Status**: Proposed
+**Date**: 2026-09-16 (Accepted 2026-09-17)
+**Status**: Accepted
+
+> **Resolution (2026-09-17).** All five spec Open Questions are resolved and the mandatory
+> security-engineer review (Decision 4) has PASSED with conditional sign-off. Per @svensson00's
+> decisions on Eyevinn/open-live#291:
+> - **OQ1 → (a):** ship **B + D** conceptually, but see OQ2 — v1 scope is narrowed below.
+> - **OQ2 → CONFIRMED-NO:** Strom builds stock, unpatched upstream `centricular/gstcefsrc`
+>   (`docker/gstcefsrc/Dockerfile`, SHA `b633408`), which exposes **neither** a per-navigation
+>   request-header property **nor** an isolated persistable per-source user-data dir (only the
+>   deprecated *global* `cef-cache-location`; PR #671 is per-*instance*, not per-source). Design B's
+>   header path and Design C's profile isolation therefore need an upstream gstcefsrc change first.
+> - **OQ2-induced scope decision → (b):** **v1 ships Design D (token-in-URL) only.** Designs B and C
+>   are deferred together as an **upstream-gated fast-follow** (they unblock once gstcefsrc gains a
+>   per-element request header + per-source request-context/user-data-dir).
+> - **OQ3 → dedicated `HTML_AUTH_KEY`** (fallback `SRT_PASSPHRASE_KEY`, fail-closed in prod).
+> - **OQ4 → passive `expired` status** for v1; active probing is a later enhancement.
+> - **OQ5 → Design A (live cookie-forwarding) rejected outright**, not deferred.
 
 ## Context
 
@@ -59,6 +75,26 @@ use. Full evaluation of all four candidates is in `docs/specs/authenticated-html
    Phase 2 implementation.** This ADR and the spec may not proceed to implementation sub-issues until
    that review has signed off on the credential-at-rest handling, the per-source profile isolation,
    and (if pursued) the Design-C interactive-provisioning channel.
+   **Status: SATISFIED (2026-09-17).** The security-engineer reviewed the B+D session-handling flow
+   and returned **PASS — conditional sign-off** (no design-level blocker). Every finding is an
+   implementation condition carried into Phase 2, and @svensson00 confirmed it need not re-run for
+   acceptance. The Phase 2 conditions (must all be met when B/D are implemented):
+   - Fresh random 12-byte GCM nonce per encrypt; **source-id as GCM AAD** to bind ciphertext to its
+     source.
+   - Fail-closed SSRF re-check (`graphicUrl()`) at flow-generation; no credentialed navigation on
+     validation failure; **do not attach the auth header across cross-origin redirects**.
+   - `409`-in-active-production guard covers `rotate`/clear, not just `PATCH`; RBAC + IDOR scoping on
+     `:id` for set and rotate.
+   - Fail-closed when a stored secret **exists but cannot be decrypted** (wrong/rotated key), never
+     fall through to plaintext/empty.
+   - Log-redaction for `auth.header.value`, decrypted plaintext, and the full `address`, plus a
+     **canary-secret log-scan test** in the acceptance suite.
+   - Design-D token-in-URL documented as an explicit operator trade-off: **short-TTL + revocable, not
+     equivalent to B**; token-bearing `address` redacted everywhere.
+   - Per-source profile dir destroyed/cleaned on source deletion and on credential rotation (applies
+     when Design C returns).
+   - **If Design C returns:** re-review as a separate gate (persisted login profiles hold full live
+     session material — higher blast radius) before the `501` is lifted.
 
 ## Consequences
 
@@ -82,9 +118,11 @@ use. Full evaluation of all four candidates is in `docs/specs/authenticated-html
 - **Credential exfiltration** if the shared server-side host is compromised. *Detection/mitigation:*
   encryption at rest, write-only/masked API, per-source profile isolation, scoped/rotatable creds,
   and the mandatory security review — the reason for the Decision-4 gate.
-- **`cefsrc` capability gap** — whether `cefsrc` can set a top-level-navigation request header and use
-  an isolated persistable user-data dir is unconfirmed (spec Open Question 2); if not, a coordinated
-  Strom change is needed, like ADR-002's element-PATCH gap.
+- **`cefsrc` capability gap — CONFIRMED (2026-09-17).** Strom's stock upstream `cefsrc` can set
+  **neither** a top-level-navigation request header **nor** an isolated persistable per-source
+  user-data dir (spec Open Question 2, resolved CONFIRMED-NO). A coordinated upstream gstcefsrc change
+  is therefore required before Designs B and C can ship — like ADR-002's element-PATCH gap. This is why
+  **v1 is scoped to Design D only** and B/C are the upstream-gated fast-follow.
 - **Session expiry on air** — a token/profile expiring mid-show drops to the login wall in PGM;
   tracked as spec Open Question 4.
 
