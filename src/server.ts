@@ -157,6 +157,11 @@ export async function buildServer() {
       // Defence-in-depth: strip credentials from any log object regardless of
       // call site, in case a raw flow/source/error escapes explicit redaction.
       // Field names mirror the sensitive keys in src/lib/log-redact.ts.
+      // `address` is redacted because a token-in-URL authenticated HTML source
+      // (Design D — ADR-003 / issue #315) carries an access token inside the
+      // source `address`. `url` is intentionally NOT a global path here (it
+      // would clobber every `req.url` in logs); the token-bearing cefsrc `url`
+      // property is handled by safeFlowProjection + redactSensitive instead.
       redact: {
         paths: [
           'srt_uri',
@@ -164,11 +169,13 @@ export async function buildServer() {
           'streamid',
           'token',
           'secret',
+          'address',
           '*.srt_uri',
           '*.passphrase',
           '*.streamid',
           '*.token',
           '*.secret',
+          '*.address',
           'req.headers.authorization',
           'headers.authorization',
         ],
