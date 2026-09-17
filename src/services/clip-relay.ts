@@ -147,19 +147,25 @@ export function startClipRelay(productionId: string, flowId: string, blockToInpu
       wsCleanup = strom.connectWebSocket(
         (event) => {
           if (event.type === 'MediaPlayerStateChanged') {
-            const { flow_id, block_id, state, position_ms, duration_ms } = event.data;
+            // Strom's MediaPlayerStateChanged carries no position/duration — it
+            // is a pure state edge; playhead comes via MediaPlayerPosition.
+            const { flow_id, block_id, state } = event.data;
             if (flow_id !== entry.flowId) return;
             const mixerInput = entry.blockToInput.get(block_id);
             if (!mixerInput) return;
-            applyReactiveState(productionId, mixerInput, state, position_ms, duration_ms);
+            applyReactiveState(productionId, mixerInput, state);
             return;
           }
           if (event.type === 'MediaPlayerPosition') {
-            const { flow_id, block_id, position_ms, duration_ms } = event.data;
+            // Strom reports position/duration in NANOSECONDS (position_ns /
+            // duration_ns); the CLIP_STATE contract is in milliseconds.
+            const { flow_id, block_id, position_ns, duration_ns } = event.data;
             if (flow_id !== entry.flowId) return;
             const mixerInput = entry.blockToInput.get(block_id);
             if (!mixerInput) return;
-            applyReactivePosition(productionId, mixerInput, position_ms, duration_ms);
+            const positionMs = Math.round(position_ns / 1e6);
+            const durationMs = duration_ns !== undefined ? Math.round(duration_ns / 1e6) : undefined;
+            applyReactivePosition(productionId, mixerInput, positionMs, durationMs);
             return;
           }
         },

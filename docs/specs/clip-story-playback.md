@@ -249,7 +249,7 @@ sequenceDiagram
     WS-->>Auto: CLIP_STATE { state: 'playing', positionMs, durationMs }
 
     Note over WS,Strom: WS subscribes to media_player push events (primary)
-    Strom-->>WS: MediaPlayerPosition { position_ms } (while playing)
+    Strom-->>WS: MediaPlayerPosition { position_ns } (while playing; ns→ms)
     WS-->>Auto: CLIP_STATE { state: 'playing', positionMs }
     Strom-->>WS: MediaPlayerStateChanged { state: 'stopped' } (end of media)
     WS-->>Auto: CLIP_STATE { state: 'completed' }
@@ -260,13 +260,19 @@ sequenceDiagram
 
 `CLIP_STATE` — including playhead position while playing — is emitted **reactively** from Strom's
 pushed media_player events. Strom broadcasts `MediaPlayerStateChanged` and `MediaPlayerPosition`
-over its flow WebSocket (`backend/src/blocks/builtin/mediaplayer/bridge.rs:555,577` and
-`builder.rs:389`, relayed by `backend/src/api/websocket.rs`). `open-live` adds those two variants
-to the `FlowEvent` union (`src/lib/strom.ts`) and consumes them in a reactive clip-relay
-(`src/services/clip-relay.ts`, modelled on `meter-relay.ts`): one WS per production, ref-counted
-across controller connections, translating each event to a `CLIP_STATE` broadcast keyed back to
-the owning `mixerInput`. The relay never downgrades a controller-owned `cued`/`completed`/`error`
-state (which Strom cannot represent) on a raw `stopped`/`paused` push.
+over its flow WebSocket. Wire shapes matched against Strom source `Eyevinn/strom` @ commit
+`0d9d469`: `types/src/events.rs` (`StromEvent` is `#[serde(tag = "type", content = "data")]`, so
+every frame is `{ "type": "<Variant>", "data": { … } }`) and
+`backend/src/blocks/builtin/mediaplayer/bridge.rs:557,579`. Each event is routed by **`block_id`**
+(there is no `element_id` on these events, unlike the meter/loudness envelope); `state` is
+lowercase (`"playing" | "paused" | "stopped"`); and position/duration are in **nanoseconds**
+(`position_ns`/`duration_ns`), which the relay converts to milliseconds for the `CLIP_STATE`
+contract. `open-live` adds those two variants to the `FlowEvent` union (`src/lib/strom.ts`) and
+consumes them in a reactive clip-relay (`src/services/clip-relay.ts`, modelled on `meter-relay.ts`):
+one WS per production, ref-counted across controller connections, translating each event to a
+`CLIP_STATE` broadcast keyed back to the owning `mixerInput`. The relay never downgrades a
+controller-owned `cued`/`completed`/`error` state (which Strom cannot represent) on a raw
+`stopped`/`paused` push.
 
 `CLIP_STATE_POLL_MS` polling of `player.getState` is retained **only as a reconciliation
 fallback** for the window when the push channel is briefly unavailable (relay reconnecting). It is
