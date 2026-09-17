@@ -10,9 +10,11 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // Mock CouchDB
 // ---------------------------------------------------------------------------
 
+const graphicsGet = vi.hoisted(() => vi.fn());
+
 vi.mock('../db/index.js', () => ({
   getSourcesDb: () => ({ get: vi.fn().mockRejectedValue(new Error('not found')) }),
-  getGraphicsDb: () => ({ get: vi.fn().mockRejectedValue(new Error('not found')) }),
+  getGraphicsDb: () => ({ get: graphicsGet }),
 }));
 
 // ---------------------------------------------------------------------------
@@ -35,7 +37,11 @@ function makeStromClient() {
   return client;
 }
 
-function makeProduction(sources: Array<{ sourceId: string; mixerInput: string }>, values?: Record<string, unknown>) {
+function makeProduction(
+  sources: Array<{ sourceId: string; mixerInput: string }>,
+  values?: Record<string, unknown>,
+  graphicAssignments: Array<{ graphicId: string; dskInput: string }> = [],
+) {
   return {
     _id: 'prod-test-only',
     _rev: '1-abc',
@@ -43,7 +49,7 @@ function makeProduction(sources: Array<{ sourceId: string; mixerInput: string }>
     name: 'Test Production',
     status: 'inactive',
     sources,
-    graphicAssignments: [],
+    graphicAssignments,
     values: values ?? {},
     pipeline: { stromConfig: null, status: 'stopped' },
     graphics: [],
@@ -61,6 +67,7 @@ function makeProduction(sources: Array<{ sourceId: string; mixerInput: string }>
 describe('activateStromFlow — test pattern sources', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    graphicsGet.mockRejectedValue(new Error('not found'));
   });
 
   it('adds one audiotestsrc per test pattern and sets num_channels correctly (test-only production)', async () => {
@@ -137,5 +144,78 @@ describe('activateStromFlow — test pattern sources', () => {
     await expect(activateStromFlow(production as never, strom as never)).resolves.toMatchObject({
       flowId: 'flow-test-123',
     });
+  });
+});
+
+describe('activateStromFlow — DSK graphic alpha mode', () => {
+  const GRAPHICS: Record<string, unknown> = {
+    'gfx-lower-third': { _id: 'gfx-lower-third', type: 'graphic', name: 'Lower third', url: 'https://example.com/l3.html' },
+    'gfx-bug': { _id: 'gfx-bug', type: 'graphic', name: 'Bug', url: 'https://example.com/bug.html' },
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    graphicsGet.mockImplementation((id: string) =>
+      id in GRAPHICS ? Promise.resolve(GRAPHICS[id]) : Promise.reject(new Error('not found')),
+    );
+  });
+
+  async function mixerPropsFor(graphicAssignments: Array<{ graphicId: string; dskInput: string }>) {
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    const strom = makeStromClient();
+    const production = makeProduction([{ sourceId: '__test1__', mixerInput: 'video_in_1' }], {}, graphicAssignments);
+
+    await activateStromFlow(production as never, strom as never);
+
+    const flow = strom.capturedFlows[0]!;
+    const blocks = flow['blocks'] as Array<Record<string, unknown>>;
+    const mixer = blocks.find((b) => b['block_definition_id'] === 'builtin.vision_mixer');
+    expect(mixer).toBeDefined();
+    return {
+      props: mixer!['properties'] as Record<string, unknown>,
+      elements: flow['elements'] as Array<Record<string, unknown>>,
+    };
+  }
+
+  function alphaModeKeys(props: Record<string, unknown>) {
+    return Object.keys(props).filter((k) => /^dsk_\d+_alpha_mode$/.test(k)).sort();
+  }
+
+  it('marks every DSK input fed by a cefsrc as premultiplied', async () => {
+    const { props, elements } = await mixerPropsFor([
+      { graphicId: 'gfx-lower-third', dskInput: 'dsk_in_0' },
+      { graphicId: 'gfx-bug', dskInput: 'dsk_in_1' },
+    ]);
+
+    expect(elements.filter((e) => e['element_type'] === 'cefsrc')).toHaveLength(2);
+    expect(props['num_dsk_inputs']).toBe(2);
+    expect(props['dsk_0_alpha_mode']).toBe('premultiplied');
+    expect(props['dsk_1_alpha_mode']).toBe('premultiplied');
+    expect(alphaModeKeys(props)).toEqual(['dsk_0_alpha_mode', 'dsk_1_alpha_mode']);
+  });
+
+  it('leaves DSK inputs without a graphic unset', async () => {
+    const { props } = await mixerPropsFor([{ graphicId: 'gfx-bug', dskInput: 'dsk_in_1' }]);
+
+    expect(props['num_dsk_inputs']).toBe(2);
+    expect(alphaModeKeys(props)).toEqual(['dsk_1_alpha_mode']);
+    expect(props['dsk_1_alpha_mode']).toBe('premultiplied');
+  });
+
+  it('does not set the alpha mode for an assignment whose graphic no longer exists', async () => {
+    const { props, elements } = await mixerPropsFor([
+      { graphicId: 'gfx-deleted', dskInput: 'dsk_in_0' },
+      { graphicId: 'gfx-lower-third', dskInput: 'dsk_in_1' },
+    ]);
+
+    expect(elements.filter((e) => e['element_type'] === 'cefsrc')).toHaveLength(1);
+    expect(alphaModeKeys(props)).toEqual(['dsk_1_alpha_mode']);
+  });
+
+  it('sets no alpha mode when the production has no graphics', async () => {
+    const { props } = await mixerPropsFor([]);
+
+    expect(props['num_dsk_inputs']).toBeUndefined();
+    expect(alphaModeKeys(props)).toEqual([]);
   });
 });
