@@ -144,7 +144,7 @@ describe('port lease service', () => {
     acquire.mockResolvedValueOnce(LEASE);
     await tickPortLease(log);
     expect(acquire).toHaveBeenCalledTimes(1);
-    expect(acquire.mock.calls[0]![0]).toMatchObject({ size: 20 });
+    expect(acquire.mock.calls[0]![0]).toMatchObject({ size: 10 });
     expect(getPortLease()).toEqual({ status: 'leased', lease: LEASE });
     const clientId = (acquire.mock.calls[0]![0] as { client_id: string }).client_id;
     expect(clientId).toMatch(/^open-live-/);
@@ -182,6 +182,65 @@ describe('port lease service', () => {
     await tickPortLease(log);
     expect(acquire).toHaveBeenCalledTimes(2);
     expect(getPortLease()).toEqual({ status: 'leased', lease: LEASE });
+  });
+
+  it('falls back to unsupported after MAX_ACQUIRE_FAILURES consecutive non-404 failures', async () => {
+    acquire.mockRejectedValue(new StromClientError(503, 'proxy unavailable'));
+    // First two failures stay pending — the state that blocks listener writes.
+    await tickPortLease(log);
+    expect(getPortLease()).toEqual({ status: 'pending' });
+    await tickPortLease(log);
+    expect(getPortLease()).toEqual({ status: 'pending' });
+    // Third consecutive non-404 failure gives up: unenforced (manual) ports.
+    await tickPortLease(log);
+    expect(getPortLease()).toEqual({ status: 'unsupported' });
+    expect(acquire).toHaveBeenCalledTimes(3);
+    // The give-up warning is logged exactly once (distinct from the per-retry warnings).
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ failures: 3 }),
+      expect.stringContaining('Giving up acquiring an SRT port range'),
+    );
+  });
+
+  it('resets the non-404 failure counter after a successful acquire', async () => {
+    acquire.mockRejectedValueOnce(new StromClientError(503, 'proxy unavailable'));
+    acquire.mockRejectedValueOnce(new StromClientError(503, 'proxy unavailable'));
+    await tickPortLease(log);
+    await tickPortLease(log);
+    expect(getPortLease()).toEqual({ status: 'pending' });
+
+    // A success clears the counter, so a later failure starts counting from zero again.
+    acquire.mockResolvedValueOnce(LEASE);
+    await tickPortLease(log);
+    expect(getPortLease()).toEqual({ status: 'leased', lease: LEASE });
+
+    // Renew 404s so we drop back to acquiring; two fresh failures must stay pending,
+    // not tip straight into unsupported off the pre-success count.
+    renew.mockRejectedValueOnce(notFound());
+    acquire.mockRejectedValueOnce(new StromClientError(503, 'proxy unavailable'));
+    await tickPortLease(log);
+    expect(getPortLease()).toEqual({ status: 'pending' });
+    acquire.mockRejectedValueOnce(new StromClientError(503, 'proxy unavailable'));
+    await tickPortLease(log);
+    expect(getPortLease()).toEqual({ status: 'pending' });
+  });
+
+  it('keeps a failed re-probe in unsupported rather than dropping into pending', async () => {
+    // Get to unsupported via a clean 404.
+    acquire.mockRejectedValueOnce(new StromClientError(404, 'API endpoint not found'));
+    await tickPortLease(log);
+    expect(getPortLease()).toEqual({ status: 'unsupported' });
+
+    // A non-404 failure on the re-probe (after the back-off) must not block writes.
+    vi.useFakeTimers();
+    try {
+      vi.advanceTimersByTime(10 * 60 * 1000 + 1);
+      acquire.mockRejectedValueOnce(new StromClientError(503, 'proxy unavailable'));
+      await tickPortLease(log);
+      expect(getPortLease()).toEqual({ status: 'unsupported' });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('keeps the last known range when a renew fails for a reason other than 404', async () => {

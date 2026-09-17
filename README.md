@@ -11,11 +11,15 @@ The fastest way to try Open Live — no Kubernetes required.
 Visit **[openlive.apps.osaas.io](https://openlive.apps.osaas.io)** to spin up a managed Open Live instance on Open Source Cloud. Start for an event, tear down after. No infrastructure to manage and no monthly minimum.
 
 - 14-day free trial, free plan available
-- 15 EUR/month (self-hosted Strom) or 69 EUR/month (shared GPU in Frankfurt)
+- 15 EUR/month (self-hosted Strom) or 69 EUR/month (shared GPU in Frankfurt — **demo purposes
+  only**; the Frankfurt GPU is shared between all users on this plan, capacity is not guaranteed
+  and performance varies with load, so it is not suitable for live production)
+- For guaranteed capacity and live production, add a **Hosted GPU** add-on (from 750 EUR/month) —
+  see the pricing card on [openlive.apps.osaas.io](https://openlive.apps.osaas.io)
 
 The in-app **Create New Open Live** flow provisions CouchDB for you and generates its admin
 password automatically. You do not choose or handle that password yourself on this path.
-The `COUCHDB_URL` environment variable documented under [Environment variables](#environment-variables)
+The `COUCHDB_URL` environment variable documented under [Configuration](#configuration)
 below is only for a self-hosted deployment where you run CouchDB yourself; it does not apply
 to the managed OSC flow above.
 
@@ -38,6 +42,7 @@ to the managed OSC flow above.
 ## Features
 
 - **Vision mixing** — cuts, auto transitions, DSK layers, picture-in-picture, graphics overlays, and fade-to-black
+- **Graphics** — HTML/image overlays keyed onto the programme via DSK, including [OGraf](https://github.com/ebu/ograf) (EBU HTML-graphics spec) templates; see the [graphics guide](docs/graphics.md)
 - **Audio mixer** — per-channel faders with EBU R128 loudness metering
 - **Multiviewer** — sub-500ms WebRTC glass-to-glass latency
 - **Stream Deck control** — hardware button panel integration
@@ -45,40 +50,136 @@ to the managed OSC flow above.
 - **REMI / remote production** — crews work from anywhere via browser; eliminates travel and equipment shipping
 - **Self-hostable** on any Kubernetes cluster, zero vendor lock-in
 
-## Requirements
+## Running it yourself
 
-- Node.js 23+
-- pnpm 10.33+
-- CouchDB instance (local or remote)
+This repository is the API server. On its own it exposes a REST API and a WebSocket
+channel — to actually cut a show you also need the two pieces below.
 
-## Setup
+**What you need**
+
+- Node.js 22 and pnpm 10.33+
+- A **CouchDB** instance (local or remote) — all productions, sources and config live here
+- A **Strom** instance — the GStreamer engine that does the real work: mixing video and
+  audio, compositing graphics, and encoding the programme and multiview outputs. Open Live
+  drives it over its REST and WebSocket APIs and never touches media itself. Run one
+  locally with Docker, or point at an existing instance. See the
+  [Strom setup guide](https://github.com/EyevinnOSC/community/wiki/User-Guide:-Open-Live-Setup#strom).
+- [open-live-studio](https://github.com/Eyevinn/open-live-studio) — the browser UI. Without
+  it you have an API and no controls.
+
+**Quickstart**
 
 ```bash
 pnpm install
 cp .env.example .env
-# Edit .env with your credentials and config
 ```
 
-## Environment variables
+The minimum to get a server running locally:
 
-Copy `.env.example` to `.env` and fill in the values:
+```env
+COUCHDB_URL=http://admin:password@localhost:5984
+STROM_URL=http://localhost:8080
+API_KEY=$(openssl rand -base64 32)
+```
+
+Then start it, and point the studio at it:
+
+```bash
+pnpm dev                                  # this server, on http://localhost:3000
+# in open-live-studio: OPEN_LIVE_URL=http://localhost:3000
+```
+
+Create the `open-live` database in CouchDB before first start. Everything else in
+[Configuration](#configuration) is optional for local development — but read
+[Operating in production](#operating-in-production) before exposing this to a network.
+
+**Commands**
+
+```bash
+pnpm dev          # development server with hot reload
+pnpm typecheck    # type-check without emitting
+pnpm build        # compile TypeScript to dist/
+pnpm start        # run the compiled server
+```
+
+## Configuration
+
+All configuration is via environment variables. Copy `.env.example` to `.env`
+and fill in the values:
 
 | Variable | Description | Default |
 |---|---|---|
 | `PORT` | Port the server listens on | `3000` |
-| `COUCHDB_URL` | Full CouchDB connection URL including credentials | required |
-| `COUCHDB_NAME` | CouchDB database name | `open-live` |
-| `CORS_ORIGIN` | Allowed CORS origin (URL of the studio frontend) | `http://localhost:5173` |
+| `COUCHDB_URL` | Full CouchDB connection URL. Credentials may be embedded, or supplied via `COUCHDB_USER`/`COUCHDB_PASSWORD` | required |
+| `COUCHDB_USER` | CouchDB username, injected into `COUCHDB_URL` at startup when the URL has no embedded credentials (only applied if `COUCHDB_PASSWORD` is also set) | _(empty)_ |
+| `COUCHDB_PASSWORD` | CouchDB password, injected into `COUCHDB_URL` at startup when the URL has no embedded credentials | _(empty)_ |
+| `CORS_ORIGIN` | Allowed CORS origin(s): a single origin, a comma-separated list, or `*` for wildcard. **When unset, cross-origin requests are disabled** (`origin: false`) and a `[security]` warning is logged — there is no default origin | _(empty — cross-origin disabled)_ |
+| `PUBLIC_BASE_URL` | Externally reachable base URL of this service, used to build WHIP callback URLs. **Required in production** (`NODE_ENV=production`): the server refuses to start without it, because otherwise WHIP URLs are derived from the `X-Forwarded-Host` header, enabling host-header injection. Outside production, logs a warning and falls back to request-derived URLs | _(empty)_ |
+| `TRUSTED_HOSTS` | Comma-separated allow-list of hostnames permitted when building request-derived WHIP URLs (used only when `PUBLIC_BASE_URL` is unset). A request whose derived host is not on this list is rejected rather than persisted | _(empty)_ |
 | `STROM_URL` | Base URL of the Strom pipeline engine | `http://localhost:7000` |
-| `STROM_TOKEN` | OSC Personal Access Token for authenticating against an OSC-hosted Strom instance | _(empty — not needed for local Strom)_ |
+| `SRT_PUBLIC_HOST` | Public hostname on which the shared Strom instance's SRT listener ports are reachable from external SRT callers. Used to build the read-only `connect` dial-in address surfaced on `mpegtssrt`/`efpsrt` outputs (`GET /api/v1/outputs`). When unset, the host is derived from the `STROM_URL` hostname; if that is loopback/private the `connect.uri` is returned as `null` with a `reason` rather than a misleading address. Set this when the SRT port is published on a different public host than the HTTP API (e.g. NATed / shared-GPU topologies) | _(empty — derived from `STROM_URL`)_ |
+| `STROM_AUTH_TOKEN` | Token for authenticating against Strom. See [Strom authentication](#strom-authentication) below. `STROM_TOKEN` is accepted as a legacy fallback | _(empty — not needed for local Strom)_ |
+| `STROM_AUTH_MODE` | How `STROM_AUTH_TOKEN` is used: `osc` exchanges an OSC Personal Access Token for a short-lived SAT (OSC-hosted Strom); `direct` sends the token as a Bearer key (self-hosted / non-OSC Strom) | `osc` |
 | `API_KEY` | Static API key protecting all `/api/v1` routes, the WebSocket controller, and the Swagger UI. **Required for any network-accessible deployment** (see below) | _(empty — routes unauthenticated)_ |
 | `TRUST_EXTERNAL_AUTH` | Acknowledges that `API_KEY` is intentionally unset because another layer (e.g. OSC's reverse proxy) handles auth instead. See below | `false` |
+| `SRT_PASSPHRASE_KEY` | AES-256 key (32 bytes, base64 or hex) that encrypts SRT source passphrases at rest. **Fails closed in production**: the encrypt/decrypt path throws if it is unset (or malformed) when a passphrase must be processed. Unset in non-production stores passphrases in plaintext with a warning. Generate with `openssl rand -base64 32` | _(empty)_ |
 | `LOG_LEVEL` | Fastify log level (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
-| `STROM_PORT_LEASE_SIZE` | Number of SRT listener ports to lease from a shared Strom — see [`docs/port-lease.md`](docs/port-lease.md) | `20` |
+| `STROM_PORT_LEASE_SIZE` | Number of SRT listener ports to lease from a shared Strom — see [`docs/port-lease.md`](docs/port-lease.md) | `10` |
 | `STROM_PORT_LEASE_CLIENT_ID` | Stable lease client id sent to Strom | hostname of `PUBLIC_BASE_URL`, else `open-live-<hostname>` |
 | `STROM_PORT_LEASE_DISABLED` | Set to `true` to turn off port leasing | `false` |
+| `IDLE_TIMEOUT_SEC` | Seconds a production may have zero connected clients before it is auto-deactivated (`endedReason: 'idle'`). A `KEEP_ALIVE` from any client resets this timer | `300` |
+| `IDLE_WARNING_LEAD_SEC` | Lead time before the idle deadline at which the backend emits a single `IDLE_WARNING` (with `remainingSec` + `deadlineMs`) over the controller WS so clients can keep the show up. Clamped to `IDLE_TIMEOUT_SEC` | `60` |
 
 > **Never commit `.env`** — it is gitignored. Use `.env.example` as the reference.
+
+## API
+
+The REST API is documented in [`docs/openapi.yaml`](docs/openapi.yaml) and served as
+interactive Swagger UI at **`/documentation`**. That is the authoritative reference — the
+list below is a map of what exists, not a complete signature listing.
+
+| Area | Routes |
+|---|---|
+| Health | `/health`, `/healthz` (OSC probe alias), `/ready` (requires CouchDB) |
+| Service status | `/api/v1/status`, `/api/v1/ping`, `/api/v1/server-info`, `POST /api/v1/reconnect` |
+| Productions | `/api/v1/productions`, `/api/v1/productions/:id`, plus `:id/activate` and `:id/deactivate` |
+| Production contents | `:id/sources`, `:id/outputs`, `:id/graphics`, `:id/macros`, `:id/whip/:mixerInput` |
+| Production runtime | `:id/pipeline`, `:id/audio`, `:id/stats/streaming`, `:id/controllers` |
+| Resources | `/api/v1/sources`, `/api/v1/outputs`, `/api/v1/graphics`, `/api/v1/production-configs` |
+| WebRTC | `/api/v1/ice-servers`, `/api/v1/whep-proxy` |
+| WebSocket | `/ws/productions/:id/controller` — the controller channel |
+
+The WebSocket controller channel — its authentication, inbound message types, and outbound
+broadcasts — is documented separately in [`docs/controller-websocket.md`](docs/controller-websocket.md).
+
+### Source model
+
+Sources represent individual video/audio feeds. Each source has a `streamType` — `srt`, `efp`, `whip`, `html`, or the built-in test patterns `test1` / `test2` — and an `address` (SRT URI, WHIP endpoint URL, or page URL for `html`). The test-pattern types need no address and are useful for bringing a production up without any ingest.
+
+SRT passphrases are embedded in the source `address` and encrypted at rest before being stored in CouchDB. For rotating a passphrase or responding to a suspected compromise, see the operator runbook in [`docs/srt-passphrase-rotation.md`](docs/srt-passphrase-rotation.md).
+
+### Activation flow
+
+1. A production is given source assignments (`POST /api/v1/productions/:id/sources`), plus any outputs and graphics.
+2. `POST /api/v1/productions/:id/activate` builds a Strom flow from the built-in topology in [`src/lib/default-flow.ts`](src/lib/default-flow.ts) — vision mixer, audio mixer, encoders and WHEP endpoints sized to the production's config — patches each assigned source's address into the matching block, then creates and starts the flow in Strom. The `stromFlowId` is stored on the production.
+3. `POST /api/v1/productions/:id/deactivate` stops and deletes the Strom flow and clears `stromFlowId`.
+
+The flow topology is generated, not user-supplied: productions are configured through their sources, outputs, graphics and config values rather than by editing flow JSON.
+
+### Graphics
+
+Graphics are HTML or image overlays rendered by the pipeline and keyed onto the programme
+output through a downstream keyer (DSK). This supports standards-based HTML templates such as
+[OGraf](https://github.com/ebu/ograf) (the EBU spec, authored with the
+[OGraf Template Editor](https://github.com/Eyevinn/ograf-editor)). See the end-to-end
+[**Graphics in Open Live** guide](docs/graphics.md) for authoring, registering, assigning to a
+DSK, and taking graphics on air — including an honest note on what is not yet integrated
+(e.g. the SPX graphics controller).
+
+## Operating in production
+
+The defaults are tuned for local development. Before this service is reachable from a
+network, both of the following apply.
 
 ### API authentication
 
@@ -90,8 +191,14 @@ must send it as a bearer token:
 Authorization: Bearer <API_KEY>
 ```
 
-WebSocket clients pass the key via the `?key=<API_KEY>` query parameter on the upgrade
-request, since the browser WebSocket API does not support custom headers.
+Browser WebSocket clients cannot set custom headers, so they carry the key through the
+`Sec-WebSocket-Protocol` header instead: offer the two sentinel subprotocols
+`openlive.bearer` and `openlive.bearer.<API_KEY>` via `new WebSocket(url, protocols)`.
+The server extracts the key from the second (`extractSubprotocolKey()`) and echoes back
+only the plain `openlive.bearer` marker, keeping the secret out of the request URL and
+access logs. The `?key=<API_KEY>` query parameter is **not** accepted — it was removed
+in #49 because it leaks the key into proxy/CDN/DevTools logs. See
+[`docs/controller-websocket.md`](docs/controller-websocket.md) for details.
 
 > **`API_KEY` must be set for any network-accessible deployment.** When `API_KEY` is
 > unset, every API route is unauthenticated — any client that can reach the service can
@@ -106,69 +213,25 @@ request, since the browser WebSocket API does not support custom headers.
 
 ### Strom authentication
 
-When `STROM_URL` points to an OSC-hosted Strom instance, set `STROM_TOKEN` to your OSC Personal Access Token. The server automatically exchanges it for a short-lived Service Access Token (SAT) and refreshes it before expiry. No extra steps needed.
+Strom authentication is configured with `STROM_AUTH_TOKEN` and `STROM_AUTH_MODE`.
+(`STROM_TOKEN` is still read as a legacy fallback for `STROM_AUTH_TOKEN`, but new
+deployments should use `STROM_AUTH_TOKEN`.)
 
-Leave `STROM_TOKEN` unset when running Strom locally without authentication.
+- **`STROM_AUTH_MODE=osc`** (the default) — for a Strom instance behind OSC authentication. Set
+  `STROM_AUTH_TOKEN` to your OSC Personal Access Token; the server automatically
+  exchanges it for a short-lived Service Access Token (SAT) and refreshes it before
+  expiry. No extra steps needed. Note that an `eyevinn-strom` instance from the OSC
+  catalogue is not a supported backend — see [OSC deployment](#osc-deployment).
+- **`STROM_AUTH_MODE=direct`** — for the shared Eyevinn instance and any self-hosted
+  Strom. `STROM_AUTH_TOKEN` is sent directly as the `Authorization: Bearer` token with
+  no exchange step.
 
-## Commands
-
-```bash
-# Start development server with hot reload
-pnpm dev
-
-# Type-check without emitting
-pnpm typecheck
-
-# Compile TypeScript to dist/
-pnpm build
-
-# Start compiled server (production / OSC deployment)
-pnpm start
-```
-
-## API
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/health` | Liveness check |
-| `GET` | `/healthz` | Liveness check (OSC health probe alias) |
-| `GET` | `/ready` | Readiness check (requires CouchDB) |
-| `GET/POST` | `/api/v1/productions` | List / create productions |
-| `GET/PATCH/DELETE` | `/api/v1/productions/:id` | Get / update / delete a production |
-| `POST` | `/api/v1/productions/:id/activate` | Activate production — creates + starts Strom flow |
-| `POST` | `/api/v1/productions/:id/deactivate` | Deactivate production — stops + deletes Strom flow |
-| `POST` | `/api/v1/productions/:id/sources` | Assign a source to a mixer input |
-| `DELETE` | `/api/v1/productions/:id/sources/:mixerInput` | Remove a source assignment |
-| `GET/POST` | `/api/v1/sources` | List / create sources |
-| `GET/PATCH/DELETE` | `/api/v1/sources/:id` | Get / update / delete a source |
-| `GET/POST` | `/api/v1/templates` | List / create Strom flow templates |
-| `GET/PATCH/DELETE` | `/api/v1/templates/:id` | Get / update / delete a template |
-| `WS` | `/ws/productions/:id/controller` | WebSocket controller channel |
-
-The REST API is documented in `docs/openapi.yaml` (also served at `/documentation`). The
-WebSocket controller channel — its authentication, inbound message types, and outbound
-broadcasts — is documented separately in [`docs/controller-websocket.md`](docs/controller-websocket.md).
-
-### Source model
-
-Sources represent individual video/audio feeds. Each source has a `streamType` (`srt` or `whip`) and an `address` (SRT URI or WHIP endpoint URL).
-
-SRT passphrases are embedded in the source `address` and encrypted at rest before being stored in CouchDB. For rotating a passphrase or responding to a suspected compromise, see the operator runbook in [`docs/srt-passphrase-rotation.md`](docs/srt-passphrase-rotation.md).
-
-### Template model
-
-A template is a reusable Strom flow blueprint. It contains:
-- `flow` — the full Strom flow JSON (`elements[]`, `blocks[]`, `links[]`)
-- `inputs[]` — parametric input slots: `{ id, blockId, addressProperty }` — maps a logical input name to a block in the flow and the property that receives the source address
-
-### Activation flow
-
-1. A production is given a `templateId` and source assignments (`POST /api/v1/productions/:id/sources`)
-2. `POST /api/v1/productions/:id/activate` clones the template flow, patches each assigned source's address into the matching block, creates the flow in Strom, and starts it. The `stromFlowId` is stored on the production.
-3. `POST /api/v1/productions/:id/deactivate` stops and deletes the Strom flow and clears `stromFlowId`.
+Leave `STROM_AUTH_TOKEN` unset when running Strom locally without authentication.
 
 ## OSC deployment
 
 The app is deployed on [Open Source Cloud](https://www.osaas.io). Environment variables are injected at runtime via an OSC parameter store — no `.env` file is needed on the server.
 
-Required services: CouchDB (`apache-couchdb`), Strom (`eyevinn-strom`), parameter store (`eyevinn-app-config-svc` + `valkey`).
+Required services: CouchDB (`apache-couchdb`), parameter store (`eyevinn-app-config-svc` + `valkey`).
+
+Strom is **not** deployed as an OSC service instance. `STROM_URL` points at a GPU host outside the OSC catalogue (the shared Eyevinn instance, or your own) — see [Strom authentication](#strom-authentication) above. The `eyevinn-strom` catalogue service is not a supported backend.

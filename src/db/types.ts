@@ -24,9 +24,70 @@ export interface Macro {
 
 // --------------- Source types ---------------
 
-export type StreamType = 'srt' | 'efp' | 'whip' | 'test1' | 'test2' | 'html';
+export type StreamType = 'srt' | 'efp' | 'whip' | 'test1' | 'test2' | 'html' | 'clip';
 
 export type SourceStatus = 'active' | 'inactive';
+
+// --------------- Clip reference types (issue #275, epic #206) ---------------
+
+/**
+ * Typed, versioned clip reference for `streamType: 'clip'` sources.
+ *
+ * A discriminated union so new byte sources can be added without breaking the
+ * contract or overloading a bare `address` string (per PM direction on #206).
+ * The reference is a *contract-level* (API/zod) concern; it is stored serialized
+ * as a JSON string in the existing optional `SourceDoc.address` field, so no
+ * persisted schema migration is introduced. See
+ * `docs/specs/clip-story-playback.md` §"Clip source model" / §"Migration".
+ *
+ * v1 implements `url` and `s3`; `tams` is accepted at the type level but rejected
+ * at runtime (501/not-implemented). No variant assumes a fixed media length — any
+ * reference may carry an optional `timerange`.
+ */
+
+/** Any fetchable file / object-storage URL. A presigned URL reduces to this. */
+export interface ClipReferenceUrl {
+  type: 'url';
+  url: string;
+  /** Optional; nothing in the model assumes a fixed file length. */
+  timerange?: string;
+}
+
+/** Object storage (MinIO / S3 objects from epic #5). */
+export interface ClipReferenceS3 {
+  type: 's3';
+  bucket: string;
+  key: string;
+  timerange?: string;
+}
+
+/** BBC Time-Addressable Media Store (flow + timerange). Reserved — not v1. */
+export interface ClipReferenceTams {
+  type: 'tams';
+  store: string;
+  flowId: string;
+  timerange: string;
+}
+
+export type ClipReference = ClipReferenceUrl | ClipReferenceS3 | ClipReferenceTams;
+
+/**
+ * Live clip playback state for a `clip` source assigned to a mixer input
+ * (epic #206, issues #277/#278). CamelCased mirror of Strom's
+ * `PlayerStateResponse` plus the cue/play/completed clip state machine
+ * (spec `docs/specs/clip-story-playback.md` §"State machine").
+ *
+ * Held only in the in-memory `clip-state` service (mirroring tally) — never
+ * persisted on a doc for v1. Restored from `player.getState` on connect.
+ */
+export interface ClipState {
+  mixerInput: string;
+  state: 'idle' | 'cued' | 'playing' | 'paused' | 'stopped' | 'completed' | 'error';
+  clipId?: string;
+  positionMs?: number;
+  durationMs?: number;
+  error?: string;
+}
 
 export interface SourceDoc {
   _id: string;
@@ -39,6 +100,54 @@ export interface SourceDoc {
   liveCamera?: boolean;
   /** SRT receiver buffer latency in ms. Only applies to srt/efp stream types. Default 125. */
   latency?: number;
+  /**
+   * Optional id of the Gateway (`GatewayDoc._id`) that registered this source
+   * (issue #263). Absent for manually-created sources. Enables the
+   * forget-gateway cascade and Studio's Sources chip. Additive and
+   * defaulted-absent — every existing source stays valid unchanged.
+   */
+  gatewayId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// --------------- Gateway types (issue #263, OL-5 Studio Gateways Phase 1) ---------------
+
+/**
+ * Gateway health, reusing the OL-4 vocabulary (`docs/specs/production-lifecycle-health.md`).
+ * Deliberately NO `degraded` value — matching the OL-4 decision (no verified
+ * per-signal source from an ingest box). Derived on read from `lastSeenAt`
+ * (compute-on-read); never persisted on the `GatewayDoc`.
+ */
+export type GatewayHealth = 'healthy' | 'down' | 'unknown';
+
+/** Strom FlowState vocabulary (`src/lib/strom.ts`) as reported per gateway input. */
+export type GatewayInputFlowState = 'idle' | 'playing' | 'paused';
+
+export interface GatewayInputStatus {
+  inputId: string;
+  name: string;
+  flowState: GatewayInputFlowState;
+  /** References SourceDoc._id when this input registered a source; null otherwise. */
+  sourceId: string | null;
+  uplink: { bitrateKbps: number; rtt_ms: number; dropped: number } | null;
+}
+
+export interface GatewayDoc {
+  _id: string;                     // "gw-<uuid>"
+  _rev?: string;
+  type: 'gateway';
+  name: string;
+  /** SHA-256 hash of the per-gateway bearer token. Raw token is never persisted (ADR-001). */
+  tokenHash: string;
+  /** ISO 8601 UTC time of the most recent heartbeat/online frame; null until first contact. */
+  lastSeenAt: string | null;
+  // ---- last-heartbeat snapshot (all optional; absent until first heartbeat) ----
+  host?: string;
+  stromVersion?: string;
+  deviceCount?: number;
+  streamingCount?: number;
+  inputs?: GatewayInputStatus[];
   createdAt: string;
   updatedAt: string;
 }
@@ -57,7 +166,18 @@ export interface GraphicDoc {
 
 // --------------- Output types ---------------
 
-export type OutputType = 'mpegtssrt' | 'efpsrt' | 'whep';
+export type OutputType = 'mpegtssrt' | 'efpsrt' | 'whep' | 'recording';
+
+/**
+ * Output health surfaced to single-source downstream consumers (issue #255).
+ *
+ * The enum shape is future-proofed to include `degraded`, but only
+ * `healthy | down | unknown` are ever derived/emitted today — Strom exposes no
+ * per-output liveness signal to populate `degraded` truthfully (spec §2 / OQ-2).
+ * `unknown` is also the absent-value semantics: an omitted `status` is
+ * equivalent to `unknown`.
+ */
+export type OutputStatus = 'healthy' | 'degraded' | 'down' | 'unknown';
 
 export interface OutputDoc {
   _id: string;           // "output-{uuid}"
@@ -65,13 +185,99 @@ export interface OutputDoc {
   type: 'output';
   name: string;
   outputType: OutputType;
-  url?: string;          // SRT URI for mpegtssrt/efpsrt; undefined for whep
+  // SRT URI for mpegtssrt/efpsrt; undefined for whep. A 'recording' output
+  // carries no url — its destination is derived from the MinIO config plus the
+  // production id (spec: vod-recording-minio.md).
+  url?: string;
+  /**
+   * Derived output health (issue #255). Optional; when absent, read as
+   * `unknown`. Computed on read from the owning production's live flow state
+   * rather than persisted (see `src/lib/production-health.ts`).
+   */
+  status?: OutputStatus;
   createdAt: string;
   updatedAt: string;
 }
 
 export interface ProductionOutputAssignment {
   outputId: string;      // references OutputDoc._id
+}
+
+// --------------- Recording (VOD) types ---------------
+
+/**
+ * A recorded VOD asset archived to object storage (epic #5, issue #42).
+ *
+ * Written on production deactivate: after open-live uploads Strom's local
+ * recorder segments to MinIO/S3 (issue #41), one `RecordingDoc` is persisted
+ * per uploaded object so the listing/playback endpoint can enumerate and
+ * presign recordings without round-tripping the bucket on every request. The
+ * listing endpoint still reconciles against the bucket prefix so a crash
+ * between upload and persist does not permanently hide an object (spec §Risks).
+ */
+export interface RecordingDoc {
+  _id: string;            // "recording-<uuid>"
+  _rev?: string;
+  type: 'recording';
+  productionId: string;   // references ProductionDoc._id
+  outputId?: string;      // the 'recording' OutputDoc that produced it, when known
+  bucket: string;
+  key: string;            // object key, e.g. "<productionId>/<segment>.mp4"
+  sizeBytes?: number;
+  durationMs?: number;
+  startedAt: string;      // ISO 8601 — when the recording session began
+  endedAt?: string;       // ISO 8601 — when the segment was finalized/uploaded
+  createdAt: string;
+  updatedAt: string;
+}
+
+// --------------- Guest calling types (issue #299, epic #208) ---------------
+
+/**
+ * A production-scoped, expiring invite for a remote guest to join via a browser
+ * (epic #208, issue #299, `docs/specs/guest-calling-intercom.md` §"Data Model").
+ *
+ * Lives in its own logical collection (`type: 'guest-invite'`). Only the SHA-256
+ * hash of the HMAC-signed invite token is persisted — the raw token is returned
+ * to the operator exactly once on create and NEVER stored, so a database read
+ * can never recover a live token (spec §Risks: "hashed storage … mandatory").
+ */
+export interface GuestInviteDoc {
+  _id: string;              // "guest-invite-<uuid>"
+  _rev?: string;
+  type: 'guest-invite';
+  productionId: string;
+  tokenHash: string;        // SHA-256 hash of the raw token; raw token never persisted
+  label?: string;
+  /** Input the guest will occupy; allocated on join if absent. */
+  mixerInput?: string;
+  expiresAt: string;        // ISO 8601
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Lifecycle state of a joined guest. `invited`/`left`/`error` are transient. */
+export type GuestSessionState = 'joined' | 'previewing' | 'on-air' | 'left' | 'error';
+
+/**
+ * A live guest session created when a guest redeems an invite (epic #208,
+ * issue #299, `docs/specs/guest-calling-intercom.md` §"Data Model").
+ * `previewing`/`on-air` are DERIVED from the vision mixer's PVW/PGM
+ * contribution in a later sub-issue; v1 persists `joined`/`left`/`error`.
+ */
+export interface GuestSessionDoc {
+  _id: string;              // "guest-session-<uuid>"
+  _rev?: string;
+  type: 'guest-session';
+  productionId: string;
+  inviteId: string;
+  mixerInput: string;
+  state: GuestSessionState;
+  /** Reference into intercom-manager, when a talkback line is provisioned (later sub-issue). */
+  intercomLineId?: string;
+  whipSessionId?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 // --------------- Production config types ---------------
@@ -94,6 +300,16 @@ export interface ProductionConfigDoc {
 export interface ProductionSourceAssignment {
   sourceId: string;   // references SourceDoc._id
   mixerInput: string; // references TemplateInputSlot.id (e.g. 'video_in_0')
+  /**
+   * Optional per-guest return feed (mix-minus) for guest-calling (epic #208,
+   * issue #299, `docs/specs/guest-calling-intercom.md` §"Return feed design").
+   * The return belongs to the assignment, not the guest session, so a rejoin on
+   * the same `mixerInput` keeps it and crew-added contributors can have one.
+   * Additive and defaulted-absent; POPULATED BY A LATER SUB-ISSUE (return /
+   * mix-minus wiring) — declared here only so the data model is stable.
+   * v1 accepts `lowLatency: false` only.
+   */
+  returnFeed?: { synced: 'program' | 'program-minus'; lowLatency?: boolean };
 }
 
 /**
@@ -124,7 +340,24 @@ export interface Tally {
   pvw: string | null;
 }
 
-export type ProductionStatus = 'active' | 'inactive' | 'activating';
+/**
+ * Production lifecycle status (issue #255).
+ *
+ * - `inactive`   — not currently running (never started, or reset to a clean
+ *   idle state). Also the status of a failed/aborted activation that never
+ *   reached `active`.
+ * - `activating` — activation in progress (flow created, not yet `playing`).
+ * - `active`     — reached a live broadcast (flow `playing`).
+ * - `ended`      — ran a broadcast and that broadcast has finished (an `active`
+ *   production that then stopped via deactivate, idle auto-deactivate, or
+ *   reconcile finding its Strom flow gone). Distinct from `inactive` so a
+ *   single-source downstream consumer can tell "never started" from "finished".
+ *   Not terminal: re-activating moves back through `activating` → `active`.
+ */
+export type ProductionStatus = 'active' | 'inactive' | 'activating' | 'ended';
+
+/** Machine-readable reason a production reached `ended` (issue #255, optional). */
+export type EndedReason = 'deactivated' | 'idle' | 'flow-lost';
 
 export interface ProductionDoc {
   _id: string;
@@ -149,6 +382,8 @@ export interface ProductionDoc {
   pipConfigs?: PipConfig[];
   /** ID of the running Strom flow (set on activate, cleared on deactivate) */
   stromFlowId?: string;
+  /** ID of the builtin.recorder block — set on activate when a 'recording' output is assigned, cleared on deactivate */
+  recorderBlockId?: string;
   /** WHEP multiview endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */
   whepEndpoint?: string;
   /** WHEP PGM output endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */
@@ -173,10 +408,37 @@ export interface ProductionDoc {
   sourceOffsetBlockIds?: Record<string, string>;
   /** Maps mixerInput → audio time_offset block ID — set on activate, cleared on deactivate */
   sourceAudioOffsetBlockIds?: Record<string, string>;
+  /** Maps mixerInput → media-player (builtin.media_player) block ID for clip sources — set on activate, cleared on deactivate */
+  clipPlayerBlockIds?: Record<string, string>;
+  /**
+   * Per-guest return feed topology (epic #208, issue #300) — set on activate,
+   * cleared on deactivate. Each entry maps a guest's mixerInput to its return aux
+   * bus, its own audio channel (excluded in `program-minus`) and the live mode,
+   * so the WS layer can drive send-level changes and mirror `to_main` into returns.
+   */
+  returnBuses?: Array<{ mixerInput: string; auxBus: number; ownChannel: number; mode: 'program' | 'program-minus' }>;
+  /** Per-guest return WHEP output URLs — set when flow reaches 'playing', cleared on deactivate */
+  returnWhepUrls?: Array<{ mixerInput: string; url: string; endpointId: string }>;
+  /**
+   * Open Intercom production/line grouping id — set when guest calling is
+   * enabled for this production (epic #208, issue #299,
+   * `docs/specs/guest-calling-intercom.md` §"Data Model"). Lets talkback lines
+   * be provisioned / torn down with the production lifecycle. Additive and
+   * defaulted-absent; POPULATED BY A LATER SUB-ISSUE (intercom provisioning) —
+   * declared here only so the data model is stable.
+   */
+  intercomProductionId?: string;
   /** Warnings accumulated when a referenced source/graphic/output was deleted while production was inactive */
   deletionWarnings?: Array<{ type: 'source' | 'graphic' | 'output'; name: string }>;
   /** Set when the idle watchdog auto-deactivated this production; cleared on next activation */
   autoDeactivated?: boolean;
+  /**
+   * Why this production reached `status: 'ended'` (issue #255). Optional,
+   * defaulted-absent; disambiguates the `ended` transition (explicit deactivate
+   * vs. idle auto-deactivate vs. reconcile losing the flow) without a separate
+   * status value. Cleared on next activation.
+   */
+  endedReason?: EndedReason;
   createdAt: string;
   updatedAt: string;
 }

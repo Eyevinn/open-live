@@ -1,16 +1,19 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
-import { getDb, getOutputsDb } from '../db/index.js';
-import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc } from '../db/types.js';
+import { getDb, getOutputsDb, getRecordingsDb } from '../db/index.js';
+import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc, RecordingDoc } from '../db/types.js';
 import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js';
 import { setTally, broadcast, getSubscriberCount } from '../services/tally.service.js';
 import { clearProductionPflState } from '../services/pfl-state.js';
-import { clearPipState, clearAudioState, clearFxState } from '../ws/controller.js';
-import { config } from '../config.js';
+import { clearPipState, clearAudioState, clearFxState, clearClipStateForProduction } from '../ws/controller.js';
+import { config, isRecordingEnabled } from '../config.js';
+import { minioTargetFromConfig, uploadRecordings } from '../lib/recording-uploader.js';
+import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
+import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type OutputStatusEntry } from '../lib/production-health.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -140,6 +143,64 @@ export async function updateProductionDoc(
 }
 
 /**
+ * Returns the id of the first `recording` output assigned to a production, if
+ * any — used to stamp `RecordingDoc.outputId` at deactivate. Best-effort: a DB
+ * read failure returns undefined rather than blocking teardown, since the field
+ * is optional.
+ */
+async function firstRecordingOutputId(
+  doc: ProductionDoc,
+  log: { warn: (obj: unknown, msg: string) => void },
+): Promise<string | undefined> {
+  const assignedIds = (doc.outputAssignments ?? []).map((a) => a.outputId);
+  if (assignedIds.length === 0) return undefined;
+  for (const outputId of assignedIds) {
+    try {
+      const output = await getOutputsDb().get(outputId);
+      if (output.outputType === 'recording') return output._id;
+    } catch (err) {
+      log.warn({ err, outputId }, 'could not resolve output while stamping RecordingDoc');
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Derive the per-output health snapshot for a production from its own state
+ * (issue #255). The signal is flow-level, so every assigned output shares the
+ * same derived status. A production reads as running when it is `active` with a
+ * live `stromFlowId`; the caller passes `stromKnown` (false only when Strom
+ * state genuinely could not be observed — e.g. reconcile lost contact).
+ */
+export function outputSnapshotForProduction(
+  doc: Pick<ProductionDoc, 'status' | 'stromFlowId' | 'outputAssignments'>,
+  opts: { stromKnown?: boolean } = {},
+): OutputStatusEntry[] {
+  const productionActive = doc.status === 'active';
+  return deriveOutputSnapshot({
+    outputIds: (doc.outputAssignments ?? []).map((a) => a.outputId),
+    stromKnown: opts.stromKnown ?? true,
+    productionActive,
+    flowRunning: productionActive && !!doc.stromFlowId,
+  });
+}
+
+/**
+ * Broadcast the `PRODUCTION_STATUS` lifecycle event (spec §3) to the production's
+ * WS subscriber set. Reuses the existing `broadcast()` fan-out (which stamps
+ * `ts`). Emitted whenever the production's `ProductionStatus` changes.
+ */
+export function emitProductionStatus(
+  doc: Pick<ProductionDoc, '_id' | 'status' | 'stromFlowId' | 'outputAssignments'>,
+  opts: { stromKnown?: boolean } = {},
+): void {
+  broadcast(
+    doc._id,
+    buildProductionStatusEvent(doc._id, doc.status, outputSnapshotForProduction(doc, opts)),
+  );
+}
+
+/**
  * Async activation polling loop — runs fire-and-forget after the HTTP
  * response has already been sent.
  *
@@ -207,8 +268,11 @@ async function runActivationFlow(
       ...(mixerBlockId !== undefined && { mixerBlockId }),
       ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
       ...(loudnessMainBlockId !== undefined && { loudnessMainBlockId }),
+      ...(activation.recorderBlockId !== undefined && { recorderBlockId: activation.recorderBlockId }),
       ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
       ...(Object.keys(activation.sourceAudioOffsetBlockIds).length > 0 && { sourceAudioOffsetBlockIds: activation.sourceAudioOffsetBlockIds }),
+      ...(Object.keys(activation.clipPlayerBlockIds).length > 0 && { clipPlayerBlockIds: activation.clipPlayerBlockIds }),
+      ...(activation.returnBuses.length > 0 && { returnBuses: activation.returnBuses }),
     });
 
     // Step 3: Poll until flow reaches 'playing' or we time out
@@ -326,6 +390,18 @@ async function runActivationFlow(
               }))
             : undefined;
 
+        // Per-guest return WHEP endpoints (issue #300). Store the internal Strom
+        // URL + endpointId; the return REST routes derive the guest-scoped,
+        // endpoint-path-checked URL from these (never `/whep-proxy?target=`).
+        const returnWhepUrls: Array<{ mixerInput: string; url: string; endpointId: string }> | undefined =
+          activation.returnWhepEntries.length > 0
+            ? activation.returnWhepEntries.map(({ mixerInput, endpointId }) => ({
+                mixerInput,
+                url: `${config.stromUrl}/whep/${endpointId}`,
+                endpointId,
+              }))
+            : undefined;
+
         await updateProductionDoc(productionId, {
           status: 'active',
           whepEndpoint,
@@ -333,14 +409,25 @@ async function runActivationFlow(
           whipEndpoints: whipEndpoints.length > 0 ? whipEndpoints : undefined,
           srtOutputUri: undefined,
           whepOutputUrls: whepOutputUrls && whepOutputUrls.length > 0 ? whepOutputUrls : undefined,
+          ...(returnWhepUrls && returnWhepUrls.length > 0 && { returnWhepUrls }),
+          ...(activation.returnBuses.length > 0 && { returnBuses: activation.returnBuses }),
           tally: initialTally,
           ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
           ...(loudnessMainBlockId !== undefined && { loudnessMainBlockId }),
           ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
           ...(Object.keys(activation.sourceAudioOffsetBlockIds).length > 0 && { sourceAudioOffsetBlockIds: activation.sourceAudioOffsetBlockIds }),
+          ...(Object.keys(activation.clipPlayerBlockIds).length > 0 && { clipPlayerBlockIds: activation.clipPlayerBlockIds }),
         });
 
         notifyProductionActivated(productionId);
+        // Emit the PRODUCTION_STATUS lifecycle event for the active transition
+        // (spec §3). Flow is playing, so all assigned outputs derive as healthy.
+        emitProductionStatus({
+          _id: productionId,
+          status: 'active',
+          stromFlowId,
+          outputAssignments: doc.outputAssignments,
+        });
         log.info({ productionId, stromFlowId, whepEndpoint, initialTally, audioMixerBlockId }, 'Production activated — flow playing');
         return;
       }
@@ -603,7 +690,8 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
 
       // Guard: reject if any non-WHEP output is already active in another production
       if (doc.outputAssignments && doc.outputAssignments.length > 0) {
-        const otherActiveProds = await getDb().find({
+        // findTrusted: literal selector written here, no request data (#257)
+        const otherActiveProds = await getDb().findTrusted({
           selector: { type: 'production', status: { $in: ['active', 'activating'] } },
           fields: ['_id', 'name', 'outputAssignments'],
           limit: 200,
@@ -637,16 +725,20 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       // does not leave the production stuck mid-activation.
       const publicBaseUrl = resolvePublicBaseUrl(req);
 
-      // Transition to 'activating' immediately and respond; clear any deletion warnings
+      // Transition to 'activating' immediately and respond; clear any deletion
+      // warnings and any prior ended/auto-deactivated markers (cleared on next
+      // activation, spec §Data Model).
       const activatingDoc: ProductionDoc = {
         ...doc,
         status: 'activating',
         deletionWarnings: undefined,
         autoDeactivated: undefined,
+        endedReason: undefined,
         updatedAt: new Date().toISOString(),
       };
       const insertResponse = await getDb().insert(activatingDoc);
       notifyProductionActivated(doc._id);
+      emitProductionStatus(activatingDoc);
 
       // Set up AbortController so deactivate can cancel the polling loop
       const abortController = new AbortController();
@@ -693,6 +785,9 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       clearAudioState(doc._id);
       clearPipState(doc._id);
       clearFxState(doc._id);
+      // Stop any clip completion-poll timers and wipe the in-memory clip-state
+      // registry — live-only clip state must not survive deactivation (#278).
+      clearClipStateForProduction(doc._id);
       // Broadcast group-state reset so all connected clients clear their ephemeral
       // group assignments — these are live-only and must not survive deactivation.
       broadcast(doc._id, { type: 'GRP_STATE_RESET' });
@@ -700,28 +795,105 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       if (doc.stromFlowId) {
         const stromToken = await getStromToken(config.stromToken).catch((err) => { req.log.error({ errMsg: err instanceof Error ? err.message : String(err) }, "SAT exchange failed — proceeding without auth"); return undefined; });
         const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
+
+        // VOD recording (issue #41): when a recorder block is active, finalise
+        // the current segment (recorder.splitNow) then upload Strom's local
+        // recordings to MinIO — Strom's recorder has no native S3 sink, so
+        // open-live pulls the segments and pushes them to object storage.
+        // Best-effort: a failed upload must not block deactivation/teardown.
+        if (doc.recorderBlockId && isRecordingEnabled()) {
+          const target = minioTargetFromConfig();
+          if (target) {
+            try {
+              await strom.recorder.splitNow(doc.stromFlowId, doc.recorderBlockId).catch(() => undefined);
+              const uploadRes = await uploadRecordings({
+                strom,
+                stromUrl: config.stromUrl,
+                stromToken,
+                outputDir: `recordings/${doc._id}`,
+                productionId: doc._id,
+                target,
+              });
+              // Persist one RecordingDoc per uploaded object so #42's listing/
+              // playback endpoint can enumerate and presign recordings without
+              // round-tripping the bucket. Best-effort: a failed persist must not
+              // block teardown, mirroring the upload's non-fatal contract.
+              const recordingOutputId = await firstRecordingOutputId(doc, req.log);
+              const finalizedAt = new Date().toISOString();
+              for (const seg of uploadRes.uploaded) {
+                try {
+                  const recId = `recording-${randomUUID()}`;
+                  const recDoc: RecordingDoc = {
+                    _id: recId,
+                    type: 'recording',
+                    productionId: doc._id,
+                    ...(recordingOutputId ? { outputId: recordingOutputId } : {}),
+                    bucket: target.bucket,
+                    key: seg.key,
+                    sizeBytes: seg.sizeBytes,
+                    startedAt: doc.updatedAt,
+                    endedAt: finalizedAt,
+                    createdAt: finalizedAt,
+                    updatedAt: finalizedAt,
+                  };
+                  await getRecordingsDb().insert(recDoc);
+                } catch (persistErr) {
+                  req.log.error({ persistErr, productionId: doc._id, key: seg.key }, 'RecordingDoc persist failed — object uploaded but unlisted');
+                }
+              }
+              req.log.info(
+                { productionId: doc._id, uploaded: uploadRes.uploaded.length, failed: uploadRes.failed.length },
+                'VOD recordings uploaded to object storage',
+              );
+            } catch (err) {
+              req.log.error({ err, productionId: doc._id }, 'VOD recording upload failed — continuing deactivation');
+            }
+          }
+        }
+
         await deactivateStromFlow(doc.stromFlowId, strom);
       }
 
+      // Tear down the Open Intercom talkback grouping (all its lines) with the
+      // production lifecycle (issue #302). Best-effort: a failed teardown must not
+      // block deactivation, mirroring the Strom/recording teardown contract.
+      if (doc.intercomProductionId && isIntercomEnabled()) {
+        await teardownIntercomProduction(doc.intercomProductionId).catch((err) => {
+          req.log.warn({ err, productionId: doc._id }, 'intercom teardown failed — continuing deactivation');
+        });
+      }
+
+      // Transition rule (spec §1): a production that was `active` (reached a live
+      // broadcast) and is now explicitly deactivated becomes `ended`; one that
+      // never reached `active` (still `activating`) becomes `inactive` — it never
+      // broadcast, so there is nothing to "end".
+      const nextStatus = stoppedStatus(doc.status);
       const updated: ProductionDoc = {
         ...doc,
-        status: 'inactive',
+        status: nextStatus,
+        endedReason: nextStatus === 'ended' ? 'deactivated' : undefined,
         stromFlowId: undefined,
         mixerBlockId: undefined,
         audioMixerBlockId: undefined,
         loudnessMainBlockId: undefined,
+        recorderBlockId: undefined,
         sourceOffsetBlockIds: undefined,
         sourceAudioOffsetBlockIds: undefined,
+        clipPlayerBlockIds: undefined,
         whepEndpoint: undefined,
         pgmWhepEndpoint: undefined,
         whipEndpoints: undefined,
         srtOutputUri: undefined,
         whepOutputUrls: undefined,
+        returnBuses: undefined,
+        returnWhepUrls: undefined,
+        intercomProductionId: undefined,
         tally: { pgm: null, pvw: null },
         updatedAt: new Date().toISOString(),
       };
       const response = await getDb().insert(updated);
       notifyProductionDeactivated(doc._id);
+      emitProductionStatus(updated);
       return reply.send({ id: updated._id, name: updated.name, status: updated.status, _rev: response.rev });
     } catch (err) {
       req.log.error({ err }, 'Deactivation failed');

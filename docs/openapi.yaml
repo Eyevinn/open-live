@@ -30,7 +30,91 @@ components:
 
     StreamType:
       type: string
-      enum: [srt, efp, whip, html]
+      enum: [srt, efp, whip, html, clip]
+      description: >-
+        Source stream kind. `clip` (epic #206) is a cue-then-play file/story
+        source whose typed `ClipReference` is stored serialized in the source's
+        `address` field. Clients must ignore unknown enum values (forward-compat).
+
+    ClipReference:
+      description: >-
+        Typed, versioned reference for a `clip` source (epic #206, issue #275).
+        A discriminated union on `type`; stored serialized as a JSON string in
+        `SourceDoc.address`. v1 implements `url` and `s3`; `tams` is reserved and
+        rejected at runtime (501). Any variant may carry an optional `timerange`
+        — nothing assumes a fixed media length.
+      oneOf:
+        - $ref: '#/components/schemas/ClipReferenceUrl'
+        - $ref: '#/components/schemas/ClipReferenceS3'
+        - $ref: '#/components/schemas/ClipReferenceTams'
+      discriminator:
+        propertyName: type
+
+    ClipReferenceUrl:
+      type: object
+      required: [type, url]
+      properties:
+        type:
+          type: string
+          enum: [url]
+        url:
+          type: string
+          description: Any fetchable file / object-storage URL (a presigned URL reduces to this).
+        timerange:
+          type: string
+          description: Optional; no fixed-length assumption.
+
+    ClipReferenceS3:
+      type: object
+      required: [type, bucket, key]
+      properties:
+        type:
+          type: string
+          enum: [s3]
+        bucket:
+          type: string
+        key:
+          type: string
+        timerange:
+          type: string
+
+    ClipReferenceTams:
+      type: object
+      description: BBC Time-Addressable Media Store. Reserved — rejected (501) in v1.
+      required: [type, store, flowId, timerange]
+      properties:
+        type:
+          type: string
+          enum: [tams]
+        store:
+          type: string
+        flowId:
+          type: string
+        timerange:
+          type: string
+
+    ClipState:
+      type: object
+      description: >-
+        Live clip playback state for a `clip` source assigned to a mixer input
+        (epic #206, issues #277/#278). CamelCased mirror of Strom's media-player
+        state plus the cue/play/completed clip state machine.
+      required: [mixerInput, state]
+      properties:
+        mixerInput:
+          type: string
+          example: video_in_0
+        state:
+          type: string
+          enum: [idle, cued, playing, paused, stopped, completed, error]
+        clipId:
+          type: string
+        positionMs:
+          type: integer
+        durationMs:
+          type: integer
+        error:
+          type: string
 
     SourceStatus:
       type: string
@@ -38,11 +122,32 @@ components:
 
     OutputType:
       type: string
-      enum: [mpegtssrt, efpsrt, whep]
+      enum: [mpegtssrt, efpsrt, whep, recording]
+      description: >
+        Output kind. 'recording' archives the programme to MinIO/S3 as a VOD via
+        Strom's builtin recorder (uploaded from local segments post-deactivate);
+        it is only accepted when MinIO/S3 is configured, otherwise creating a
+        recording output returns 400.
+
+    OutputStatus:
+      type: string
+      description: >-
+        Derived output health (issue #255). `healthy` = the owning production is
+        active with a running flow; `down` = not running; `unknown` = health
+        could not be determined (or field absent, which is equivalent to
+        `unknown`). `degraded` is reserved in the enum for a future per-output
+        signal and is never emitted today. Clients must ignore unknown enum
+        values (forward-compat).
+      enum: [healthy, degraded, down, unknown]
 
     ProductionStatus:
       type: string
-      enum: [active, inactive, activating]
+      description: >-
+        Production lifecycle status. `ended` (issue #255) means the production
+        ran a broadcast that has finished, distinct from `inactive` (never
+        started / clean idle). Clients must ignore unknown enum values
+        (forward-compat).
+      enum: [active, inactive, activating, ended]
 
     MacroActionType:
       type: string
@@ -178,12 +283,100 @@ components:
           $ref: '#/components/schemas/OutputType'
         url:
           type: string
+          description: >-
+            Operator-authored SRT bind/listen URI (e.g. srt://:43524?mode=listener).
+            Undefined for whep outputs. Round-tripped by POST/PATCH.
+        connect:
+          $ref: '#/components/schemas/SrtConnect'
+        status:
+          allOf:
+            - $ref: '#/components/schemas/OutputStatus'
+          description: >-
+            Derived output health (issue #255). Read-only; computed on read from
+            the owning production's live flow state, not persisted. Optional —
+            an absent value is equivalent to `unknown`.
         createdAt:
           type: string
           format: date-time
         updatedAt:
           type: string
           format: date-time
+
+    RecordingAsset:
+      type: object
+      description: >-
+        A recorded VOD asset archived to MinIO/S3 (epic #5, issue #42). One asset
+        is persisted per uploaded object when a production with a `recording`
+        output deactivates. `playbackUrl` is a time-boxed presigned GET URL
+        (TTL = RECORDING_PRESIGN_TTL_S) so a private bucket's recordings can be
+        played without exposing storage credentials; it is omitted when a
+        presigned URL cannot be produced (e.g. bucket reconfigured).
+      required: [id, productionId, bucket, key, startedAt, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+        productionId:
+          type: string
+        outputId:
+          type: string
+          description: The 'recording' output that produced this asset, when known.
+        bucket:
+          type: string
+        key:
+          type: string
+          description: Object key within the bucket.
+        sizeBytes:
+          type: integer
+        durationMs:
+          type: integer
+        startedAt:
+          type: string
+          format: date-time
+        endedAt:
+          type: string
+          format: date-time
+        playbackUrl:
+          type: string
+          description: Presigned GET URL for playback. Omitted when unavailable.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    SrtConnect:
+      type: object
+      description: >-
+        Read-only, server-derived dial-in address an external SRT caller uses to
+        reach this output. Present only on mpegtssrt/efpsrt outputs that have a
+        well-formed bind URL. `uri`/`host` are null (with a `reason`) when the
+        Strom SRT host cannot be resolved server-side; `port` is always present.
+      required: [uri, host, port, mode, source]
+      properties:
+        uri:
+          type: string
+          nullable: true
+          description: Assembled srt://host:port?mode=… dial-in string, or null when host is unresolved.
+        host:
+          type: string
+          nullable: true
+          description: Resolved SRT host external callers dial, or null when unresolved.
+        port:
+          type: integer
+          description: SRT port parsed from the authored bind URI.
+        mode:
+          type: string
+          enum: [caller, listener]
+          description: The SRT mode the EXTERNAL side should use (inverse of the authored mode).
+        source:
+          type: string
+          enum: [authored-host, srt-public-host, strom-host, unknown]
+          description: Provenance of the resolved host.
+        reason:
+          type: string
+          enum: [srt-host-not-configured, srt-host-not-loopback-reachable, strom-url-not-parseable]
+          description: Present only when `uri` is null — why the host could not be resolved.
 
     OutputInput:
       type: object
@@ -484,6 +677,167 @@ components:
           type: string
         statusCode:
           type: integer
+
+    # ── Guest calling (epic #208, issue #299) ─────────────────────────────────────
+
+    GuestInviteCreate:
+      type: object
+      properties:
+        label:
+          type: string
+          minLength: 1
+          maxLength: 256
+        expiresInS:
+          type: integer
+          minimum: 60
+          maximum: 604800
+          description: Override the default invite TTL (GUEST_INVITE_TTL_S). Bounded so invites stay short-lived.
+        mixerInput:
+          type: string
+          description: Optional pre-allocated input the guest will occupy (e.g. `video_in_1`); allocated on join if absent.
+
+    GuestInviteCreated:
+      type: object
+      required: [id, productionId, joinUrl, token, expiresAt]
+      properties:
+        id:
+          type: string
+        productionId:
+          type: string
+        joinUrl:
+          type: string
+        token:
+          type: string
+          description: The raw HMAC-signed invite token. Returned exactly once and NEVER stored — only its SHA-256 hash is persisted.
+        expiresAt:
+          type: string
+          format: date-time
+        mixerInput:
+          type: string
+
+    GuestInvite:
+      type: object
+      required: [id, productionId, expiresAt, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+        productionId:
+          type: string
+        label:
+          type: string
+        mixerInput:
+          type: string
+        expiresAt:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    GuestSession:
+      type: object
+      required: [id, productionId, inviteId, mixerInput, state, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+        productionId:
+          type: string
+        inviteId:
+          type: string
+        mixerInput:
+          type: string
+        state:
+          type: string
+          enum: [joined, previewing, on-air, left, error]
+        intercomLineId:
+          type: string
+        whipSessionId:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    GuestReturnMode:
+      type: object
+      required: [key, label, synced, delivery]
+      properties:
+        key:
+          type: string
+          enum: [program, program-minus, low-latency-minus]
+        label:
+          type: string
+        synced:
+          type: boolean
+        excludesMixerInput:
+          type: string
+        delivery:
+          type: object
+
+    ReturnModeBody:
+      type: object
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [program, program-minus, low-latency-minus]
+          description: >-
+            `program` opens the guest's own send; `program-minus` (default) closes it
+            for mix-minus. `low-latency-minus` is a client-side feed choice not built in
+            v1 and returns 400.
+
+    ReturnModeResult:
+      type: object
+      required: [mixerInput, mode]
+      properties:
+        mixerInput:
+          type: string
+        mode:
+          type: string
+          enum: [program, program-minus]
+
+    GuestJoinResult:
+      type: object
+      required: [guestId, whipUrl, feeds, modes, defaultMode, returnMode]
+      properties:
+        guestId:
+          type: string
+        whipUrl:
+          type: string
+          description: WHIP publish URL on the EXISTING `/api/v1/productions/{id}/whip/{mixerInput}` contract.
+        feeds:
+          type: array
+          description: >-
+            Per-guest return feeds. In v1 this carries the `picture` feed (program
+            video over WHEP with a single mix-minus audio track) when the production
+            is active and a return aux bus exists for the guest's input; otherwise empty.
+          items:
+            type: object
+            required: [id, url, video]
+            properties:
+              id:
+                type: string
+              url:
+                type: string
+              video:
+                type: boolean
+        modes:
+          type: array
+          items:
+            $ref: '#/components/schemas/GuestReturnMode'
+        defaultMode:
+          type: string
+        returnMode:
+          type: string
+          enum: [program, program-minus]
+        intercomLine:
+          type: object
+          description: Present only when an Open Intercom talkback line is provisioned (later sub-issue).
 
 paths:
   # ── Health ──────────────────────────────────────────────────────────────────
@@ -970,6 +1324,93 @@ paths:
         '404':
           description: Not found
 
+  # ── Recordings (VOD) ─────────────────────────────────────────────────────────
+
+  /api/v1/productions/{id}/recordings:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: List a production's recordings
+      operationId: listProductionRecordings
+      tags: [Recordings]
+      responses:
+        '200':
+          description: Array of recording assets, each with a presigned playbackUrl
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RecordingAsset'
+        '404':
+          description: Production not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Object storage or database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/recordings:
+    get:
+      summary: List recordings across all productions
+      operationId: listRecordings
+      tags: [Recordings]
+      responses:
+        '200':
+          description: Array of recording assets
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RecordingAsset'
+        '503':
+          description: Object storage or database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/recordings/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Get a single recording
+      operationId: getRecording
+      tags: [Recordings]
+      responses:
+        '200':
+          description: Recording asset
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordingAsset'
+        '404':
+          description: Recording not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Object storage unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   # ── Production Configs ───────────────────────────────────────────────────────
 
   /api/v1/production-configs:
@@ -1272,6 +1713,168 @@ paths:
           description: Removed
         '404':
           description: Not found
+
+  # Production — Clip cue/play control (epic #206, issue #277)
+
+  /api/v1/productions/{id}/clips/{mixerInput}/cue:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^video_in_\d{1,2}$'
+        description: Mixer input the clip source is assigned to, e.g. `video_in_0`
+    post:
+      summary: Cue a clip into the ready state
+      description: >-
+        Loads the clip's resolved playlist entry into the media-player block and
+        seeks to index 0, leaving it paused/ready. Maps to Strom
+        `player.setPlaylist({files:[clip]}) + player.goto({index:0})`.
+      operationId: cueClip
+      tags: [Productions]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                clipId:
+                  type: string
+                  minLength: 1
+                  maxLength: 256
+      responses:
+        '200':
+          description: Clip cued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClipState'
+        '400':
+          description: Invalid body or mixerInput
+        '401':
+          description: Missing/invalid API key (when configured)
+        '404':
+          description: Production or clip source not found
+        '409':
+          description: Production is not activated
+        '502':
+          description: Strom returned an error
+        '503':
+          description: Strom is unreachable
+
+  /api/v1/productions/{id}/clips/{mixerInput}/play:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^video_in_\d{1,2}$'
+    post:
+      summary: Play the currently cued clip
+      description: Maps to Strom `player.control({action:'play'})`.
+      operationId: playClip
+      tags: [Productions]
+      responses:
+        '200':
+          description: Clip playing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClipState'
+        '401':
+          description: Missing/invalid API key (when configured)
+        '404':
+          description: Production or clip source not found
+        '409':
+          description: Production is not activated, or no clip cued
+        '502':
+          description: Strom returned an error
+        '503':
+          description: Strom is unreachable
+
+  /api/v1/productions/{id}/clips/{mixerInput}/stop:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^video_in_\d{1,2}$'
+    post:
+      summary: Stop clip playback
+      description: Maps to Strom `player.control({action:'stop'})`.
+      operationId: stopClip
+      tags: [Productions]
+      responses:
+        '200':
+          description: Clip stopped
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClipState'
+        '401':
+          description: Missing/invalid API key (when configured)
+        '404':
+          description: Production or clip source not found
+        '409':
+          description: Production is not activated
+        '502':
+          description: Strom returned an error
+        '503':
+          description: Strom is unreachable
+
+  /api/v1/productions/{id}/clips/{mixerInput}/state:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^video_in_\d{1,2}$'
+    get:
+      summary: Get current clip state
+      operationId: getClipState
+      tags: [Productions]
+      responses:
+        '200':
+          description: Current clip state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClipState'
+        '401':
+          description: Missing/invalid API key (when configured)
+        '404':
+          description: Production or clip source not found
+        '409':
+          description: Production is not activated
+        '502':
+          description: Strom returned an error
+        '503':
+          description: Strom is unreachable
 
   # Production — Graphic assignments
 
@@ -1844,3 +2447,458 @@ paths:
       responses:
         '204':
           description: Session closed
+
+  # ── Guest calling (epic #208, issue #299) ─────────────────────────────────────
+
+  /api/v1/productions/{id}/guests/invites:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Create a production-scoped guest invite
+      description: |
+        Mints an HMAC-signed, expiring invite token. The raw token is returned
+        exactly once; only its SHA-256 hash is persisted. Requires the shared
+        API key. Returns 503 when `GUEST_INVITE_SECRET` is unset (feature disabled).
+      operationId: createGuestInvite
+      tags: [Guests]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GuestInviteCreate'
+      responses:
+        '201':
+          description: Invite created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GuestInviteCreated'
+        '400':
+          description: Invalid body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Production not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Guest calling disabled or database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    get:
+      summary: List guest invites for a production
+      operationId: listGuestInvites
+      tags: [Guests]
+      responses:
+        '200':
+          description: Invites
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/GuestInvite'
+        '404':
+          description: Production not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Guest calling disabled or database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/productions/{id}/guests/invites/{inviteId}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: inviteId
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      summary: Revoke a guest invite
+      operationId: deleteGuestInvite
+      tags: [Guests]
+      responses:
+        '204':
+          description: Invite revoked
+        '403':
+          description: Invite belongs to a different production
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Invite not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/guests/{inviteId}/join:
+    parameters:
+      - name: inviteId
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Guest join (token-authed)
+      description: |
+        Called by the guest browser via the invite link. Authenticates with the
+        per-invite HMAC token in `Authorization: Bearer <token>` — NOT the shared
+        API key. `whipUrl` reuses the existing WHIP proxy contract.
+      operationId: guestJoin
+      tags: [Guests]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Join accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GuestJoinResult'
+        '401':
+          description: Missing, invalid, or revoked invite token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Production not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Invite expired or capacity reached
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Guest calling disabled or database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/guests/{inviteId}/session:
+    parameters:
+      - name: inviteId
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      summary: Guest leaves (token-authed)
+      operationId: guestLeave
+      tags: [Guests]
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Session ended
+        '401':
+          description: Missing, invalid, or revoked invite token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Guest calling disabled or database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/guests/{inviteId}/session/return:
+    parameters:
+      - name: inviteId
+        in: path
+        required: true
+        schema:
+          type: string
+    put:
+      summary: Guest switches their own return mode (token-authed)
+      description: >-
+        Switches the guest's return feed between `program` and `program-minus`
+        (mix-minus). The mixerInput is pinned server-side to the invite's scoped
+        input. `low-latency-minus` is not built in v1 and returns 400.
+      operationId: guestSetReturnMode
+      tags: [Guests]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReturnModeBody'
+      responses:
+        '200':
+          description: Return mode applied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReturnModeResult'
+        '400':
+          description: Invalid or unsupported mode (`low-latency-minus`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing, invalid, or revoked invite token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No return on that input, or production not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Guest calling disabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/productions/{id}/returns/{mixerInput}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Get the crew/guest join-shape view of a return on an input
+      operationId: getReturn
+      tags: [Returns]
+      responses:
+        '200':
+          description: Return join shape (publish input, modes, current mode, feeds)
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: Production not found, or no assignment on that input
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/productions/{id}/returns/{mixerInput}/mode:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+    put:
+      summary: Crew sets the return mode for an input (persist + apply live + broadcast RETURN_STATE)
+      operationId: setReturnMode
+      tags: [Returns]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReturnModeBody'
+      responses:
+        '200':
+          description: Return mode applied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReturnModeResult'
+        '400':
+          description: Invalid or unsupported mode (`low-latency-minus`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No return on that input
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/productions/{id}/returns/{mixerInput}/picture/whep:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Establish the return picture WHEP session (server-scoped signaling proxy)
+      description: >-
+        Proxies a WHEP offer to the Strom return output derived SERVER-SIDE from the
+        production's persisted `returnWhepUrls` (scoped to the input). Returns a
+        `Location` header rewritten to a session subpath under this route so a guest
+        can only tear down their own session.
+      operationId: startReturnPictureWhep
+      tags: [Returns]
+      requestBody:
+        required: true
+        content:
+          application/sdp:
+            schema:
+              type: string
+      responses:
+        '201':
+          description: WHEP answer SDP
+          content:
+            application/sdp:
+              schema:
+                type: string
+        '404':
+          description: Production not found, or feed unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Production inactive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Upstream Strom unreachable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/productions/{id}/returns/{mixerInput}/picture/whep/{sessionId}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: sessionId
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      summary: Tear down the return picture WHEP session
+      operationId: stopReturnPictureWhep
+      tags: [Returns]
+      responses:
+        '204':
+          description: Session torn down (idempotent)
+
+  /api/v1/productions/{id}/guests:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: List live guest sessions for a production
+      operationId: listGuestSessions
+      tags: [Guests]
+      responses:
+        '200':
+          description: Guest sessions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/GuestSession'
+        '404':
+          description: Production not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Guest calling disabled or database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/productions/{id}/guests/{guestId}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: guestId
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      summary: Kick a guest
+      description: Marks the guest session `left`. Take-to-air/preview reuse the existing vision-mixer `SET_PVW`/`TAKE`; no new switching commands are introduced.
+      operationId: kickGuest
+      tags: [Guests]
+      responses:
+        '204':
+          description: Guest kicked
+        '403':
+          description: Guest is in a different production
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Guest not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'

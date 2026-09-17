@@ -1,16 +1,33 @@
 import type { FastifyPluginAsync } from 'fastify';
 import type { WebSocket } from '@fastify/websocket';
 import { z } from 'zod';
-import { getDb, getSourcesDb } from '../db/index.js';
+import { getDb, getSourcesDb, getGuestSessionsDb, getGuestInvitesDb } from '../db/index.js';
 import { updateProductionDoc } from '../routes/productions.js';
-import type { ProductionDoc } from '../db/types.js';
-import { getTally, setTally, subscribe, unsubscribe, broadcast } from '../services/tally.service.js';
+import type { ProductionDoc, ClipState, SourceDoc, GuestSessionState } from '../db/types.js';
+import { getTally, setTally, subscribe, unsubscribe, broadcast, nextSeq, currentSeq } from '../services/tally.service.js';
+import {
+  cueClip, playClip, stopClip, pauseClip, seekClip,
+  resolveClipSource, resolveClipTarget,
+  ClipNotFoundError, ClipNotActivatedError, ClipNotCuedError,
+} from '../lib/clip-control.js';
+import { getClipStateEntry, getAllClipStates, setClipStateEntry, clearClipState } from '../services/clip-state.service.js';
+import { CONTRACT_VERSION, computeTallyContributions } from '../services/automation-contract.js';
 import { startMeterRelay, stopMeterRelay } from '../services/meter-relay.js';
 import { StromClient, StromClientError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms, type VideoEffect, type EffectTarget, type SetVideoEffectRequest } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
+import { graphicUrl } from '../lib/url-validation.js';
+import { decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
+import { loadAudioChannels } from '../lib/audio-channels.js';
+import {
+  mirrorToMainForPersistedReturns,
+  returnSendMatrix,
+  type PersistedReturnBus,
+  type ReturnMode,
+} from '../lib/return-feeds.js';
 import { config } from '../config.js';
-import { notifySubscriberJoin } from '../services/idle-watchdog.js';
+import { notifySubscriberJoin, resetIdleTimer } from '../services/idle-watchdog.js';
 import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
+import { buildProductionStatusEvent, deriveOutputSnapshot } from '../lib/production-health.js';
 
 function stromErrorMessage(err: unknown): string {
   if (err instanceof StromClientError) return err.message;
@@ -36,7 +53,7 @@ const RATE_LIMIT_EXPENSIVE_MAX = 5;
 const RATE_LIMIT_WINDOW_MS = 1000;
 
 /** Message types whose processing is expensive enough to warrant a tighter cap. */
-const EXPENSIVE_MESSAGE_TYPES = new Set(['MACRO_EXEC', 'GO_LIVE', 'CUT_STREAM']);
+const EXPENSIVE_MESSAGE_TYPES = new Set(['MACRO_EXEC', 'GO_LIVE', 'CUT_STREAM', 'HTML_SOURCE_EVENT']);
 
 /** Per-connection sliding-window timestamps. Lives on the connection ctx so it
  * is garbage-collected when the socket closes (no global registry to leak). */
@@ -64,6 +81,36 @@ function checkRateLimit(state: RateLimitState, isExpensive: boolean, now: number
 
   state.general.push(now);
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Command acknowledgement helpers (automation contract §2)
+// ---------------------------------------------------------------------------
+//
+// Two-phase ACK: clients attach an optional `cmdId` to any inbound command.
+// The server sends:
+//   ACK { cmdId, phase: 'accepted', seq, ts }  — passed validation + dispatched
+//   ACK { cmdId, phase: 'executed', seq, ts }  — Strom call returned / state persisted
+//   NACK { cmdId, error, seq, ts }             — rejected (validation or runtime error)
+//
+// Clients that omit `cmdId` see the existing behaviour unchanged.
+// ACK/NACK events go only to the originating socket, not broadcast to all subscribers.
+
+/**
+ * Send an ACK frame directly to the originating socket.
+ * `seq` and `ts` are stamped here so they are consistent with the broadcast envelope.
+ */
+function sendAck(ws: WebSocket, productionId: string, cmdId: string, phase: 'accepted' | 'executed'): void {
+  const seq = nextSeq(productionId);
+  ws.send(JSON.stringify({ type: 'ACK', cmdId, phase, seq, ts: new Date().toISOString() }));
+}
+
+/**
+ * Send a NACK frame directly to the originating socket.
+ */
+function sendNack(ws: WebSocket, productionId: string, cmdId: string, error: string): void {
+  const seq = nextSeq(productionId);
+  ws.send(JSON.stringify({ type: 'NACK', cmdId, error, seq, ts: new Date().toISOString() }));
 }
 
 // Mirror of MAX_DB_WRITE_RETRIES in routes/productions.ts — the number of
@@ -128,35 +175,50 @@ async function persistMixerMutation(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Optional client-supplied command correlation id (automation contract §2).
+// Clients that want two-phase ACK (accepted → executed) attach a cmdId to
+// any inbound command. The server echoes it in ACK/NACK events. Additive /
+// backward-compatible: clients that do not send cmdId see unchanged behaviour.
+// ---------------------------------------------------------------------------
+
 type InboundMessage =
-  | { type: 'CUT'; mixerInput: string; afvRampUpMs?: number; afvRampDownMs?: number }
-  | { type: 'TRANSITION'; mixerInput: string; transitionType: string; durationMs?: number; afvRampUpMs?: number; afvRampDownMs?: number }
-  | { type: 'TAKE'; pip?: number; transitionType?: string; durationMs?: number; afvRampUpMs?: number; afvRampDownMs?: number }
-  | { type: 'SET_PVW'; mixerInput: string }
-  | { type: 'FTB'; active?: boolean; durationMs?: number }
-  | { type: 'SET_OVL'; alpha: number }
-  | { type: 'GO_LIVE' }
-  | { type: 'CUT_STREAM' }
-  | { type: 'GRAPHIC_ON'; overlayId: string }
-  | { type: 'GRAPHIC_OFF'; overlayId: string }
-  | { type: 'DSK_TOGGLE'; layer: number; visible?: boolean }
-  | { type: 'MACRO_EXEC'; macroId: string }
-  | { type: 'AUDIO_SET'; elementId: string; property: 'volume' | 'mute'; value: unknown; ramp_ms?: number }
-  | { type: 'AFV_SET'; mixerInput: string; enabled: boolean }
-  | { type: 'AFV_RAMP_SET'; rampUpMs: number; rampDownMs: number }
-  | { type: 'PFL_SET'; elementId: string; enabled: boolean; volume?: number }
-  | { type: 'AFL_SET'; elementId: string; enabled: boolean }
-  | { type: 'AUX_SEND_SET'; elementId: string; auxBus: number; level: number; enabled: boolean; pre?: boolean }
-  | { type: 'AUX_MASTER_SET'; auxBus: number; volume: number; muted: boolean }
-  | { type: 'GRP_SEND_SET'; elementId: string; grpBus: number; level: number; enabled: boolean }
-  | { type: 'GRP_MASTER_SET'; grpBus: number; volume: number; muted: boolean }
-  | { type: 'MONITOR_SET'; volume: number; muted: boolean }
-  | { type: 'SOURCE_OFFSET_SET'; mixerInput: string; offsetMs: number }
-  | { type: 'SOURCE_AUDIO_OFFSET_SET'; mixerInput: string; offsetMs: number }
-  | { type: 'LOUDNESS_RESET' }
-  | { type: 'SELECT_PVW_PIP'; pip: number }
-  | { type: 'SET_PIP'; pip: number; bg: number | null; zones: PipZone[]; transforms?: PipTransforms }
-  | { type: 'SET_EFFECT'; target: EffectTarget; effect: VideoEffect };
+  | { type: 'CUT'; mixerInput: string; afvRampUpMs?: number; afvRampDownMs?: number; cmdId?: string }
+  | { type: 'TRANSITION'; mixerInput: string; transitionType: string; durationMs?: number; afvRampUpMs?: number; afvRampDownMs?: number; cmdId?: string }
+  | { type: 'TAKE'; pip?: number; transitionType?: string; durationMs?: number; afvRampUpMs?: number; afvRampDownMs?: number; cmdId?: string }
+  | { type: 'SET_PVW'; mixerInput: string; cmdId?: string }
+  | { type: 'FTB'; active?: boolean; durationMs?: number; cmdId?: string }
+  | { type: 'SET_OVL'; alpha: number; cmdId?: string }
+  | { type: 'GO_LIVE'; cmdId?: string }
+  | { type: 'CUT_STREAM'; cmdId?: string }
+  | { type: 'GRAPHIC_ON'; overlayId: string; cmdId?: string }
+  | { type: 'GRAPHIC_OFF'; overlayId: string; cmdId?: string }
+  | { type: 'DSK_TOGGLE'; layer: number; visible?: boolean; cmdId?: string }
+  | { type: 'MACRO_EXEC'; macroId: string; cmdId?: string }
+  | { type: 'AUDIO_SET'; elementId: string; property: 'volume' | 'mute'; value: unknown; ramp_ms?: number; cmdId?: string }
+  | { type: 'AFV_SET'; mixerInput: string; enabled: boolean; cmdId?: string }
+  | { type: 'AFV_RAMP_SET'; rampUpMs: number; rampDownMs: number; cmdId?: string }
+  | { type: 'PFL_SET'; elementId: string; enabled: boolean; volume?: number; cmdId?: string }
+  | { type: 'AFL_SET'; elementId: string; enabled: boolean; cmdId?: string }
+  | { type: 'AUX_SEND_SET'; elementId: string; auxBus: number; level: number; enabled: boolean; pre?: boolean; cmdId?: string }
+  | { type: 'AUX_MASTER_SET'; auxBus: number; volume: number; muted: boolean; cmdId?: string }
+  | { type: 'GRP_SEND_SET'; elementId: string; grpBus: number; level: number; enabled: boolean; cmdId?: string }
+  | { type: 'GRP_MASTER_SET'; grpBus: number; volume: number; muted: boolean; cmdId?: string }
+  | { type: 'MONITOR_SET'; volume: number; muted: boolean; cmdId?: string }
+  | { type: 'SOURCE_OFFSET_SET'; mixerInput: string; offsetMs: number; cmdId?: string }
+  | { type: 'SOURCE_AUDIO_OFFSET_SET'; mixerInput: string; offsetMs: number; cmdId?: string }
+  | { type: 'LOUDNESS_RESET'; cmdId?: string }
+  | { type: 'SELECT_PVW_PIP'; pip: number; cmdId?: string }
+  | { type: 'SET_PIP'; pip: number; bg: number | null; zones: PipZone[]; transforms?: PipTransforms; cmdId?: string }
+  | { type: 'SET_EFFECT'; target: EffectTarget; effect: VideoEffect; cmdId?: string }
+  | { type: 'HTML_SOURCE_EVENT'; sourceId: string; params: Record<string, string>; mode?: 'replace' | 'merge'; cmdId?: string }
+  | { type: 'CLIP_CUE'; mixerInput: string; clipId?: string; cmdId?: string }
+  | { type: 'CLIP_PLAY'; mixerInput: string; cmdId?: string }
+  | { type: 'CLIP_STOP'; mixerInput: string; cmdId?: string }
+  | { type: 'CLIP_PAUSE'; mixerInput: string; cmdId?: string }
+  | { type: 'CLIP_SEEK'; mixerInput: string; positionMs: number; cmdId?: string }
+  | { type: 'RETURN_SET'; mixerInput: string; mode: ReturnMode; cmdId?: string }
+  | { type: 'KEEP_ALIVE'; cmdId?: string };
 
 // ---------------------------------------------------------------------------
 // Runtime schema validation for inbound WS messages
@@ -193,45 +255,51 @@ const TransitionTypeSchema = z.enum([
   'negative_flash', 'ripple',
 ]);
 
+// Optional client-supplied correlation id for two-phase ACK. UUID-like string,
+// capped at 128 chars to prevent oversized strings from reaching the handler.
+const cmdIdSchema = z.string().min(1).max(128).optional();
+
 const InboundMessageSchema = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('CUT'), mixerInput: mixerInputSchema, afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional() }),
-  z.object({ type: z.literal('TRANSITION'), mixerInput: mixerInputSchema, transitionType: TransitionTypeSchema, durationMs: rampMsSchema.optional(), afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional() }),
-  z.object({ type: z.literal('TAKE'), pip: pipIndexSchema.optional(), transitionType: TransitionTypeSchema.optional(), durationMs: rampMsSchema.optional(), afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional() }),
-  z.object({ type: z.literal('SET_PVW'), mixerInput: mixerInputSchema }),
-  z.object({ type: z.literal('FTB'), active: z.boolean().optional(), durationMs: rampMsSchema.optional() }),
-  z.object({ type: z.literal('SET_OVL'), alpha: alphaSchema }),
-  z.object({ type: z.literal('GO_LIVE') }),
-  z.object({ type: z.literal('CUT_STREAM') }),
-  z.object({ type: z.literal('GRAPHIC_ON'), overlayId: z.string().min(1).max(128) }),
-  z.object({ type: z.literal('GRAPHIC_OFF'), overlayId: z.string().min(1).max(128) }),
-  z.object({ type: z.literal('DSK_TOGGLE'), layer: layerSchema, visible: z.boolean().optional() }),
-  z.object({ type: z.literal('MACRO_EXEC'), macroId: z.string().min(1).max(128) }),
+  z.object({ type: z.literal('CUT'), mixerInput: mixerInputSchema, afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('TRANSITION'), mixerInput: mixerInputSchema, transitionType: TransitionTypeSchema, durationMs: rampMsSchema.optional(), afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('TAKE'), pip: pipIndexSchema.optional(), transitionType: TransitionTypeSchema.optional(), durationMs: rampMsSchema.optional(), afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('SET_PVW'), mixerInput: mixerInputSchema, cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('FTB'), active: z.boolean().optional(), durationMs: rampMsSchema.optional(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('SET_OVL'), alpha: alphaSchema, cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('GO_LIVE'), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('CUT_STREAM'), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('GRAPHIC_ON'), overlayId: z.string().min(1).max(128), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('GRAPHIC_OFF'), overlayId: z.string().min(1).max(128), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('DSK_TOGGLE'), layer: layerSchema, visible: z.boolean().optional(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('MACRO_EXEC'), macroId: z.string().min(1).max(128), cmdId: cmdIdSchema }),
   z.object({
     type: z.literal('AUDIO_SET'),
     elementId: elementIdSchema,
     property: z.enum(['volume', 'mute']),
     value: z.union([z.number().min(0).max(10), z.boolean()]),
     ramp_ms: rampMsSchema.optional(),
+    cmdId: cmdIdSchema,
   }),
-  z.object({ type: z.literal('AFV_SET'), mixerInput: mixerInputSchema, enabled: z.boolean() }),
-  z.object({ type: z.literal('AFV_RAMP_SET'), rampUpMs: rampMsSchema, rampDownMs: rampMsSchema }),
-  z.object({ type: z.literal('PFL_SET'), elementId: elementIdSchema, enabled: z.boolean(), volume: levelSchema.optional() }),
-  z.object({ type: z.literal('AFL_SET'), elementId: elementIdSchema, enabled: z.boolean() }),
-  z.object({ type: z.literal('AUX_SEND_SET'), elementId: elementIdSchema, auxBus: busSchema, level: levelSchema, enabled: z.boolean(), pre: z.boolean().optional() }),
-  z.object({ type: z.literal('AUX_MASTER_SET'), auxBus: busSchema, volume: faderSchema, muted: z.boolean() }),
-  z.object({ type: z.literal('GRP_SEND_SET'), elementId: elementIdSchema, grpBus: busSchema, level: levelSchema, enabled: z.boolean() }),
-  z.object({ type: z.literal('GRP_MASTER_SET'), grpBus: busSchema, volume: faderSchema, muted: z.boolean() }),
-  z.object({ type: z.literal('MONITOR_SET'), volume: faderSchema, muted: z.boolean() }),
-  z.object({ type: z.literal('SOURCE_OFFSET_SET'), mixerInput: mixerInputSchema, offsetMs: offsetMsSchema }),
-  z.object({ type: z.literal('SOURCE_AUDIO_OFFSET_SET'), mixerInput: mixerInputSchema, offsetMs: offsetMsSchema }),
-  z.object({ type: z.literal('LOUDNESS_RESET') }),
-  z.object({ type: z.literal('SELECT_PVW_PIP'), pip: pipIndexSchema }),
+  z.object({ type: z.literal('AFV_SET'), mixerInput: mixerInputSchema, enabled: z.boolean(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('AFV_RAMP_SET'), rampUpMs: rampMsSchema, rampDownMs: rampMsSchema, cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('PFL_SET'), elementId: elementIdSchema, enabled: z.boolean(), volume: levelSchema.optional(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('AFL_SET'), elementId: elementIdSchema, enabled: z.boolean(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('AUX_SEND_SET'), elementId: elementIdSchema, auxBus: busSchema, level: levelSchema, enabled: z.boolean(), pre: z.boolean().optional(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('AUX_MASTER_SET'), auxBus: busSchema, volume: faderSchema, muted: z.boolean(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('GRP_SEND_SET'), elementId: elementIdSchema, grpBus: busSchema, level: levelSchema, enabled: z.boolean(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('GRP_MASTER_SET'), grpBus: busSchema, volume: faderSchema, muted: z.boolean(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('MONITOR_SET'), volume: faderSchema, muted: z.boolean(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('SOURCE_OFFSET_SET'), mixerInput: mixerInputSchema, offsetMs: offsetMsSchema, cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('SOURCE_AUDIO_OFFSET_SET'), mixerInput: mixerInputSchema, offsetMs: offsetMsSchema, cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('LOUDNESS_RESET'), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('SELECT_PVW_PIP'), pip: pipIndexSchema, cmdId: cmdIdSchema }),
   z.object({
     type: z.literal('SET_PIP'),
     pip: pipIndexSchema,
     bg: z.number().int().min(0).max(15).nullable(),
     zones: z.array(PipZoneSchema).max(15),
     transforms: z.record(z.string(), z.object({ left: z.number().min(0).max(1), top: z.number().min(0).max(1), right: z.number().min(0).max(1), bottom: z.number().min(0).max(1) })).optional(),
+    cmdId: cmdIdSchema,
   }),
   z.object({
     type: z.literal('SET_EFFECT'),
@@ -254,7 +322,34 @@ const InboundMessageSchema = z.discriminatedUnion('type', [
       z.object({ type: z.literal('underwater'), intensity: z.number().min(0).max(1).optional() }),
       z.object({ type: z.literal('color_correct'), brightness: z.number().optional(), contrast: z.number().optional(), saturation: z.number().optional(), hue: z.number().optional(), gamma: z.number().optional(), temperature: z.number().optional(), tint: z.number().optional() }),
     ]),
+    cmdId: cmdIdSchema,
   }),
+  // Generic HTML-source event-forwarding surface (issue #268, spec
+  // docs/specs/html-source-event-forwarding.md). Thin transport only: params
+  // are opaque key/value query parameters — Open Live never interprets graphic
+  // semantics. The resulting effective URL is re-validated with graphicUrl().
+  z.object({
+    type: z.literal('HTML_SOURCE_EVENT'),
+    sourceId: z.string().min(1).max(128),          // references SourceDoc._id ("src-<uuid>")
+    params: z.record(
+      z.string().min(1).max(64),                   // param key
+      z.string().max(1024),                        // param value (opaque to Open Live)
+    ),
+    mode: z.enum(['replace', 'merge']).default('merge').optional(),
+    cmdId: cmdIdSchema,
+  }),
+  // Clip cue/play control (epic #206, issue #278). Reuses mixerInputSchema;
+  // handlers delegate to the shared src/lib/clip-control.ts module.
+  z.object({ type: z.literal('CLIP_CUE'), mixerInput: mixerInputSchema, clipId: z.string().min(1).max(256).optional(), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('CLIP_PLAY'), mixerInput: mixerInputSchema, cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('CLIP_STOP'), mixerInput: mixerInputSchema, cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('CLIP_PAUSE'), mixerInput: mixerInputSchema, cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('CLIP_SEEK'), mixerInput: mixerInputSchema, positionMs: z.number().int().min(0).max(24 * 60 * 60 * 1000), cmdId: cmdIdSchema }),
+  // Crew switches a guest's synced return mode (epic #208, issue #301). Shares
+  // applyReturnMode with the crew REST route and guest token route: persist +
+  // apply live + broadcast RETURN_STATE. v1 only program/program-minus.
+  z.object({ type: z.literal('RETURN_SET'), mixerInput: mixerInputSchema, mode: z.enum(['program', 'program-minus']), cmdId: cmdIdSchema }),
+  z.object({ type: z.literal('KEEP_ALIVE'), cmdId: cmdIdSchema }),
 ]);
 
 // ---------------------------------------------------------------------------
@@ -268,6 +363,49 @@ const InboundMessageSchema = z.discriminatedUnion('type', [
 function padToIndex(mixerInput: string): number | null {
   const match = /video_in_(\d+)$/.exec(mixerInput);
   return match ? parseInt(match[1], 10) : null;
+}
+
+/**
+ * Computes the effective HTML-source URL from a base address and forwarded
+ * params (issue #268). `merge` updates/adds the given keys on the base URL's
+ * current query; `replace` sets the query to exactly `params`. The resulting
+ * URL is re-validated with `graphicUrl()` — the same SSRF/scheme gate that
+ * guards source creation — so event-forwarding cannot smuggle a private-IP
+ * host, a `javascript:`/`file:` scheme, or a `data:text/html` target past it.
+ *
+ * Exported for tests. Throws on an unparseable base address, an oversized
+ * query, or a `graphicUrl()` rejection.
+ */
+export function buildHtmlSourceUrl(
+  baseAddress: string,
+  currentParams: Record<string, string>,
+  params: Record<string, string>,
+  mode: 'replace' | 'merge',
+): { effectiveUrl: string; params: Record<string, string> } {
+  let parsed: URL;
+  try {
+    parsed = new URL(baseAddress);
+  } catch {
+    throw new Error('HTML source address is not a valid URL');
+  }
+  // Effective params: 'replace' uses exactly the incoming params; 'merge'
+  // layers the incoming params over the current effective set.
+  const effective: Record<string, string> =
+    mode === 'replace' ? { ...params } : { ...currentParams, ...params };
+
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(effective)) {
+    search.set(key, value);
+  }
+  const query = search.toString();
+  if (query.length > HTML_SOURCE_MAX_QUERY_LENGTH) {
+    throw new Error('HTML source query too long');
+  }
+  parsed.search = query;
+  const effectiveUrl = parsed.toString();
+  // Re-validate the resulting URL — non-negotiable SSRF guard (spec Risks).
+  graphicUrl(effectiveUrl);
+  return { effectiveUrl, params: effective };
 }
 
 function toStromTransition(type: string): StromTransitionType {
@@ -436,6 +574,22 @@ const overlayAlphaByProduction = new Map<string, number>()
 const dskLayersByProduction    = new Map<string, Record<number, boolean>>()
 
 /**
+ * Effective HTML-source query parameters per production, keyed by sourceId
+ * (SourceDoc._id). Transient in-memory operator state — mirrors
+ * `overlayAlphaByProduction` (issue #268, ADR-002): replayed on connect,
+ * reset on server restart, never persisted to CouchDB.
+ */
+interface HtmlSourceState {
+  params: Record<string, string>;
+  effectiveUrl: string;
+  updatedAt: string;
+}
+const htmlSourceParamsByProduction = new Map<string, Map<string, HtmlSourceState>>()
+
+/** Max serialized query length applied to a forwarded HTML-source URL. Bounds cefsrc URL size. */
+const HTML_SOURCE_MAX_QUERY_LENGTH = 4096;
+
+/**
  * PVW mixer-input pad that was on PVW immediately before SELECT_PVW_PIP was
  * received.  Stored so the PiP TAKE can pass it as `to_input` to Strom,
  * which becomes Strom's `pgm_input` (real background behind the PiP) after
@@ -462,6 +616,52 @@ const pgmBgByProduction = new Map<string, string | null>()
  */
 const pgmBgOf = (productionId: string): string | null =>
   pgmBgByProduction.get(productionId) ?? null
+
+/**
+ * Builds the contribution-based tally payload (automation contract §3).
+ *
+ * Returns the fields to spread into a TALLY broadcast — backward-compatible:
+ * the existing `pgm` / `pvw` / `pgmBg` fields are still present; the new
+ * `program` / `preview` / `contributions` fields are additive.
+ *
+ * @param productionId - the production
+ * @param tally        - current {pgm, pvw} tally
+ * @param doc          - current ProductionDoc (for graphics state)
+ */
+function buildTallyPayload(
+  productionId: string,
+  tally: { pgm: string | null; pvw: string | null },
+  doc: ProductionDoc,
+): {
+  pgm: string | null;
+  pvw: string | null;
+  pgmBg: string | null;
+  program: string[];
+  preview: string[];
+  contributions: Array<{ source: string; role: string }>;
+} {
+  const pgmBg = pgmBgOf(productionId);
+  const pgmPip = pgmPipByProduction.get(productionId) ?? null;
+  const pvwPip = pvwPipByProduction.get(productionId) ?? null;
+  const pvwBefore = pvwBeforePipByProduction.get(productionId) ?? null;
+  const pipConfigs = pipConfigsByProduction.get(productionId);
+  const dskLayers = dskLayersByProduction.get(productionId);
+  const activeGraphics = (doc.graphics ?? []).filter((g) => g.active).map((g) => g.id);
+
+  const { program, preview, contributions } = computeTallyContributions(
+    tally.pgm,
+    tally.pvw,
+    pgmPip,
+    pvwPip,
+    pgmBg,
+    pvwBefore,
+    pipConfigs,
+    dskLayers,
+    activeGraphics,
+  );
+
+  return { pgm: tally.pgm, pvw: tally.pvw, pgmBg, program, preview, contributions };
+}
 
 
 /** Wipe all per-production audio state. Called when the pipeline changes or production deactivates. */
@@ -499,6 +699,7 @@ export function clearPipState(productionId: string): void {
   pgmBgByProduction.delete(productionId)
   overlayAlphaByProduction.delete(productionId)
   dskLayersByProduction.delete(productionId)
+  htmlSourceParamsByProduction.delete(productionId)
   broadcast(productionId, {
     type: 'PIP_STATE',
     pgmPip: null,
@@ -563,33 +764,89 @@ export function clearFxState(productionId: string): void {
   fxAvailableByProduction.delete(productionId)
 }
 
-/**
- * Returns the 0-based audio channel index for a given mixerInput, or null if
- * the source has no audio channel (test sources are skipped).
- * WHIP and HTML sources carry audio and are included.
- */
-async function resolveAudioChannelIndex(doc: ProductionDoc, mixerInput: string): Promise<number | null> {
-  const sorted = [...doc.sources].sort((a, b) => a.mixerInput.localeCompare(b.mixerInput));
-  const sourcesDb = getSourcesDb();
-  let audioIdx = 0;
-  for (const assignment of sorted) {
-    let streamType: string | undefined;
-    try {
-      const src = await sourcesDb.get(assignment.sourceId);
-      streamType = src.streamType;
-    } catch {
-      // "Whip" is a virtual WHIP source that carries audio — treat it as 'whip'
-      if (assignment.sourceId === 'Whip') {
-        streamType = 'whip';
-      } else {
-        continue; // other virtual sources (test1, test2) have no audio
-      }
-    }
-    if (streamType === 'test1' || streamType === 'test2') continue;
-    if (assignment.mixerInput === mixerInput) return audioIdx;
-    audioIdx++;
+// ---------------------------------------------------------------------------
+// Clip completion polling (epic #206, issue #278).
+//
+// Strom's media_player does not push player-state transitions, so while a clip
+// is `playing` we poll `player.getState` every CLIP_STATE_POLL_MS. When Strom
+// reports `stopped` (end-of-media) we transition the clip to `completed` and
+// broadcast CLIP_STATE once. Completion latency is therefore bounded by one
+// poll interval (≤ CLIP_STATE_POLL_MS, default 250 ms) — documented in
+// docs/controller-websocket.md. Timers are keyed `productionId:mixerInput` and
+// cleaned up on stop/disconnect/deactivate.
+// ---------------------------------------------------------------------------
+const clipPollTimers = new Map<string, ReturnType<typeof setInterval>>()
+
+function clipPollKey(productionId: string, mixerInput: string): string {
+  return `${productionId}:${mixerInput}`
+}
+
+/** Stops (and forgets) the completion poll timer for a clip, if one is running. */
+function stopClipPoll(productionId: string, mixerInput: string): void {
+  const key = clipPollKey(productionId, mixerInput)
+  const timer = clipPollTimers.get(key)
+  if (timer) {
+    clearInterval(timer)
+    clipPollTimers.delete(key)
   }
-  return null;
+}
+
+/**
+ * Starts (or restarts) the completion poll for a playing clip. On each tick it
+ * reads the player state; when Strom reports `stopped` it records/broadcasts a
+ * `completed` CLIP_STATE and stops the timer. Errors are logged and stop the
+ * poll (a subsequent play restarts it).
+ */
+function startClipPoll(productionId: string, mixerInput: string, clipId?: string): void {
+  stopClipPoll(productionId, mixerInput)
+  const key = clipPollKey(productionId, mixerInput)
+  const timer = setInterval(() => {
+    void (async () => {
+      try {
+        const doc = await getDb().get(productionId)
+        const { flowId, blockId } = resolveClipTarget(doc, mixerInput)
+        const strom = await makeStromClient()
+        const player = await strom.player.getState(flowId, blockId)
+        if (player.state === 'stopped') {
+          const state: ClipState = {
+            mixerInput,
+            state: 'completed',
+            ...(clipId !== undefined ? { clipId } : {}),
+            ...(player.position_ms !== undefined ? { positionMs: player.position_ms } : {}),
+            ...(player.duration_ms !== undefined ? { durationMs: player.duration_ms } : {}),
+          }
+          setClipStateEntry(productionId, state)
+          broadcast(productionId, { type: 'CLIP_STATE', ...state })
+          stopClipPoll(productionId, mixerInput)
+        }
+      } catch (err) {
+        console.warn(`[controller] clip poll error (${mixerInput}):`, String(err))
+        stopClipPoll(productionId, mixerInput)
+      }
+    })()
+  }, config.clipStatePollMs)
+  clipPollTimers.set(key, timer)
+}
+
+/**
+ * Clears all clip state for a production: stops every completion poll timer and
+ * wipes the in-memory registry. Called on deactivate (mirrors clearPipState /
+ * clearAudioState / clearFxState).
+ */
+export function clearClipStateForProduction(productionId: string): void {
+  for (const key of clipPollTimers.keys()) {
+    if (key.startsWith(`${productionId}:`)) {
+      clearInterval(clipPollTimers.get(key)!)
+      clipPollTimers.delete(key)
+    }
+  }
+  clearClipState(productionId)
+}
+
+/** Returns the 0-based audio channel index for a given mixerInput, or null if it has no channel. */
+async function resolveAudioChannelIndex(doc: ProductionDoc, mixerInput: string): Promise<number | null> {
+  const channels = await loadAudioChannels(doc.sources);
+  return channels.find((c) => c.assignment.mixerInput === mixerInput)?.channel ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -615,41 +872,112 @@ async function applyAudioFollow(
 ): Promise<void> {
   // Default to empty set — an uninitialised registry never routes all channels.
   const afvChannels = afvChannelsByProduction.get(productionId) ?? new Set<string>();
-  const sorted = [...doc.sources].sort((a, b) => a.mixerInput.localeCompare(b.mixerInput));
-  const sourcesDb = getSourcesDb();
-
-  let audioIdx = 0;
   const properties: Record<string, unknown> = {};
   const ramp_ms_overrides: Record<string, number> = {};
-  for (const assignment of sorted) {
-    let streamType: string | undefined;
-    try {
-      const src = await sourcesDb.get(assignment.sourceId);
-      streamType = src.streamType;
-    } catch {
-      // "Whip" is a virtual WHIP source that carries audio — treat it as 'whip'
-      if (assignment.sourceId === 'Whip') {
-        streamType = 'whip';
-      } else {
-        continue; // other virtual sources (test1, test2) have no audio
-      }
-    }
-    if (streamType === 'test1' || streamType === 'test2') continue;
-
-    const chIdx = ++audioIdx;
+  const toMainChanges = new Map<number, boolean>();
+  for (const { channel, assignment } of await loadAudioChannels(doc.sources)) {
     // Only update routing for channels the operator has opted into AFV.
     // Channels with AFV off are never touched by the switcher.
     if (!afvChannels.has(assignment.mixerInput)) continue;
 
     const routed = newPgmMixerInput === null || assignment.mixerInput === newPgmMixerInput;
-    const key = `ch${chIdx}_to_main`;
+    const key = `ch${channel + 1}_to_main`;
     properties[key] = routed;
     ramp_ms_overrides[key] = routed ? rampUpMs : rampDownMs;
+    toMainChanges.set(channel, routed);
   }
+  // Mirror the AFV routing into every guest return in the same update so a return
+  // never keeps a channel AFV just took off program (spec §"Mirror `to_main`").
+  Object.assign(properties, mirrorToMainForPersistedReturns(
+    (doc.returnBuses ?? []) as PersistedReturnBus[],
+    toMainChanges,
+  ));
   if (Object.keys(properties).length > 0) {
     await strom.flows.updateBlockProperties(stromFlowId, audioBlockId, { properties, ramp_ms_overrides })
       .catch((err) => console.warn('[controller] audio follow error:', String(err)));
   }
+}
+
+// ---------------------------------------------------------------------------
+// Guest return feeds — shared mode handler (epic #208, issue #300)
+// ---------------------------------------------------------------------------
+
+/** Result of a return-mode change request. */
+export type ReturnModeResult =
+  | { ok: true; mixerInput: string; mode: ReturnMode }
+  | { ok: false; code: 'not_found' | 'invalid_mode' | 'inactive' };
+
+/**
+ * The single mode-change entry point shared by the crew REST route, the guest
+ * token route and the WS `RETURN_SET` command (issue #301 calls this). It:
+ *   1. validates the input has a return bus (v1 only `program`/`program-minus`),
+ *   2. persists the mode on the assignment's `returnFeed` and `doc.returnBuses`,
+ *   3. applies the send matrix live if the flow is active — respecting channels
+ *      the crew has currently muted so a switch to `program` never reopens a
+ *      muted channel, and
+ *   4. broadcasts `RETURN_STATE` (the WS surface #301 completes; this is a
+ *      minimal, correct hook — persist + apply + broadcast).
+ *
+ * NOTE: AFV-driven closures are re-mirrored continuously by applyAudioFollow, so
+ * a channel AFV has taken off program self-corrects on the next cut; this switch
+ * factors in operator mutes (the persistent off-program state) precisely.
+ */
+export async function applyReturnMode(
+  productionId: string,
+  mixerInput: string,
+  mode: ReturnMode,
+): Promise<ReturnModeResult> {
+  if (mode !== 'program' && mode !== 'program-minus') {
+    return { ok: false, code: 'invalid_mode' };
+  }
+  let doc: ProductionDoc;
+  try {
+    doc = await getDb().get(productionId);
+  } catch {
+    return { ok: false, code: 'not_found' };
+  }
+  const assignment = doc.sources.find((s) => s.mixerInput === mixerInput);
+  if (!assignment || !assignment.returnFeed) {
+    return { ok: false, code: 'not_found' };
+  }
+
+  // Persist the mode on the assignment and on the resolved return-bus cache.
+  const nextSources = doc.sources.map((s) =>
+    s.mixerInput === mixerInput
+      ? { ...s, returnFeed: { ...s.returnFeed!, synced: mode } }
+      : s,
+  );
+  const nextReturnBuses = (doc.returnBuses ?? []).map((rb) =>
+    rb.mixerInput === mixerInput ? { ...rb, mode } : rb,
+  );
+  await updateProductionDoc(productionId, {
+    sources: nextSources,
+    ...(nextReturnBuses.length > 0 && { returnBuses: nextReturnBuses }),
+  }).catch((err) => console.warn('[controller] persist return mode error:', err));
+
+  // Apply live if the flow is active and this input has a resolved return bus.
+  const rb = nextReturnBuses.find((r) => r.mixerInput === mixerInput);
+  if (rb && doc.stromFlowId && doc.audioMixerBlockId) {
+    const numChannels = numAudioChannelsByProduction.get(productionId)
+      ?? (await loadAudioChannels(doc.sources)).length;
+    // Honour operator mutes: a muted channel (element ch{N}) stays closed even in
+    // program mode. AFV self-corrects on the next cut via applyAudioFollow.
+    const muted = mutedElementsByProduction.get(productionId) ?? new Set<string>();
+    const toMainByChannel = new Map<number, boolean>();
+    for (let ch = 0; ch < numChannels; ch++) {
+      toMainByChannel.set(ch, !muted.has(`ch${ch + 1}`));
+    }
+    const props = returnSendMatrix(rb.auxBus, rb.ownChannel, mode, numChannels, toMainByChannel);
+    try {
+      const strom = await makeStromClient();
+      await strom.flows.updateBlockProperties(doc.stromFlowId, doc.audioMixerBlockId, { properties: props });
+    } catch (err) {
+      console.warn('[controller] apply return mode error:', err);
+    }
+  }
+
+  broadcast(productionId, { type: 'RETURN_STATE', mixerInput, mode });
+  return { ok: true, mixerInput, mode };
 }
 
 // ---------------------------------------------------------------------------
@@ -681,17 +1009,44 @@ export async function handleMessage(
   // the sliding-window caps and inform the client via the standard ERROR frame.
   if (!ctx.rateLimit) ctx.rateLimit = { general: [], expensive: [] };
   if (!checkRateLimit(ctx.rateLimit, EXPENSIVE_MESSAGE_TYPES.has(msg.type), Date.now())) {
-    ws.send(JSON.stringify({ type: 'ERROR', error: 'Rate limit exceeded' }));
+    const rateLimitError = 'Rate limit exceeded';
+    if ('cmdId' in msg && msg.cmdId) {
+      sendNack(ws, productionId, msg.cmdId, rateLimitError);
+    } else {
+      ws.send(JSON.stringify({ type: 'ERROR', error: rateLimitError }));
+    }
     return;
   }
 
+  // Phase 1 ACK: command passed schema validation and is being dispatched.
+  // Sent before any async work so the automation client can record the accepted time.
+  const cmdId = 'cmdId' in msg ? (msg.cmdId as string | undefined) : undefined;
+  if (cmdId) {
+    sendAck(ws, productionId, cmdId, 'accepted');
+  }
+
+  // KEEP_ALIVE is a pure liveness/activity signal (issue #290): it resets the
+  // idle timer and cancels any pending idle warning (triggering an
+  // IDLE_WARNING_CLEARED broadcast when a warning was outstanding). It needs no
+  // production doc and touches no Strom flow, so handle it before the DB fetch
+  // that the mixer/audio/clip commands below require.
+  if (msg.type === 'KEEP_ALIVE') {
+    resetIdleTimer(productionId);
+    if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
+    return;
+  }
 
   const db = getDb();
   let doc: ProductionDoc;
   try {
     doc = await db.get(productionId);
   } catch {
-    ws.send(JSON.stringify({ type: 'ERROR', error: 'Production not found' }));
+    const notFoundError = 'Production not found';
+    if (cmdId) {
+      sendNack(ws, productionId, cmdId, notFoundError);
+    } else {
+      ws.send(JSON.stringify({ type: 'ERROR', error: notFoundError }));
+    }
     return;
   }
 
@@ -720,7 +1075,7 @@ export async function handleMessage(
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: null, pips: pipConfigsByProduction.get(productionId) ?? [] });
       }
       await persistMixerMutation(productionId, 'CUT', (d) => ({ ...d, tally: newTally }));
-      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId) });
+      broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
       await stromTransition(doc, fromPadCut, msg.mixerInput, 'cut');
       if (curPgmPipCut !== null && doc.stromFlowId && doc.mixerBlockId) {
         try {
@@ -733,6 +1088,7 @@ export async function handleMessage(
       if (doc.stromFlowId && ctx.audioBlockId) {
         void applyAudioFollow(productionId, doc, msg.mixerInput, doc.stromFlowId, ctx.audioBlockId, await makeStromClient(), msg.afvRampUpMs, msg.afvRampDownMs);
       }
+      if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
       break;
     }
     case 'TRANSITION': {
@@ -751,7 +1107,7 @@ export async function handleMessage(
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: curPgmPipTrans, pips: pipConfigsByProduction.get(productionId) ?? [] });
       }
       await persistMixerMutation(productionId, 'TRANSITION', (d) => ({ ...d, tally: newTally }));
-      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId), transitionType: msg.transitionType, durationMs: msg.durationMs });
+      broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc), transitionType: msg.transitionType, durationMs: msg.durationMs });
       await stromTransition(doc, fromPadTrans, msg.mixerInput, toStromTransition(msg.transitionType), msg.durationMs);
       if (curPgmPipTrans !== null && doc.stromFlowId && doc.mixerBlockId) {
         try {
@@ -764,6 +1120,7 @@ export async function handleMessage(
       if (doc.stromFlowId && ctx.audioBlockId) {
         void applyAudioFollow(productionId, doc, msg.mixerInput, doc.stromFlowId, ctx.audioBlockId, await makeStromClient(), msg.afvRampUpMs, msg.afvRampDownMs);
       }
+      if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
       break;
     }
     case 'TAKE': {
@@ -799,7 +1156,7 @@ export async function handleMessage(
       // reads this map, and it must hold the background the take just
       // broadcast even when Strom is unconfigured or its call throws.
       if (newPgmPip !== null) pgmBgByProduction.set(productionId, newPgmBg);
-      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: newPgmBg });
+      broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: newPgmPip, pvwPip: newPvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
       const takeTransition = toStromTransition(msg.transitionType ?? 'cut');
       if (curPvwPip !== null) {
@@ -859,6 +1216,7 @@ export async function handleMessage(
       if (doc.stromFlowId && ctx.audioBlockId) {
         void applyAudioFollow(productionId, doc, tally.pvw, doc.stromFlowId, ctx.audioBlockId, await makeStromClient(), msg.afvRampUpMs, msg.afvRampDownMs);
       }
+      if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
       break;
     }
     case 'SET_PVW': {
@@ -869,7 +1227,7 @@ export async function handleMessage(
       const newTally = { pgm: tally.pgm, pvw: msg.mixerInput };
       setTally(productionId, newTally);
       await persistMixerMutation(productionId, 'SET_PVW', (d) => ({ ...d, tally: newTally }));
-      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId) });
+      broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: pgmPipByProduction.get(productionId) ?? null, pvwPip: null, pips: pipConfigsByProduction.get(productionId) ?? [] });
       if (doc.stromFlowId && doc.mixerBlockId) {
         const inputIndex = padToIndex(msg.mixerInput);
@@ -882,6 +1240,7 @@ export async function handleMessage(
           }
         }
       }
+      if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
       break;
     }
     case 'SELECT_PVW_PIP': {
@@ -894,7 +1253,7 @@ export async function handleMessage(
       const newTally = { pgm: tally.pgm, pvw: null };
       setTally(productionId, newTally);
       await persistMixerMutation(productionId, 'SELECT_PVW_PIP', (d) => ({ ...d, tally: newTally }));
-      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId) });
+      broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: pgmPipByProduction.get(productionId) ?? null, pvwPip: msg.pip, pips: pipConfigsByProduction.get(productionId) ?? [] });
       if (doc.stromFlowId && doc.mixerBlockId) {
         try {
@@ -905,6 +1264,7 @@ export async function handleMessage(
           console.warn('[controller] Strom selectPreview (pip) error:', err);
         }
       }
+      if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
       break;
     }
     case 'SET_PIP': {
@@ -1166,6 +1526,13 @@ export async function handleMessage(
             const ch = parseInt(chMatch[1], 10);
             // to_main = !mute (true=ON routing, false=OFF routing)
             props = { [`ch${ch}_to_main`]: !msg.value };
+            // Mirror the routing change into every guest return in the SAME update
+            // (spec §"Mirror `to_main` into return sends") so a return never keeps
+            // a channel the crew just muted. ch is 1-based here; returns are 0-based.
+            Object.assign(props, mirrorToMainForPersistedReturns(
+              (doc.returnBuses ?? []) as PersistedReturnBus[],
+              new Map([[ch - 1, !msg.value]]),
+            ));
           }
           await strom.flows.updateBlockProperties(doc.stromFlowId, ctx.audioBlockId, {
             properties: props,
@@ -1203,7 +1570,14 @@ export async function handleMessage(
             broadcast(productionId, { type: 'AUDIO_STATE', elementId, property: 'mute', value: false });
             const strom = await makeStromClient();
             await strom.flows.updateBlockProperties(doc.stromFlowId, `${ctx.audioBlockId}`, {
-              properties: { [`ch${chIdx + 1}_to_main`]: isOnPgm },
+              properties: {
+                [`ch${chIdx + 1}_to_main`]: isOnPgm,
+                // Mirror into returns in the same update (spec §"Mirror `to_main`").
+                ...mirrorToMainForPersistedReturns(
+                  (doc.returnBuses ?? []) as PersistedReturnBus[],
+                  new Map([[chIdx, isOnPgm]]),
+                ),
+              },
             }).catch((err) => console.warn('[controller] AFV_SET routing error:', err));
           }
         }
@@ -1577,10 +1951,201 @@ export async function handleMessage(
       }
       break;
     }
+    case 'HTML_SOURCE_EVENT': {
+      // Thin, generic event-forwarding surface for HTML sources (issue #268,
+      // spec docs/specs/html-source-event-forwarding.md). Open Live stays a
+      // transport: it only mutates the source's effective URL query string and
+      // reloads the running cefsrc — no per-graphic logic.
+      const mode: 'replace' | 'merge' = msg.mode ?? 'merge';
+
+      // The production must be active (a running flow) for a live reload.
+      if (!doc.stromFlowId) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Production is not activated' }));
+        break;
+      }
+
+      // Resolve the source assignment (sourceId → mixerInput) on this production.
+      const assignment = doc.sources.find((s) => s.sourceId === msg.sourceId);
+      if (!assignment) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Source not found in production' }));
+        break;
+      }
+
+      // Fetch the SourceDoc to confirm it is an HTML source and get its base URL.
+      let sourceDoc;
+      try {
+        sourceDoc = await getSourcesDb().get(msg.sourceId);
+      } catch {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Source not found' }));
+        break;
+      }
+      if (sourceDoc.streamType !== 'html') {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Source is not an HTML source' }));
+        break;
+      }
+      // HTML addresses are stored plaintext (only SRT passphrases are encrypted),
+      // but decrypt defensively for parity with the flow generator.
+      const baseAddress = decryptAddressPassphrase(sourceDoc.address);
+
+      // Compute effective params + URL, re-validating through graphicUrl().
+      const bySource = htmlSourceParamsByProduction.get(productionId);
+      const currentParams = bySource?.get(msg.sourceId)?.params ?? {};
+      let effectiveUrl: string;
+      let effectiveParams: Record<string, string>;
+      try {
+        const built = buildHtmlSourceUrl(baseAddress, currentParams, msg.params, mode);
+        effectiveUrl = built.effectiveUrl;
+        effectiveParams = built.params;
+      } catch (err) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: err instanceof Error ? err.message : 'Invalid HTML source URL' }));
+        break;
+      }
+
+      // Reload the running cefsrc element by updating its `url` property live.
+      // The element id is deterministic (flow-generator.ts:527):
+      //   e-html-<padIndex>-<endpointSuffix>
+      // where padIndex derives from the mixerInput (video_in_N) and
+      // endpointSuffix from the production id.
+      const padIndex = padToIndex(assignment.mixerInput);
+      if (padIndex === null) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Source has no mixer input' }));
+        break;
+      }
+      const endpointSuffix = productionId.replace(/^prod-/, '').slice(0, 8);
+      const elementId = `e-html-${padIndex}-${endpointSuffix}`;
+      try {
+        const strom = await makeStromClient();
+        await strom.properties.updateElement(doc.stromFlowId, elementId, {
+          property_name: 'url',
+          value: effectiveUrl,
+        });
+      } catch (err) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: `HTML source reload failed: ${stromErrorMessage(err)}` }));
+        break;
+      }
+
+      // Persist effective state in the per-production in-memory registry and echo.
+      const updatedAt = new Date().toISOString();
+      const map = htmlSourceParamsByProduction.get(productionId) ?? new Map<string, HtmlSourceState>();
+      map.set(msg.sourceId, { params: effectiveParams, effectiveUrl, updatedAt });
+      htmlSourceParamsByProduction.set(productionId, map);
+      broadcast(productionId, {
+        type: 'HTML_SOURCE_STATE',
+        sourceId: msg.sourceId,
+        params: effectiveParams,
+        effectiveUrl,
+        updatedAt,
+      });
+      break;
+    }
+    case 'CLIP_CUE':
+    case 'CLIP_PLAY':
+    case 'CLIP_STOP':
+    case 'CLIP_PAUSE':
+    case 'CLIP_SEEK': {
+      const mixerInput = msg.mixerInput;
+      try {
+        const strom = await makeStromClient();
+        let state: ClipState;
+        switch (msg.type) {
+          case 'CLIP_CUE': {
+            const source = await resolveClipSource(doc, mixerInput, (sid) => getSourcesDb().get(sid) as Promise<SourceDoc>);
+            // A new cue supersedes any in-flight completion poll.
+            stopClipPoll(productionId, mixerInput);
+            state = await cueClip(strom, doc, source, mixerInput, msg.clipId);
+            break;
+          }
+          case 'CLIP_PLAY': {
+            const tracked = getClipStateEntry(productionId, mixerInput);
+            if (!tracked || tracked.state === 'idle') throw new ClipNotCuedError();
+            state = await playClip(strom, doc, mixerInput, tracked.clipId);
+            // Begin (or restart) polling for end-of-media completion.
+            startClipPoll(productionId, mixerInput, state.clipId ?? tracked.clipId);
+            break;
+          }
+          case 'CLIP_PAUSE': {
+            const tracked = getClipStateEntry(productionId, mixerInput);
+            state = await pauseClip(strom, doc, mixerInput, tracked?.clipId);
+            stopClipPoll(productionId, mixerInput);
+            break;
+          }
+          case 'CLIP_STOP': {
+            const tracked = getClipStateEntry(productionId, mixerInput);
+            state = await stopClip(strom, doc, mixerInput, tracked?.clipId);
+            stopClipPoll(productionId, mixerInput);
+            break;
+          }
+          case 'CLIP_SEEK': {
+            const tracked = getClipStateEntry(productionId, mixerInput);
+            state = await seekClip(strom, doc, mixerInput, msg.positionMs, tracked?.clipId);
+            break;
+          }
+        }
+        setClipStateEntry(productionId, state);
+        broadcast(productionId, { type: 'CLIP_STATE', ...state });
+      } catch (err) {
+        // Typed clip errors carry a human-readable message; Strom transport
+        // errors are surfaced via stromErrorMessage (502/503-style text).
+        let errText: string;
+        if (err instanceof ClipNotFoundError || err instanceof ClipNotActivatedError || err instanceof ClipNotCuedError) {
+          errText = err.message;
+        } else {
+          errText = `Clip: ${stromErrorMessage(err)}`;
+        }
+        // Also record + broadcast the error transition so subscribers converge.
+        const errorState: ClipState = { mixerInput, state: 'error', error: errText };
+        setClipStateEntry(productionId, errorState);
+        broadcast(productionId, { type: 'CLIP_STATE', ...errorState });
+        ws.send(JSON.stringify({ type: 'ERROR', error: errText }));
+      }
+      break;
+    }
+    case 'RETURN_SET': {
+      // Delegate to the single shared mode-change entry point (issue #300); it
+      // persists, applies the send matrix live, and broadcasts RETURN_STATE to
+      // all subscribers — so no extra broadcast is needed here.
+      const result = await applyReturnMode(productionId, msg.mixerInput, msg.mode);
+      if (!result.ok) {
+        const errText =
+          result.code === 'invalid_mode' ? 'Invalid return mode'
+          : result.code === 'inactive' ? 'Production is not activated'
+          : 'No return feed on that input';
+        if (cmdId) sendNack(ws, productionId, cmdId, errText);
+        else ws.send(JSON.stringify({ type: 'ERROR', error: errText }));
+        break;
+      }
+      if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
+      break;
+    }
     default: {
       ws.send(JSON.stringify({ type: 'ERROR', error: 'Unknown message type' }));
     }
   }
+}
+
+/**
+ * Best-effort display state for a guest (epic #208, issue #301). `previewing`/
+ * `on-air` are DERIVED from the live vision-mixer contribution set (#209): a
+ * guest whose mixerInput contributes to program reads `on-air`, to preview
+ * `previewing`, otherwise the persisted `joined`. `left`/`error` are
+ * authoritative and pass through unchanged.
+ *
+ * LIMITATION (per issue #301): a guest composited as a PiP *inset* contributes
+ * to the tally set as its source id, not its `video_in_N` pad, so this derives
+ * `joined` rather than `on-air`/`previewing` for that case until the PiP-inset
+ * tally gap #209 raises is closed. It also re-derives only at connect-time and
+ * on lifecycle events, not continuously on every mixer take.
+ */
+export function deriveGuestDisplayState(
+  persisted: GuestSessionState,
+  mixerInput: string,
+  program: string[],
+  preview: string[],
+): GuestSessionState {
+  if (persisted === 'left' || persisted === 'error') return persisted;
+  if (program.includes(mixerInput)) return 'on-air';
+  if (preview.includes(mixerInput)) return 'previewing';
+  return 'joined';
 }
 
 const controllerWs: FastifyPluginAsync = async (fastify) => {
@@ -1630,6 +2195,20 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
         activeFlowIdByProduction.set(id, connectDoc.stromFlowId)
       }
 
+      // -----------------------------------------------------------------------
+      // Automation contract §4: Connect-time snapshot (spec §4).
+      // Emit HELLO first so clients know the contract version before any state.
+      // All snapshot frames are single-socket sends (not broadcast) because they
+      // are point-to-point resync, not production-wide state changes.
+      // -----------------------------------------------------------------------
+      socket.send(JSON.stringify({
+        type: 'HELLO',
+        contractVersion: CONTRACT_VERSION,
+        productionId: id,
+        seq: nextSeq(id),
+        ts: new Date().toISOString(),
+      }));
+
       // Restore tally from DB if not already in memory (e.g. after server restart)
       let tally = getTally(id);
       if (tally.pgm === null && tally.pvw === null && connectDoc?.tally) {
@@ -1638,11 +2217,54 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
           setTally(id, tally);
         }
       }
-      socket.send(JSON.stringify({ type: 'TALLY', ...tally, pgmBg: pgmBgOf(id) }));
+      // Send TALLY with full contribution-based fields (spec §3 + §4).
+      // The helper reads from in-memory maps which are already populated above.
+      {
+        const tallyPayload = connectDoc
+          ? buildTallyPayload(id, tally, connectDoc)
+          : { pgm: tally.pgm, pvw: tally.pvw, pgmBg: pgmBgOf(id), program: tally.pgm ? [tally.pgm] : [], preview: tally.pvw ? [tally.pvw] : [], contributions: [] as Array<{ source: string; role: string }> };
+        const seq = nextSeq(id);
+        socket.send(JSON.stringify({ type: 'TALLY', ...tallyPayload, seq, ts: new Date().toISOString() }));
+      }
+
+      // Connect snapshot for the production lifecycle (issue #255, spec §3):
+      // emit one PRODUCTION_STATUS with the current status + per-output health so a
+      // single-source downstream consumer attaching mid-broadcast learns the state
+      // immediately without a REST round-trip. Sent directly to this socket (not
+      // broadcast), so we stamp `ts` here to match the broadcast() envelope; `seq`
+      // rides the #209 envelope once it lands (not yet — carries `ts` only for now).
+      if (connectDoc) {
+        const productionActive = connectDoc.status === 'active';
+        const outputs = deriveOutputSnapshot({
+          outputIds: (connectDoc.outputAssignments ?? []).map((a) => a.outputId),
+          stromKnown: true,
+          productionActive,
+          flowRunning: productionActive && !!connectDoc.stromFlowId,
+        });
+        socket.send(JSON.stringify({
+          ts: new Date().toISOString(),
+          ...buildProductionStatusEvent(id, connectDoc.status, outputs),
+        }));
+      }
 
       const cachedAlpha = overlayAlphaByProduction.get(id);
       if (cachedAlpha !== undefined) {
         socket.send(JSON.stringify({ type: 'OVL_STATE', alpha: cachedAlpha }));
+      }
+
+      // Replay current HTML-source forwarded params so a freshly-connected
+      // Studio/Companion client shows the effective parameters (issue #268).
+      const cachedHtmlParams = htmlSourceParamsByProduction.get(id);
+      if (cachedHtmlParams) {
+        for (const [sourceId, state] of cachedHtmlParams) {
+          socket.send(JSON.stringify({
+            type: 'HTML_SOURCE_STATE',
+            sourceId,
+            params: state.params,
+            effectiveUrl: state.effectiveUrl,
+            updatedAt: state.updatedAt,
+          }));
+        }
       }
 
       // Sync PiP state from in-memory server cache (populated by SET_PIP / SELECT_PVW_PIP).
@@ -1888,6 +2510,132 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
           console.warn('[controller] audio sync error:', err);
         }
       }
+
+      // -----------------------------------------------------------------------
+      // Automation contract §4: GRAPHIC_STATE snapshot (spec §4).
+      // This was the one piece missing from the original connect sync.
+      // Emits the active state of each graphics overlay so automation clients
+      // get the full picture on connect (not just changes thereafter).
+      // -----------------------------------------------------------------------
+      if (connectDoc) {
+        const graphicsState = (connectDoc.graphics ?? []).map((g) => ({
+          overlayId: g.id,
+          name: g.name,
+          active: g.active,
+        }));
+        socket.send(JSON.stringify({
+          type: 'GRAPHIC_STATE',
+          graphics: graphicsState,
+          seq: nextSeq(id),
+          ts: new Date().toISOString(),
+        }));
+      }
+
+      // -----------------------------------------------------------------------
+      // Clip state snapshot (epic #206, issue #278). For each clip source (a
+      // mixerInput present in clipPlayerBlockIds) send the current CLIP_STATE,
+      // alongside the TALLY / PIP_STATE / DSK_STATE / OVL_STATE sync. Prefer the
+      // in-memory registry (authoritative for cued/completed/error, which Strom
+      // cannot report); otherwise restore from Strom's live player.getState.
+      // -----------------------------------------------------------------------
+      if (connectDoc?.clipPlayerBlockIds) {
+        const clipInputs = Object.keys(connectDoc.clipPlayerBlockIds);
+        let clipStrom: StromClient | null = null;
+        for (const mixerInput of clipInputs) {
+          const tracked = getClipStateEntry(id, mixerInput);
+          if (tracked) {
+            socket.send(JSON.stringify({ type: 'CLIP_STATE', ...tracked }));
+            continue;
+          }
+          // Cold registry (server restart / first connect): restore from Strom.
+          try {
+            if (!clipStrom) clipStrom = await makeStromClient();
+            const { flowId, blockId } = resolveClipTarget(connectDoc, mixerInput);
+            const player = await clipStrom.player.getState(flowId, blockId);
+            const state: ClipState = {
+              mixerInput,
+              state: player.state === 'playing' ? 'playing' : player.state === 'paused' ? 'paused' : 'stopped',
+              ...(player.position_ms !== undefined ? { positionMs: player.position_ms } : {}),
+              ...(player.duration_ms !== undefined ? { durationMs: player.duration_ms } : {}),
+            };
+            setClipStateEntry(id, state);
+            socket.send(JSON.stringify({ type: 'CLIP_STATE', ...state }));
+          } catch (err) {
+            console.warn(`[controller] clip state connect sync error (${mixerInput}):`, String(err));
+          }
+        }
+      }
+
+      // -----------------------------------------------------------------------
+      // Guest-calling snapshot (epic #208, issue #301). Emits the current guest
+      // set (GUEST_STATE per live session) and per-input return-feed modes
+      // (RETURN_STATE) so a controller attaching mid-production learns them
+      // without a REST round-trip. previewing/on-air are DERIVED from the live
+      // tally contribution set; `left` sessions are excluded.
+      // -----------------------------------------------------------------------
+      if (connectDoc) {
+        try {
+          const sessionsResult = await getGuestSessionsDb().find({
+            selector: { type: 'guest-session', productionId: id },
+          });
+          const sessions = (Array.isArray(sessionsResult?.docs) ? sessionsResult.docs : [])
+            .filter((s) => s.state !== 'left');
+          if (sessions.length > 0) {
+            const invitesResult = await getGuestInvitesDb().find({
+              selector: { type: 'guest-invite', productionId: id },
+            });
+            const labelByInvite = new Map(
+              (Array.isArray(invitesResult?.docs) ? invitesResult.docs : [])
+                .map((inv) => [inv._id, inv.label] as const),
+            );
+            const tallyNow = getTally(id);
+            const { program, preview } = buildTallyPayload(id, tallyNow, connectDoc);
+            for (const s of sessions) {
+              const label = labelByInvite.get(s.inviteId);
+              socket.send(JSON.stringify({
+                type: 'GUEST_STATE',
+                guestId: s._id,
+                mixerInput: s.mixerInput,
+                state: deriveGuestDisplayState(s.state, s.mixerInput, program, preview),
+                ...(label ? { label } : {}),
+                ...(s.intercomLineId ? { intercomLine: s.intercomLineId } : {}),
+                seq: nextSeq(id),
+                ts: new Date().toISOString(),
+              }));
+            }
+          }
+          // Return-feed modes. Prefer the resolved returnBuses cache; fall back
+          // to the modes persisted on the source assignments' returnFeed.
+          const returnModes = connectDoc.returnBuses?.length
+            ? connectDoc.returnBuses.map((rb) => ({ mixerInput: rb.mixerInput, mode: rb.mode }))
+            : (connectDoc.sources ?? [])
+                .filter((src) => src.returnFeed)
+                .map((src) => ({ mixerInput: src.mixerInput, mode: src.returnFeed!.synced }));
+          for (const r of returnModes) {
+            socket.send(JSON.stringify({
+              type: 'RETURN_STATE',
+              mixerInput: r.mixerInput,
+              mode: r.mode,
+              seq: nextSeq(id),
+              ts: new Date().toISOString(),
+            }));
+          }
+        } catch (err) {
+          console.warn('[controller] guest snapshot connect sync error:', String(err));
+        }
+      }
+
+      // -----------------------------------------------------------------------
+      // Automation contract §4: SNAPSHOT_END (spec §4).
+      // Signals to reconnecting automation clients that the resync is complete.
+      // seq echoes the last event seq emitted during this snapshot so the client
+      // can resume applying live broadcast events with seq > snapshotEnd.seq.
+      // -----------------------------------------------------------------------
+      socket.send(JSON.stringify({
+        type: 'SNAPSHOT_END',
+        seq: currentSeq(id),
+        ts: new Date().toISOString(),
+      }));
     }
   );
 };

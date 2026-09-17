@@ -44,16 +44,37 @@ server. When it is unset, all routes (including this WebSocket) are unauthentica
 When `API_KEY` is set, the upgrade request must carry the key one of two ways
 (verified against the auth hook in `src/server.ts`):
 
-- **`Authorization: Bearer <API_KEY>`** header, or
-- **`?key=<API_KEY>`** query parameter on the upgrade URL.
+- **`Authorization: Bearer <API_KEY>`** header — for non-browser clients that can set
+  request headers, or
+- the **`Sec-WebSocket-Protocol`** header, populated via the subprotocol list argument
+  of the browser `WebSocket` API — for browser clients that cannot set custom headers.
 
-The query-parameter form exists because the browser `WebSocket` API cannot set custom
-request headers; non-browser clients that can set headers may use either form. The key
-is compared with a constant-time comparison; a mismatch returns `401 Unauthorized` and
-the upgrade is rejected.
+The browser form exists because the JS `WebSocket` API cannot set arbitrary request
+headers, but it can offer subprotocols through `new WebSocket(url, protocols)`. The
+client offers **two** sentinel subprotocols:
 
-```
-wss://<host>/ws/productions/<id>/controller?key=<API_KEY>
+- `openlive.bearer` — a plain marker, and
+- `openlive.bearer.<API_KEY>` — carries the actual key.
+
+The server extracts the key from the second subprotocol (`extractSubprotocolKey()` in
+`src/server.ts`) and echoes back only the plain `openlive.bearer` marker, so the secret
+is never reflected into the handshake response header. This keeps the key out of the
+request URL — and therefore out of proxy, CDN, and browser DevTools access logs.
+
+The key is compared with a constant-time comparison; a mismatch returns
+`401 Unauthorized` and the upgrade is rejected.
+
+> The key is **never** accepted via a `?key=<API_KEY>` query parameter. That form was
+> deliberately removed (#49): reverse proxies, CDNs, and browser DevTools log the full
+> request URL, so a static, non-expiring key placed there leaks into access logs as a
+> permanent credential.
+
+```js
+// Browser client
+const ws = new WebSocket(
+  'wss://<host>/ws/productions/<id>/controller',
+  ['openlive.bearer', `openlive.bearer.${apiKey}`],
+);
 ```
 
 ## Inbound messages (client → server)
@@ -92,6 +113,14 @@ otherwise ignored. The inbound type union (`src/ws/controller.ts`):
 | `SELECT_PVW_PIP` | `pip: number` | Select a PiP slot into preview |
 | `SET_PIP` | `pip: number`, `bg: number \| null`, `zones: PipZone[]`, `transforms?: PipTransforms` | Configure a PiP slot |
 | `SET_EFFECT` | `target: EffectTarget`, `effect: VideoEffect` | Set a video effect on an input or master |
+| `HTML_SOURCE_EVENT` | `sourceId: string`, `params: Record<string,string>`, `mode?: 'merge' \| 'replace'` | Forward operator params into an HTML source's URL query and reload the running `cefsrc`. `merge` (default) updates/adds keys on the current effective query; `replace` sets it to exactly `params`. The resulting URL is re-validated with `graphicUrl()` (SSRF/scheme gate). |
+| `CLIP_CUE` | `mixerInput: string`, `clipId?: string` | Load the clip source assigned to `mixerInput` into its media-player block and hold it ready (`setPlaylist` + `goto index 0`, leaving the player paused at the start). Broadcasts `CLIP_STATE` `cued`. |
+| `CLIP_PLAY` | `mixerInput: string` | Start playback of the cued clip (`control play`). Rejected (`ERROR` + `CLIP_STATE` `error`) if nothing is cued on that input. Broadcasts `CLIP_STATE` `playing` and starts the completion poll. |
+| `CLIP_PAUSE` | `mixerInput: string` | Pause playback (`control pause`). Broadcasts `CLIP_STATE` `paused` and stops the completion poll. |
+| `CLIP_STOP` | `mixerInput: string` | Stop playback (`control stop`). Broadcasts `CLIP_STATE` `stopped` and stops the completion poll. |
+| `CLIP_SEEK` | `mixerInput: string`, `positionMs: number` | Seek within the clip (`seek position_ms`); `positionMs` is a non-negative integer (0 … 24 h). Broadcasts the resulting `CLIP_STATE`. |
+| `RETURN_SET` | `mixerInput: string`, `mode: 'program' \| 'program-minus'` | Crew switch a guest's synced return mode (epic #208, issue #301). Shares `applyReturnMode` with the crew REST route and the guest token route: persist + apply the send matrix live + broadcast `RETURN_STATE`. `NACK`/`ERROR` when the input has no return feed, the mode is invalid, or the production is not active. |
+| `KEEP_ALIVE` | — | Client activity / liveness signal (issue #290). Resets the production's idle timer and cancels any pending idle warning; when a warning was outstanding this broadcasts `IDLE_WARNING_CLEARED`. Needs no production doc, so it is handled before the doc fetch the other commands require. |
 
 `VideoEffect` (the `effect` field of `SET_EFFECT`) is itself a discriminated union on
 its own `type`: `none`, `chroma_key`, `pixelate`, `blur`, `duotone`, `vignette`, `vhs`,
@@ -131,8 +160,14 @@ are emitted from `src/ws/controller.ts` and `src/services/meter-relay.ts`:
 | `SOURCE_OFFSET_STATE` | `mixerInput: string`, `offsetMs: number` | A per-source video offset changes; also replayed on connect |
 | `SOURCE_AUDIO_OFFSET_STATE` | `mixerInput: string`, `offsetMs: number` | A per-source audio offset changes; also replayed on connect |
 | `FX_STATE` | `fxAvailable: boolean`, `inputEffects: VideoEffect[]`, `masterEffect: VideoEffect` | Video-effect state changes; also sent on connect |
+| `HTML_SOURCE_STATE` | `sourceId: string`, `params: Record<string,string>`, `effectiveUrl: string`, `updatedAt: string` | An HTML source's forwarded params changed (after a successful `HTML_SOURCE_EVENT`); also replayed on connect. In-memory only — resets on server restart. |
+| `CLIP_STATE` | `mixerInput: string`, `state: 'idle' \| 'cued' \| 'playing' \| 'paused' \| 'stopped' \| 'completed' \| 'error'`, `clipId?: string`, `positionMs?: number`, `durationMs?: number`, `error?: string` | A clip transitions on `mixerInput` (cue/play/pause/stop/seek), reaches end-of-media (`completed`), or a clip operation fails (`error`); also sent on connect for each clip source |
 | `METER_DATA` | `elementId: string`, `peak`, `rms` | Audio meter tick (relayed from Strom); `elementId` is `main`, `monitor`, `ch{N}`, `aux{N}`, or `grp{N}` |
 | `LOUDNESS_DATA` | `elementId: 'main'`, `momentary`, `shortterm`, `integrated`, `loudness_range`, `true_peak` | EBU R128 loudness tick (relayed from Strom) |
+| `IDLE_WARNING` | `productionId: string`, `remainingSec: number`, `deadlineMs: number` | The idle watchdog (`src/services/idle-watchdog.ts`) crossed the warning threshold (T-minus `IDLE_WARNING_LEAD_SEC`, default 60s) before an idle auto-deactivation (issue #290). `remainingSec` is the integer countdown to the deadline; `deadlineMs` is the absolute epoch-ms deadline. Emitted once per idle cycle. |
+| `IDLE_WARNING_CLEARED` | `productionId: string` | A pending idle warning was cancelled because activity reset the idle timer (a subscriber joined or a `KEEP_ALIVE` was received). |
+| `RETURN_STATE` | `mixerInput: string`, `mode: 'program' \| 'program-minus'` | A per-guest return feed's mix-minus mode changed on `mixerInput` (crew via `PUT .../returns/{mixerInput}/mode`, the `RETURN_SET` WS command, or the guest via `PUT /api/v1/guests/{inviteId}/session/return`). `program-minus` closes that guest's own send; `program` opens it (epic #208, issue #300). Also emitted once per configured return during the connect-time snapshot. |
+| `GUEST_STATE` | `guestId: string`, `mixerInput: string`, `state: 'invited' \| 'joined' \| 'previewing' \| 'on-air' \| 'left' \| 'error'`, `label?`, `intercomLine?` | A guest's lifecycle state changed (epic #208, issue #301). Broadcast on the persisted join/leave/kick transitions and emitted once per live guest in the connect-time snapshot. `previewing`/`on-air` are **derived** from the live vision-mixer contribution set (#209); a guest composited only as a PiP *inset* reads `joined` until the PiP-inset tally gap #209 raises is closed. |
 | `ERROR` | `error: string` | An inbound frame was invalid or an operation failed (sent to originating socket) |
 
 `pgmBg` is the mixer input a PiP on program is composited over. It is `null` unless
@@ -148,7 +183,44 @@ state to the new socket before any further broadcasts: `TALLY`, `OVL_STATE` (if 
 `PIP_STATE`, any `DSK_STATE` layers, per-channel and master `AUDIO_STATE` /
 `AUX_MASTER_STATE` / `GRP_MASTER_STATE` / `MONITOR_STATE`, `AUX_SEND_STATE`,
 `GRP_SEND_STATE` (or `GRP_STATE_RESET`), `AFV_STATE`, `PFL_STATE` / `AFL_STATE`,
-`SOURCE_OFFSET_STATE` / `SOURCE_AUDIO_OFFSET_STATE`, `AFV_RAMP_STATE`, and `FX_STATE`.
+`SOURCE_OFFSET_STATE` / `SOURCE_AUDIO_OFFSET_STATE`, `AFV_RAMP_STATE`, `FX_STATE`,
+`HTML_SOURCE_STATE` (per HTML source with forwarded params), `CLIP_STATE` (one per
+clip source — a `mixerInput` present in `clipPlayerBlockIds`), `GUEST_STATE` (one per
+live guest session, `left` excluded) and `RETURN_STATE` (one per configured return
+feed — epic #208, issue #301).
 This lets a freshly-connected client rebuild the full control state without sending
 any inbound messages. See the connect handler in `src/ws/controller.ts` for the exact
 ordering.
+
+The `CLIP_STATE` snapshot prefers the in-memory clip-state registry
+(`src/services/clip-state.service.ts`), which is authoritative for the states Strom
+cannot itself report (`cued`, `completed`, `error`). If the registry has no entry for
+an input (cold start after a server restart), the server restores it from Strom's live
+`player.getState` (mapping `playing`/`paused`/`stopped`).
+
+## Clip / story playback
+
+Clip playback drives a Strom `builtin.media_player` block that is injected per clip
+source at activation and recorded on the production document as
+`clipPlayerBlockIds[mixerInput] → blockId`. The WebSocket `CLIP_*` commands above and
+the equivalent REST endpoints (`/api/v1/productions/:id/clips/:mixerInput/{cue,play,stop}`,
+`GET .../state`) share the same control logic in `src/lib/clip-control.ts`, so both
+surfaces observe and mutate the same player and registry. See
+`docs/specs/clip-story-playback.md` for the authoritative contract.
+
+### Completion detection and timing envelope
+
+Strom's media player does not push player-state transitions, so end-of-media
+(`completed`) is detected by a **poll fallback**: while a clip is `playing`, the server
+polls `player.getState` every `CLIP_STATE_POLL_MS` (config `clipStatePollMs`, default
+`250` ms). On the first poll that observes `stopped`, the server records and broadcasts
+a single `CLIP_STATE` `completed`, then stops the poll. The poll timer is
+production-scoped (shared across all sockets watching the production) and is torn down
+on stop/pause, on deactivate, and when a new cue supersedes it.
+
+Consequently the **completion latency** — the delay between Strom reaching end-of-media
+and clients receiving `CLIP_STATE` `completed` — is bounded by one poll interval, i.e.
+**≤ `CLIP_STATE_POLL_MS` (default 250 ms)**, plus the round-trip of a single
+`player.getState` call. Empirical measurement of the tail latency requires a live Strom
+instance and is not asserted here; lowering `CLIP_STATE_POLL_MS` tightens the bound at
+the cost of more polling traffic.

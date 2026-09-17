@@ -23,16 +23,57 @@ import whipRoutes from './routes/whip.js';
 import productionConfigsRoutes from './routes/production-configs.js';
 import graphicsRoutes from './routes/graphics.js';
 import outputsRoutes from './routes/outputs.js';
+import recordingsRoutes from './routes/recordings.js';
+import authRoutes from './routes/auth.js';
+import gatewaysRoutes from './routes/gateways.js';
+import clipsRoutes from './routes/clips.js';
+import guestsRoutes from './routes/guests.js';
+import returnsRoutes from './routes/returns.js';
 import controllerWs from './ws/controller.js';
+import gatewayHeartbeatWs from './ws/gateway-heartbeat.js';
 
-// Routes exempt from the DB-availability guard (don't touch the DB)
-const DB_EXEMPT_PATHS = new Set(['/health', '/ready', '/api/v1/status', '/api/v1/server-info', '/api/v1/reconnect']);
+// Routes exempt from the DB-availability guard (don't touch the DB).
+// /api/v1/auth/token performs a SAT exchange and never touches CouchDB, so it
+// must remain available even when the DB is down. It is deliberately NOT added
+// to AUTH_EXEMPT_PATHS: it still requires the API key.
+const DB_EXEMPT_PATHS = new Set(['/health', '/ready', '/api/v1/status', '/api/v1/server-info', '/api/v1/reconnect', '/api/v1/auth/token']);
 // Routes exempt from API key auth (health probes + status used by the UI before auth is set up).
 // /api/v1/reconnect is intentionally NOT exempt (#59): it triggers DB/Strom connection attempts
 // and returns their reachability, so an unauthenticated caller could leak infrastructure status
 // or exhaust connections. It is a mutating POST and the studio calls it via its authenticated
 // api client, so requiring the API key here does not break the legitimate caller.
 const AUTH_EXEMPT_PATHS = new Set(['/health', '/ready', '/api/v1/status']);
+
+/**
+ * Matches the inbound gateway heartbeat WS upgrade path
+ * `/ws/gateways/:id/heartbeat` (issue #263, ADR-001). This socket is NOT gated
+ * by the shared `API_KEY`: it authenticates with a per-gateway bearer token,
+ * verified inside the WS handler (`src/ws/gateway-heartbeat.ts`). It is
+ * therefore exempted from the shared-key onRequest gate below so the shared key
+ * alone neither grants nor is required for heartbeat access. The per-gateway
+ * token does not grant access to any other route.
+ */
+function isGatewayHeartbeatPath(path: string): boolean {
+  return /^\/ws\/gateways\/[^/]+\/heartbeat$/.test(path);
+}
+
+/**
+ * Matches the token-authed guest-join / guest-session routes
+ * (`POST /api/v1/guests/:inviteId/join`, `DELETE /api/v1/guests/:inviteId/session`;
+ * epic #208, issue #299). These are called by the guest browser via the invite
+ * link and authenticate with a per-invite HMAC bearer token verified INSIDE the
+ * handler (`src/routes/guests.ts`), NOT the shared `API_KEY`. They are therefore
+ * exempted from the shared-key onRequest gate — mirroring the gateway heartbeat
+ * exemption — so the shared key alone neither grants nor is required for guest
+ * join. The invite token grants only that guest's WHIP input + session; it does
+ * not grant access to any other route. The production-scoped invite-management
+ * routes (`/api/v1/productions/:id/guests/...`) are deliberately NOT exempt: they
+ * are operator/automation surfaces behind the shared key.
+ */
+function isGuestTokenAuthedPath(path: string): boolean {
+  // join, session (leave), and session/return (guest return-mode switch, #300).
+  return /^\/api\/v1\/guests\/[^/]+\/(join|session|session\/return)$/.test(path);
+}
 
 // Sentinel subprotocols used to carry the API key through the
 // Sec-WebSocket-Protocol header on browser WebSocket upgrades (#49). Browsers
@@ -65,6 +106,48 @@ function extractSubprotocolKey(header: string | string[] | undefined): string | 
     }
   }
   return undefined;
+}
+
+// How a request presented its API key, for forensic audit logging (#51). This
+// mirrors the two transports the auth hook accepts: the `Authorization: Bearer`
+// header (REST / non-browser clients) and the `openlive.bearer.<key>`
+// Sec-WebSocket-Protocol subprotocol (browser WS clients, #49). 'none' means no
+// credential was presented on the request.
+type AuthMethod = 'bearer' | 'ws-subprotocol' | 'none';
+
+/**
+ * Masks an API key for audit logging so a suspected-compromise investigation
+ * can correlate which key was used WITHOUT ever persisting the secret itself.
+ * Only a short suffix survives: `key_***<last4>`. Keys too short to safely
+ * reveal a suffix (<8 chars) are fully masked as `key_***`.
+ */
+function maskCredential(key: string): string {
+  if (key.length < 8) return 'key_***';
+  return `key_***${key.slice(-4)}`;
+}
+
+/**
+ * Derives the authentication context for an audit entry from the request
+ * headers, truthfully reflecting how THIS server authenticates (#51):
+ *   - `Authorization: Bearer <key>`            -> 'bearer'
+ *   - `openlive.bearer.<key>` WS subprotocol   -> 'ws-subprotocol'
+ *   - neither present                          -> 'none'
+ * `maskedCred` is only set when a credential was actually presented, and never
+ * contains the raw key — only the `maskCredential` suffix form.
+ */
+function deriveAuthContext(
+  authorization: string | undefined,
+  subprotocol: string | string[] | undefined
+): { authMethod: AuthMethod; maskedCred?: string } {
+  const bearerKey = authorization?.startsWith('Bearer ') ? authorization.slice(7) : undefined;
+  if (bearerKey) {
+    return { authMethod: 'bearer', maskedCred: maskCredential(bearerKey) };
+  }
+  const subprotocolKey = extractSubprotocolKey(subprotocol);
+  if (subprotocolKey) {
+    return { authMethod: 'ws-subprotocol', maskedCred: maskCredential(subprotocolKey) };
+  }
+  return { authMethod: 'none' };
 }
 
 export async function buildServer() {
@@ -229,6 +312,14 @@ export async function buildServer() {
     fastify.addHook('onRequest', async (req, reply) => {
       const path = req.url.split('?')[0]!;
       if (AUTH_EXEMPT_PATHS.has(path)) return;
+      // The gateway heartbeat WS authenticates with a per-gateway token inside
+      // the handler (ADR-001), not the shared API key — so it must bypass this
+      // shared-key gate. The `?key=` query string is still never accepted.
+      if (isGatewayHeartbeatPath(path)) return;
+      // The guest join/session routes authenticate with a per-invite HMAC token
+      // inside the handler (issue #299), not the shared API key — so they must
+      // bypass this shared-key gate. The invite token is scoped to that guest.
+      if (isGuestTokenAuthedPath(path)) return;
       // Guard the REST API, the WebSocket controller, and the Swagger UI /
       // OpenAPI spec routes. The /ws/ prefix must be listed explicitly:
       // without it, /ws/productions/:id/controller bypasses auth entirely and
@@ -269,12 +360,21 @@ export async function buildServer() {
     if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return;
     if (!req.url.startsWith('/api/v1')) return;
     const ip = req.ip ?? '';
+    // Record which credential authenticated the request (#51) so a suspected
+    // key compromise can be traced. maskedCred only ever carries a masked
+    // suffix — the raw key is never logged.
+    const { authMethod, maskedCred } = deriveAuthContext(
+      req.headers['authorization'],
+      req.headers['sec-websocket-protocol']
+    );
     fastify.log.info({
       audit: true,
       method: req.method,
       url: req.url.split('?')[0],
       status: reply.statusCode,
       ip,
+      authMethod,
+      ...(maskedCred ? { maskedCred } : {}),
     }, 'audit');
   });
 
@@ -313,7 +413,14 @@ export async function buildServer() {
   await fastify.register(productionConfigsRoutes);
   await fastify.register(graphicsRoutes);
   await fastify.register(outputsRoutes);
+  await fastify.register(recordingsRoutes);
+  await fastify.register(authRoutes);
+  await fastify.register(gatewaysRoutes);
+  await fastify.register(clipsRoutes);
+  await fastify.register(guestsRoutes);
+  await fastify.register(returnsRoutes);
   await fastify.register(controllerWs);
+  await fastify.register(gatewayHeartbeatWs);
 
   return fastify;
 }
