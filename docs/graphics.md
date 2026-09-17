@@ -51,6 +51,26 @@ The practical consequence: an **HTML graphic must be served from a trusted `http
 cannot be pasted inline as a `data:` URI. Host your OGraf template (or any HTML template) at a
 reachable https URL, then register that URL.
 
+### Authenticated HTML sources (token-in-URL, v1)
+
+An HTML source behind a login can be rendered today **only** if the provider offers a
+signed/expiring share or access link: put that token-bearing URL in the source `address` and the
+renderer navigates to it like any other `https://` URL. This is **Design D** of
+[`docs/specs/authenticated-html-sources.md`](specs/authenticated-html-sources.md) (ADR-003) and is
+the only authenticated-HTML mechanism in v1.
+
+Operator trade-off — read before relying on it:
+
+- The token lives in the URL you provide. Use the **shortest-lived, revocable** token the provider
+  supports; a long-lived token in a source address is a long-lived credential.
+- This is **not** equivalent to a stored per-source credential. Per-source stored credentials and
+  isolated persisted login profiles (Designs B/C) are deferred pending an upstream `gstcefsrc`
+  capability — token-in-URL does not provide credential rotation, masking-on-read, or
+  interactive/MFA login.
+- Open Live treats a token-bearing `address` as a secret **in its logs** (redacted in
+  `src/lib/log-redact.ts` and the server logger), but it cannot control how the *provider* logs the
+  token, nor does it mask the token in the source read API — the operator chose to place it there.
+
 ### API and WebSocket surface
 
 Graphics touch three parts of the API server. All of this is the authoritative, code-backed

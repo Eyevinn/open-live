@@ -97,3 +97,57 @@ describe('safeFlowProjection', () => {
     expect(out.elements).toEqual([]);
   });
 });
+
+/**
+ * Design D (token-in-URL) authenticated HTML sources — issue #315,
+ * docs/specs/authenticated-html-sources.md, ADR-003 Decision 4.
+ *
+ * A signed/expiring access token is carried inside the HTML source `address`,
+ * which the flow generator maps onto the `cefsrc` element's `url` property
+ * (src/lib/flow-generator.ts:584-592). The canary is a recognisable token that
+ * must never survive into any logged representation of a source or a flow.
+ */
+describe('authenticated HTML source token redaction (Design D, #315)', () => {
+  const CANARY = 'tkn-CANARY-9f83b1e0-DO-NOT-LOG';
+
+  it('redacts a token-bearing HTML source address', () => {
+    const source = {
+      id: 'src-html-1',
+      name: 'Scoreboard',
+      streamType: 'html',
+      address: `https://scores.example.com/live?access_token=${CANARY}`,
+    };
+    const out = redactSensitive(source) as Record<string, unknown>;
+    expect(out.address).toBe('[REDACTED]');
+    expect(out.name).toBe('Scoreboard');
+    expect(JSON.stringify(out)).not.toContain(CANARY);
+  });
+
+  it('redacts a token-bearing url property (cefsrc element)', () => {
+    const out = redactSensitive({
+      element_type: 'cefsrc',
+      properties: { url: `https://scores.example.com/live?access_token=${CANARY}` },
+    });
+    expect(JSON.stringify(out)).not.toContain(CANARY);
+  });
+
+  it('never leaks the canary through a logged flow projection', () => {
+    // Mirrors the cefsrc element the flow generator emits for an HTML source.
+    const flow = {
+      blocks: [],
+      elements: [
+        {
+          id: 'e-html-0-abc',
+          element_type: 'cefsrc',
+          properties: { url: `https://scores.example.com/live?access_token=${CANARY}` },
+        },
+      ],
+      links: [],
+    };
+
+    // Both the intended flow-log path (safeFlowProjection) and the generic
+    // structured-log redactor must scrub the canary.
+    expect(JSON.stringify(safeFlowProjection(flow))).not.toContain(CANARY);
+    expect(JSON.stringify(redactSensitive(flow))).not.toContain(CANARY);
+  });
+});

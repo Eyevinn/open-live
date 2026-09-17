@@ -7,10 +7,17 @@
  * `guestInviteSecret` / `intercomManagerToken` — are redacted here without a
  * dedicated rule (epic #208, issue #299, spec §Risks: "Redact
  * INTERCOM_MANAGER_TOKEN and GUEST_INVITE_SECRET in logs").
+ *
+ * `address` / `url` are redacted because an authenticated HTML source (Design D,
+ * token-in-URL — `docs/specs/authenticated-html-sources.md`, ADR-003) carries a
+ * signed/expiring access token inside the source `address`, which becomes the
+ * `cefsrc` element's `url` property in the generated flow. Treat both as secrets
+ * in logs so a token-bearing HTML-source address never leaks (issue #315). SRT
+ * addresses (which may embed a `?passphrase=`) benefit from the same rule.
  */
 
 const SENSITIVE_KEYS =
-  /srt_uri|passphrase|streamid|authorization|token|pat|secret|access_?key/i;
+  /srt_uri|passphrase|streamid|authorization|token|pat|secret|access_?key|address|url/i;
 
 export function redactSensitive(obj: unknown): unknown {
   if (Array.isArray(obj)) {
