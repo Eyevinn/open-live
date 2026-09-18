@@ -86,8 +86,16 @@ export const config = {
    * short-lived SAT via POST /api/v1/auth/token (issue #204) so browser
    * clients (e.g. open-live-studio) never hold the PAT. NEVER returned to a
    * client.
+   *
+   * Read from `OSC_PAT` first (the original var), falling back to
+   * `OSC_ACCESS_TOKEN` — the env the OSC platform maps the `OscAccessToken`
+   * service config option onto. The funnel provisions the token via
+   * `OscAccessToken` (mirroring the studio service's param of the same name),
+   * so without this fallback a correctly-provisioned instance still returned
+   * `503 "Token exchange is not configured"` because nothing set `OSC_PAT`
+   * (issue #318).
    */
-  oscPat: process.env['OSC_PAT'] ?? undefined,
+  oscPat: process.env['OSC_PAT'] ?? process.env['OSC_ACCESS_TOKEN'] ?? undefined,
   /**
    * The OSC serviceId that SATs minted via /api/v1/auth/token are scoped to.
    * Fixed server-side config (never caller-supplied) so the token endpoint
