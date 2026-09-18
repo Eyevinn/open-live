@@ -69,7 +69,9 @@ const authRoutes: FastifyPluginAsync = async (fastify) => {
 
       if (!config.oscPat) {
         // Misconfiguration: no PAT is available to exchange.
-        fastify.log.error('POST /api/v1/auth/token — OSC_PAT is not configured')
+        fastify.log.error(
+          'POST /api/v1/auth/token — no OSC PAT configured (set OSC_ACCESS_TOKEN, or legacy OSC_PAT)',
+        )
         return reply
           .status(503)
           .send({ error: 'Token exchange is not configured', statusCode: 503 })

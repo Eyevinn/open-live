@@ -2,8 +2,38 @@
 
 **Epic**: Cross-service remediation for `Eyevinn/open-live-studio` #10 — *[SECURITY][HIGH] OSC_PAT exposed in plaintext via publicly-accessible /env-config.js*
 **Author**: architect
-**Status**: Phase 1 — Spec (pending team-lead gate)
+**Status**: Accepted (2026-09-18) — see §0 Implementation Reconciliation for how the shipped endpoint differs from the original design and the resolved env-provisioning decision.
 **Affected services**: `open-live` (backend), `open-live-studio` (frontend)
+
+## 0. Implementation Reconciliation (2026-09-18, issue #318)
+
+This spec was authored as Phase 1 and never flipped to Accepted, yet the implementing
+code shipped 2026-09-15 (PR #228, issue #204). The shipped endpoint diverged from the
+design below; #318 surfaced the divergence when a freshly funnel-provisioned instance
+returned `503 "Token exchange is not configured"`. The as-shipped reality, now accepted:
+
+- **Endpoint**: shipped as `POST /api/v1/auth/token` (not the `POST /api/v1/osc/service-token`
+  drafted in §2). `serviceId` is fixed server-side (`config.oscSatServiceId`, default
+  `eyevinn-strom`) and the request body is empty — the allowlist/`serviceId` request field
+  from §2/§6 was not built; the fixed-server-side approach satisfies the same anti-SSRF goal.
+- **Response**: `{ token, expiry }` (OSC `expiry` passed through verbatim), not the
+  `{ token, serviceId, expiresAt }` drafted in §2.
+- **PAT env var (the #318 decision)**: the backend reads its OSC PAT from a **dedicated
+  `OSC_PAT`** var (`src/config.ts`), *not* by reusing `STROM_AUTH_TOKEN` as §1/§5 proposed.
+  That separate-var choice is kept, but no OSC provisioning path set `OSC_PAT`, so the
+  endpoint 503'd on every fresh instance. **Resolution (option 2 — provision it; decided by
+  @svensson00, relayed from @birme, 2026-09-18):** the `eyevinn-open-live` service gains an
+  `OscAccessToken` config option (mirroring the studio service's param of the same name),
+  which the funnel passes on create. The OSC platform maps `OscAccessToken` onto the
+  `OSC_ACCESS_TOKEN` env var, so `src/config.ts` now resolves the PAT as
+  `OSC_PAT ?? OSC_ACCESS_TOKEN` — the funnel-provisioned `OSC_ACCESS_TOKEN` satisfies it
+  with no code change required per instance. The studio holds no PAT (per open-live-studio#10);
+  it only calls this endpoint for a short-lived SAT.
+- **Verification target**: `POST /api/v1/auth/token` returns 200 and Studio connects on a
+  fresh beta-channel instance (`magnus/betatest`).
+
+Sections 1–7 below are the original Phase-1 design, retained for context; where they conflict
+with this section, this section (the shipped + accepted reality) governs.
 
 ## 1. Problem Statement
 
