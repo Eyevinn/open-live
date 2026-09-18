@@ -362,6 +362,20 @@ const InboundMessageSchema = z.discriminatedUnion('type', [
  * Extracts the numeric index from a mixer pad name like "video_in_2" → 2.
  * Returns null if the pad name doesn't match the expected format.
  */
+/**
+ * True when `mixerInput` is already the on-air source. A CUT or TRANSITION
+ * to it is a no-op, like pressing the PGM button of the source that is
+ * already on air. Without this guard the tally became `{pgm: X, pvw: X}` and
+ * the Strom take ran with `from_input === to_input`, which Strom treats as a
+ * PGM/PVW swap, so the picture flipped to the previous preview.
+ *
+ * While a PiP is on PGM `tally.pgm` is null and a CUT to a real input is a
+ * genuine change, so this never fires in that state.
+ */
+function isAlreadyOnProgram(productionId: string, mixerInput: string): boolean {
+  return getTally(productionId).pgm === mixerInput && (pgmPipByProduction.get(productionId) ?? null) === null;
+}
+
 function padToIndex(mixerInput: string): number | null {
   const match = /video_in_(\d+)$/.exec(mixerInput);
   return match ? parseInt(match[1], 10) : null;
@@ -1079,6 +1093,10 @@ export async function handleMessage(
 
   switch (msg.type) {
     case 'CUT': {
+      if (isAlreadyOnProgram(productionId, msg.mixerInput)) {
+        if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
+        break;
+      }
       const tally = getTally(productionId);
       // When a PiP is on PGM, tally.pgm is null. Use the tracked Strom PGM
       // background input so stromTransition has a valid from_input.
@@ -1119,6 +1137,10 @@ export async function handleMessage(
       break;
     }
     case 'TRANSITION': {
+      if (isAlreadyOnProgram(productionId, msg.mixerInput)) {
+        if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
+        break;
+      }
       const tally = getTally(productionId);
       const curPgmPipTrans = pgmPipByProduction.get(productionId) ?? null;
       const fromPadTrans = (curPgmPipTrans !== null && tally.pgm === null)
@@ -1426,21 +1448,25 @@ export async function handleMessage(
           if (action.type === 'CUT' && action.sourceId) {
             const mixerInput = resolveInput(action.sourceId);
             if (!mixerInput) break;
-            const tally = getTally(productionId);
-            const newTally = { pgm: mixerInput, pvw: tally.pgm };
-            setTally(productionId, newTally);
-            await persistMixerMutation(productionId, 'MACRO_EXEC:CUT', (d) => ({ ...d, tally: newTally }));
-            broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId) });
-            await stromTransition(currentDoc, tally.pgm, mixerInput, 'cut');
+            if (!isAlreadyOnProgram(productionId, mixerInput)) {
+              const tally = getTally(productionId);
+              const newTally = { pgm: mixerInput, pvw: tally.pgm };
+              setTally(productionId, newTally);
+              await persistMixerMutation(productionId, 'MACRO_EXEC:CUT', (d) => ({ ...d, tally: newTally }));
+              broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId) });
+              await stromTransition(currentDoc, tally.pgm, mixerInput, 'cut');
+            }
           } else if (action.type === 'TRANSITION' && action.sourceId) {
             const mixerInput = resolveInput(action.sourceId);
             if (!mixerInput) break;
-            const tally = getTally(productionId);
-            const newTally = { pgm: mixerInput, pvw: tally.pgm };
-            setTally(productionId, newTally);
-            await persistMixerMutation(productionId, 'MACRO_EXEC:TRANSITION', (d) => ({ ...d, tally: newTally }));
-            broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId), transitionType: action.transitionType, durationMs: action.durationMs });
-            await stromTransition(currentDoc, tally.pgm, mixerInput, toStromTransition(action.transitionType ?? 'cut'), action.durationMs);
+            if (!isAlreadyOnProgram(productionId, mixerInput)) {
+              const tally = getTally(productionId);
+              const newTally = { pgm: mixerInput, pvw: tally.pgm };
+              setTally(productionId, newTally);
+              await persistMixerMutation(productionId, 'MACRO_EXEC:TRANSITION', (d) => ({ ...d, tally: newTally }));
+              broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: pgmBgOf(productionId), transitionType: action.transitionType, durationMs: action.durationMs });
+              await stromTransition(currentDoc, tally.pgm, mixerInput, toStromTransition(action.transitionType ?? 'cut'), action.durationMs);
+            }
           } else if (action.type === 'TAKE') {
             const tally = getTally(productionId);
             const newTally = { pgm: tally.pvw, pvw: tally.pgm };
