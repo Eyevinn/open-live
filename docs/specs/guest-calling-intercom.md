@@ -398,10 +398,15 @@ from Proposed → Accepted.
 These do not gate accepting the spec or cutting sub-issues; they are resolved during
 implementation or in a dependent `open-live-studio` ticket.
 
-- **Mix for the low-latency return (after v1):** an aux bus on `builtin.mixer` (keeps each guest's
-  channel processing, carries the audio mixer's latency) vs. `builtin.liveaudiorouter` fed before
-  the mixer (lower latency, raw microphones, no limiter unless Eyevinn/strom#795 lands). Measure
-  path headroom and per-guest jitter on real links first; see
+- **Mix for the low-latency return (after v1):** `builtin.liveaudiorouter` fed before the mixer.
+  An aux bus on `builtin.mixer` is ruled out: it puts the conversation through the program
+  mixer, which passes one guest's bad link on to every other guest. With one contributor on a
+  badly impaired link, the other contributors' audio on the `liveaudiorouter` path kept 0.13–0.18%
+  dropout, the same as the control, while the program mixer took every contributor's audio to 7%
+  dropout and shifted its own delay by 220 ms (Strom loopback rig, 0–200 ms jitter, 0.4–1.2 s
+  stalls and about 13% burst loss on one WHIP publisher's packets, dropout of a test tone from a
+  clean contributor). Still open: the router feeds raw microphones, with no limiter unless
+  Eyevinn/strom#795 lands. Measure path headroom first; see
   [Low-latency mode](#low-latency-mode-after-v1). Only relevant once `low-latency-minus` ships;
   v1 is `lowLatency: false`.
 - **Guest auth model for invite links:** production-scoped, expiring, single-use vs reusable? This
