@@ -109,10 +109,22 @@ explicitly a later enhancement.
 audio-only WHEP output, played by the client in place of the picture feed's audio. v1 accepts
 only `returnFeed.lowLatency: false`. Before it ships:
 
-- **Ingest jitterbuffer.** Strom's WHIP input defaults to a 400 ms jitterbuffer, set at build
-  time, and it dominates return delay. Open Live needs a per-assignment value sized from jitter
-  measured in rehearsal; a smaller buffer trades that guest's program quality for conversation
-  latency.
+- **Absorb stalls after the jitterbuffer, not in it.** Each seat keeps one WHIP jitterbuffer
+  at its quality setting (Strom's default is 400 ms), shared by program and the fast feed.
+  Shortening it is the wrong lever: publishers do not retransmit Opus, a 400–700 ms network
+  stall passes through the jitterbuffer at any practical setting, and a shorter one only drops
+  audio that arrives late. Program dropout at an audio jitterbuffer of 100 ms against 400 ms
+  was 4.9% against 0.2% with 150 ms link stalls, and 10.6% against 0.14% with 300 ms stalls
+  (Strom loopback rig, fixed stalls every 3 s on the WHIP publishers' packets, dropout of a
+  test tone on the program WHEP output, 3 trials per cell). The fast feed instead needs stalls
+  absorbed downstream of the jitterbuffer, on the conversation path only: run at a low target
+  latency, time-stretch audio to cover a stall rather than go silent, then play slightly fast
+  until back at target. A prototype recovered a 400 ms stall with no skip and no added
+  dropout; nothing that does this is built yet.
+- **Conversation audio never airs.** What airs is each voice via the program path, buffered and
+  unstretched; the conversation path governs only what guests hear of each other. It must
+  never feed program output or a recording, because time-scaled audio cannot be recovered
+  afterwards.
 - **Path headroom.** A return that bypasses the audio mixer (`mix_latency`, with
   `min_upstream_latency` set to the slowest SRT source, `src/lib/flow-generator.ts:148-153,418-435`)
   may be released early with a negative WHEP `ts_offset_ms`. Unverified on Open Live's flow; must
