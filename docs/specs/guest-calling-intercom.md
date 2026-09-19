@@ -111,7 +111,7 @@ only `returnFeed.lowLatency: false`. Before it ships:
 
 - **Absorb stalls after the jitterbuffer, not in it.** Each seat keeps one WHIP jitterbuffer
   at its quality setting (Strom's default is 400 ms), shared by program and the fast feed.
-  Shortening it is the wrong lever: publishers do not retransmit Opus, a 400–700 ms network
+  Shortening it does not help: publishers do not retransmit Opus, a 400–700 ms network
   stall passes through the jitterbuffer at any practical setting, and a shorter one only drops
   audio that arrives late. Program dropout at an audio jitterbuffer of 100 ms against 400 ms
   was 4.9% against 0.2% with 150 ms link stalls, and 10.6% against 0.14% with 300 ms stalls
@@ -399,13 +399,13 @@ These do not gate accepting the spec or cutting sub-issues; they are resolved du
 implementation or in a dependent `open-live-studio` ticket.
 
 - **Mix for the low-latency return (after v1):** `builtin.liveaudiorouter` fed before the mixer.
-  An aux bus on `builtin.mixer` is ruled out: it puts the conversation through the program
+  Not an aux bus on `builtin.mixer`: it puts the conversation through the program
   mixer, which passes one guest's bad link on to every other guest. With one contributor on a
   badly impaired link, the other contributors' audio on the `liveaudiorouter` path kept 0.13–0.18%
   dropout, the same as the control, while the program mixer took every contributor's audio to 7%
   dropout and shifted its own delay by 220 ms (Strom loopback rig, 0–200 ms jitter, 0.4–1.2 s
   stalls and about 13% burst loss on one WHIP publisher's packets, dropout of a test tone from a
-  clean contributor). Still open: the router feeds raw microphones, with no limiter unless
+  clean contributor). Open: the router feeds raw microphones, with no limiter unless
   Eyevinn/strom#795 lands. Measure path headroom first; see
   [Low-latency mode](#low-latency-mode-after-v1). Only relevant once `low-latency-minus` ships;
   v1 is `lowLatency: false`.
