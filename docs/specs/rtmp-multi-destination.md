@@ -1,8 +1,14 @@
 # Spec: RTMP multi-destination output with platform presets (OL-11)
 
-**Status: Proposed** (2026-09-18) — Phase 1 spec-only deliverable for the epic-workflow team-lead gate.
-Implementation may not begin until this spec + ADR-004 are reviewed and the Open Questions below are
-resolved, and until the load-bearing upstream Strom dependencies (strom#783, strom#840) close.
+**Status: Accepted** (2026-09-19) — Phase 1 spec-only deliverable for the epic-workflow team-lead gate.
+Reviewed and accepted at the team-lead gate on 2026-09-19; all four Open Questions were resolved by
+@svensson00 (see **Resolved Decisions** below). Per that decision, **strom#840 is recorded as the
+gating dependency in the Implementation Plan** — implementation may not begin until strom#840 closes
+(one dead destination must not take down program output), and the required `security-engineer` review
+of the stream-key handling flow is a hard gate before any Phase 2 code.
+_Superseded header note (was: Status Proposed, 2026-09-18): "Implementation may not begin until this
+spec + ADR-004 are reviewed and the Open Questions below are resolved, and until the load-bearing
+upstream Strom dependencies (strom#783, strom#840) close."_
 **Author:** architect agent
 **Related issues:** Eyevinn/open-live#319 (OL-11 epic — backend), Eyevinn/open-live-studio#143
 (Studio companion — destination-management UI). Upstream dependencies (both OPEN, not duplicated
@@ -317,22 +323,58 @@ assigned RTMP destination, wired exactly like the existing SRT output
 > applied, and (b) redact `rtmp_url` in any open-live-side logging of the generated flow. This is an
 > ADR-004 hard rule.
 
+## Resolved Decisions (team-lead gate, 2026-09-19 — @svensson00)
+
+All four Open Questions below are **resolved**; each is annotated inline with **RESOLVED**. Summary:
+
+1. **v1 presets — RESOLVED.** Ship all three named presets (**YouTube, Twitch, Facebook**) **plus one
+   generic custom-RTMP destination** (operator supplies the raw RTMP(S) ingest URL + stream key).
+   Nothing else until a customer asks. The `platform` union therefore becomes
+   `'youtube' | 'twitch' | 'facebook' | 'custom'`; for `'custom'`, the operator supplies `ingestUrl`
+   directly instead of it being resolved from the preset table (validate it as an `rtmp(s)://` URL and
+   apply the same SSRF/secret-handling discipline).
+2. **Credential-at-rest key — RESOLVED.** Use a **dedicated `RTMP_CREDENTIALS_KEY`** (same AES-256-GCM
+   `srt-passphrase-crypto` helper), **not** a reuse of `SRT_PASSPHRASE_KEY` — coupling stream-key
+   rotation to the SRT passphrase key would make both rotations riskier. (@svensson00 flagged this as
+   an infra call and invited @birme to object if reuse is preferred; recorded as dedicated-key unless
+   backend flags otherwise during implementation.) Supersedes the spec's earlier `RTMP_STREAM_KEY_KEY`
+   naming — use `RTMP_CREDENTIALS_KEY`.
+3. **Per-destination failure — RESOLVED, and strom#840 is a v1 blocker.** One dead destination must not
+   take down program output; that robustness fix genuinely needs **strom#840**, which is therefore the
+   **gating dependency recorded in the Implementation Plan below**. Until it lands, per-destination
+   status derived from **connection state only** (`unknown` / `failed`) is acceptable for v1.
+4. **Encoder defaults — RESOLVED.** Presets carry **platform-safe encoder defaults in Open Live for
+   now**, explicitly marked **temporary** until strom#783 gives the engine a source of truth. Not a
+   hard blocker; the temporary in-repo defaults unblock v1.
+
+### Implementation Plan — gating dependency
+
+**strom#840 is the gating dependency for v1 implementation** (@svensson00, 2026-09-19): a refused input
+must not unlink the pad and crash program output, so multi-destination publish may not ship until
+strom#840 closes. strom#783 is *not* a hard blocker — Open Live ships temporary platform-safe encoder
+defaults until it lands. The `security-engineer` review of the stream-key handling flow (ADR-004
+Decision 4) remains a hard gate before any Phase 2 code, independent of the Strom deps.
+
 ## Open Questions
 
-Flag every genuine product/design decision below to `team-lead` before Phase 2 begins.
+_All resolved at the 2026-09-19 team-lead gate — see **Resolved Decisions** above. Retained for
+provenance; each carries its **RESOLVED** annotation._
 
 1. **Which platform presets ship in v1?** The epic names YouTube, Twitch, Facebook. Confirm all three
    ship in v1 (vs. a subset), and decide whether a `'custom'` / "other RTMP URL" preset ships
    alongside them or is deferred (the epic's headline flow is preset-only; a raw-URL destination
    reintroduces the manual-URL UX the epic explicitly moves away from, and widens the SSRF/secret
-   surface). **Product decision — team-lead / @svensson00.**
+   surface). **Product decision — team-lead / @svensson00. → RESOLVED 2026-09-19: ship YouTube,
+   Twitch, Facebook AND a generic `'custom'` raw-URL destination; nothing else until a customer asks.**
 
 2. **Credential-at-rest key: reuse `SRT_PASSPHRASE_KEY` or a dedicated `RTMP_STREAM_KEY_KEY`?**
    ADR-003 chose a dedicated `HTML_AUTH_KEY` (fallback to `SRT_PASSPHRASE_KEY`) for blast-radius
    isolation. A dedicated key is cleaner for rotation/isolation but is one more secret to provision;
    the SRT key is already wired and fail-closed. Recommend a dedicated `RTMP_STREAM_KEY_KEY` that
    falls back to `SRT_PASSPHRASE_KEY` when unset — but this is a security call for the
-   `security-engineer` review. **Design/security decision.**
+   `security-engineer` review. **Design/security decision. → RESOLVED 2026-09-19: dedicated
+   `RTMP_CREDENTIALS_KEY` (no reuse of `SRT_PASSPHRASE_KEY`), same AES-256-GCM helper; decoupled so
+   stream-key rotation does not force an SRT-passphrase-key rotation.**
 
 3. **How is per-destination failure surfaced, given strom#840?** Today's `OutputStatus` (issue #255)
    is derived **flow-level** — all outputs of a running production read `healthy` uniformly
@@ -341,13 +383,17 @@ Flag every genuine product/design decision below to `team-lead` before Phase 2 b
    strom#840 (a refused input unlinks the pad → `Internal data stream error` instead of a clean
    per-destination rejection). Decide the v1 behaviour: (a) ship flow-level status only and document
    the limitation, or (b) gate the per-destination-status UI on strom#840 closing. **Design decision,
-   gated on strom#840 (OPEN).**
+   gated on strom#840 (OPEN). → RESOLVED 2026-09-19: strom#840 is the v1 gating dependency (one dead
+   destination must not take down program output); until it lands, connection-state-only status
+   (`unknown`/`failed`) is acceptable.**
 
 4. **Encoder defaults source of truth (ties to strom#783).** strom#783 (OPEN) is the fix that
    constrains `rtmp_output`'s default video profile to what RTMP receivers accept. Decide whether
    open-live sets an explicit encoder profile on the `builtin.rtmp_output` / upstream `builtin.videoenc`
    block, or relies on the strom#783 default once it lands. Implementation of the "no operator tuning"
-   promise is gated on strom#783. **Design decision, gated on strom#783 (OPEN).**
+   promise is gated on strom#783. **Design decision, gated on strom#783 (OPEN). → RESOLVED 2026-09-19:
+   presets carry platform-safe encoder defaults in Open Live now, explicitly temporary until strom#783
+   lands; NOT a hard v1 blocker (only strom#840 is).**
 
 ## Risks
 

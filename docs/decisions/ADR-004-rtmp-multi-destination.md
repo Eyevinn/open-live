@@ -1,7 +1,19 @@
 # ADR-004: RTMP multi-destination models each destination as an `OutputDoc`, with the stream key handled as an encrypted, write-only credential
 
-**Date**: 2026-09-18
-**Status**: Proposed
+**Date**: 2026-09-18 (Accepted 2026-09-19)
+**Status**: Accepted
+
+> **Accepted at the team-lead gate, 2026-09-19.** All four spec Open Questions were resolved by
+> @svensson00 (see `docs/specs/rtmp-multi-destination.md` → **Resolved Decisions**):
+> (1) v1 presets = YouTube + Twitch + Facebook + a generic `'custom'` raw-URL destination;
+> (2) credential-at-rest key = a **dedicated `RTMP_CREDENTIALS_KEY`** (no reuse of `SRT_PASSPHRASE_KEY`),
+> same AES-256-GCM helper — settling Decision 4's Open-Question-2 recommendation as
+> `RTMP_CREDENTIALS_KEY` rather than `RTMP_STREAM_KEY_KEY`/reuse;
+> (3) **strom#840 is the v1 gating dependency** recorded in the spec's Implementation Plan (one dead
+> destination must not take down program output); until it lands, connection-state-only per-destination
+> status is acceptable; (4) encoder defaults ship as temporary platform-safe in-repo values until
+> strom#783 (not a hard blocker). The Decision-4 `security-engineer` review remains a hard gate before
+> any Phase 2 code.
 
 ## Context
 
