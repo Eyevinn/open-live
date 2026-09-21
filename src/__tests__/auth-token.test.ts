@@ -106,8 +106,10 @@ describe('POST /api/v1/auth/token (#204)', () => {
     expect(body).toEqual({ token: 'short-lived-sat', expiry: 1_800_000_000 });
 
     // The exchange is scoped to the fixed server-side serviceId, using the
-    // server-held PAT — neither comes from the request.
-    expect(exchangeMock).toHaveBeenCalledWith(TEST_PAT, 'eyevinn-strom');
+    // server-held PAT — neither comes from the request. Must be
+    // eyevinn-open-live: the studio sets the returned SAT as the
+    // eyevinn-open-live.sat cookie for OSC's reverse proxy.
+    expect(exchangeMock).toHaveBeenCalledWith(TEST_PAT, 'eyevinn-open-live');
 
     // The PAT must never appear anywhere in the response payload.
     expect(res.body).not.toContain(TEST_PAT);
