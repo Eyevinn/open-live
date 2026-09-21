@@ -18,6 +18,12 @@ import { exchangeServiceToken, TokenExchangeError } from '../lib/osc-token.js'
  *
  *   Guarded by the global API-key auth hook in server.ts (the path is NOT in
  *   AUTH_EXEMPT_PATHS) and rate-limited below.
+ *
+ *   When STROM_AUTH_MODE=direct (self-hosted / funnel-provisioned deployments),
+ *   there is no OSC SAT to mint — the tenant has no eyevinn-strom subscription
+ *   and the exchange would 403 "not entitled" (issue #322). The endpoint then
+ *   returns 503, which the Studio treats as "no auth" (relies on the
+ *   same-origin/proxy session instead). The PAT is never returned in any mode.
  */
 
 // The body carries no security-relevant input: the serviceId and target URL
@@ -66,6 +72,24 @@ const authRoutes: FastifyPluginAsync = async (fastify) => {
       // Validate the body — throws ZodError (→ 400 via the global handler) on
       // any unexpected field.
       TokenRequest.parse(req.body ?? {})
+
+      // Direct Strom-auth deployments (funnel-provisioned instances wire the
+      // shared dev Strom via STROM_AUTH_MODE=direct) have no eyevinn-strom
+      // subscription, so an OSC SAT exchange for that scope can only ever
+      // 403 "not entitled" (issue #322). There is no SAT to mint in this mode:
+      // the deployment authenticates to the API via a same-origin/proxy session
+      // (API_KEY), not an OSC SAT cookie. Degrade gracefully with the same 503
+      // the "no PAT configured" path uses — the Studio treats it as "no auth"
+      // and sends requests without an Authorization header, which is correct
+      // for a direct/self-hosted deployment. The PAT is never touched here.
+      if (config.stromAuthMode === 'direct') {
+        fastify.log.info(
+          'POST /api/v1/auth/token — STROM_AUTH_MODE=direct: no OSC SAT exchange needed; responding no-auth',
+        )
+        return reply
+          .status(503)
+          .send({ error: 'SAT exchange not required in direct auth mode', statusCode: 503 })
+      }
 
       if (!config.oscPat) {
         // Misconfiguration: no PAT is available to exchange.
