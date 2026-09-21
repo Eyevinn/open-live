@@ -229,8 +229,7 @@ To keep this guide accurate, the following are **not** part of the Open Live cod
   [SPX-GC](https://github.com/TuomoKu/SPX-GC) can drive, and there is no rundown / play /
   continue / stop / update-data bridge from SPX into Open Live. The community discussion in
   [Eyevinn/strom#243](https://github.com/Eyevinn/strom/issues/243) frames OGraf-via-Open-Live as
-  a direction, and the diagnosis in `Eyevinn/agent-team-supply#264` concerns an OGraf renderer
-  URL-shape problem on OSC — both are upstream/aspirational, not a shipped feature here. Until an
+  a direction — upstream/aspirational, not a shipped feature here. Until an
   SPX bridge exists, treat SPX as an external authoring/playout tool that is not wired to Open
   Live.
 - **OGraf-native ingest / control.** Open Live does not accept a `.ograf.zip`, does not host
