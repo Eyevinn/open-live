@@ -306,6 +306,14 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
       } catch {
         return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
       }
+      // Block a join to a production whose broadcast has ended (deactivated —
+      // issue #325). Deactivate revokes outstanding invites, but a still-TTL-valid
+      // token must not be able to redeem a fresh session (and provision a fresh
+      // intercom line) against a finished production. `inactive`/`activating`
+      // remain joinable — invites are minted before a production goes live.
+      if (production.status === 'ended') {
+        return reply.status(409).send({ error: 'Production is not active', statusCode: 409 });
+      }
       // Allocate a mixer input if the invite did not pin one: reuse the invite's
       // preset, else the first unassigned `video_in_N` on the production.
       const mixerInput = invite.mixerInput ?? allocateMixerInput(production);
