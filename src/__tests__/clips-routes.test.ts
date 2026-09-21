@@ -74,21 +74,32 @@ interface StromRequest {
 const stromRequests: StromRequest[] = [];
 // Controllable player state returned by GET …/player/state
 let playerState: Record<string, unknown> = { state: 'stopped' };
+// When true, the media-player control endpoints (playlist/goto/control/seek)
+// answer with 200 and an empty body — the real shared-Strom behaviour that
+// regressed to a 502 in open-live#333. GET …/player/state always returns JSON.
+let controlReturnsEmpty200 = false;
 
 const stromServer: Server = createServer((req, res) => {
   const chunks: Buffer[] = [];
   req.on('data', (c: Buffer) => chunks.push(c));
   req.on('end', () => {
     const raw = Buffer.concat(chunks).toString('utf8');
+    const url = req.url ?? '';
     stromRequests.push({
       method: req.method ?? '',
-      path: req.url ?? '',
+      path: url,
       ...(raw ? { body: JSON.parse(raw) as unknown } : {}),
     });
-    res.writeHead(200, { 'content-type': 'application/json' });
-    if ((req.url ?? '').endsWith('/player/state')) {
+    if (url.endsWith('/player/state')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify(playerState));
+    } else if (controlReturnsEmpty200) {
+      // Empty 200, no content-type — exactly what Strom's media-player control
+      // endpoints send on OSC shared-Strom deployments.
+      res.writeHead(200);
+      res.end();
     } else {
+      res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ success: true }));
     }
   });
@@ -152,6 +163,7 @@ beforeEach(() => {
   sourceStore.clear();
   stromRequests.length = 0;
   playerState = { state: 'stopped' };
+  controlReturnsEmpty200 = false;
   clearClipState(PROD);
   productionStore.set(PROD, makeProduction());
   sourceStore.set('src-clip', makeSource());
@@ -252,5 +264,37 @@ describe('GET /clips/:mixerInput/state', () => {
     sourceStore.set('src-clip', makeSource({ streamType: 'srt', address: 'srt://1.2.3.4:9000' }));
     const res = await app.inject({ method: 'GET', url: `/api/v1/productions/${PROD}/clips/video_in_0/state`, headers: AUTH });
     expect(res.statusCode).toBe(404);
+  });
+});
+
+// Regression: on OSC shared-Strom deployments the media-player control
+// endpoints answer a successful command with 200 and an empty body. Those
+// `post<void>` calls must resolve as success, not surface as a 502
+// (open-live#333).
+describe('clip control against a shared Strom that returns empty 200s', () => {
+  beforeEach(() => {
+    controlReturnsEmpty200 = true;
+  });
+
+  it('cues (empty-200 setPlaylist + goto) and returns a cued ClipState', async () => {
+    playerState = { state: 'paused', duration_ms: 12000, position_ms: 0 };
+    const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: {} });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ mixerInput: 'video_in_0', state: 'cued' });
+  });
+
+  it('plays (empty-200 control) after a cue', async () => {
+    await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: {} });
+    playerState = { state: 'playing', position_ms: 40, duration_ms: 12000 };
+    const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/play`, headers: AUTH });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ mixerInput: 'video_in_0', state: 'playing' });
+  });
+
+  it('stops (empty-200 control) and returns a stopped ClipState', async () => {
+    playerState = { state: 'stopped', position_ms: 0 };
+    const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/stop`, headers: AUTH });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ mixerInput: 'video_in_0', state: 'stopped' });
   });
 });
