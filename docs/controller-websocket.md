@@ -77,6 +77,27 @@ const ws = new WebSocket(
 );
 ```
 
+### OSC-hosted deployments
+
+On OSC-hosted deployments `API_KEY` is typically unset (an external layer — the OSC
+platform's own ingress gate — handles authentication instead), so the scheme above
+does not apply. Authentication there is enforced entirely upstream, by the gate's
+`/authenticate` check, before the upgrade request ever reaches this server.
+
+Historically that gate only recognized a session cookie, an `Authorization` header, or
+an `x-jwt` header — none of which a cross-origin browser WS upgrade can reliably carry
+(the SAT cookie is scoped to the Studio's own host, not the backend's, and a `?token=`
+query param was never accepted). `@osaas/orchestrator@4.11.0`
+(osaas-lib-orchestrator#263) added a fourth: the **`osc.bearer`** / **`osc.bearer.<sat>`**
+`Sec-WebSocket-Protocol` sentinel pair, generalizing this server's own `openlive.bearer`
+scheme so any OSC service can use it (open-live-studio#144).
+
+This server never extracts or checks the `osc.bearer.<sat>` token itself — the gate
+already validated it upstream — but it must still echo the plain `osc.bearer` marker
+back in the handshake response (`selectWsSubprotocol()` in `src/server.ts`), for the
+same reason as the `openlive.bearer` case: the browser fails the connection if none of
+its offered subprotocols come back.
+
 ## Inbound messages (client → server)
 
 Inbound frames are validated against a discriminated union (`InboundMessageSchema` in
