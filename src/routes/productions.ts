@@ -1,8 +1,8 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
-import { getDb, getOutputsDb, getRecordingsDb } from '../db/index.js';
-import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc, RecordingDoc } from '../db/types.js';
+import { getDb, getOutputsDb, getRecordingsDb, getGuestInvitesDb, getGuestSessionsDb } from '../db/index.js';
+import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc, RecordingDoc, GuestSessionDoc } from '../db/types.js';
 import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js';
@@ -163,6 +163,55 @@ async function firstRecordingOutputId(
     }
   }
   return undefined;
+}
+
+/**
+ * Revoke a production's outstanding guest invites and mark its live guest
+ * sessions `left` on deactivate (issue #325).
+ *
+ * A guest invite token is the security boundary of guest calling: deactivating a
+ * production must invalidate its invites so a still-TTL-valid token can no longer
+ * redeem a session (and provision a fresh intercom line) against a finished
+ * production. Invites are deleted (mirroring the per-invite DELETE revoke in
+ * guests.ts); live sessions (state !== 'left') are transitioned to `left`
+ * (mirroring the kick/leave transition). The join guard in guests.ts is the
+ * belt-and-braces backstop for invites created between this sweep and any later
+ * write. Failures are logged per-doc and swallowed — the caller treats the whole
+ * sweep as best-effort, matching the Strom/intercom teardown contract.
+ */
+async function revokeGuestInvitesForProduction(
+  productionId: string,
+  log: { warn: (obj: unknown, msg: string) => void },
+): Promise<void> {
+  // Delete outstanding invites for this production.
+  const invitesDb = getGuestInvitesDb();
+  const invites = await invitesDb.find({
+    selector: { type: 'guest-invite', productionId },
+  });
+  for (const invite of Array.isArray(invites?.docs) ? invites.docs : []) {
+    if (!invite._rev) continue;
+    try {
+      await invitesDb.destroy(invite._id, invite._rev);
+    } catch (err) {
+      log.warn({ err, inviteId: invite._id, productionId }, 'guest invite revoke on deactivate failed');
+    }
+  }
+
+  // Mark any live guest sessions `left`.
+  const sessionsDb = getGuestSessionsDb();
+  const sessions = await sessionsDb.find({
+    selector: { type: 'guest-session', productionId },
+  });
+  const now = new Date().toISOString();
+  for (const session of Array.isArray(sessions?.docs) ? sessions.docs : []) {
+    if (session.state === 'left') continue;
+    try {
+      const leftSession: GuestSessionDoc = { ...session, state: 'left', updatedAt: now };
+      await sessionsDb.insert(leftSession);
+    } catch (err) {
+      log.warn({ err, guestId: session._id, productionId }, 'guest session leave on deactivate failed');
+    }
+  }
 }
 
 /**
@@ -862,6 +911,17 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
           req.log.warn({ err, productionId: doc._id }, 'intercom teardown failed — continuing deactivation');
         });
       }
+
+      // Revoke the production's outstanding guest invites and mark any live guest
+      // sessions `left` (issue #325). A guest invite token is the security
+      // boundary of guest calling; a still-TTL-valid token must not be able to
+      // join a deactivated production and provision a fresh intercom line. This
+      // mirrors the per-invite DELETE revoke (guests.ts) and the kick/leave
+      // session transition. Best-effort: a failed sweep must not block
+      // deactivation, matching the Strom/intercom teardown contract.
+      await revokeGuestInvitesForProduction(doc._id, req.log).catch((err) => {
+        req.log.warn({ err, productionId: doc._id }, 'guest-invite revoke failed — continuing deactivation');
+      });
 
       // Transition rule (spec §1): a production that was `active` (reached a live
       // broadcast) and is now explicitly deactivated becomes `ended`; one that
