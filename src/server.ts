@@ -90,6 +90,32 @@ function isGuestTokenAuthedPath(path: string): boolean {
 const WS_SUBPROTOCOL_MARKER = 'openlive.bearer';
 const WS_SUBPROTOCOL_KEY_PREFIX = 'openlive.bearer.';
 
+// Sentinel subprotocol the OSC platform's ingress gate uses to authenticate a
+// WS upgrade on OSC-hosted deployments (issue open-live-studio#144,
+// osaas-lib-orchestrator#263) — a generalization of the openlive.bearer scheme
+// above so any OSC service can use it. The gate's /authenticate auth_request
+// validates the SAT carried in `osc.bearer.<token>` *before* this request ever
+// reaches this server, so — unlike WS_SUBPROTOCOL_KEY_PREFIX above — this app
+// never extracts or checks the token itself; it only needs to echo the marker
+// back in handleProtocols below so the browser doesn't fail the handshake for
+// not getting one of its offered subprotocols back (same reason as #49).
+const WS_OSC_BEARER_MARKER = 'osc.bearer';
+
+/**
+ * Selects which client-offered WS subprotocol (if any) this server echoes
+ * back in the handshake response. The browser WebSocket API fails the
+ * connection if the client offered subprotocols and the server's response
+ * doesn't echo one of them (#49), so any recognized bearer marker — whether
+ * this app's own openlive.bearer (self-hosted API_KEY, checked separately in
+ * the onRequest hook below) or the platform's osc.bearer (validated upstream
+ * by the OSC gate) — must be selected here for the handshake to succeed.
+ */
+export function selectWsSubprotocol(protocols: Set<string>): string | false {
+  if (protocols.has(WS_SUBPROTOCOL_MARKER)) return WS_SUBPROTOCOL_MARKER;
+  if (protocols.has(WS_OSC_BEARER_MARKER)) return WS_OSC_BEARER_MARKER;
+  return false;
+}
+
 /**
  * Extracts the API key from a Sec-WebSocket-Protocol header value, if present.
  * The header is a comma-separated list of client-offered subprotocols; we look
@@ -281,16 +307,11 @@ export async function buildServer() {
   // The browser WebSocket API rejects the handshake unless the server echoes
   // one of the client-offered subprotocols back in Sec-WebSocket-Protocol. When
   // a client authenticates by offering the `openlive.bearer.<key>` subprotocol
-  // (#49), we must select it so the connection is not torn down by the browser.
+  // (#49) or the platform's `osc.bearer.<sat>` subprotocol (open-live-studio#144),
+  // we must select it so the connection is not torn down by the browser.
   await fastify.register(websocket, {
     options: {
-      handleProtocols: (protocols: Set<string>) => {
-        // Select the plain marker when offered so the response header does not
-        // reflect the secret-bearing subprotocol. Never echo the key itself.
-        if (protocols.has(WS_SUBPROTOCOL_MARKER)) return WS_SUBPROTOCOL_MARKER;
-        // No bearer subprotocol offered: don't select any (behaves as before).
-        return false;
-      },
+      handleProtocols: selectWsSubprotocol,
     },
   });
 
