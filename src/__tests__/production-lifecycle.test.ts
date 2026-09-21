@@ -23,10 +23,17 @@ const mockFindTrusted = vi.fn();
 const mockOutputGet = vi.fn();
 const mockOutputFind = vi.fn();
 
+const mockInviteFind = vi.fn(async (): Promise<{ docs: unknown[] }> => ({ docs: [] }));
+const mockInviteDestroy = vi.fn();
+const mockSessionFind = vi.fn(async (): Promise<{ docs: unknown[] }> => ({ docs: [] }));
+const mockSessionInsert = vi.fn();
+
 vi.mock('../db/index.js', () => ({
   getDb: () => ({ get: mockGet, insert: mockInsert, find: mockFind, findTrusted: mockFindTrusted }),
   getOutputsDb: () => ({ get: mockOutputGet, find: mockOutputFind, insert: mockInsert, destroy: vi.fn() }),
   getSourcesDb: () => ({ get: mockGet }),
+  getGuestInvitesDb: () => ({ find: mockInviteFind, destroy: mockInviteDestroy }),
+  getGuestSessionsDb: () => ({ find: mockSessionFind, insert: mockSessionInsert }),
   connectDb: vi.fn().mockResolvedValue(undefined),
   isDbReady: vi.fn().mockResolvedValue(true),
   isDbConnected: vi.fn().mockReturnValue(true),
@@ -99,6 +106,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockFind.mockResolvedValue({ docs: [] });
   mockFindTrusted.mockResolvedValue({ docs: [] });
+  mockInviteFind.mockResolvedValue({ docs: [] });
+  mockSessionFind.mockResolvedValue({ docs: [] });
 });
 
 // ---------------------------------------------------------------------------
@@ -121,6 +130,37 @@ describe('explicit deactivate — active → ended, activating → inactive (spe
     expect(inserted.status).toBe('ended');
     expect(inserted.endedReason).toBe('deactivated');
     expect(inserted.stromFlowId).toBeUndefined();
+  });
+
+  it('revokes outstanding guest invites and marks live guest sessions left on deactivate (issue #325)', async () => {
+    const doc = makeProductionDoc({ status: 'active', stromFlowId: 'flow-abc' });
+    mockGet.mockResolvedValue(doc);
+    mockDeactivateStromFlow.mockResolvedValue(undefined);
+    mockInsert.mockResolvedValue({ rev: '2-bcd', ok: true, id: doc._id });
+    mockInviteFind.mockResolvedValue({
+      docs: [
+        { _id: 'guest-invite-1', _rev: '1-a', type: 'guest-invite', productionId: doc._id },
+        { _id: 'guest-invite-2', _rev: '3-b', type: 'guest-invite', productionId: doc._id },
+      ],
+    });
+    mockSessionFind.mockResolvedValue({
+      docs: [
+        { _id: 'guest-session-1', _rev: '1-a', type: 'guest-session', productionId: doc._id, inviteId: 'guest-invite-1', mixerInput: 'video_in_0', state: 'joined' },
+        { _id: 'guest-session-2', _rev: '1-b', type: 'guest-session', productionId: doc._id, inviteId: 'guest-invite-2', mixerInput: 'video_in_1', state: 'left' },
+      ],
+    });
+
+    const app = await buildServer();
+    const res = await app.inject({ method: 'POST', url: '/api/v1/productions/prod-test-1/deactivate' });
+
+    expect(res.statusCode).toBe(200);
+    // Both outstanding invites are destroyed (per-invite revoke pattern).
+    expect(mockInviteDestroy).toHaveBeenCalledWith('guest-invite-1', '1-a');
+    expect(mockInviteDestroy).toHaveBeenCalledWith('guest-invite-2', '3-b');
+    // Only the live session is transitioned to `left`; the already-left one is skipped.
+    const inserted = mockSessionInsert.mock.calls.map((c) => c[0]);
+    expect(inserted).toHaveLength(1);
+    expect(inserted[0]).toMatchObject({ _id: 'guest-session-1', state: 'left' });
   });
 
   it('an activating production that is deactivated stays inactive (never broadcast)', async () => {
