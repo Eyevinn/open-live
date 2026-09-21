@@ -217,7 +217,15 @@ export async function buildServer() {
     origin: corsOrigins,
     methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: false,
+    // The studio calls POST /api/v1/auth/token with `credentials: 'include'`
+    // to ride the OSC proxy/same-origin session (open-live-studio's sat.ts).
+    // With this false, @fastify/cors omits Access-Control-Allow-Credentials
+    // entirely, which the browser reports as an empty header value and fails
+    // the preflight for any credentialed request — independent of the origin
+    // allow-list above. @fastify/cors reflects the specific request origin
+    // (not a literal '*') when `origin: true`, so this is safe to combine
+    // with the wildcard opt-in.
+    credentials: true,
     maxAge: 86400,
     strictPreflight: true,
   });
