@@ -1,12 +1,18 @@
 /**
- * Tests for POST /api/v1/auth/token in STROM_AUTH_MODE=direct (issue #322).
+ * Tests for POST /api/v1/auth/token in STROM_AUTH_MODE=direct (issue #329).
  *
- * Funnel-provisioned / self-hosted deployments wire the shared dev Strom via
- * STROM_AUTH_MODE=direct. Such tenants have no eyevinn-strom subscription, so an
- * OSC SAT exchange for that scope can only ever 403 "not entitled". The endpoint
- * must NOT attempt the exchange in this mode: it degrades to 503, which the
- * Studio treats as "no auth" (sends requests without an Authorization header,
- * relying on the same-origin/proxy session). The PAT is never returned.
+ * STROM_AUTH_MODE only controls how *this backend* talks to Strom directly —
+ * it says nothing about what OSC service the Studio's own SAT is scoped to.
+ * #324/#322 short-circuited this endpoint to a 503 whenever
+ * STROM_AUTH_MODE=direct, reasoning that funnel-provisioned tenants have no
+ * eyevinn-strom subscription. True, but irrelevant after #328: the exchange
+ * is scoped to config.oscSatServiceId, which now defaults to
+ * eyevinn-open-live — a service every funnel-provisioned tenant *is*
+ * entitled to. The #324 short-circuit made that fix unreachable and left the
+ * Studio's eyevinn-open-live.sat cookie (see open-live-studio's sat.ts) never
+ * set, so it could never pass the OSC reverse-proxy wall on a funnel
+ * instance. This suite guards that STROM_AUTH_MODE=direct does NOT bypass
+ * the exchange.
  *
  * config reads env once at module load, so STROM_AUTH_MODE is set here BEFORE
  * importing the server — this file is intentionally separate from the osc-mode
@@ -59,8 +65,9 @@ beforeEach(() => {
   exchangeMock.mockReset();
 });
 
-describe('POST /api/v1/auth/token — STROM_AUTH_MODE=direct (#322)', () => {
-  it('degrades to 503 without attempting the doomed SAT exchange', async () => {
+describe('POST /api/v1/auth/token — STROM_AUTH_MODE=direct (#329)', () => {
+  it('still attempts the SAT exchange, scoped to eyevinn-open-live', async () => {
+    exchangeMock.mockResolvedValue({ token: 'short-lived-sat', expiry: 1_800_000_000 });
     const app = await buildServer();
     const res = await app.inject({
       method: 'POST',
@@ -69,10 +76,26 @@ describe('POST /api/v1/auth/token — STROM_AUTH_MODE=direct (#322)', () => {
       payload: {},
     });
 
-    expect(res.statusCode).toBe(503);
-    // The whole point: no eyevinn-strom exchange is attempted in direct mode.
-    expect(exchangeMock).not.toHaveBeenCalled();
-    // The PAT must never leak into the response, even on the degrade path.
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ token: 'short-lived-sat', expiry: 1_800_000_000 });
+    // STROM_AUTH_MODE=direct must NOT change the exchange scope or skip it.
+    expect(exchangeMock).toHaveBeenCalledWith(TEST_PAT, 'eyevinn-open-live');
+    // The PAT must never leak into the response.
+    expect(res.body).not.toContain(TEST_PAT);
+  });
+
+  it('surfaces a 502, not a silent 503, when the exchange fails', async () => {
+    exchangeMock.mockRejectedValue(new TokenExchangeError('User not entitled to access service'));
+    const app = await buildServer();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/token',
+      headers: { authorization: `Bearer ${TEST_API_KEY}` },
+      payload: {},
+    });
+
+    expect(res.statusCode).toBe(502);
+    expect(exchangeMock).toHaveBeenCalledWith(TEST_PAT, 'eyevinn-open-live');
     expect(res.body).not.toContain(TEST_PAT);
   });
 });
