@@ -109,10 +109,22 @@ explicitly a later enhancement.
 audio-only WHEP output, played by the client in place of the picture feed's audio. v1 accepts
 only `returnFeed.lowLatency: false`. Before it ships:
 
-- **Ingest jitterbuffer.** Strom's WHIP input defaults to a 400 ms jitterbuffer, set at build
-  time, and it dominates return delay. Open Live needs a per-assignment value sized from jitter
-  measured in rehearsal; a smaller buffer trades that guest's program quality for conversation
-  latency.
+- **Absorb stalls after the jitterbuffer, not in it.** Each seat keeps one WHIP jitterbuffer
+  at its quality setting (Strom's default is 400 ms), shared by program and the fast feed.
+  Shortening it does not help: publishers do not retransmit Opus, a 400–700 ms network
+  stall passes through the jitterbuffer at any practical setting, and a shorter one only drops
+  audio that arrives late. Program dropout at an audio jitterbuffer of 100 ms against 400 ms
+  was 4.9% against 0.2% with 150 ms link stalls, and 10.6% against 0.14% with 300 ms stalls
+  (Strom loopback rig, fixed stalls every 3 s on the WHIP publishers' packets, dropout of a
+  test tone on the program WHEP output, 3 trials per cell). The fast feed instead needs stalls
+  absorbed downstream of the jitterbuffer, on the conversation path only: run at a low target
+  latency, time-stretch audio to cover a stall rather than go silent, then play slightly fast
+  until back at target. A prototype recovered a 400 ms stall with no skip and no added
+  dropout; nothing that does this is built yet.
+- **Conversation audio never airs.** What airs is each voice via the program path, buffered and
+  unstretched; the conversation path governs only what guests hear of each other. It must
+  never feed program output or a recording, because time-scaled audio cannot be recovered
+  afterwards.
 - **Path headroom.** A return that bypasses the audio mixer (`mix_latency`, with
   `min_upstream_latency` set to the slowest SRT source, `src/lib/flow-generator.ts:148-153,418-435`)
   may be released early with a negative WHEP `ts_offset_ms`. Unverified on Open Live's flow; must
@@ -386,10 +398,15 @@ from Proposed → Accepted.
 These do not gate accepting the spec or cutting sub-issues; they are resolved during
 implementation or in a dependent `open-live-studio` ticket.
 
-- **Mix for the low-latency return (after v1):** an aux bus on `builtin.mixer` (keeps each guest's
-  channel processing, carries the audio mixer's latency) vs. `builtin.liveaudiorouter` fed before
-  the mixer (lower latency, raw microphones, no limiter unless Eyevinn/strom#795 lands). Measure
-  path headroom and per-guest jitter on real links first; see
+- **Mix for the low-latency return (after v1):** `builtin.liveaudiorouter` fed before the mixer.
+  Not an aux bus on `builtin.mixer`: it puts the conversation through the program
+  mixer, which passes one guest's bad link on to every other guest. With one contributor on a
+  badly impaired link, the other contributors' audio on the `liveaudiorouter` path kept 0.13–0.18%
+  dropout, the same as the control, while the program mixer took every contributor's audio to 7%
+  dropout and shifted its own delay by 220 ms (Strom loopback rig, 0–200 ms jitter, 0.4–1.2 s
+  stalls and about 13% burst loss on one WHIP publisher's packets, dropout of a test tone from a
+  clean contributor). Open: the router feeds raw microphones, with no limiter unless
+  Eyevinn/strom#795 lands. Measure path headroom first; see
   [Low-latency mode](#low-latency-mode-after-v1). Only relevant once `low-latency-minus` ships;
   v1 is `lowLatency: false`.
 - **Guest auth model for invite links:** production-scoped, expiring, single-use vs reusable? This
