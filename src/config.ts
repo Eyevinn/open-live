@@ -101,8 +101,18 @@ export const config = {
    * Fixed server-side config (never caller-supplied) so the token endpoint
    * cannot be redirected at an arbitrary service (anti-SSRF / privilege
    * escalation).
+   *
+   * Must be `eyevinn-open-live` — open-live-studio's sat.ts sets the SAT this
+   * endpoint returns as the `eyevinn-open-live.sat` cookie, the name OSC's
+   * reverse proxy expects for open-live REST/WS auth. This previously
+   * defaulted to `eyevinn-strom` (copied from strom-token.ts's own PAT→SAT
+   * exchange, used for the backend's unrelated server-to-Strom calls), which
+   * fails for funnel-provisioned tenants: their PAT is scoped to their own
+   * `eyevinn-open-live`/`eyevinn-open-live-studio` subscriptions, not the
+   * shared `eyevinn-strom` service, so the exchange was rejected upstream and
+   * surfaced as a 502 on every fresh instance.
    */
-  oscSatServiceId: process.env['OSC_SAT_SERVICE_ID'] ?? 'eyevinn-strom',
+  oscSatServiceId: process.env['OSC_SAT_SERVICE_ID'] ?? 'eyevinn-open-live',
   /**
    * Explicit acknowledgement that this deployment intentionally has no
    * API_KEY because an external layer (e.g. OSC's reverse proxy) handles
