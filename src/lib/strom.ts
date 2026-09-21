@@ -750,6 +750,15 @@ export class StromClient {
     const contentType = res.headers.get('content-type') ?? ''
     if (!contentType.includes('application/json')) {
       const text = await res.text()
+      // Strom's media-player control endpoints (player/control, playlist, goto,
+      // seek) answer a successful command with 200 and an empty body — no
+      // content-type. On OSC shared-Strom deployments these `post<void>` calls
+      // must be treated as success, not rejected as "non-JSON" (which the clip
+      // routes mapped to a spurious 502; open-live#333). Only a 2xx with a
+      // genuinely empty body is a success; a 2xx with a non-JSON *payload*
+      // (e.g. an HTML page) is still a bad gateway, and any non-2xx stays an
+      // error so proxy error pages continue to surface.
+      if (res.ok && text.length === 0) return undefined as T
       throw new StromClientError(
         res.status,
         `Strom returned non-JSON response (${res.status}): ${text.slice(0, 120)}`,
