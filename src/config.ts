@@ -221,6 +221,15 @@ export const config = {
   /** Presigned playback URL TTL in seconds (used by #42's listing endpoint). */
   recordingPresignTtlS: parsePositiveIntEnv('RECORDING_PRESIGN_TTL_S', 3600),
   /**
+   * AES-256 key (base64 or hex, 32 bytes) used to encrypt authenticated-HTML-
+   * source auth material at rest (issue #314, `docs/specs/authenticated-html-
+   * sources.md`, ADR-003 OQ3). Falls back to `SRT_PASSPHRASE_KEY` when unset so
+   * existing deployments keep working. Fail-closed in production when neither is
+   * set and any `auth` secret exists. Consumed by `src/lib/html-auth-crypto.ts`;
+   * never returned to a client and redacted in logs (`src/lib/log-redact.ts`).
+   */
+  htmlAuthKey: process.env['HTML_AUTH_KEY'] ?? process.env['SRT_PASSPHRASE_KEY'] ?? undefined,
+  /**
    * Interval (ms) at which the WS layer polls `player.getState` to detect clip
    * completion when Strom does not push player-state changes (epic #206,
    * issues #277/#278; spec §"Configuration"). Completion latency is bounded by
