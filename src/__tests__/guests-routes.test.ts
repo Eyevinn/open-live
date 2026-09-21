@@ -265,6 +265,24 @@ describe('POST /api/v1/guests/:inviteId/join', () => {
     expect(res.statusCode).toBe(401);
   });
 
+  it('409s when the production has been deactivated (ended) — token cannot join (issue #325)', async () => {
+    const invite = await createInvite();
+    // Simulate a deactivate having ended the production while the token is still
+    // cryptographically valid: the join must be rejected before a session is
+    // created or an intercom line provisioned.
+    const prod = productionsStore.get('prod-1')!;
+    productionsStore.set('prod-1', { ...prod, status: 'ended' } as ProductionDoc);
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/v1/guests/${invite.id}/join`,
+      headers: { authorization: `Bearer ${invite.token}` },
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toMatch(/not active/i);
+    // No guest session was persisted for the rejected join.
+    expect(sessionsStore.size).toBe(0);
+  });
+
   it('409s when the invite has expired (persisted expiry check)', async () => {
     const invite = await createInvite();
     // Force the stored doc past expiry while the signature is still in the future
