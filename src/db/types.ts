@@ -107,6 +107,57 @@ export interface PersistedClipCue {
   durationMs?: number;
 }
 
+/**
+ * Authenticated-HTML-source auth material (issue #314,
+ * `docs/specs/authenticated-html-sources.md`, ADR-003).
+ *
+ * Additive and present only for `streamType: 'html'`; absent = today's
+ * anonymous rendering behaviour (purely additive, no migration).
+ *
+ * Discriminated by `mode`:
+ *  - `header`  → Design B: a static credential applied to the top-level
+ *    navigation request. The credential VALUE is write-only over the API
+ *    (accepted on write, never returned; encrypted at rest via
+ *    `src/lib/html-auth-crypto.ts`, masked on read as `valueSet: true`).
+ *  - `profile` → Design C: a named, persisted, isolated renderer profile,
+ *    with a passive `status` so Studio can warn before activation.
+ *
+ * v1 scope note (ADR-003 OQ2 → CONFIRMED-NO): stock upstream `cefsrc` exposes
+ * neither a per-navigation request header nor a per-source isolated user-data
+ * dir, so Designs B and C **cannot render** yet — they are an upstream-gated
+ * fast-follow. The `auth` field is accepted and stored at the contract level
+ * (like the reserved `ClipReferenceTams` above), and the interactive-login
+ * provisioning endpoint returns 501 until its channel is decided and
+ * security-reviewed. The shipped v1 authentication path is Design D
+ * (token-in-URL) — a token carried inside the source `address`, which needs no
+ * new field and is redacted in logs (`src/lib/log-redact.ts`, issue #315).
+ */
+export interface HtmlSourceAuthHeader {
+  /** Header name, e.g. "Authorization". Validated: token-header allowlist, max 64. */
+  name: string;
+  /**
+   * Read-only echo of whether a credential value is stored. The value itself is
+   * WRITE-ONLY over the API — accepted on write, never returned — and encrypted
+   * at rest. Never contains the plaintext.
+   */
+  valueSet?: boolean;
+}
+
+export interface HtmlSourceAuthProfile {
+  /** Server-issued profile id, "hprof-<uuid>". */
+  profileId: string;
+  /** Passive session status surfaced to Studio (ADR-003 OQ4). */
+  status: 'unprovisioned' | 'provisioned' | 'expired';
+  /** ISO 8601 UTC timestamp of the last successful provisioning, when any. */
+  lastProvisionedAt?: string;
+}
+
+export interface HtmlSourceAuth {
+  mode: 'header' | 'profile';
+  header?: HtmlSourceAuthHeader;
+  profile?: HtmlSourceAuthProfile;
+}
+
 export interface SourceDoc {
   _id: string;
   _rev?: string;
@@ -118,6 +169,24 @@ export interface SourceDoc {
   liveCamera?: boolean;
   /** SRT receiver buffer latency in ms. Only applies to srt/efp stream types. Default 125. */
   latency?: number;
+  /**
+   * Authenticated-HTML-source auth material (issue #314). Present only for
+   * `streamType: 'html'`. Additive and defaulted-absent — every existing source
+   * stays valid unchanged. See {@link HtmlSourceAuth}.
+   *
+   * The stored form differs from the API form: `header.value` is held encrypted
+   * (`encv1:` bundle) on an internal field and never appears in `HtmlSourceAuth`
+   * itself, which only echoes `valueSet`.
+   */
+  auth?: HtmlSourceAuth;
+  /**
+   * Internal-only ciphertext store for a Design-B header credential value
+   * (issue #314). Encrypted at rest (`src/lib/html-auth-crypto.ts`), bound to
+   * this source id via GCM AAD. Never returned by the API, never logged. Kept
+   * separate from `auth.header` so the API-facing `auth` object can be echoed
+   * back to clients without any risk of leaking the ciphertext.
+   */
+  authHeaderValueEnc?: string;
   /**
    * Optional id of the Gateway (`GatewayDoc._id`) that registered this source
    * (issue #263). Absent for manually-created sources. Enables the
