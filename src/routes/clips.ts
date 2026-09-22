@@ -33,6 +33,7 @@ import {
   ClipNotCuedError,
 } from '../lib/clip-control.js';
 import { setClipStateEntry, getClipStateEntry } from '../services/clip-state.service.js';
+import { persistClipCue, clearPersistedClipCue } from '../services/clip-cue-store.js';
 
 // mixerInput path param — same shape as the WS mixerInputSchema.
 const mixerInputSchema = z.string().regex(/^video_in_\d{1,2}$/).max(20);
@@ -83,6 +84,19 @@ const clipsRoutes: FastifyPluginAsync = async (fastify) => {
         const strom = await makeStromClient();
         const state = await cueClip(strom, doc, source, mixerInput, body.clipId);
         setClipStateEntry(doc._id, state);
+        // Persist the cue point so it survives deactivate/reactivate and server
+        // restart, restored to `cued` and never auto-played (issue #307 / OQ3).
+        // The WS CLIP_CUE handler already does this; the REST /cue endpoint must
+        // too, or a cue made over REST leaves ProductionDoc.clipCues unwritten
+        // and nothing is restored on reactivate (issue #336). Best-effort — a
+        // failed persist must not fail the cue itself.
+        if (state.clipId) {
+          await persistClipCue(doc._id, mixerInput, {
+            clipId: state.clipId,
+            ...(state.positionMs !== undefined ? { positionMs: state.positionMs } : {}),
+            ...(state.durationMs !== undefined ? { durationMs: state.durationMs } : {}),
+          });
+        }
         return reply.send(state);
       } catch (err) {
         return handleClipError(err, reply);
@@ -125,6 +139,10 @@ const clipsRoutes: FastifyPluginAsync = async (fastify) => {
         const strom = await makeStromClient();
         const state = await stopClip(strom, doc, mixerInput, source._id);
         setClipStateEntry(doc._id, state);
+        // A stop clears the cue — mirror the WS CLIP_STOP handler so a REST stop
+        // also drops the persisted cue point, leaving nothing to restore on the
+        // next reactivate (issue #307 / OQ3, issue #336).
+        await clearPersistedClipCue(doc._id, mixerInput);
         return reply.send(state);
       } catch (err) {
         return handleClipError(err, reply);

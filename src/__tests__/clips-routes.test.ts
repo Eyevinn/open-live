@@ -226,6 +226,46 @@ describe('POST /clips/:mixerInput/cue', () => {
   });
 });
 
+// Regression for issue #336: a clip cued over the REST /cue endpoint must
+// persist its cue point onto ProductionDoc.clipCues (OQ3), exactly as the WS
+// CLIP_CUE handler does, so it survives deactivate/reactivate and server
+// restart. Before the fix, REST /cue set only the in-memory registry and left
+// clipCues unwritten (null on GET productions/:id), so nothing was restored on
+// reactivate and the clip read `stopped`.
+describe('POST /clips/:mixerInput/cue persists the cue point (issue #336)', () => {
+  it('writes ProductionDoc.clipCues so the cue survives deactivate/reactivate', async () => {
+    playerState = { state: 'paused', duration_ms: 12000, position_ms: 0 };
+    const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: {} });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ mixerInput: 'video_in_0', state: 'cued' });
+
+    // The cue point is now on the persisted doc (survives a cold registry) —
+    // this is the value GET productions/:id exposes and the WS connect handler
+    // restores to `cued` on reactivate.
+    const persisted = productionStore.get(PROD);
+    expect(persisted?.clipCues).toMatchObject({
+      video_in_0: { clipId: 'src-clip', durationMs: 12000 },
+    });
+  });
+
+  it('persists the explicit clipId given in the body', async () => {
+    const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: { clipId: 'story-42' } });
+    expect(res.statusCode).toBe(200);
+    expect(productionStore.get(PROD)?.clipCues?.['video_in_0']?.clipId).toBe('story-42');
+  });
+
+  it('drops the persisted cue on stop, leaving nothing to restore', async () => {
+    // Cue first so there is a persisted cue to clear.
+    await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: {} });
+    expect(productionStore.get(PROD)?.clipCues?.['video_in_0']).toBeDefined();
+
+    playerState = { state: 'stopped', position_ms: 0 };
+    const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/stop`, headers: AUTH });
+    expect(res.statusCode).toBe(200);
+    expect(productionStore.get(PROD)?.clipCues?.['video_in_0']).toBeUndefined();
+  });
+});
+
 describe('POST /clips/:mixerInput/play', () => {
   it('409s when nothing has been cued', async () => {
     const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/play`, headers: AUTH });
