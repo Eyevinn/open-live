@@ -936,33 +936,32 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [stromHost, srtPortRange, srtPortLease]
+                required: [stromHost, srtPorts, srtPortState]
                 properties:
                   stromHost:
                     type: string
                     description: Hostname of the Strom media server
-                  srtPortRange:
-                    type: object
+                  srtPorts:
+                    type: array
                     nullable: true
                     description: >-
-                      SRT listener ports this instance has leased on the shared Strom.
-                      Hostless listener sources and outputs (`srt://:PORT?mode=listener`)
-                      must use a port in this range; `srt://:0?mode=listener` asks the
-                      server to assign the lowest free one. Null unless `srtPortLease`
-                      is `leased`.
-                    required: [first, last]
-                    properties:
-                      first:
-                        type: integer
-                      last:
-                        type: integer
-                  srtPortLease:
+                      SRT listener ports this instance has reserved from the shared
+                      Strom's port pool. Hostless listener sources and outputs
+                      (`srt://:PORT?mode=listener`) must use one of them;
+                      `srt://:0?mode=listener` asks the server to assign the lowest free
+                      one. An explicit list, not a range — Strom's pool can have holes,
+                      so these are not necessarily contiguous. Null unless
+                      `srtPortState` is `reserved`.
+                    items:
+                      type: integer
+                  srtPortState:
                     type: string
-                    enum: [leased, pending, unsupported, disabled]
+                    enum: [reserved, pending, unsupported, disabled]
                     description: >-
-                      State of the Strom port lease. `pending` — not yet acquired, listener
-                      sources are rejected with 503 until it is; `unsupported` — Strom has no
-                      port lease API, ports are not enforced; `disabled` — turned off via
+                      State of this instance's port reservation. `pending` — not held yet,
+                      listener sources are rejected with 503 until they are; `unsupported` —
+                      Strom hands out no ports (no pool configured, or no port pool API at
+                      all), ports are not enforced; `disabled` — turned off via
                       STROM_PORT_LEASE_DISABLED.
 
   /api/v1/reconnect:
