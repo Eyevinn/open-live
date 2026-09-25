@@ -209,3 +209,42 @@ describe('macro CUT with no PiP anywhere', () => {
     expect(tallies()[0]).toMatchObject({ pgm: 'video_in_2', pvw: 'video_in_0' });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Interactive CUT / TRANSITION must both clear a preview-only PiP (#343)
+//
+// After SELECT_PVW_PIP the PiP is the only thing in preview. Sending a real
+// source to program (whether by CUT or TRANSITION) replaces preview, so the
+// stale PiP must be cleared and a PIP_STATE {pvwPip:null} broadcast. TRANSITION
+// used to skip this while CUT did it, leaving clients showing both.
+// ---------------------------------------------------------------------------
+
+describe('interactive send of a real source over a preview-only PiP', () => {
+  it('CUT clears the preview-only PiP and broadcasts PIP_STATE {pvwPip:null}', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+
+    await send({ type: 'SELECT_PVW_PIP', pip: 0 });
+    resetRecordings();
+
+    await send({ type: 'CUT', mixerInput: 'video_in_2' });
+
+    const states = pipStates();
+    expect(states).toHaveLength(1);
+    expect(states[0]).toMatchObject({ pgmPip: null, pvwPip: null });
+    expect(tallies()[0]).toMatchObject({ pgm: 'video_in_2', pvw: 'video_in_0' });
+  });
+
+  it('TRANSITION clears the preview-only PiP and broadcasts PIP_STATE {pvwPip:null}', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+
+    await send({ type: 'SELECT_PVW_PIP', pip: 0 });
+    resetRecordings();
+
+    await send({ type: 'TRANSITION', mixerInput: 'video_in_2', transitionType: 'fade' });
+
+    const states = pipStates();
+    expect(states).toHaveLength(1);
+    expect(states[0]).toMatchObject({ pgmPip: null, pvwPip: null });
+    expect(tallies()[0]).toMatchObject({ pgm: 'video_in_2', pvw: 'video_in_0' });
+  });
+});
