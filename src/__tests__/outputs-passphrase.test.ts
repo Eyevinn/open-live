@@ -13,7 +13,7 @@
 import { describe, it, expect, vi, beforeAll, beforeEach, afterAll } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { OutputDoc } from '../db/types.js';
-import type { PortLease } from '../lib/strom.js';
+import type { PortReservation } from '../lib/strom.js';
 
 // ---------------------------------------------------------------------------
 // Mock CouchDB
@@ -56,7 +56,7 @@ vi.mock('../lib/strom.js', async (importOriginal) => {
       delete: vi.fn().mockResolvedValue({}),
     };
     mixer = { multiviewEndpoint: vi.fn() };
-    portLeases = { acquire: vi.fn(), renew: vi.fn(), release: vi.fn(), list: vi.fn(), get: vi.fn() };
+    ports = { pool: vi.fn(), reservations: { create: vi.fn(), renew: vi.fn(), release: vi.fn(), list: vi.fn(), get: vi.fn(), assign: vi.fn(), unassign: vi.fn() } };
   }
   return { ...actual, StromClient: MockStromClient };
 });
@@ -74,17 +74,16 @@ const KEY_B64 = Buffer.from(Array.from({ length: 32 }, (_, i) => i + 1)).toStrin
 const SECRET = 'supersecretpass'; // 15 chars — valid SRT length
 const originalEnv = { ...process.env };
 
-const LEASE: PortLease = {
+const RESERVATION: PortReservation = {
   id: 'lease-1',
-  client_id: 'open-live-test',
-  first_port: 47100,
-  last_port: 47119,
+  owner_id: 'open-live-test',
+  ports: [47100, 47101, 47102, 47103, 47104, 47105, 47106, 47107, 47108, 47109, 47110, 47111, 47112, 47113, 47114, 47115, 47116, 47117, 47118, 47119],
   created_at: '2026-01-01T00:00:00Z',
   expires_at: '2026-01-01T00:10:00Z',
 };
 
 let app: FastifyInstance;
-let _resetPortLeaseState: typeof import('../services/port-lease.js')._resetPortLeaseState;
+let _resetPortReservationState: typeof import('../services/port-reservation.js')._resetPortReservationState;
 let resetKeyCache: typeof import('../lib/srt-passphrase-crypto.js').resetKeyCache;
 let isEncrypted: typeof import('../lib/srt-passphrase-crypto.js').isEncrypted;
 let encryptAddressPassphrase: typeof import('../lib/srt-passphrase-crypto.js').encryptAddressPassphrase;
@@ -92,7 +91,7 @@ let encryptAddressPassphrase: typeof import('../lib/srt-passphrase-crypto.js').e
 beforeAll(async () => {
   process.env['SRT_PASSPHRASE_KEY'] = KEY_B64;
   delete process.env['NODE_ENV'];
-  ({ _resetPortLeaseState } = await import('../services/port-lease.js'));
+  ({ _resetPortReservationState } = await import('../services/port-reservation.js'));
   ({ resetKeyCache, isEncrypted, encryptAddressPassphrase } = await import('../lib/srt-passphrase-crypto.js'));
   const { buildServer } = await import('../server.js');
   app = await buildServer();
@@ -105,7 +104,7 @@ afterAll(() => {
 beforeEach(() => {
   process.env['SRT_PASSPHRASE_KEY'] = KEY_B64;
   resetKeyCache();
-  _resetPortLeaseState({ status: 'leased', lease: LEASE });
+  _resetPortReservationState({ status: 'reserved', reservation: RESERVATION });
   mockOutputsGet.mockReset();
   mockOutputsInsert.mockReset();
   mockOutputsInsert.mockResolvedValue({ ok: true, rev: '1-new' });

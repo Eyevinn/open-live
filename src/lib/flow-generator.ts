@@ -8,6 +8,8 @@ import { decryptAddressPassphrase } from './srt-passphrase-crypto.js';
 import { safeFlowProjection } from './log-redact.js';
 import { VIRTUAL_SOURCES, assignAudioChannels } from './audio-channels.js';
 import { assignReturnBuses, returnSendMatrix } from './return-feeds.js';
+import { assignPortsToFlow, unassignPortsFromFlow } from '../services/port-reservation.js';
+import { listenerPortRequest } from '../services/listener-ports.js';
 
 /**
  * Generates a Strom flow from a template + source assignments,
@@ -77,6 +79,12 @@ function findPgmFeedPad(flow: FlowTopology): string | null {
   if (encPgm) return `${encPgm['id'] as string}:video_out`;
   return null;
 }
+
+/** `console` in the shape the port services log through. */
+const portLog = {
+  debug: (obj: object, msg?: string) => console.debug('[flow-generator]', msg ?? '', obj),
+  warn: (obj: object, msg?: string) => console.warn('[flow-generator]', msg ?? '', obj),
+};
 
 export async function activateStromFlow(
   production: ProductionDoc,
@@ -1035,6 +1043,22 @@ export async function activateStromFlow(
 
   const flowId = created.flow.id;
 
+  // Tell Strom which of our reserved ports this flow binds, so they are not
+  // reclaimed under a running pipeline if this instance dies without releasing
+  // its reservation. Read back off the blocks we just sent rather than off the
+  // source documents, so what is declared is exactly what the flow contains.
+  // Best effort — the reservation is what actually holds the ports.
+  const boundPorts = [
+    ...new Set(
+      (flow.blocks as Array<{ properties?: Record<string, unknown> }>)
+        .map((b) => b.properties?.['srt_uri'])
+        .filter((uri): uri is string => typeof uri === 'string')
+        .map((uri) => listenerPortRequest(uri))
+        .filter((port): port is number => port !== null && port > 0),
+    ),
+  ];
+  void assignPortsToFlow(portLog, flowId, boundPorts);
+
   try {
     await strom.flows.start(flowId);
   } catch (err) {
@@ -1091,4 +1115,7 @@ export async function deactivateStromFlow(
   } catch {
     // ignore — flow may not exist
   }
+  // The ports go back to our reservation, not to Strom's pool. Strom drops the
+  // association on its own once the flow is gone, so this only makes it prompt.
+  void unassignPortsFromFlow(portLog, stromFlowId);
 }

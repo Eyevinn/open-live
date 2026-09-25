@@ -617,28 +617,56 @@ export interface IceServersResponse {
   ice_servers: IceServer[]
 }
 
-// --- Port leases ---
+// --- Port pool ---
 
-/** A range of SRT listener ports reserved for one client on a shared Strom instance. */
-export interface PortLease {
+/** Port numbers reserved for one owner on a shared Strom instance. */
+export interface PortReservation {
   id: string
-  client_id: string
-  first_port: number
-  last_port: number
+  owner_id: string
+  /**
+   * The ports held, ascending. Strom prefers a contiguous run and prefers
+   * extending one on growth, but neither is guaranteed — a hole in the pool,
+   * another owner's ports, or one Strom found blocked can put a gap anywhere.
+   * Never assume contiguity.
+   */
+  ports: number[]
   /** RFC 3339 timestamp */
   created_at: string
   /** RFC 3339 timestamp */
   expires_at: string
+  /** Ports this owner has declared in use by a flow. */
+  in_use?: Array<{ port: number; flow_id: string }>
 }
 
-export interface AcquirePortLeaseRequest {
-  client_id: string
-  size: number
+export interface CreateReservationRequest {
+  owner_id: string
+  /** Total ports to hold. Larger than held adds; equal or smaller is a no-op. */
+  count: number
   ttl_secs?: number
 }
 
-export interface RenewPortLeaseRequest {
+export interface RenewReservationRequest {
   ttl_secs?: number
+}
+
+export interface AssignPortsRequest {
+  flow_id: string
+  ports: number[]
+}
+
+/** What Strom will and will not hand out, answered whether or not a pool is configured. */
+export interface PortPoolStatus {
+  enabled: boolean
+  ports: Array<{ first: number; last: number }>
+  total: number
+  free: number
+  entries: Array<{
+    port: number
+    state: 'reserved' | 'assigned' | 'blocked'
+    owner_id?: string
+    reservation_id?: string
+    flow_id?: string
+  }>
 }
 
 export interface WhepStreamsResponse {
@@ -800,17 +828,32 @@ export class StromClient {
   }
 
   // -------------------------------------------------------------------------
-  // Port leases
+  // Port pool
   // -------------------------------------------------------------------------
 
-  portLeases = {
-    list: () => this.get<PortLease[]>('/api/port-leases'),
-    get: (id: string) => this.get<PortLease>(`/api/port-leases/${id}`),
-    /** Idempotent on client_id: returns the existing (renewed) lease if one is held. */
-    acquire: (body: AcquirePortLeaseRequest) => this.post<PortLease>('/api/port-leases', body),
-    renew: (id: string, body: RenewPortLeaseRequest = {}) =>
-      this.post<PortLease>(`/api/port-leases/${id}/renew`, body),
-    release: (id: string) => this.del<void>(`/api/port-leases/${id}`),
+  ports = {
+    /**
+     * Answers whether this Strom hands out ports at all, and how much of its
+     * pool is free — on an unconfigured server too, which is what lets a 409
+     * from `reservations.create` be told apart: no pool at all, or a pool with
+     * nothing left in it.
+     */
+    pool: () => this.get<PortPoolStatus>('/api/ports'),
+    reservations: {
+      list: () => this.get<PortReservation[]>('/api/ports/reservations'),
+      get: (id: string) => this.get<PortReservation>(`/api/ports/reservations/${id}`),
+      /** Idempotent on owner_id: returns the existing (renewed) reservation if one is held. */
+      create: (body: CreateReservationRequest) =>
+        this.post<PortReservation>('/api/ports/reservations', body),
+      renew: (id: string, body: RenewReservationRequest = {}) =>
+        this.post<PortReservation>(`/api/ports/reservations/${id}/renew`, body),
+      release: (id: string) => this.del<void>(`/api/ports/reservations/${id}`),
+      /** Declare which of the reservation's ports a flow uses. Replaces that flow's set. */
+      assign: (id: string, body: AssignPortsRequest) =>
+        this.post<PortReservation>(`/api/ports/reservations/${id}/assign`, body),
+      unassign: (id: string, flowId: string) =>
+        this.del<void>(`/api/ports/reservations/${id}/assign/${flowId}`),
+    },
   }
 
   // -------------------------------------------------------------------------

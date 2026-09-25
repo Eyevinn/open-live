@@ -8,7 +8,7 @@ import { graphicUrl, srtUrl } from '../lib/url-validation.js';
 import { deserializeClipReference } from '../lib/clip-reference.js';
 import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
 import { encryptHtmlAuthValue } from '../lib/html-auth-crypto.js';
-import { getPortLease } from '../services/port-lease.js';
+import { getPortReservation } from '../services/port-reservation.js';
 import { clashesAfterWrite, listenerPortRequest, resolveListenerAddress, usedListenerPorts } from '../services/listener-ports.js';
 
 /**
@@ -303,7 +303,7 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       let address = body.address;
       let port: number | null = null;
       if (isSrt) {
-        const resolved = resolveListenerAddress(body.address, getPortLease(), used);
+        const resolved = resolveListenerAddress(body.address, getPortReservation(), used);
         if (!resolved.ok) {
           return reply.status(resolved.statusCode).send({ error: resolved.error, statusCode: resolved.statusCode });
         }
@@ -390,7 +390,7 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
           (effectiveStreamType === 'srt' || effectiveStreamType === 'efp')
         ) {
           const stored = doc.streamType === 'srt' || doc.streamType === 'efp' ? listenerPortRequest(doc.address) : null;
-          const resolved = resolveListenerAddress(effectiveAddress, getPortLease(), await usedListenerPorts(), {
+          const resolved = resolveListenerAddress(effectiveAddress, getPortReservation(), await usedListenerPorts(), {
             exclude: { kind: 'source', id: doc._id },
             keep: stored,
           });

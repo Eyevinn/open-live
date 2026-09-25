@@ -98,7 +98,7 @@ vi.mock('../lib/strom.js', async (importOriginal) => {
     system = { version: vi.fn(), iceServers: vi.fn() };
     flows = { get: vi.fn(), start: vi.fn(), stop: vi.fn(), delete: vi.fn() };
     mixer = { multiviewEndpoint: vi.fn() };
-    portLeases = { acquire: vi.fn(), renew: vi.fn(), release: vi.fn(), list: vi.fn(), get: vi.fn() };
+    ports = { pool: vi.fn(), reservations: { create: vi.fn(), renew: vi.fn(), release: vi.fn(), list: vi.fn(), get: vi.fn(), assign: vi.fn(), unassign: vi.fn() } };
   }
   return { ...actual, StromClient: MockStromClient };
 });
@@ -107,8 +107,8 @@ vi.mock('../lib/strom-token.js', () => ({
   getStromToken: vi.fn().mockResolvedValue('test-token'),
 }));
 
-vi.mock('../services/port-lease.js', () => ({
-  getPortLease: () => ({ start: 9000, end: 9100 }),
+vi.mock('../services/port-reservation.js', () => ({
+  getPortReservation: () => ({ start: 9000, end: 9100 }),
 }));
 
 vi.mock('../services/listener-ports.js', () => ({
