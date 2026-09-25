@@ -323,6 +323,57 @@ assigned RTMP destination, wired exactly like the existing SRT output
 > applied, and (b) redact `rtmp_url` in any open-live-side logging of the generated flow. This is an
 > ADR-004 hard rule.
 
+## Studio UI scope (Eyevinn/open-live-studio#143)
+
+This section specifies the Studio-side companion (open-live-studio#143), the "destination-management
+UI" half of the epic. Studio talks only to the backend outputs surface defined in **API Design** above
+— it introduces no new backend concept — so this section constrains UX and the credential-handling
+contract the browser must honour, not new endpoints.
+
+**In scope for v1** (faithful to #143):
+
+1. **Add / remove destinations.** Studio surfaces the existing outputs CRUD (**API Design** above) as a
+   per-production destination list: create an `outputType: 'rtmp'` output (`POST /api/v1/outputs`),
+   attach it to the current production via the existing `outputAssignments` mechanism (no new
+   "add-destination" endpoint), and detach/delete it. Delete/detach respects the backend `409` when the
+   destination is assigned to an active/activating production — Studio surfaces that as "stop the
+   production before removing this destination", it does not attempt a force-delete.
+2. **Platform preset picker.** A picker over the v1 preset set — **YouTube, Twitch, Facebook, and the
+   generic `custom` raw-URL destination** (per Resolved Decision 1). For the three named presets the
+   operator supplies **only a stream key**; Studio never constructs or displays a preset RTMP URL (the
+   backend resolves `ingestUrl` from the static preset table). For `custom`, Studio additionally
+   collects the `rtmp(s)://` ingest URL and sends it in the create request; validation errors
+   (bad scheme, unknown platform) surface from the backend `400`.
+3. **Masked stream-key input.** The stream key is entered in a masked field (password-style, no reveal
+   that round-trips to a log, no autofill into a shareable URL). It is sent **only** on create/patch and
+   **never rendered back** from a GET: responses carry `streamKeySet: boolean` (and `platform`,
+   `ingestUrl`), never the key. The UI shows "key set" / "no key" state from `streamKeySet`, offers a
+   "replace key" action (a `PATCH` with a new `streamKey`) and a "clear key" action
+   (`streamKey: ""`), and never reconstructs or caches the plaintext key client-side. This is the
+   explicit anti-pattern of open-live-studio#10 (HIGH / CVSS 7.5, credential shipped to the browser) —
+   the v1 UI must not repeat it.
+4. **Per-destination status.** Studio renders a status badge per destination from the backend's derived
+   `OutputStatus`. Per Resolved Decision 3, until strom#840 closes the backend can only express
+   **connection-state-only** status (`unknown` / `failed`, plus the flow-level `healthy`/`degraded`/
+   `down`/`unknown` from issue #255 that applies uniformly across a running production's outputs). The
+   UI must therefore present status honestly at that granularity and must **not** imply a truthful
+   "3 up, 1 refused" per-destination liveness it cannot yet get — a truthful per-destination badge is
+   gated on strom#840 and lights up automatically once the backend surfaces per-output liveness.
+
+**Explicitly OUT of v1 scope** (per #143 and epic#319):
+
+- **OAuth "sign in with YouTube / Twitch / Facebook" account integration.** v1 is paste-a-stream-key
+  only; no account linking, no channel enumeration, no token exchange in the browser. Possible
+  follow-up epic, not v1.
+- Mid-show hot add/rotate of a destination on a live production — the backend composes the key into
+  `rtmp_url` only at flow-generation time and there is no running-element PATCH primitive (see
+  **Risks**), so destination changes require a production restart. Studio reflects this (changes apply
+  on next activation) rather than promising a live hot-swap.
+
+**Backend contract Studio depends on** (all defined above, no new work): write-only stream key
+(`streamKeySet` echo, never the key); additive `rtmp` object on outputs responses; the existing
+`400`/`404`/`409`/`503` error semantics; and the existing production `outputAssignments` grouping.
+
 ## Resolved Decisions (team-lead gate, 2026-09-19 — @svensson00)
 
 All four Open Questions below are **resolved**; each is annotated inline with **RESOLVED**. Summary:
