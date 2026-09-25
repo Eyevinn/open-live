@@ -369,11 +369,19 @@ const InboundMessageSchema = z.discriminatedUnion('type', [
  * the Strom take ran with `from_input === to_input`, which Strom treats as a
  * PGM/PVW swap, so the picture flipped to the previous preview.
  *
- * While a PiP is on PGM `tally.pgm` is null and a CUT to a real input is a
- * genuine change, so this never fires in that state.
+ * While a PiP is on PGM `tally.pgm` is null, so the real on-air source is the
+ * tracked background behind the PiP (`pgmBgByProduction`). A CUT/TRANSITION to
+ * that same background input would emit a degenerate `from_input === to_input`
+ * take (issue #342), so it is also "already on program": treat it as a no-op
+ * (the PiP stays on program). A CUT to any *other* real input while a PiP is on
+ * PGM is a genuine change and still proceeds normally.
  */
 function isAlreadyOnProgram(productionId: string, mixerInput: string): boolean {
-  return getTally(productionId).pgm === mixerInput && (pgmPipByProduction.get(productionId) ?? null) === null;
+  const pgmPip = pgmPipByProduction.get(productionId) ?? null;
+  if (pgmPip === null) {
+    return getTally(productionId).pgm === mixerInput;
+  }
+  return (pgmBgByProduction.get(productionId) ?? null) === mixerInput;
 }
 
 function padToIndex(mixerInput: string): number | null {
@@ -1122,7 +1130,12 @@ export async function handleMessage(
       await persistMixerMutation(productionId, 'CUT', (d) => ({ ...d, tally: newTally }));
       broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
       await stromTransition(doc, fromPadCut, msg.mixerInput, 'cut');
-      if (curPgmPipCut !== null && doc.stromFlowId && doc.mixerBlockId) {
+      // Only restore the displaced PiP into Strom's preview if the operator has
+      // not changed PVW during the Strom round trip. Without this guard a
+      // SET_PVW / SELECT_PVW_PIP that lands while /transition is in flight is
+      // overwritten by a stale restore (issue #341).
+      if (curPgmPipCut !== null && doc.stromFlowId && doc.mixerBlockId
+          && (pvwPipByProduction.get(productionId) ?? null) === curPgmPipCut) {
         try {
           const strom = await makeStromClient();
           await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: curPgmPipCut } });
@@ -1163,7 +1176,12 @@ export async function handleMessage(
       await persistMixerMutation(productionId, 'TRANSITION', (d) => ({ ...d, tally: newTally }));
       broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc), transitionType: msg.transitionType, durationMs: msg.durationMs });
       await stromTransition(doc, fromPadTrans, msg.mixerInput, toStromTransition(msg.transitionType), msg.durationMs);
-      if (curPgmPipTrans !== null && doc.stromFlowId && doc.mixerBlockId) {
+      // Only restore the displaced PiP into Strom's preview if the operator has
+      // not changed PVW during the Strom round trip. Without this guard a
+      // SET_PVW / SELECT_PVW_PIP that lands while /transition is in flight is
+      // overwritten by a stale restore (issue #341).
+      if (curPgmPipTrans !== null && doc.stromFlowId && doc.mixerBlockId
+          && (pvwPipByProduction.get(productionId) ?? null) === curPgmPipTrans) {
         try {
           const strom = await makeStromClient();
           await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: curPgmPipTrans } });
