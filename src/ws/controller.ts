@@ -1122,7 +1122,12 @@ export async function handleMessage(
       await persistMixerMutation(productionId, 'CUT', (d) => ({ ...d, tally: newTally }));
       broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
       await stromTransition(doc, fromPadCut, msg.mixerInput, 'cut');
-      if (curPgmPipCut !== null && doc.stromFlowId && doc.mixerBlockId) {
+      // Only restore the displaced PiP into Strom's preview if the operator has
+      // not changed PVW during the Strom round trip. Without this guard a
+      // SET_PVW / SELECT_PVW_PIP that lands while /transition is in flight is
+      // overwritten by a stale restore (issue #341).
+      if (curPgmPipCut !== null && doc.stromFlowId && doc.mixerBlockId
+          && (pvwPipByProduction.get(productionId) ?? null) === curPgmPipCut) {
         try {
           const strom = await makeStromClient();
           await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: curPgmPipCut } });
@@ -1158,7 +1163,12 @@ export async function handleMessage(
       await persistMixerMutation(productionId, 'TRANSITION', (d) => ({ ...d, tally: newTally }));
       broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc), transitionType: msg.transitionType, durationMs: msg.durationMs });
       await stromTransition(doc, fromPadTrans, msg.mixerInput, toStromTransition(msg.transitionType), msg.durationMs);
-      if (curPgmPipTrans !== null && doc.stromFlowId && doc.mixerBlockId) {
+      // Only restore the displaced PiP into Strom's preview if the operator has
+      // not changed PVW during the Strom round trip. Without this guard a
+      // SET_PVW / SELECT_PVW_PIP that lands while /transition is in flight is
+      // overwritten by a stale restore (issue #341).
+      if (curPgmPipTrans !== null && doc.stromFlowId && doc.mixerBlockId
+          && (pvwPipByProduction.get(productionId) ?? null) === curPgmPipTrans) {
         try {
           const strom = await makeStromClient();
           await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: curPgmPipTrans } });
