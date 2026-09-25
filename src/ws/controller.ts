@@ -1153,12 +1153,17 @@ export async function handleMessage(
         : tally.pgm;
       const newTally = { pgm: msg.mixerInput, pvw: tally.pgm };
       setTally(productionId, newTally);
+      const curPvwPipTrans = pvwPipByProduction.get(productionId) ?? null;
       if (curPgmPipTrans !== null) {
         pgmPipByProduction.set(productionId, null);
         pvwPipByProduction.set(productionId, curPgmPipTrans);
         pvwBeforePipByProduction.set(productionId, pgmBgByProduction.get(productionId) ?? null);
         pgmBgByProduction.delete(productionId);
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: curPgmPipTrans, pips: pipConfigsByProduction.get(productionId) ?? [] });
+      } else if (curPvwPipTrans !== null) {
+        // PiP was in PVW — transitioning a real source to PGM replaces PVW, so clear it (matches CUT)
+        pvwPipByProduction.set(productionId, null);
+        broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: null, pips: pipConfigsByProduction.get(productionId) ?? [] });
       }
       await persistMixerMutation(productionId, 'TRANSITION', (d) => ({ ...d, tally: newTally }));
       broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc), transitionType: msg.transitionType, durationMs: msg.durationMs });
