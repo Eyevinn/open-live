@@ -67,6 +67,12 @@ interface StromRequest {
 
 const stromRequests: StromRequest[] = [];
 
+// When > 0, the fake Strom delays its reply to /transition by this many ms,
+// widening the round-trip window so a concurrent inbound message (e.g. SET_PVW)
+// can be interleaved deterministically. Mirrors the 150 ms delay used to
+// reproduce issue #341.
+let transitionDelayMs = 0;
+
 const stromServer: Server = createServer((req, res) => {
   const chunks: Buffer[] = [];
   req.on('data', (c: Buffer) => chunks.push(c));
@@ -77,8 +83,15 @@ const stromServer: Server = createServer((req, res) => {
       path: req.url ?? '',
       ...(raw ? { body: JSON.parse(raw) as unknown } : {}),
     });
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ success: true }));
+    const respond = () => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ success: true }));
+    };
+    if (transitionDelayMs > 0 && (req.url ?? '').endsWith('/transition')) {
+      setTimeout(respond, transitionDelayMs);
+    } else {
+      respond();
+    }
   });
 });
 
@@ -159,9 +172,12 @@ beforeEach(() => {
   clearPipState(PROD);
   setTally(PROD, { pgm: 'video_in_0', pvw: 'video_in_1' });
   resetRecordings();
+  transitionDelayMs = 0;
   mockGet.mockReset();
   mockInsert.mockClear();
 });
+
+const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 // ---------------------------------------------------------------------------
 // The PGM background must be recorded even when Strom is unconfigured
@@ -207,6 +223,45 @@ describe('macro CUT with no PiP anywhere', () => {
 
     expect(requestsTo(TRANSITION)[0]?.body).toMatchObject({ from_input: 0, to_input: 2 });
     expect(tallies()[0]).toMatchObject({ pgm: 'video_in_2', pvw: 'video_in_0' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Race: a PVW change during the Strom round trip must not be clobbered by the
+// PiP restore that a displacing CUT queues after the transition (issue #341).
+// ---------------------------------------------------------------------------
+
+describe('interactive CUT PiP restore vs. concurrent SET_PVW (issue #341)', () => {
+  it('does not restore the displaced PiP into Strom preview if the operator changed PVW mid-transition', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+
+    // Arrange: put PiP 0 on PGM via the real state machine.
+    await send({ type: 'SELECT_PVW_PIP', pip: 0 });
+    await send({ type: 'TAKE' });
+    resetRecordings();
+
+    // A CUT to a real source displaces the PGM PiP into PVW, then restores it
+    // to Strom's preview *after* awaiting /transition. Delay that reply so the
+    // operator's SET_PVW lands inside the round-trip window.
+    transitionDelayMs = 150;
+    const cutPromise = send({ type: 'CUT', mixerInput: 'video_in_2' });
+    await delay(30);
+
+    // Operator changes PVW to a real source while /transition is in flight.
+    await send({ type: 'SET_PVW', mixerInput: 'video_in_1' });
+
+    await cutPromise;
+    transitionDelayMs = 0;
+
+    // Server state agrees the PiP is gone from PVW.
+    expect(pipStates().at(-1)).toMatchObject({ pvwPip: null });
+
+    // Strom's preview must end on the operator's source (input 1), NOT a stale
+    // pip restore. Before the fix the final preview request was { pip: 0 }.
+    expect(requestsTo(PREVIEW).at(-1)?.body).toEqual({ source: { input: 1 } });
+    expect(requestsTo(PREVIEW)).not.toContainEqual(
+      expect.objectContaining({ body: { source: { pip: 0 } } }),
+    );
   });
 });
 
