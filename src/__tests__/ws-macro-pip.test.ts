@@ -198,9 +198,164 @@ describe('pgmBg with no Strom flow configured', () => {
     // `pgmBgByProduction` is what a connecting client is served from. The
     // connect sync lives in the plugin rather than handleMessage, so observe
     // the map through a later TALLY, which reads it instead of recomputing it.
-    await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
+    // SET_PVW leaves the PiP on program, so the background is still current.
+    await send({ type: 'SET_PVW', mixerInput: 'video_in_2' });
 
     expect(tallies()[0]).toMatchObject({ pgmBg: 'video_in_1' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Macro CUT / TRANSITION over a PiP that is on program
+// ---------------------------------------------------------------------------
+
+describe('macro CUT with a PiP on program', () => {
+  it('moves the PiP to preview, tells clients, and restores it in Strom', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([{ type: 'CUT', sourceId: 'cam3' }]));
+
+    // Put PiP 0 on program: select it into preview, then take.
+    await send({ type: 'SELECT_PVW_PIP', pip: 0 });
+    await send({ type: 'TAKE' });
+    resetRecordings();
+
+    await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
+
+    // The PiP leaves program for preview, and every subscriber is told.
+    expect(pipStates()).toHaveLength(1);
+    expect(pipStates()[0]).toMatchObject({ pgmPip: null, pvwPip: 0 });
+
+    // The PiP is put back on Strom's preview bus.
+    expect(requestsTo(PREVIEW)).toContainEqual({
+      method: 'PUT',
+      path: PREVIEW,
+      body: { source: { pip: 0 } },
+    });
+
+    // from_input is the tracked background (video_in_1), not a collapsed to_input.
+    expect(requestsTo(TRANSITION)[0]?.body).toMatchObject({ from_input: 1, to_input: 2 });
+  });
+});
+
+describe('macro TRANSITION with a PiP on program', () => {
+  it('moves the PiP to preview and restores it in Strom', async () => {
+    mockGet.mockResolvedValue(
+      makeProductionDoc([
+        { type: 'TRANSITION', sourceId: 'cam3', transitionType: 'mix', durationMs: 500 },
+      ]),
+    );
+
+    await send({ type: 'SELECT_PVW_PIP', pip: 0 });
+    await send({ type: 'TAKE' });
+    resetRecordings();
+
+    await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
+
+    expect(pipStates()).toHaveLength(1);
+    expect(pipStates()[0]).toMatchObject({ pgmPip: null, pvwPip: 0 });
+    expect(requestsTo(PREVIEW)).toContainEqual({
+      method: 'PUT',
+      path: PREVIEW,
+      body: { source: { pip: 0 } },
+    });
+    expect(requestsTo(TRANSITION)[0]?.body).toMatchObject({ from_input: 1, to_input: 2 });
+  });
+});
+
+describe('macro TAKE with a PiP on program', () => {
+  it('moves the PiP to preview and restores it in Strom after the take', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([{ type: 'TAKE' }]));
+
+    await send({ type: 'SELECT_PVW_PIP', pip: 0 });
+    await send({ type: 'TAKE' });
+    resetRecordings();
+
+    await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
+
+    expect(pipStates()).toHaveLength(1);
+    expect(pipStates()[0]).toMatchObject({ pgmPip: null, pvwPip: 0 });
+    expect(tallies()[0]).toMatchObject({ pgm: 'video_in_0', pvw: null });
+    expect(requestsTo(TRANSITION)[0]?.body).toMatchObject({ from_input: 1, to_input: 0 });
+    // The restore follows the transition, so it is the last preview select.
+    expect(requestsTo(PREVIEW).at(-1)?.body).toEqual({ source: { pip: 0 } });
+  });
+});
+
+describe('macro TAKE with a PiP on program and another in preview', () => {
+  it('leaves the program PiP in place', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([{ type: 'TAKE' }]));
+
+    await send({ type: 'SELECT_PVW_PIP', pip: 0 });
+    await send({ type: 'TAKE' });
+    await send({ type: 'SELECT_PVW_PIP', pip: 1 });
+    resetRecordings();
+
+    await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
+
+    // PiP 0 is still on air, so it must not be announced as moved to
+    // preview or selected into Strom's preview.
+    expect(pipStates()).toHaveLength(0);
+    for (const req of requestsTo(PREVIEW)) {
+      expect(req.body).not.toEqual({ source: { pip: 0 } });
+    }
+  });
+});
+
+describe('macro TAKE with a PiP on program and nothing in preview', () => {
+  it('leaves the program PiP in place', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([{ type: 'TAKE' }]));
+
+    await send({ type: 'SELECT_PVW_PIP', pip: 0 });
+    await send({ type: 'TAKE' });
+    // Empty PVW behind the PGM PiP.
+    setTally(PROD, { pgm: null, pvw: null });
+    resetRecordings();
+
+    await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
+
+    expect(pipStates()).toHaveLength(0);
+    expect(requestsTo(TRANSITION)).toHaveLength(0);
+    for (const req of requestsTo(PREVIEW)) {
+      expect(req.body).not.toEqual({ source: { pip: 0 } });
+    }
+  });
+});
+
+describe('macro CUT TALLY over a PiP on program', () => {
+  it('matches the TALLY an interactive CUT sends from the same state', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([{ type: 'CUT', sourceId: 'cam3' }]));
+
+    const cutFromPgmPip = async (msg: Record<string, unknown>) => {
+      clearPipState(PROD);
+      setTally(PROD, { pgm: 'video_in_0', pvw: 'video_in_1' });
+      await send({ type: 'SELECT_PVW_PIP', pip: 0 });
+      await send({ type: 'TAKE' });
+      resetRecordings();
+      await send(msg);
+      return tallies()[0];
+    };
+
+    const fromMacro = await cutFromPgmPip({ type: 'MACRO_EXEC', macroId: 'macro-1' });
+    const fromCut = await cutFromPgmPip({ type: 'CUT', mixerInput: 'video_in_2' });
+
+    expect(fromMacro).toHaveProperty('program');
+    expect(fromMacro).toEqual(fromCut);
+  });
+});
+
+describe('macro CUT with a PiP in preview only', () => {
+  it('clears the preview PiP', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([{ type: 'CUT', sourceId: 'cam3' }]));
+
+    await send({ type: 'SELECT_PVW_PIP', pip: 0 });
+    resetRecordings();
+
+    await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
+
+    expect(pipStates()).toHaveLength(1);
+    expect(pipStates()[0]).toMatchObject({ pgmPip: null, pvwPip: null });
+    for (const req of requestsTo(PREVIEW)) {
+      expect(req.body).not.toEqual({ source: { pip: 0 } });
+    }
   });
 });
 
