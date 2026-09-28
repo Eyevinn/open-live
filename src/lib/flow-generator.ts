@@ -866,7 +866,7 @@ export async function activateStromFlow(
         // extra 'recording' assignments are ignored so we never fan-out writes.
         if (recorderBlockId) continue;
         // Per-production output directory: recorder writes
-        // {media_path}/{output_dir}/{prefix}_%05d.{ext} (Strom recorder.rs). We key
+        // {media_path}/{output_dir}/{filename_prefix}_%05d.{ext} (Strom recorder.rs). We key
         // it by production id so segments are trivially locatable + uploadable.
         const outputDir = `recordings/${production._id}`;
         flow.blocks.push({
@@ -875,7 +875,7 @@ export async function activateStromFlow(
           name: outputDoc.name,
           properties: {
             output_dir: outputDir,
-            prefix: production._id,
+            filename_prefix: production._id,
           },
           position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
         });

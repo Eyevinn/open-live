@@ -88,6 +88,7 @@ describe('flow-generator — recorder wiring (#41)', () => {
       'recordings/prod-rec-1',
     );
     expect(result.recorderOutputDir).toBe('recordings/prod-rec-1');
+    expect((recorder!['properties'] as Record<string, unknown>)['filename_prefix']).toBe('prod-rec-1');
 
     // Recorder receives the PGM video feed and the main audio bus
     const videoIn = links.find((l) => l['to'] === `${recId}:video_in_0`);
