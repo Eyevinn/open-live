@@ -2,7 +2,7 @@
  * VOD recording uploader — upload-from-local path (epic #5, issue #41).
  *
  * Strom's builtin.recorder writes local files only
- * ({media_path}/{output_dir}/{filename_prefix}_%05d.{ext}, per
+ * ({media_path}/{output_dir}/{filename_prefix}_{timestamp}_%05d.{ext}, per
  * backend/src/blocks/builtin/recorder.rs — confirmed by the PM on issue #41,
  * 2026-09-15). It has NO native S3/MinIO sink. So after a production
  * deactivates, open-live:
