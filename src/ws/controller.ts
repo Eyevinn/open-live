@@ -1229,6 +1229,18 @@ export async function handleMessage(
       // reads this map, and it must hold the background the take just
       // broadcast even when Strom is unconfigured or its call throws.
       if (newPgmPip !== null) pgmBgByProduction.set(productionId, newPgmBg);
+      // When the PiP was on PGM (curPgmPip set, curPvwPip null) this take moves
+      // it to PVW. Update the PiP maps *before* building the TALLY so the
+      // broadcast reflects the new state (`pgmBg: null` and the background that
+      // was under the PiP now surfaced in `preview`) rather than the stale
+      // pre-take state. Mirrors the ordering CUT / TRANSITION and the macro TAKE
+      // already use. (issue #356)
+      const reversePipTake = curPvwPip === null && curPgmPip !== null;
+      const reversePgmBg = reversePipTake ? (pgmBgByProduction.get(productionId) ?? null) : null;
+      if (reversePipTake) {
+        pvwBeforePipByProduction.set(productionId, reversePgmBg);
+        pgmBgByProduction.delete(productionId);
+      }
       broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: newPgmPip, pvwPip: newPvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
       const takeTransition = toStromTransition(msg.transitionType ?? 'cut');
@@ -1259,11 +1271,11 @@ export async function handleMessage(
       } else if (curPgmPip !== null) {
         // PiP is on PGM → taking to a real input; PiP moves to PVW.
         // Use the tracked PGM background as from_input (tally.pgm is null while a
-        // PiP occupies PGM).  Save pgmBg as pvwBeforePip so the next forward PiP
-        // take has a valid to_input ≠ from_input (avoids "sole program source" 400).
-        const pgmBg = pgmBgByProduction.get(productionId) ?? null;
-        pvwBeforePipByProduction.set(productionId, pgmBg);
-        pgmBgByProduction.delete(productionId);
+        // PiP occupies PGM). `pvwBeforePipByProduction` was already set to this
+        // background and `pgmBgByProduction` cleared above (before the TALLY
+        // broadcast), so the next forward PiP take has a valid to_input ≠
+        // from_input (avoids "sole program source" 400). Reuse the captured value.
+        const pgmBg = reversePgmBg;
         if (doc.stromFlowId && doc.mixerBlockId) {
           try {
             const strom = await makeStromClient();
