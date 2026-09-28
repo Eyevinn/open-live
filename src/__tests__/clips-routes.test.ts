@@ -111,7 +111,7 @@ process.env['STROM_URL'] = `http://127.0.0.1:${(stromServer.address() as Address
 afterAll(() => stromServer.close());
 
 // ---------------------------------------------------------------------------
-// Clip URL preflight (issue #351): cueClip now does a real HEAD/GET fetch
+// Clip URL preflight (issue #351): cueClip now does a real ranged-GET fetch
 // against the clip's resolved URL before touching Strom. The fixture source
 // address below is a public-looking hostname (required to pass httpUrlOnly's
 // SSRF check), not actually reachable from the test sandbox. Intercept fetch

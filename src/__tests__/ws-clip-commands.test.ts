@@ -94,7 +94,7 @@ process.env['STROM_URL'] = `http://127.0.0.1:${(stromServer.address() as Address
 afterAll(() => stromServer.close());
 
 // ---------------------------------------------------------------------------
-// Clip URL preflight (issue #351): cueClip now does a real HEAD/GET fetch
+// Clip URL preflight (issue #351): cueClip now does a real ranged-GET fetch
 // against the clip's resolved URL before touching Strom. The fixture source
 // address below is a public-looking hostname (required to pass httpUrlOnly's
 // SSRF check — a loopback/private literal would be rejected there), so it is
@@ -104,11 +104,33 @@ afterAll(() => stromServer.close());
 // real fetch untouched.
 // ---------------------------------------------------------------------------
 const CLIP_URL = 'https://media.example.com/story-a.mp4';
+// s3-reference presigned URLs resolve against this host (see MINIO_* env below).
+const S3_HOST = 's3.example.test';
+// A public-looking URL whose preflight answers a 302 (Location = redirectLocation),
+// used to exercise the manual-redirect re-validation path.
+const REDIRECT_URL = 'https://redirect.example.com/clip.mp4';
 const realFetch = globalThis.fetch;
 let clipUrlStatus = 200;
+let s3Status = 200;
+let redirectLocation: string | null = null;
+// Records method + Range header of every intercepted preflight probe so tests
+// can assert the probe is a ranged GET (never a HEAD — s3 presigned URLs are
+// signed for GET only).
+const preflightProbes: Array<{ url: string; method: string; range: string | null }> = [];
 vi.spyOn(globalThis, 'fetch').mockImplementation(((input: RequestInfo | URL, init?: RequestInit) => {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+  let host = '';
+  try { host = new URL(url).host; } catch { /* non-URL input, leave blank */ }
+  const method = (init?.method ?? 'GET').toUpperCase();
+  const range = new Headers(init?.headers).get('range');
+  if (url === CLIP_URL || url === REDIRECT_URL || host === S3_HOST) {
+    preflightProbes.push({ url, method, range });
+  }
+  if (url === REDIRECT_URL && redirectLocation) {
+    return Promise.resolve(new Response(null, { status: 302, headers: { location: redirectLocation } }));
+  }
   if (url === CLIP_URL) return Promise.resolve(new Response(null, { status: clipUrlStatus }));
+  if (host === S3_HOST) return Promise.resolve(new Response(null, { status: s3Status }));
   return realFetch(input as never, init);
 }) as typeof fetch);
 afterAll(() => { globalThis.fetch = realFetch; });
@@ -117,6 +139,14 @@ afterAll(() => { globalThis.fetch = realFetch; });
 // have to wait out the production defaults (5s each).
 process.env['CLIP_STALL_TIMEOUT_MS'] = '300';
 process.env['CLIP_CUE_READY_TIMEOUT_MS'] = '300';
+
+// Object storage config so `type: 's3'` clip references resolve to a presigned
+// GET URL against S3_HOST (exercises the s3 preflight path, issue #351 review).
+process.env['MINIO_ENDPOINT'] = S3_HOST;
+process.env['MINIO_USE_SSL'] = 'true';
+process.env['MINIO_ACCESS_KEY'] = 'test-access-key';
+process.env['MINIO_SECRET_KEY'] = 'test-secret-key';
+process.env['MINIO_BUCKET'] = 'clips';
 
 const { handleMessage, clearClipStateForProduction } = await import('../ws/controller.js');
 const { config } = await import('../config.js');
@@ -182,6 +212,9 @@ beforeEach(() => {
   stromRequests.length = 0;
   playerState = { state: 'stopped' };
   clipUrlStatus = 200;
+  s3Status = 200;
+  redirectLocation = null;
+  preflightProbes.length = 0;
   (ws.send as unknown as ReturnType<typeof vi.fn>).mockClear();
   updateProductionDoc.mockClear();
   productionDocs.clear();
@@ -355,6 +388,92 @@ describe('clip URL preflight (issue #351)', () => {
     expect(errorFrames()).toHaveLength(0);
     expect(clipStates().at(-1)).toMatchObject({ state: 'cued', durationMs: 12000 });
     expect(playerReqs('playlist')).toHaveLength(1);
+  });
+
+  it('probes the clip URL with a ranged GET, never a HEAD', async () => {
+    clipUrlStatus = 200;
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+
+    expect(preflightProbes.length).toBeGreaterThan(0);
+    // A HEAD would 403 against a GET-presigned s3 URL (SignatureDoesNotMatch),
+    // so the preflight must use a ranged GET for both url and s3 references.
+    expect(preflightProbes.every((p) => p.method === 'GET')).toBe(true);
+    expect(preflightProbes.at(-1)?.range).toBe('bytes=0-0');
+  });
+});
+
+// s3 clip references (issue #351 review): resolveClipFile presigns a SigV4 GET
+// URL (signed for GET only). The preflight must therefore probe with a ranged
+// GET, not a HEAD — a HEAD would return 403 SignatureDoesNotMatch and fail the
+// cue for every s3 clip. All other fixtures use type:'url', which is why this
+// slipped CI, so these tests use an explicit s3 reference.
+describe('clip URL preflight — s3 references (issue #351)', () => {
+  const S3_ADDRESS = JSON.stringify({ type: 's3', bucket: 'clips', key: 'story/a.mp4' });
+
+  it('cues an s3 reference by probing its presigned GET URL with a ranged GET', async () => {
+    sourceDocs.set('src-clip', makeSourceDoc({ address: S3_ADDRESS }));
+    s3Status = 200;
+    playerState = { state: 'paused', duration_ns: 9_000_000_000, position_ns: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+
+    expect(errorFrames()).toHaveLength(0);
+    expect(clipStates().at(-1)).toMatchObject({ state: 'cued', durationMs: 9000 });
+    expect(playerReqs('playlist')).toHaveLength(1);
+    // The presigned URL was actually probed, and with a ranged GET (not HEAD).
+    const s3Probe = preflightProbes.find((p) => p.url.includes(S3_HOST));
+    expect(s3Probe).toBeDefined();
+    expect(s3Probe?.method).toBe('GET');
+    expect(s3Probe?.range).toBe('bytes=0-0');
+    // The playlist file handed to Strom is the presigned URL against the store.
+    expect((playerReqs('playlist')[0].body as { files: string[] }).files[0]).toContain(`https://${S3_HOST}/clips/story/a.mp4`);
+  });
+
+  it('surfaces a non-2xx s3 object as a CLIP_STATE error before touching Strom', async () => {
+    sourceDocs.set('src-clip', makeSourceDoc({ address: S3_ADDRESS }));
+    s3Status = 404;
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+
+    expect(errorFrames().length).toBeGreaterThan(0);
+    expect(clipStates().at(-1)).toMatchObject({ state: 'error', error: 'Clip URL returned HTTP 404' });
+    expect(playerReqs('playlist')).toHaveLength(0);
+  });
+});
+
+// SSRF via redirect on the new server-side fetch surface (issue #351 review):
+// the preflight follows redirects manually and re-validates each Location with
+// the same httpUrlOnly SSRF gate before following.
+describe('clip URL preflight — redirect SSRF (issue #351)', () => {
+  function useRedirectSource() {
+    sourceDocs.set('src-clip', makeSourceDoc({ address: JSON.stringify({ type: 'url', url: REDIRECT_URL }) }));
+  }
+
+  it('blocks a redirect to a link-local metadata address and never cues', async () => {
+    useRedirectSource();
+    redirectLocation = 'http://169.254.169.254/latest/meta-data/';
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+
+    expect(errorFrames().length).toBeGreaterThan(0);
+    expect(clipStates().at(-1)).toMatchObject({ state: 'error' });
+    expect(String(clipStates().at(-1)?.error)).toContain('redirect blocked');
+    // The internal target must never be fetched, and Strom must never be touched.
+    expect(preflightProbes.some((p) => p.url.includes('169.254.169.254'))).toBe(false);
+    expect(playerReqs('playlist')).toHaveLength(0);
+  });
+
+  it('follows a redirect to another allowed public URL after re-validating it', async () => {
+    useRedirectSource();
+    redirectLocation = CLIP_URL; // a re-validated, allowed public host
+    clipUrlStatus = 200;
+    playerState = { state: 'paused', duration_ns: 6_000_000_000, position_ns: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+
+    expect(errorFrames()).toHaveLength(0);
+    expect(clipStates().at(-1)).toMatchObject({ state: 'cued', durationMs: 6000 });
+    // Both hops were probed with a ranged GET.
+    expect(preflightProbes.some((p) => p.url === REDIRECT_URL)).toBe(true);
+    expect(preflightProbes.some((p) => p.url === CLIP_URL)).toBe(true);
+    expect(preflightProbes.every((p) => p.method === 'GET')).toBe(true);
   });
 });
 

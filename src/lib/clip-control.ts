@@ -33,6 +33,7 @@ import type { StromClient, PlayerStateResponse } from './strom.js';
 import type { ClipReference, ClipState, ProductionDoc, SourceDoc } from '../db/types.js';
 import { deserializeClipReference } from './clip-reference.js';
 import { minioTargetFromConfig, type MinioTarget } from './recording-uploader.js';
+import { httpUrlOnly } from './url-validation.js';
 import { config } from '../config.js';
 import { markClipPlayPending } from '../services/clip-state.service.js';
 
@@ -193,32 +194,79 @@ function sleep(ms: number): Promise<void> {
  * failure, connection refused, …) silently cues the operator into a clip
  * that will never load.
  *
- * Issues a `HEAD` request first; an origin that rejects `HEAD` (405/501 —
- * some presigned-URL / CDN configurations) falls back to a ranged GET of the
- * first byte so this never downloads the whole file just to check
- * reachability. Operates on `url` as already resolved by {@link resolveClipFile}
- * — for a `url` reference this is SSRF-validated by `deserializeClipReference`
+ * Probes with a ranged GET (`Range: bytes=0-0`) rather than a `HEAD`: a
+ * `HEAD` cannot be used for `s3` references because {@link presignS3Get}
+ * signs the SigV4 URL for the `GET` method only, so S3/MinIO answer a `HEAD`
+ * against a GET-presigned URL with `403 SignatureDoesNotMatch` — a false
+ * "unreachable". A ranged GET matches the signed method and works for both
+ * `url` and `s3` references while still fetching only the first byte, so this
+ * never downloads the whole file just to check reachability.
+ *
+ * Redirects are followed manually (`redirect: 'manual'`): each `Location`
+ * target is re-validated through the same `httpUrlOnly` SSRF gate the original
+ * `url` reference passed, up to {@link PREFLIGHT_MAX_REDIRECTS} hops. Without
+ * this, an operator-supplied public URL that 30x-redirects to
+ * `169.254.169.254` / `metadata.google.internal` / an internal host would be
+ * chased by open-live's own backend process (`httpUrlOnly` only checks the
+ * *original* host at parse time), turning the preflight into an internal-
+ * network probe/oracle.
+ *
+ * Operates on `url` as already resolved by {@link resolveClipFile} — for a
+ * `url` reference this is SSRF-validated by `deserializeClipReference`
  * (`httpUrlOnly`) before it ever reaches here; for `s3` it is a presigned URL
- * against the configured object store. This performs no additional host
- * validation of its own, only a liveness check of the already-approved URL.
+ * against the configured object store.
  */
+const PREFLIGHT_MAX_REDIRECTS = 3;
+const PREFLIGHT_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
 async function preflightClipUrl(url: string, timeoutMs: number): Promise<void> {
-  let res: Response;
-  try {
-    res = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(timeoutMs) });
-    if (res.status === 405 || res.status === 501) {
-      res = await fetch(url, {
+  let current = url;
+  for (let hop = 0; ; hop++) {
+    let res: Response;
+    try {
+      res = await fetch(current, {
         method: 'GET',
         headers: { Range: 'bytes=0-0' },
+        redirect: 'manual',
         signal: AbortSignal.timeout(timeoutMs),
       });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new ClipMediaError(`Clip URL could not be reached: ${reason}`);
     }
-  } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err);
-    throw new ClipMediaError(`Clip URL could not be reached: ${reason}`);
-  }
-  if (!res.ok) {
-    throw new ClipMediaError(`Clip URL returned HTTP ${res.status}`);
+    // Don't stream the body: a Range-ignoring origin would otherwise start
+    // pulling the whole file just to satisfy a reachability check.
+    await res.body?.cancel().catch(() => undefined);
+
+    if (PREFLIGHT_REDIRECT_STATUSES.has(res.status)) {
+      const location = res.headers.get('location');
+      if (!location) {
+        throw new ClipMediaError(`Clip URL returned HTTP ${res.status} without a Location header`);
+      }
+      if (hop >= PREFLIGHT_MAX_REDIRECTS) {
+        throw new ClipMediaError(`Clip URL exceeded the redirect limit (${PREFLIGHT_MAX_REDIRECTS})`);
+      }
+      let next: string;
+      try {
+        next = new URL(location, current).toString();
+      } catch {
+        throw new ClipMediaError('Clip URL redirected to an invalid location');
+      }
+      // Re-apply the SSRF gate to the redirect target before following it.
+      try {
+        httpUrlOnly(next);
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        throw new ClipMediaError(`Clip URL redirect blocked: ${reason}`);
+      }
+      current = next;
+      continue;
+    }
+
+    if (!res.ok) {
+      throw new ClipMediaError(`Clip URL returned HTTP ${res.status}`);
+    }
+    return;
   }
 }
 
