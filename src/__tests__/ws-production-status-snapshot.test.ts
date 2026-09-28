@@ -149,6 +149,14 @@ describe('WS connect snapshot — activation warnings', () => {
     expect(messages.filter((m) => m.type === 'ERROR')).toEqual([{ type: 'ERROR', error: warning.message }]);
   });
 
+  it('sends no warning while the production is still activating, or stopped with a stale flow id', async () => {
+    for (const status of ['activating', 'inactive']) {
+      mockGet.mockResolvedValue(makeProductionDoc({ status, stromFlowId: 'flow-abc', activationWarnings: [warning] }));
+      const messages = await connectAndCollect('prod-ws-1');
+      expect(messages.filter((m) => m.type === 'ERROR')).toEqual([]);
+    }
+  });
+
   it('sends no warning for a production that is not live', async () => {
     mockGet.mockResolvedValue(makeProductionDoc({ status: 'ended', activationWarnings: [warning] }));
 

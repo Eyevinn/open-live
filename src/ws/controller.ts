@@ -2955,7 +2955,7 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
       // Warnings from activation (e.g. a recording with no sound), re-sent on
       // every connect while the production is live so a controller opened after
       // activation still sees them. Studio shows ERROR frames as a toast.
-      if (connectDoc?.stromFlowId) {
+      if (connectDoc?.status === 'active' && connectDoc.stromFlowId) {
         for (const w of connectDoc.activationWarnings ?? []) {
           socket.send(JSON.stringify({ type: 'ERROR', error: w.message }));
         }
