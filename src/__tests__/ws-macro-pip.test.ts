@@ -13,7 +13,7 @@
  * exercises the same state machine the server runs in production.
  */
 
-import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
@@ -73,6 +73,11 @@ const stromRequests: StromRequest[] = [];
 // reproduce issue #341.
 let transitionDelayMs = 0;
 
+// When >= 400, the fake Strom fails /transition with this status, reproducing
+// Strom rejecting the actual cut/transition (issue #355). Other endpoints
+// (e.g. /preview) keep answering 200.
+let transitionStatus = 200;
+
 const stromServer: Server = createServer((req, res) => {
   const chunks: Buffer[] = [];
   req.on('data', (c: Buffer) => chunks.push(c));
@@ -83,7 +88,13 @@ const stromServer: Server = createServer((req, res) => {
       path: req.url ?? '',
       ...(raw ? { body: JSON.parse(raw) as unknown } : {}),
     });
+    const isTransition = (req.url ?? '').endsWith('/transition');
     const respond = () => {
+      if (isTransition && transitionStatus >= 400) {
+        res.writeHead(transitionStatus, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'transition rejected' }));
+        return;
+      }
       res.writeHead(200, { 'content-type': 'application/json' });
       // The /dsk endpoint returns the resolved key state; the controller reads
       // `dsk`/`enabled` off it. Echo the request so callers see what they asked.
@@ -94,7 +105,7 @@ const stromServer: Server = createServer((req, res) => {
         res.end(JSON.stringify({ success: true }));
       }
     };
-    if (transitionDelayMs > 0 && (req.url ?? '').endsWith('/transition')) {
+    if (transitionDelayMs > 0 && isTransition) {
       setTimeout(respond, transitionDelayMs);
     } else {
       respond();
@@ -185,8 +196,10 @@ beforeEach(() => {
   setTally(PROD, { pgm: 'video_in_0', pvw: 'video_in_1' });
   resetRecordings();
   transitionDelayMs = 0;
+  transitionStatus = 200;
   mockGet.mockReset();
-  mockInsert.mockClear();
+  mockInsert.mockReset();
+  mockInsert.mockResolvedValue({ ok: true });
 });
 
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -270,6 +283,132 @@ describe('macro TRANSITION with a PiP on program', () => {
       body: { source: { pip: 0 } },
     });
     expect(requestsTo(TRANSITION)[0]?.body).toMatchObject({ from_input: 1, to_input: 2 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #355 — a displaced PiP must not be announced or restored when the Strom
+// transition or the DB write fails, or clients and Strom end up disagreeing.
+// ---------------------------------------------------------------------------
+
+function serverError(): Error & { statusCode: number } {
+  const err = new Error('Internal Server Error') as Error & { statusCode: number };
+  err.statusCode = 500;
+  return err;
+}
+
+/** Put PiP 0 on program from the beforeEach state, then forget the recordings. */
+async function arrangePgmPip() {
+  await send({ type: 'SELECT_PVW_PIP', pip: 0 });
+  await send({ type: 'TAKE' });
+  resetRecordings();
+}
+
+/** True if any PREVIEW request restored PiP 0 into Strom's preview bus. */
+function restoredPip0() {
+  return requestsTo(PREVIEW).some((r) => JSON.stringify(r.body) === JSON.stringify({ source: { pip: 0 } }));
+}
+
+describe('PiP on program when the Strom transition is rejected (issue #355)', () => {
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  it('interactive CUT: does not announce the move or restore the PiP on a /transition 500', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+    await arrangePgmPip();
+    transitionStatus = 500;
+
+    await send({ type: 'CUT', mixerInput: 'video_in_2' });
+
+    // The transition was attempted, but Strom rejected it...
+    expect(requestsTo(TRANSITION)).toHaveLength(1);
+    // ...so clients are NOT told the PiP left program...
+    expect(pipStates()).toHaveLength(0);
+    // ...and the PiP is NOT put back on Strom's preview (it is still on air).
+    expect(restoredPip0()).toBe(false);
+  });
+
+  it('interactive TRANSITION: does not announce the move or restore the PiP on a /transition 500', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+    await arrangePgmPip();
+    transitionStatus = 500;
+
+    await send({ type: 'TRANSITION', mixerInput: 'video_in_2', transitionType: 'fade', durationMs: 500 });
+
+    expect(requestsTo(TRANSITION)).toHaveLength(1);
+    expect(pipStates()).toHaveLength(0);
+    expect(restoredPip0()).toBe(false);
+  });
+
+  it('macro CUT: does not announce the move or restore the PiP on a /transition 500', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([{ type: 'CUT', sourceId: 'cam3' }]));
+    await arrangePgmPip();
+    transitionStatus = 500;
+
+    await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
+
+    expect(requestsTo(TRANSITION)).toHaveLength(1);
+    expect(pipStates()).toHaveLength(0);
+    expect(restoredPip0()).toBe(false);
+  });
+
+  it('macro TRANSITION: does not announce the move or restore the PiP on a /transition 500', async () => {
+    mockGet.mockResolvedValue(
+      makeProductionDoc([{ type: 'TRANSITION', sourceId: 'cam3', transitionType: 'mix', durationMs: 500 }]),
+    );
+    await arrangePgmPip();
+    transitionStatus = 500;
+
+    await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
+
+    expect(requestsTo(TRANSITION)).toHaveLength(1);
+    expect(pipStates()).toHaveLength(0);
+    expect(restoredPip0()).toBe(false);
+  });
+});
+
+describe('PiP on program when the DB write fails (issue #355)', () => {
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  it('interactive CUT: leaves no PIP_STATE broadcast without a matching TALLY on a non-conflict DB throw', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+    await arrangePgmPip();
+    // The persist for the CUT below fails with a non-conflict error, which
+    // propagates out of handleMessage (matches ws-persist-error-propagation).
+    mockInsert.mockRejectedValue(serverError());
+
+    await expect(send({ type: 'CUT', mixerInput: 'video_in_2' })).rejects.toThrow('Internal Server Error');
+
+    // The displacement broadcast now follows the persist, so a failed write
+    // leaves neither a TALLY nor a dangling PIP_STATE behind.
+    expect(tallies()).toHaveLength(0);
+    expect(pipStates()).toHaveLength(0);
+    // Every PIP_STATE that IS broadcast must be backed by a TALLY.
+    if (pipStates().length > 0) expect(tallies().length).toBeGreaterThan(0);
+  });
+
+  it('macro CUT: leaves no PIP_STATE broadcast without a matching TALLY on a non-conflict DB throw', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([{ type: 'CUT', sourceId: 'cam3' }]));
+    await arrangePgmPip();
+    mockInsert.mockRejectedValue(serverError());
+
+    // The macro loop catches the failed action and reports MACRO_ERROR rather
+    // than rejecting, but the persist still throws before any TALLY/PIP_STATE.
+    await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
+
+    expect(tallies()).toHaveLength(0);
+    expect(pipStates()).toHaveLength(0);
   });
 });
 
