@@ -263,7 +263,11 @@ export function emitProductionStatus(
 async function runActivationFlow(
   productionId: string,
   signal: AbortSignal,
-  log: { error: (obj: unknown, msg: string) => void; info: (obj: unknown, msg: string) => void },
+  log: {
+    error: (obj: unknown, msg: string) => void;
+    warn: (obj: unknown, msg: string) => void;
+    info: (obj: unknown, msg: string) => void;
+  },
   publicBaseUrl: string,
 ): Promise<void> {
   let stromFlowId: string | undefined;
@@ -322,7 +326,9 @@ async function runActivationFlow(
       ...(Object.keys(activation.sourceAudioOffsetBlockIds).length > 0 && { sourceAudioOffsetBlockIds: activation.sourceAudioOffsetBlockIds }),
       ...(Object.keys(activation.clipPlayerBlockIds).length > 0 && { clipPlayerBlockIds: activation.clipPlayerBlockIds }),
       ...(activation.returnBuses.length > 0 && { returnBuses: activation.returnBuses }),
+      ...(activation.warnings.length > 0 && { activationWarnings: activation.warnings }),
     });
+    for (const w of activation.warnings) log.warn({ productionId, warning: w.type }, w.message);
 
     // Step 3: Poll until flow reaches 'playing' or we time out
     const deadline = Date.now() + FLOW_POLL_TIMEOUT_MS;
@@ -788,6 +794,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         ...doc,
         status: 'activating',
         deletionWarnings: undefined,
+        activationWarnings: undefined,
         autoDeactivated: undefined,
         endedReason: undefined,
         updatedAt: new Date().toISOString(),
