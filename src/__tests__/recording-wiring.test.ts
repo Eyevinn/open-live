@@ -90,11 +90,19 @@ describe('flow-generator — recorder wiring (#41)', () => {
     expect(result.recorderOutputDir).toBe('recordings/prod-rec-1');
     expect((recorder!['properties'] as Record<string, unknown>)['filename_prefix']).toBe('prod-rec-1');
 
-    // Recorder receives the PGM video feed and the main audio bus
+    // Recorder receives the PGM video feed and the main audio bus, AAC-encoded
+    // because the recorder refuses raw audio
     const videoIn = links.find((l) => l['to'] === `${recId}:video_in_0`);
     const audioIn = links.find((l) => l['to'] === `${recId}:audio_in_0`);
     expect(videoIn).toBeDefined();
     expect(audioIn).toBeDefined();
+    const [encId, encPad] = (audioIn!['from'] as string).split(':');
+    expect(encPad).toBe('encoded_out');
+    const enc = blocks.find((b) => b['id'] === encId);
+    expect(enc?.['block_definition_id']).toBe('builtin.audioenc');
+    expect((enc!['properties'] as Record<string, unknown>)['codec']).toBe('aac');
+    const encIn = links.find((l) => l['to'] === `${encId}:audio_in`);
+    expect(encIn?.['from']).toMatch(/:main_out$/);
   });
 
   it('wires at most one recorder block even if two recording outputs are assigned', async () => {
