@@ -1733,9 +1733,12 @@ paths:
     post:
       summary: Cue a clip into the ready state
       description: >-
-        Loads the clip's resolved playlist entry into the media-player block and
-        seeks to index 0, leaving it paused/ready. Maps to Strom
-        `player.setPlaylist({files:[clip]}) + player.goto({index:0})`.
+        Preflight-checks the clip's resolved URL for reachability, loads it into the
+        media-player block, seeks to index 0 (Strom
+        `player.setPlaylist({files:[clip]}) + player.goto({index:0})`), then waits for
+        Strom to confirm a loaded duration before reporting `cued`. A non-2xx/unreachable
+        URL or a duration that never arrives fails the cue with a 502 rather than
+        reporting `cued` for media that cannot play (issue #351).
       operationId: cueClip
       tags: [Productions]
       requestBody:
@@ -1765,7 +1768,12 @@ paths:
         '409':
           description: Production is not activated
         '502':
-          description: Strom returned an error
+          description: >-
+            Strom returned an error, or the clip's media could not be reached/loaded
+            (issue #351). Like other 5xx responses the body carries a generic message
+            (`src/server.ts`'s error handler never leaks internals on 5xx); the specific
+            reason (e.g. `Clip URL returned HTTP 403`) is surfaced over the WebSocket
+            controller's `CLIP_STATE`/`ERROR` frames for this same cue.
         '503':
           description: Strom is unreachable
 
