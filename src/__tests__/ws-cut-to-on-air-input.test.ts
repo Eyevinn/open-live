@@ -120,6 +120,17 @@ function transitions() {
   return stromRequests.filter((r) => r.path === TRANSITION);
 }
 
+function pipStates() {
+  return broadcasts.filter((m) => m.type === 'PIP_STATE');
+}
+
+function degenerateTakes() {
+  return transitions().filter((r) => {
+    const b = r.body as { from_input?: number; to_input?: number };
+    return b.from_input === b.to_input;
+  });
+}
+
 beforeEach(() => {
   clearPipState(PROD);
   setTally(PROD, { pgm: 'video_in_0', pvw: 'video_in_1' });
@@ -132,12 +143,15 @@ beforeEach(() => {
 });
 
 describe('CUT to the input already on program', () => {
-  it('changes nothing: no tally broadcast, no Strom take', async () => {
+  it('does not change state or take, but re-broadcasts current tally (#353 item 3)', async () => {
     await send({ type: 'CUT', mixerInput: 'video_in_0' });
 
-    expect(tallies()).toHaveLength(0);
+    // State is unchanged and no Strom take fires, but the current tally is
+    // re-broadcast so an optimistically-swapped client is corrected.
     expect(transitions()).toHaveLength(0);
     expect(getTally(PROD)).toEqual({ pgm: 'video_in_0', pvw: 'video_in_1' });
+    expect(tallies()).toHaveLength(1);
+    expect(tallies()[0]).toMatchObject({ pgm: 'video_in_0', pvw: 'video_in_1' });
   });
 
   it('still acks the command so the sender is not left waiting', async () => {
@@ -158,12 +172,13 @@ describe('CUT to the input already on program', () => {
 });
 
 describe('TRANSITION to the input already on program', () => {
-  it('changes nothing: no tally broadcast, no Strom take', async () => {
+  it('does not change state or take, but re-broadcasts current tally (#353 item 3)', async () => {
     await send({ type: 'TRANSITION', mixerInput: 'video_in_0', transitionType: 'fade', durationMs: 500 });
 
-    expect(tallies()).toHaveLength(0);
     expect(transitions()).toHaveLength(0);
     expect(getTally(PROD)).toEqual({ pgm: 'video_in_0', pvw: 'video_in_1' });
+    expect(tallies()).toHaveLength(1);
+    expect(tallies()[0]).toMatchObject({ pgm: 'video_in_0', pvw: 'video_in_1' });
   });
 
   it('a TRANSITION to a different input is unaffected', async () => {
@@ -175,17 +190,19 @@ describe('TRANSITION to the input already on program', () => {
 });
 
 // ---------------------------------------------------------------------------
-// CUT / TRANSITION to the source *behind an on-air PiP* (issue #342)
+// CUT / TRANSITION to the source *behind an on-air PiP* (issues #342, #353)
 //
 // With a PiP on PGM the tally.pgm is null and the real on-air source is the
-// tracked background behind the PiP. Cutting to that same background input used
-// to slip past isAlreadyOnProgram (tally.pgm === null) and fire a degenerate
-// from_input === to_input take, which a real vision mixer reads ambiguously.
+// tracked background behind the PiP. Cutting to that same background input must
+// take the PiP off program (the background stays on PGM, PVW clears, the PiP
+// moves to PVW) — #347 mis-classified it as "already on program" and dropped the
+// command silently, leaving the Studio tally split (#353). The command must
+// still never fire a degenerate from_input === to_input take (#342).
 // PiP-on-PGM state is arranged through real inbound messages (SELECT_PVW_PIP +
 // TAKE), exactly like ws-macro-pip.test.ts, so the same state machine runs.
 // ---------------------------------------------------------------------------
 
-describe('CUT/TRANSITION to the input behind an on-air PiP (#342)', () => {
+describe('CUT/TRANSITION to the input behind an on-air PiP (#342, #353)', () => {
   /** Put PiP 0 on PGM over background video_in_1; return with recordings cleared. */
   async function pipOnProgramOverInput1() {
     // pgm=video_in_0, pvw=video_in_1 from beforeEach. Selecting the PiP in PVW
@@ -199,18 +216,17 @@ describe('CUT/TRANSITION to the input behind an on-air PiP (#342)', () => {
     stromRequests.length = 0;
   }
 
-  it('CUT to the background does NOT emit a degenerate from_input === to_input take', async () => {
+  it('CUT to the background takes the PiP off program without a degenerate take (#353)', async () => {
     await pipOnProgramOverInput1();
 
     await send({ type: 'CUT', mixerInput: 'video_in_1' });
 
-    // The fix: this is "already on program", so no take and no tally change.
-    expect(transitions()).toHaveLength(0);
-    expect(transitions().some((r) => {
-      const b = r.body as { from_input?: number; to_input?: number };
-      return b.from_input === b.to_input;
-    })).toBe(false);
-    expect(tallies()).toHaveLength(0);
+    // The background stays on PGM, PVW clears, and the PiP moves to PVW.
+    expect(tallies().at(-1)).toMatchObject({ pgm: 'video_in_1', pvw: null });
+    expect(pipStates().at(-1)).toMatchObject({ pgmPip: null, pvwPip: 0 });
+    expect(getTally(PROD)).toEqual({ pgm: 'video_in_1', pvw: null });
+    // Never a degenerate from_input === to_input take (#342).
+    expect(degenerateTakes()).toHaveLength(0);
   });
 
   it('CUT to the background still acks the command', async () => {
@@ -224,13 +240,15 @@ describe('CUT/TRANSITION to the input behind an on-air PiP (#342)', () => {
     expect(acks.at(-1)).toMatchObject({ cmdId: 'c-pip', phase: 'executed' });
   });
 
-  it('TRANSITION to the background does NOT emit a degenerate take', async () => {
+  it('TRANSITION to the background takes the PiP off program without a degenerate take (#353)', async () => {
     await pipOnProgramOverInput1();
 
     await send({ type: 'TRANSITION', mixerInput: 'video_in_1', transitionType: 'fade', durationMs: 500 });
 
-    expect(transitions()).toHaveLength(0);
-    expect(tallies()).toHaveLength(0);
+    expect(tallies().at(-1)).toMatchObject({ pgm: 'video_in_1', pvw: null });
+    expect(pipStates().at(-1)).toMatchObject({ pgmPip: null, pvwPip: 0 });
+    expect(getTally(PROD)).toEqual({ pgm: 'video_in_1', pvw: null });
+    expect(degenerateTakes()).toHaveLength(0);
   });
 
   it('CUT to a DIFFERENT real input while a PiP is on PGM is unaffected', async () => {

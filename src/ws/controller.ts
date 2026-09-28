@@ -369,19 +369,21 @@ const InboundMessageSchema = z.discriminatedUnion('type', [
  * the Strom take ran with `from_input === to_input`, which Strom treats as a
  * PGM/PVW swap, so the picture flipped to the previous preview.
  *
- * While a PiP is on PGM `tally.pgm` is null, so the real on-air source is the
- * tracked background behind the PiP (`pgmBgByProduction`). A CUT/TRANSITION to
- * that same background input would emit a degenerate `from_input === to_input`
- * take (issue #342), so it is also "already on program": treat it as a no-op
- * (the PiP stays on program). A CUT to any *other* real input while a PiP is on
- * PGM is a genuine change and still proceeds normally.
+ * While a PiP is on PGM this always returns false (the pre-#347 rule, restored
+ * in #353): a CUT/TRANSITION to *any* real input — including the background
+ * tracked behind the PiP — is a genuine change, because it must take the PiP off
+ * program. The target-equals-background case is handled explicitly by the
+ * CUT/TRANSITION/macro paths via `takePipOffToBackground`, which avoids the
+ * degenerate `from_input === to_input` take (issue #342) without dropping the
+ * command. #347 returned true here when the target equalled the background,
+ * which silently dropped the command and left the Studio tally split (#353).
  */
 function isAlreadyOnProgram(productionId: string, mixerInput: string): boolean {
   const pgmPip = pgmPipByProduction.get(productionId) ?? null;
-  if (pgmPip === null) {
-    return getTally(productionId).pgm === mixerInput;
+  if (pgmPip !== null) {
+    return false;
   }
-  return (pgmBgByProduction.get(productionId) ?? null) === mixerInput;
+  return getTally(productionId).pgm === mixerInput;
 }
 
 function padToIndex(mixerInput: string): number | null {
@@ -483,6 +485,86 @@ async function stromTransition(
   } catch (err) {
     console.warn('[controller] Strom transition error:', err);
   }
+}
+
+/**
+ * #353: a CUT/TRANSITION whose target is exactly the real input already tracked
+ * behind an on-program PiP (`pgmBgByProduction`). Pre-#347 this took the PiP off
+ * program; #347 re-classified it as "already on program" in `isAlreadyOnProgram`,
+ * so the CUT/TRANSITION handlers only acked and broke — no TALLY, no PIP_STATE,
+ * no Strom call. The command was silently dropped, so the client's optimistic
+ * swap was never corrected and the Studio tally was left split (PGM showing both
+ * the real source and the PiP, PVW empty). This restores the pre-#347 behaviour:
+ * the background stays on PGM, PVW clears, and the PiP moves to PVW.
+ *
+ * Tally + PiP state are mutated and broadcast synchronously (before any Strom
+ * await), matching the non-background PiP path in the CUT/TRANSITION handlers.
+ *
+ * Strom: we deliberately do NOT fire a mixer transition here. The target input
+ * equals the on-air background, so a transition would carry
+ * `from_input === to_input`, which Strom treats as a degenerate PGM/PVW swap
+ * (issue #342) and which flips the picture to the previous preview. This client's
+ * Strom mixer API (`src/lib/strom.ts`) exposes only `transition` and
+ * `selectPreview`; there is no dedicated "clear the on-program PiP overlay"
+ * endpoint, and the transition model swaps the PVW/PGM buses, so removing the
+ * overlay while keeping the same background on program cannot be expressed
+ * without that forbidden degenerate transition. We therefore select the PiP on
+ * Strom's preview (mirroring the `pvwPip` state we just broadcast and the
+ * pip-restore step the other PiP paths use), treating any error as non-fatal.
+ *
+ * OPEN QUESTION: fully decompositing the on-program PiP inside Strom for this
+ * exact "take the background out from under the PiP" case likely needs a
+ * Strom-side primitive this client does not yet expose (a non-degenerate
+ * program-overlay clear). Until then the controller tally/PiP state and the
+ * TALLY/PIP_STATE broadcasts are always corrected so optimistically-swapped
+ * clients are made consistent. See issue #353.
+ */
+async function takePipOffToBackground(
+  productionId: string,
+  doc: ProductionDoc,
+  target: string,
+  pgmPip: number,
+  persistLabel: string,
+  transitionMeta?: { transitionType?: string; durationMs?: number },
+): Promise<void> {
+  const newTally = { pgm: target, pvw: null };
+  setTally(productionId, newTally);
+  // PiP leaves PGM and lands on PVW; the background it sat over stays on PGM.
+  pgmPipByProduction.set(productionId, null);
+  pvwPipByProduction.set(productionId, pgmPip);
+  pvwBeforePipByProduction.set(productionId, target);
+  pgmBgByProduction.delete(productionId);
+  broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: pgmPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
+  await persistMixerMutation(productionId, persistLabel, (d) => ({ ...d, tally: newTally }));
+  broadcast(productionId, {
+    type: 'TALLY',
+    ...buildTallyPayload(productionId, newTally, doc),
+    ...(transitionMeta?.transitionType ? { transitionType: transitionMeta.transitionType, durationMs: transitionMeta.durationMs } : {}),
+  });
+  if (doc.stromFlowId && doc.mixerBlockId) {
+    try {
+      const strom = await makeStromClient();
+      await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: pgmPip } });
+    } catch (err) {
+      console.debug('[controller] Strom selectPreview (PiP off to background, non-fatal):', err);
+    }
+  }
+}
+
+/**
+ * #353 item 3: never drop a CUT/TRANSITION silently. On the genuine no-op path
+ * (the target is already the sole on-air source, no PiP involved) re-broadcast
+ * the current TALLY and PIP_STATE so a client that optimistically swapped
+ * PGM/PVW is corrected back to the real state.
+ */
+function rebroadcastMixerState(productionId: string, doc: ProductionDoc): void {
+  broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, getTally(productionId), doc) });
+  broadcast(productionId, {
+    type: 'PIP_STATE',
+    pgmPip: pgmPipByProduction.get(productionId) ?? null,
+    pvwPip: pvwPipByProduction.get(productionId) ?? null,
+    pips: pipConfigsByProduction.get(productionId) ?? [],
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,7 +1184,19 @@ export async function handleMessage(
 
   switch (msg.type) {
     case 'CUT': {
+      // #353: taking the real source out from under an on-program PiP (target
+      // equals the tracked background). Handle before the general path so we
+      // never fall through to a degenerate from_input === to_input take.
+      const curPgmPipBgCut = pgmPipByProduction.get(productionId) ?? null;
+      if (curPgmPipBgCut !== null && (pgmBgByProduction.get(productionId) ?? null) === msg.mixerInput) {
+        await takePipOffToBackground(productionId, doc, msg.mixerInput, curPgmPipBgCut, 'CUT');
+        if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
+        break;
+      }
       if (isAlreadyOnProgram(productionId, msg.mixerInput)) {
+        // #353 item 3: never drop the command silently — re-broadcast current
+        // state so a client that optimistically swapped PGM/PVW is corrected.
+        rebroadcastMixerState(productionId, doc);
         if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
         break;
       }
@@ -1151,7 +1245,17 @@ export async function handleMessage(
       break;
     }
     case 'TRANSITION': {
+      // #353: same as CUT — a TRANSITION whose target is the background under an
+      // on-program PiP takes the PiP off program instead of being dropped.
+      const curPgmPipBgTrans = pgmPipByProduction.get(productionId) ?? null;
+      if (curPgmPipBgTrans !== null && (pgmBgByProduction.get(productionId) ?? null) === msg.mixerInput) {
+        await takePipOffToBackground(productionId, doc, msg.mixerInput, curPgmPipBgTrans, 'TRANSITION', { transitionType: msg.transitionType, durationMs: msg.durationMs });
+        if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
+        break;
+      }
       if (isAlreadyOnProgram(productionId, msg.mixerInput)) {
+        // #353 item 3: never drop the command silently — re-broadcast current state.
+        rebroadcastMixerState(productionId, doc);
         if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
         break;
       }
@@ -1484,7 +1588,12 @@ export async function handleMessage(
           if (action.type === 'CUT' && action.sourceId) {
             const mixerInput = resolveInput(action.sourceId);
             if (!mixerInput) break;
-            if (!isAlreadyOnProgram(productionId, mixerInput)) {
+            const curPgmPipBg = pgmPipByProduction.get(productionId) ?? null;
+            if (curPgmPipBg !== null && (pgmBgByProduction.get(productionId) ?? null) === mixerInput) {
+              // #353: macro CUT to the background under an on-program PiP takes
+              // the PiP off program instead of being silently skipped.
+              await takePipOffToBackground(productionId, currentDoc, mixerInput, curPgmPipBg, 'MACRO_EXEC:CUT');
+            } else if (!isAlreadyOnProgram(productionId, mixerInput)) {
               const tally = getTally(productionId);
               const curPgmPip = pgmPipByProduction.get(productionId) ?? null;
               // tally.pgm is null while a PiP is on PGM, so pass the tracked
@@ -1524,7 +1633,11 @@ export async function handleMessage(
           } else if (action.type === 'TRANSITION' && action.sourceId) {
             const mixerInput = resolveInput(action.sourceId);
             if (!mixerInput) break;
-            if (!isAlreadyOnProgram(productionId, mixerInput)) {
+            const curPgmPipBg = pgmPipByProduction.get(productionId) ?? null;
+            if (curPgmPipBg !== null && (pgmBgByProduction.get(productionId) ?? null) === mixerInput) {
+              // #353: macro TRANSITION to the background under an on-program PiP.
+              await takePipOffToBackground(productionId, currentDoc, mixerInput, curPgmPipBg, 'MACRO_EXEC:TRANSITION', { transitionType: action.transitionType, durationMs: action.durationMs });
+            } else if (!isAlreadyOnProgram(productionId, mixerInput)) {
               const tally = getTally(productionId);
               const curPgmPip = pgmPipByProduction.get(productionId) ?? null;
               const fromPad = (curPgmPip !== null && tally.pgm === null)
