@@ -237,6 +237,38 @@ export const config = {
    */
   clipStatePollMs: parsePositiveIntEnv('CLIP_STATE_POLL_MS', 250),
   /**
+   * Timeout (ms) for the preflight reachability check `cueClip` performs
+   * against a clip's resolved URL (the `url` reference as-is, or the `s3`
+   * reference's presigned GET URL) before handing it to Strom (issue #351).
+   * Strom's `setPlaylist`/`goto` accept the load before it knows the fetch
+   * will fail — the HTTP fetch happens asynchronously inside its pipeline —
+   * so without this check an unfetchable URL (HTTP 403, DNS failure, refused
+   * connection, …) silently cued the operator into a clip that could never
+   * load (`CUED` forever, then `PLAYING` at 0:00/0:00). Default 5s.
+   */
+  clipPreflightTimeoutMs: parsePositiveIntEnv('CLIP_PREFLIGHT_TIMEOUT_MS', 5000),
+  /**
+   * Total time (ms), after `setPlaylist`/`goto` return, that `cueClip` will
+   * poll `player.getState` waiting for Strom to report a non-zero
+   * `duration_ms` before failing the cue (issue #351). A reachable URL can
+   * still fail to load inside Strom's pipeline (unsupported codec, truncated
+   * file, …); `MediaPlayerState::state()` reports a ready/playing state
+   * regardless, so a confirmed non-zero duration is the only reliable "media
+   * actually loaded" signal. Polled every 250 ms. Default 5s.
+   */
+  clipCueReadyTimeoutMs: parsePositiveIntEnv('CLIP_CUE_READY_TIMEOUT_MS', 5000),
+  /**
+   * Max time (ms) a `playing` clip's Strom-reported position may stay
+   * unchanged before the controller moves it to `error` (issue #351). Strom's
+   * media-player reports `playing` whenever the player is not paused and the
+   * playlist is non-empty, even when the pipeline never produced a frame —
+   * so a stalled playhead, observed on the existing completion-poll cadence
+   * (`clipStatePollMs`), is the only signal available to detect a stuck
+   * player without a Strom-side pipeline-error event (tracked separately as
+   * issue #360). Default 5s.
+   */
+  clipStallTimeoutMs: parsePositiveIntEnv('CLIP_STALL_TIMEOUT_MS', 5000),
+  /**
    * Idle auto-deactivation deadline in seconds (issue #290). A production with
    * zero subscribers for this long is auto-deactivated with
    * `endedReason: 'idle'` / `autoDeactivated: true`. Defaults to 300s, matching
