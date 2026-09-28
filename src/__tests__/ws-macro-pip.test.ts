@@ -363,6 +363,36 @@ describe('macro TALLY over a PiP on program', () => {
 
     expect(fromMacro).toMatchObject({ pgm: 'video_in_0', program: ['video_in_0'], pgmBg: null });
   });
+
+  // Regression for #356: the interactive TAKE that moves a PiP from PGM to PVW
+  // used to build the TALLY before updating the PiP maps, so it broadcast a
+  // stale pgmBg (the old background) and an empty preview. It must now report
+  // pgmBg: null and the background that is now under the PiP in preview.
+  it('interactive TAKE moving a PiP off program reports pgmBg: null and the background in preview', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+
+    const fromTake = await tallyFromPgmPip({ type: 'TAKE' });
+
+    expect(fromTake).toMatchObject({
+      pgm: 'video_in_0',
+      pvw: null,
+      pgmBg: null,
+      program: ['video_in_0'],
+      preview: ['video_in_1'],
+    });
+  });
+
+  // The interactive TAKE's TALLY must match the macro TAKE's from the same
+  // state (the parity the issue calls for).
+  it('interactive TAKE matches the TALLY a macro TAKE sends from the same state', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([{ type: 'TAKE' }]));
+
+    const fromMacro = await tallyFromPgmPip({ type: 'MACRO_EXEC', macroId: 'macro-1' });
+    const fromTake = await tallyFromPgmPip({ type: 'TAKE' });
+
+    expect(fromTake).toHaveProperty('program');
+    expect(fromTake).toEqual(fromMacro);
+  });
 });
 
 describe('macro TRANSITION with a PiP in preview only', () => {
