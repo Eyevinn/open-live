@@ -204,6 +204,36 @@ describe('POST /api/v1/productions/:id/activate', () => {
     await app.close();
   });
 
+  it('clears activation warnings when activation fails', async () => {
+    const doc = makeProductionDoc();
+    mockGet.mockImplementation(async () => mockInsert.mock.calls.at(-1)?.[0] ?? doc);
+    mockInsert.mockResolvedValue({ rev: '2-bcd', ok: true, id: doc._id });
+    mockActivateStromFlow.mockResolvedValue({
+      flowId: 'flow-abc',
+      mixerBlockId: null,
+      audioMixerBlockId: null,
+      loudnessMainBlockId: null,
+      warnings: [{ type: 'recording-no-audio', message: 'no sound' }],
+      sourceOffsetBlockIds: {},
+      sourceAudioOffsetBlockIds: {},
+      clipPlayerBlockIds: {},
+      returnBuses: [],
+      returnWhepEntries: [],
+    });
+    mockStromFlowsGet.mockRejectedValue(new Error('Strom down'));
+    mockDeactivateStromFlow.mockResolvedValue(undefined);
+
+    const app = await buildServer();
+    await app.inject({ method: 'POST', url: '/api/v1/productions/prod-test-1/activate' });
+
+    await vi.waitFor(() => {
+      const last = mockInsert.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+      expect(last['status']).toBe('inactive');
+      expect(last['activationWarnings']).toBeUndefined();
+    });
+    await app.close();
+  });
+
   it('returns 409 if production is already active', async () => {
     const doc = makeProductionDoc({ status: 'active' });
     mockGet.mockResolvedValue(doc);
