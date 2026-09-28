@@ -135,7 +135,7 @@ otherwise ignored. The inbound type union (`src/ws/controller.ts`):
 | `SET_PIP` | `pip: number`, `bg: number \| null`, `zones: PipZone[]`, `transforms?: PipTransforms` | Configure a PiP slot |
 | `SET_EFFECT` | `target: EffectTarget`, `effect: VideoEffect` | Set a video effect on an input or master |
 | `HTML_SOURCE_EVENT` | `sourceId: string`, `params: Record<string,string>`, `mode?: 'merge' \| 'replace'` | Forward operator params into an HTML source's URL query and reload the running `cefsrc`. `merge` (default) updates/adds keys on the current effective query; `replace` sets it to exactly `params`. The resulting URL is re-validated with `graphicUrl()` (SSRF/scheme gate). |
-| `CLIP_CUE` | `mixerInput: string`, `clipId?: string` | Load the clip source assigned to `mixerInput` into its media-player block and hold it ready (`setPlaylist` + `goto index 0`, leaving the player paused at the start). Broadcasts `CLIP_STATE` `cued`. The cue point is persisted on `ProductionDoc.clipCues`, surviving deactivate/reactivate and server restart (restored to `cued`, never auto-playing). |
+| `CLIP_CUE` | `mixerInput: string`, `clipId?: string` | Load the clip source assigned to `mixerInput` into its media-player block and hold it ready (`setPlaylist` + `goto index 0`, leaving the player paused at the start). Broadcasts `CLIP_STATE` `cued` — but only once the clip's URL has passed a reachability preflight and Strom has confirmed a loaded duration; otherwise `CLIP_STATE` `error` (issue #351, see below). The cue point is persisted on `ProductionDoc.clipCues`, surviving deactivate/reactivate and server restart (restored to `cued`, never auto-playing). |
 | `CLIP_PLAY` | `mixerInput: string` | Start playback of the cued clip (`control play`). Rejected (`ERROR` + `CLIP_STATE` `error`) if nothing is cued on that input. Broadcasts `CLIP_STATE` `playing`; subsequent transitions/position arrive reactively (with the poll as a reconciliation fallback). |
 | `CLIP_PAUSE` | `mixerInput: string` | Pause playback (`control pause`). Broadcasts `CLIP_STATE` `paused` and stops the reconciliation poll. |
 | `CLIP_STOP` | `mixerInput: string` | Stop playback (`control stop`). Broadcasts `CLIP_STATE` `stopped`, stops the reconciliation poll, and clears the persisted cue. |
@@ -254,3 +254,39 @@ push round-trip; in the degraded fallback path it is bounded by one poll interva
 (**≤ `CLIP_STATE_POLL_MS`, default 250 ms**) plus a single `player.getState` round-trip.
 Empirical measurement of the tail latency requires a live Strom instance and is not
 asserted here.
+
+### Media reachability, cue readiness, and the stall watchdog (issue #351)
+
+Strom's `setPlaylist`/`goto` accept a clip load optimistically — the actual fetch happens
+asynchronously inside its pipeline — and `player.getState` reports a ready/`playing` state
+regardless of whether the file ever actually loaded. Left unchecked, this meant an
+unfetchable clip URL (e.g. an HTTP 403) surfaced no error at all: `CLIP_CUE` reported
+`cued`, and a subsequent `CLIP_PLAY` reported `playing` at `0:00 / 0:00` forever. Three
+checks close this gap, all implemented in the shared `src/lib/clip-control.ts` /
+`src/ws/controller.ts` control path so both the WS and REST surfaces get them:
+
+1. **Preflight (cue time).** Before `setPlaylist`, `cueClip` issues a `HEAD` request (falling
+   back to a ranged `GET` for origins that reject `HEAD`) against the clip's resolved URL —
+   the `url` reference as-is, or the `s3` reference's presigned GET URL — reusing the
+   `httpUrlOnly` SSRF validation already applied when the reference was parsed. A non-2xx
+   response or network failure fails the cue with `CLIP_STATE { state: 'error', error: 'Clip
+   URL returned HTTP <status>' }` (or `'Clip URL could not be reached: <reason>'`) and
+   `setPlaylist`/`goto` are never called. Timeout: `CLIP_PREFLIGHT_TIMEOUT_MS` (config
+   `clipPreflightTimeoutMs`, default `5000` ms).
+2. **Cue readiness (post-cue).** After `setPlaylist`/`goto`, `cueClip` polls
+   `player.getState` until Strom reports a non-zero `duration_ms` — the only reliable
+   "media actually loaded" signal — before reporting `cued`. If no duration arrives within
+   `CLIP_CUE_READY_TIMEOUT_MS` (config `clipCueReadyTimeoutMs`, default `5000` ms), the cue
+   fails with `CLIP_STATE { state: 'error', error: 'Clip media could not be loaded' }`.
+3. **Stall watchdog (while playing).** The existing completion-poll timer (see above) also
+   tracks the last-seen `position_ms` for a `playing` clip. If the position hasn't advanced
+   for `CLIP_STALL_TIMEOUT_MS` (config `clipStallTimeoutMs`, default `5000` ms), the clip is
+   moved to `CLIP_STATE { state: 'error', error: 'Clip playback stalled — position has not
+   advanced' }` instead of being left `playing` indefinitely. Both the WS `CLIP_PLAY` handler
+   and the REST `POST .../play` endpoint start this poll on a successful play.
+
+Out of scope: mapping a Strom-side player pipeline error (e.g. a codec failure after the
+file loaded and reported a valid duration) directly to `CLIP_STATE` `error` depends on a
+Strom companion change (`StromEvent::PipelineError`) that does not exist yet — tracked
+separately as issue #360. The three checks above fully cover the reachability/never-loaded
+class of failure reported in issue #351.

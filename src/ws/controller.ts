@@ -8,7 +8,7 @@ import { getTally, setTally, subscribe, unsubscribe, broadcast, nextSeq, current
 import {
   cueClip, playClip, stopClip, pauseClip, seekClip,
   resolveClipSource, resolveClipTarget,
-  ClipNotFoundError, ClipNotActivatedError, ClipNotCuedError,
+  ClipNotFoundError, ClipNotActivatedError, ClipNotCuedError, ClipMediaError,
 } from '../lib/clip-control.js';
 import { getClipStateEntry, getAllClipStates, setClipStateEntry, clearClipState } from '../services/clip-state.service.js';
 import { persistClipCue, clearPersistedClipCue } from '../services/clip-cue-store.js';
@@ -369,19 +369,21 @@ const InboundMessageSchema = z.discriminatedUnion('type', [
  * the Strom take ran with `from_input === to_input`, which Strom treats as a
  * PGM/PVW swap, so the picture flipped to the previous preview.
  *
- * While a PiP is on PGM `tally.pgm` is null, so the real on-air source is the
- * tracked background behind the PiP (`pgmBgByProduction`). A CUT/TRANSITION to
- * that same background input would emit a degenerate `from_input === to_input`
- * take (issue #342), so it is also "already on program": treat it as a no-op
- * (the PiP stays on program). A CUT to any *other* real input while a PiP is on
- * PGM is a genuine change and still proceeds normally.
+ * While a PiP is on PGM this always returns false (the pre-#347 rule, restored
+ * in #353): a CUT/TRANSITION to *any* real input — including the background
+ * tracked behind the PiP — is a genuine change, because it must take the PiP off
+ * program. The target-equals-background case is handled explicitly by the
+ * CUT/TRANSITION/macro paths via `takePipOffToBackground`, which avoids the
+ * degenerate `from_input === to_input` take (issue #342) without dropping the
+ * command. #347 returned true here when the target equalled the background,
+ * which silently dropped the command and left the Studio tally split (#353).
  */
 function isAlreadyOnProgram(productionId: string, mixerInput: string): boolean {
   const pgmPip = pgmPipByProduction.get(productionId) ?? null;
-  if (pgmPip === null) {
-    return getTally(productionId).pgm === mixerInput;
+  if (pgmPip !== null) {
+    return false;
   }
-  return (pgmBgByProduction.get(productionId) ?? null) === mixerInput;
+  return getTally(productionId).pgm === mixerInput;
 }
 
 function padToIndex(mixerInput: string): number | null {
@@ -490,6 +492,86 @@ async function stromTransition(
     return false;
   }
   return true;
+}
+
+/**
+ * #353: a CUT/TRANSITION whose target is exactly the real input already tracked
+ * behind an on-program PiP (`pgmBgByProduction`). Pre-#347 this took the PiP off
+ * program; #347 re-classified it as "already on program" in `isAlreadyOnProgram`,
+ * so the CUT/TRANSITION handlers only acked and broke — no TALLY, no PIP_STATE,
+ * no Strom call. The command was silently dropped, so the client's optimistic
+ * swap was never corrected and the Studio tally was left split (PGM showing both
+ * the real source and the PiP, PVW empty). This restores the pre-#347 behaviour:
+ * the background stays on PGM, PVW clears, and the PiP moves to PVW.
+ *
+ * Tally + PiP state are mutated and broadcast synchronously (before any Strom
+ * await), matching the non-background PiP path in the CUT/TRANSITION handlers.
+ *
+ * Strom: we deliberately do NOT fire a mixer transition here. The target input
+ * equals the on-air background, so a transition would carry
+ * `from_input === to_input`, which Strom treats as a degenerate PGM/PVW swap
+ * (issue #342) and which flips the picture to the previous preview. This client's
+ * Strom mixer API (`src/lib/strom.ts`) exposes only `transition` and
+ * `selectPreview`; there is no dedicated "clear the on-program PiP overlay"
+ * endpoint, and the transition model swaps the PVW/PGM buses, so removing the
+ * overlay while keeping the same background on program cannot be expressed
+ * without that forbidden degenerate transition. We therefore select the PiP on
+ * Strom's preview (mirroring the `pvwPip` state we just broadcast and the
+ * pip-restore step the other PiP paths use), treating any error as non-fatal.
+ *
+ * OPEN QUESTION: fully decompositing the on-program PiP inside Strom for this
+ * exact "take the background out from under the PiP" case likely needs a
+ * Strom-side primitive this client does not yet expose (a non-degenerate
+ * program-overlay clear). Until then the controller tally/PiP state and the
+ * TALLY/PIP_STATE broadcasts are always corrected so optimistically-swapped
+ * clients are made consistent. See issue #353.
+ */
+async function takePipOffToBackground(
+  productionId: string,
+  doc: ProductionDoc,
+  target: string,
+  pgmPip: number,
+  persistLabel: string,
+  transitionMeta?: { transitionType?: string; durationMs?: number },
+): Promise<void> {
+  const newTally = { pgm: target, pvw: null };
+  setTally(productionId, newTally);
+  // PiP leaves PGM and lands on PVW; the background it sat over stays on PGM.
+  pgmPipByProduction.set(productionId, null);
+  pvwPipByProduction.set(productionId, pgmPip);
+  pvwBeforePipByProduction.set(productionId, target);
+  pgmBgByProduction.delete(productionId);
+  broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: pgmPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
+  await persistMixerMutation(productionId, persistLabel, (d) => ({ ...d, tally: newTally }));
+  broadcast(productionId, {
+    type: 'TALLY',
+    ...buildTallyPayload(productionId, newTally, doc),
+    ...(transitionMeta?.transitionType ? { transitionType: transitionMeta.transitionType, durationMs: transitionMeta.durationMs } : {}),
+  });
+  if (doc.stromFlowId && doc.mixerBlockId) {
+    try {
+      const strom = await makeStromClient();
+      await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: pgmPip } });
+    } catch (err) {
+      console.debug('[controller] Strom selectPreview (PiP off to background, non-fatal):', err);
+    }
+  }
+}
+
+/**
+ * #353 item 3: never drop a CUT/TRANSITION silently. On the genuine no-op path
+ * (the target is already the sole on-air source, no PiP involved) re-broadcast
+ * the current TALLY and PIP_STATE so a client that optimistically swapped
+ * PGM/PVW is corrected back to the real state.
+ */
+function rebroadcastMixerState(productionId: string, doc: ProductionDoc): void {
+  broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, getTally(productionId), doc) });
+  broadcast(productionId, {
+    type: 'PIP_STATE',
+    pgmPip: pgmPipByProduction.get(productionId) ?? null,
+    pvwPip: pvwPipByProduction.get(productionId) ?? null,
+    pips: pipConfigsByProduction.get(productionId) ?? [],
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -809,21 +891,31 @@ export function clearFxState(productionId: string): void {
 // (a poll error stranding the clip as `playing`) is exactly what OQ2 called out.
 // Timers are keyed `productionId:mixerInput` and cleaned up on
 // stop/disconnect/deactivate.
+//
+// The same tick also runs the stall WATCHDOG (issue #351): Strom's
+// `MediaPlayerState::state()` reports `playing` whenever the player is not
+// paused and the playlist is non-empty, even if the pipeline never produced a
+// frame — the root cause of "PLAYING at 0:00/0:00 indefinitely" with no error.
+// A `position_ms` that hasn't moved for `config.clipStallTimeoutMs` moves the
+// clip to `error` instead of leaving it stuck as `playing` forever.
 // ---------------------------------------------------------------------------
 const clipPollTimers = new Map<string, ReturnType<typeof setInterval>>()
+/** Last observed position + when it was last seen to change, keyed like clipPollTimers. */
+const clipLastPosition = new Map<string, { positionMs: number; since: number }>()
 
 function clipPollKey(productionId: string, mixerInput: string): string {
   return `${productionId}:${mixerInput}`
 }
 
 /** Stops (and forgets) the completion poll timer for a clip, if one is running. */
-function stopClipPoll(productionId: string, mixerInput: string): void {
+export function stopClipPoll(productionId: string, mixerInput: string): void {
   const key = clipPollKey(productionId, mixerInput)
   const timer = clipPollTimers.get(key)
   if (timer) {
     clearInterval(timer)
     clipPollTimers.delete(key)
   }
+  clipLastPosition.delete(key)
 }
 
 /**
@@ -839,7 +931,7 @@ function stopClipPoll(productionId: string, mixerInput: string): void {
  * has done its job (converged to `completed`) or when the clip is no longer
  * locally `playing` (relay/stop/pause already took it out of the playing state).
  */
-function startClipPoll(productionId: string, mixerInput: string, clipId?: string): void {
+export function startClipPoll(productionId: string, mixerInput: string, clipId?: string): void {
   stopClipPoll(productionId, mixerInput)
   const key = clipPollKey(productionId, mixerInput)
   const timer = setInterval(() => {
@@ -870,6 +962,38 @@ function startClipPoll(productionId: string, mixerInput: string, clipId?: string
           stopClipPoll(productionId, mixerInput)
           // A completed clip is no longer cued — drop the persisted cue point.
           await clearPersistedClipCue(productionId, mixerInput)
+          return
+        }
+        if (player.state !== 'playing') {
+          // Paused (or another non-terminal state): nothing to watchdog this
+          // tick — reset the stall tracker so a resumed play doesn't inherit a
+          // stale "unchanged since" timestamp from before the pause.
+          clipLastPosition.delete(key)
+          return
+        }
+        // Stall watchdog (issue #351): `player.state === 'playing'` here can
+        // still mean the pipeline never produced a frame (root cause of the
+        // reported bug) — a position that hasn't advanced for
+        // `clipStallTimeoutMs` is the only observable signal available.
+        // Strom reports position/duration in nanoseconds; the contract is ms.
+        const positionMs = player.position_ns !== undefined ? Math.round(player.position_ns / 1e6) : 0
+        const last = clipLastPosition.get(key)
+        const now = Date.now()
+        if (!last || last.positionMs !== positionMs) {
+          clipLastPosition.set(key, { positionMs, since: now })
+        } else if (now - last.since >= config.clipStallTimeoutMs) {
+          const state: ClipState = {
+            mixerInput,
+            state: 'error',
+            error: 'Clip playback stalled — position has not advanced',
+            ...(clipId !== undefined ? { clipId } : {}),
+            positionMs,
+            ...(player.duration_ns !== undefined ? { durationMs: Math.round(player.duration_ns / 1e6) } : {}),
+          }
+          setClipStateEntry(productionId, state)
+          broadcast(productionId, { type: 'CLIP_STATE', ...state })
+          stopClipPoll(productionId, mixerInput)
+          await clearPersistedClipCue(productionId, mixerInput)
         }
       } catch (err) {
         // Transient error: log and keep polling. Never self-terminate on a single
@@ -895,6 +1019,7 @@ export function clearClipStateForProduction(productionId: string): void {
     if (key.startsWith(`${productionId}:`)) {
       clearInterval(clipPollTimers.get(key)!)
       clipPollTimers.delete(key)
+      clipLastPosition.delete(key)
     }
   }
   clearClipState(productionId)
@@ -1109,7 +1234,19 @@ export async function handleMessage(
 
   switch (msg.type) {
     case 'CUT': {
+      // #353: taking the real source out from under an on-program PiP (target
+      // equals the tracked background). Handle before the general path so we
+      // never fall through to a degenerate from_input === to_input take.
+      const curPgmPipBgCut = pgmPipByProduction.get(productionId) ?? null;
+      if (curPgmPipBgCut !== null && (pgmBgByProduction.get(productionId) ?? null) === msg.mixerInput) {
+        await takePipOffToBackground(productionId, doc, msg.mixerInput, curPgmPipBgCut, 'CUT');
+        if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
+        break;
+      }
       if (isAlreadyOnProgram(productionId, msg.mixerInput)) {
+        // #353 item 3: never drop the command silently — re-broadcast current
+        // state so a client that optimistically swapped PGM/PVW is corrected.
+        rebroadcastMixerState(productionId, doc);
         if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
         break;
       }
@@ -1168,7 +1305,17 @@ export async function handleMessage(
       break;
     }
     case 'TRANSITION': {
+      // #353: same as CUT — a TRANSITION whose target is the background under an
+      // on-program PiP takes the PiP off program instead of being dropped.
+      const curPgmPipBgTrans = pgmPipByProduction.get(productionId) ?? null;
+      if (curPgmPipBgTrans !== null && (pgmBgByProduction.get(productionId) ?? null) === msg.mixerInput) {
+        await takePipOffToBackground(productionId, doc, msg.mixerInput, curPgmPipBgTrans, 'TRANSITION', { transitionType: msg.transitionType, durationMs: msg.durationMs });
+        if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
+        break;
+      }
       if (isAlreadyOnProgram(productionId, msg.mixerInput)) {
+        // #353 item 3: never drop the command silently — re-broadcast current state.
+        rebroadcastMixerState(productionId, doc);
         if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
         break;
       }
@@ -1505,7 +1652,12 @@ export async function handleMessage(
           if (action.type === 'CUT' && action.sourceId) {
             const mixerInput = resolveInput(action.sourceId);
             if (!mixerInput) break;
-            if (!isAlreadyOnProgram(productionId, mixerInput)) {
+            const curPgmPipBg = pgmPipByProduction.get(productionId) ?? null;
+            if (curPgmPipBg !== null && (pgmBgByProduction.get(productionId) ?? null) === mixerInput) {
+              // #353: macro CUT to the background under an on-program PiP takes
+              // the PiP off program instead of being silently skipped.
+              await takePipOffToBackground(productionId, currentDoc, mixerInput, curPgmPipBg, 'MACRO_EXEC:CUT');
+            } else if (!isAlreadyOnProgram(productionId, mixerInput)) {
               const tally = getTally(productionId);
               const curPgmPip = pgmPipByProduction.get(productionId) ?? null;
               // tally.pgm is null while a PiP is on PGM, so pass the tracked
@@ -1553,7 +1705,11 @@ export async function handleMessage(
           } else if (action.type === 'TRANSITION' && action.sourceId) {
             const mixerInput = resolveInput(action.sourceId);
             if (!mixerInput) break;
-            if (!isAlreadyOnProgram(productionId, mixerInput)) {
+            const curPgmPipBg = pgmPipByProduction.get(productionId) ?? null;
+            if (curPgmPipBg !== null && (pgmBgByProduction.get(productionId) ?? null) === mixerInput) {
+              // #353: macro TRANSITION to the background under an on-program PiP.
+              await takePipOffToBackground(productionId, currentDoc, mixerInput, curPgmPipBg, 'MACRO_EXEC:TRANSITION', { transitionType: action.transitionType, durationMs: action.durationMs });
+            } else if (!isAlreadyOnProgram(productionId, mixerInput)) {
               const tally = getTally(productionId);
               const curPgmPip = pgmPipByProduction.get(productionId) ?? null;
               const fromPad = (curPgmPip !== null && tally.pgm === null)
@@ -1643,10 +1799,16 @@ export async function handleMessage(
             if (!currentDoc.stromFlowId || !currentDoc.mixerBlockId) {
               throw new Error('Pipeline not active or mixer block not resolved');
             }
-            await strom.mixer.toggleDsk(currentDoc.stromFlowId, currentDoc.mixerBlockId, {
+            const result = await strom.mixer.toggleDsk(currentDoc.stromFlowId, currentDoc.mixerBlockId, {
               dsk: (action.layer ?? 0) + 1,
               enabled: action.visible ?? true,
             });
+            // Mirror the interactive DSK_TOGGLE handler: record the keyed layer
+            // so buildTallyPayload includes it, and tell clients it changed.
+            const layer0 = result.dsk - 1;
+            const dskMap = dskLayersByProduction.get(productionId) ?? {};
+            dskLayersByProduction.set(productionId, { ...dskMap, [layer0]: result.enabled });
+            broadcast(productionId, { type: 'DSK_STATE', layer: layer0, visible: result.enabled });
           }
         } catch (err) {
           failedAt = i;
@@ -2308,7 +2470,12 @@ export async function handleMessage(
         // Typed clip errors carry a human-readable message; Strom transport
         // errors are surfaced via stromErrorMessage (502/503-style text).
         let errText: string;
-        if (err instanceof ClipNotFoundError || err instanceof ClipNotActivatedError || err instanceof ClipNotCuedError) {
+        if (
+          err instanceof ClipNotFoundError ||
+          err instanceof ClipNotActivatedError ||
+          err instanceof ClipNotCuedError ||
+          err instanceof ClipMediaError
+        ) {
           errText = err.message;
         } else {
           errText = `Clip: ${stromErrorMessage(err)}`;

@@ -96,7 +96,14 @@ const stromServer: Server = createServer((req, res) => {
         return;
       }
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ success: true }));
+      // The /dsk endpoint returns the resolved key state; the controller reads
+      // `dsk`/`enabled` off it. Echo the request so callers see what they asked.
+      if ((req.url ?? '').endsWith('/dsk') && raw) {
+        const body = JSON.parse(raw) as { dsk: number; enabled: boolean };
+        res.end(JSON.stringify({ dsk: body.dsk, enabled: body.enabled, message: 'ok' }));
+      } else {
+        res.end(JSON.stringify({ success: true }));
+      }
     };
     if (transitionDelayMs > 0 && isTransition) {
       setTimeout(respond, transitionDelayMs);
@@ -166,6 +173,11 @@ function pipStates() {
 /** Every TALLY broadcast seen so far, in order. */
 function tallies() {
   return broadcasts.filter((m) => m.type === 'TALLY');
+}
+
+/** Every DSK_STATE broadcast seen so far, in order. */
+function dskStates() {
+  return broadcasts.filter((m) => m.type === 'DSK_STATE');
 }
 
 /** Requests the controller made to Strom, in order. */
@@ -593,6 +605,48 @@ describe('macro CUT with a PiP in preview only', () => {
     for (const req of requestsTo(PREVIEW)) {
       expect(req.body).not.toEqual({ source: { pip: 0 } });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Macro DSK_TOGGLE must update DSK state and broadcast DSK_STATE (issue #357)
+//
+// A macro DSK_TOGGLE used to call Strom's toggleDsk without recording the keyed
+// layer or telling clients, so every later TALLY omitted the keyed DSK. It must
+// now behave like the interactive DSK_TOGGLE: record dskLayersByProduction and
+// broadcast DSK_STATE, so the CUT that follows in the same macro carries dsk:0.
+// ---------------------------------------------------------------------------
+
+const DSK = '/api/flows/flow-1/blocks/mixer-1/dsk';
+
+describe('macro DSK_TOGGLE (issue #357)', () => {
+  it('keys the DSK, broadcasts DSK_STATE, and the following CUT TALLY carries dsk:0', async () => {
+    mockGet.mockResolvedValue(
+      makeProductionDoc([
+        { type: 'DSK_TOGGLE', layer: 0, visible: true },
+        { type: 'CUT', sourceId: 'cam3' },
+      ]),
+    );
+
+    await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
+
+    // Strom was asked to enable DSK 1 (1-based), matching the interactive path.
+    expect(requestsTo(DSK)).toContainEqual({
+      method: 'POST',
+      path: DSK,
+      body: { dsk: 1, enabled: true },
+    });
+
+    // Clients are told the key changed, addressed by 0-based layer.
+    expect(dskStates()).toHaveLength(1);
+    expect(dskStates()[0]).toMatchObject({ layer: 0, visible: true });
+
+    // The CUT that follows builds its TALLY off the now-keyed DSK layer, so the
+    // keyed DSK appears in both program and contributions.
+    const tally = tallies()[0];
+    expect(tally).toMatchObject({ pgm: 'video_in_2' });
+    expect(tally?.program).toContain('dsk:0');
+    expect(tally?.contributions).toContainEqual({ source: 'dsk:0', role: 'dsk' });
   });
 });
 

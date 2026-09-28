@@ -73,6 +73,19 @@ await new Promise<void>((resolve) => stromServer.listen(0, '127.0.0.1', () => re
 process.env['STROM_URL'] = `http://127.0.0.1:${(stromServer.address() as AddressInfo).port}`;
 afterAll(() => stromServer.close());
 
+// Clip URL preflight (issue #351): cueClip now does a real HEAD/GET fetch
+// against the clip's resolved URL before touching Strom. Intercept fetch ONLY
+// for the fixture clip URL below; everything else (real StromClient traffic
+// to the throwaway server above) passes through to the real fetch untouched.
+const CLIP_URL = 'https://media.example.com/story-a.mp4';
+const realFetch = globalThis.fetch;
+vi.spyOn(globalThis, 'fetch').mockImplementation(((input: RequestInfo | URL, init?: RequestInit) => {
+  const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+  if (url === CLIP_URL) return Promise.resolve(new Response(null, { status: 200 }));
+  return realFetch(input as never, init);
+}) as typeof fetch);
+afterAll(() => { globalThis.fetch = realFetch; });
+
 const { buildServer } = await import('../server.js');
 const { handleMessage, clearClipStateForProduction } = await import('../ws/controller.js');
 
