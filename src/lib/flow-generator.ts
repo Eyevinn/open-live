@@ -1032,7 +1032,7 @@ export async function activateStromFlow(
           },
           position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
         });
-        if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
+        if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in_0` });
         if (mainAudioSource) flow.links.push({ from: mainAudioSource, to: `${blockId}:audio_in_0` });
         recorderBlockId = blockId;
         recorderOutputDir = outputDir;
