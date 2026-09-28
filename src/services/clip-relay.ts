@@ -23,7 +23,7 @@ import { StromClient } from '../lib/strom.js';
 import { config } from '../config.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { broadcast } from './tally.service.js';
-import { getClipStateEntry, setClipStateEntry } from './clip-state.service.js';
+import { getClipStateEntry, setClipStateEntry, isClipPlayPending, clearClipPlayPending } from './clip-state.service.js';
 import { clearPersistedClipCue } from './clip-cue-store.js';
 import type { ClipState } from '../db/types.js';
 
@@ -61,6 +61,15 @@ export function applyReactiveState(
     }
     if (tracked.state === 'error' && stromState !== 'playing') {
       return;
+    }
+    // A `cued` clip transiently reports `playing` in Strom because Cue's `goto`
+    // starts the pipeline before `cueClip`'s `stop()` parks it (issue #350).
+    // Suppress that edge unless Open Live has itself just sent Play — in which
+    // case the `playing` is real; consume the play-pending flag so a later cue's
+    // goto artefact is not mistaken for it.
+    if (tracked.state === 'cued' && stromState === 'playing') {
+      if (!isClipPlayPending(productionId, mixerInput)) return;
+      clearClipPlayPending(productionId, mixerInput);
     }
   }
 

@@ -32,6 +32,10 @@ import type { ClipReference, ClipState, ProductionDoc, SourceDoc } from '../db/t
 import { deserializeClipReference } from './clip-reference.js';
 import { minioTargetFromConfig, type MinioTarget } from './recording-uploader.js';
 import { config } from '../config.js';
+import { markClipPlayPending } from '../services/clip-state.service.js';
+
+/** Strom reports/accepts media-player position and duration in nanoseconds. */
+const NS_PER_MS = 1_000_000;
 
 /** Thrown when the production has no clip source / player block for a mixer input (→ 404). */
 export class ClipNotFoundError extends Error {
@@ -184,15 +188,23 @@ export function mapPlayerState(
     mixerInput,
     state,
     ...(opts.clipId !== undefined ? { clipId: opts.clipId } : {}),
-    ...(player.position_ms !== undefined ? { positionMs: player.position_ms } : {}),
-    ...(player.duration_ms !== undefined ? { durationMs: player.duration_ms } : {}),
+    // Strom reports position/duration in nanoseconds; the ClipState contract is ms.
+    ...(player.position_ns !== undefined ? { positionMs: Math.round(player.position_ns / NS_PER_MS) } : {}),
+    ...(player.duration_ns !== undefined ? { durationMs: Math.round(player.duration_ns / NS_PER_MS) } : {}),
   };
 }
 
 /**
  * Cue a clip into the ready state: load the playlist and seek to the first
- * entry, leaving the player paused/ready (spec §"State machine": cue =
- * setPlaylist({files:[clip]}) + goto({index:0})).
+ * entry, leaving the player parked at its first frame (spec §"State machine":
+ * cue = setPlaylist({files:[clip]}) + goto({index:0}) + leave paused/ready).
+ *
+ * Strom's `setPlaylist`/`goto` both START playback (goto → `load_current_file`
+ * sets the pipeline Playing; setPlaylist auto-`goto(0)` from Stopped), so Cue
+ * would run the clip instead of parking it (issue #350). Strom has no
+ * "load paused" mode, so we explicitly `control({action:'stop'})` afterwards —
+ * in Strom `stop` is pause + seek 0, i.e. exactly "parked at the first frame".
+ * This also fixes the restore path (`controller.ts` re-cues a persisted cue).
  *
  * The clip source is resolved from the production's source assignments for this
  * mixer input; `clipId`, when supplied, must match the assigned source id.
@@ -208,6 +220,8 @@ export async function cueClip(
   const file = resolveClipFile(source);
   await strom.player.setPlaylist(flowId, blockId, { files: [file] });
   await strom.player.goto(flowId, blockId, { index: 0 });
+  // Park at frame 0: Strom's stop = pause + seek 0 (issue #350).
+  await strom.player.control(flowId, blockId, { action: 'stop' });
   const player = await strom.player.getState(flowId, blockId);
   return mapPlayerState(mixerInput, player, { clipId: clipId ?? source._id, justCued: true });
 }
@@ -215,6 +229,10 @@ export async function cueClip(
 /** Play the currently cued clip (player.control({action:'play'})). */
 export async function playClip(strom: StromClient, doc: ProductionDoc, mixerInput: string, clipId?: string): Promise<ClipState> {
   const { flowId, blockId } = resolveClipTarget(doc, mixerInput);
+  // Tell the reactive relay that the imminent Strom `playing` push is a real
+  // Play (not the goto-induced edge on a still-`cued` clip) so it is not
+  // suppressed by the cued-clip guard (issue #350).
+  markClipPlayPending(doc._id, mixerInput);
   await strom.player.control(flowId, blockId, { action: 'play' });
   const player = await strom.player.getState(flowId, blockId);
   return mapPlayerState(mixerInput, player, { clipId });
@@ -236,10 +254,10 @@ export async function stopClip(strom: StromClient, doc: ProductionDoc, mixerInpu
   return mapPlayerState(mixerInput, player, { clipId });
 }
 
-/** Seek within the clip (player.seek({position_ms})). */
+/** Seek within the clip (player.seek({position_ns}); Strom expects nanoseconds). */
 export async function seekClip(strom: StromClient, doc: ProductionDoc, mixerInput: string, positionMs: number, clipId?: string): Promise<ClipState> {
   const { flowId, blockId } = resolveClipTarget(doc, mixerInput);
-  await strom.player.seek(flowId, blockId, { position_ms: positionMs });
+  await strom.player.seek(flowId, blockId, { position_ns: positionMs * NS_PER_MS });
   const player = await strom.player.getState(flowId, blockId);
   return mapPlayerState(mixerInput, player, { clipId });
 }

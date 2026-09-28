@@ -183,18 +183,25 @@ describe('CLIP_* schema validation', () => {
 
 describe('CLIP_CUE / PLAY / PAUSE / STOP transitions', () => {
   it('CLIP_CUE sets playlist + gotos and broadcasts CLIP_STATE cued', async () => {
-    playerState = { state: 'paused', duration_ms: 12000, position_ms: 0 };
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
     await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
     expect(errorFrames()).toHaveLength(0);
     expect(playerReqs('playlist')[0].body).toEqual({ files: ['https://media.example.com/story-a.mp4'] });
     expect(playerReqs('goto')[0].body).toEqual({ index: 0 });
+    // Issue #350: Cue must park the clip at frame 0. Strom's setPlaylist/goto
+    // start playback, so cueClip issues control({action:'stop'}) (= pause+seek0)
+    // after the goto, in that order, before reading state.
+    expect(playerReqs('control').at(-1)?.body).toEqual({ action: 'stop' });
+    const order = (suffix: string) => stromRequests.findIndex((r) => r.path === `/api/flows/${FLOW}/blocks/${BLOCK}/player/${suffix}`);
+    expect(order('playlist')).toBeLessThan(order('goto'));
+    expect(order('goto')).toBeLessThan(order('control'));
     const states = clipStates();
     expect(states.at(-1)).toMatchObject({ type: 'CLIP_STATE', mixerInput: 'video_in_0', state: 'cued', durationMs: 12000 });
   });
 
   it('CLIP_PLAY after cue broadcasts CLIP_STATE playing and controls play', async () => {
     await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
-    playerState = { state: 'playing', position_ms: 20, duration_ms: 12000 };
+    playerState = { state: 'playing', position_ns: 20_000_000, duration_ns: 12_000_000_000 };
     await send({ type: 'CLIP_PLAY', mixerInput: 'video_in_0' });
     expect(playerReqs('control').at(-1)?.body).toEqual({ action: 'play' });
     expect(clipStates().at(-1)).toMatchObject({ state: 'playing' });
@@ -209,7 +216,7 @@ describe('CLIP_CUE / PLAY / PAUSE / STOP transitions', () => {
 
   it('CLIP_PAUSE controls pause and broadcasts paused', async () => {
     await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
-    playerState = { state: 'paused', position_ms: 500, duration_ms: 12000 };
+    playerState = { state: 'paused', position_ns: 500_000_000, duration_ns: 12_000_000_000 };
     await send({ type: 'CLIP_PAUSE', mixerInput: 'video_in_0' });
     expect(playerReqs('control').at(-1)?.body).toEqual({ action: 'pause' });
     expect(clipStates().at(-1)).toMatchObject({ state: 'paused' });
@@ -217,7 +224,7 @@ describe('CLIP_CUE / PLAY / PAUSE / STOP transitions', () => {
 
   it('CLIP_STOP controls stop and broadcasts stopped', async () => {
     await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
-    playerState = { state: 'stopped', position_ms: 0 };
+    playerState = { state: 'stopped', position_ns: 0 };
     await send({ type: 'CLIP_STOP', mixerInput: 'video_in_0' });
     expect(playerReqs('control').at(-1)?.body).toEqual({ action: 'stop' });
     expect(clipStates().at(-1)).toMatchObject({ state: 'stopped' });
@@ -225,9 +232,9 @@ describe('CLIP_CUE / PLAY / PAUSE / STOP transitions', () => {
 
   it('CLIP_SEEK seeks and broadcasts state', async () => {
     await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
-    playerState = { state: 'paused', position_ms: 5000, duration_ms: 12000 };
+    playerState = { state: 'paused', position_ns: 5_000_000_000, duration_ns: 12_000_000_000 };
     await send({ type: 'CLIP_SEEK', mixerInput: 'video_in_0', positionMs: 5000 });
-    expect(playerReqs('seek').at(-1)?.body).toEqual({ position_ms: 5000 });
+    expect(playerReqs('seek').at(-1)?.body).toEqual({ position_ns: 5_000_000_000 });
     expect(clipStates().length).toBeGreaterThan(0);
   });
 
@@ -245,7 +252,7 @@ describe('cue persistence (issue #307 / OQ3)', () => {
   }
 
   it('CLIP_CUE persists the cue point to the production doc', async () => {
-    playerState = { state: 'paused', duration_ms: 12000, position_ms: 0 };
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
     await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
     const call = clipCuesCalls().at(-1);
     expect(call).toBeDefined();
@@ -254,9 +261,9 @@ describe('cue persistence (issue #307 / OQ3)', () => {
   });
 
   it('CLIP_STOP clears the persisted cue', async () => {
-    playerState = { state: 'paused', duration_ms: 12000, position_ms: 0 };
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
     await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
-    playerState = { state: 'stopped', position_ms: 0 };
+    playerState = { state: 'stopped', position_ns: 0 };
     await send({ type: 'CLIP_STOP', mixerInput: 'video_in_0' });
     const lastClipCues = (clipCuesCalls().at(-1)![1] as { clipCues: Record<string, unknown> }).clipCues;
     expect(lastClipCues['video_in_0']).toBeUndefined();
@@ -270,12 +277,12 @@ describe('completion poll fallback', () => {
     // trip, so we let the poll run for real and wait it out. Latency is bounded
     // by one poll interval (config.clipStatePollMs).
     await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
-    playerState = { state: 'playing', position_ms: 10, duration_ms: 8000 };
+    playerState = { state: 'playing', position_ns: 10_000_000, duration_ns: 8_000_000_000 };
     await send({ type: 'CLIP_PLAY', mixerInput: 'video_in_0' });
     broadcasts.length = 0;
 
     // Strom now reports end-of-media.
-    playerState = { state: 'stopped', position_ms: 8000, duration_ms: 8000 };
+    playerState = { state: 'stopped', position_ns: 8_000_000_000, duration_ns: 8_000_000_000 };
 
     // Wait until the poll observes `stopped` and broadcasts `completed` (or a
     // generous multiple of the poll interval elapses).

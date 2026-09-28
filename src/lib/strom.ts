@@ -439,8 +439,10 @@ export interface PlayerControlRequest {
 export interface PlayerStateResponse {
   state: 'playing' | 'paused' | 'stopped'
   current_file?: string
-  position_ms?: number
-  duration_ms?: number
+  /** Playhead position in NANOSECONDS (Strom `types/src/mediaplayer.rs`). */
+  position_ns?: number
+  /** Media duration in NANOSECONDS (Strom `types/src/mediaplayer.rs`). */
+  duration_ns?: number
   playlist?: string[]
 }
 
@@ -449,7 +451,8 @@ export interface SetPlaylistRequest {
 }
 
 export interface SeekRequest {
-  position_ms: number
+  /** Seek target in NANOSECONDS (Strom expects `position_ns`, not `_ms`). */
+  position_ns: number
 }
 
 export interface GotoRequest {

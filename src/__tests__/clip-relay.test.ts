@@ -55,7 +55,7 @@ function pushRawFrame(json: string): void {
 }
 
 const { applyReactiveState, applyReactivePosition, startClipRelay, forceStopClipRelay } = await import('../services/clip-relay.js');
-const { setClipStateEntry, getClipStateEntry, clearClipState } = await import('../services/clip-state.service.js');
+const { setClipStateEntry, getClipStateEntry, clearClipState, markClipPlayPending, isClipPlayPending } = await import('../services/clip-state.service.js');
 
 const PROD = 'prod-relay-01';
 const INPUT = 'video_in_0';
@@ -73,6 +73,7 @@ beforeEach(() => {
 describe('reactive MediaPlayerStateChanged mapping', () => {
   it('emits playing with position on a play push', () => {
     setClipStateEntry(PROD, { mixerInput: INPUT, state: 'cued', clipId: 'c1', durationMs: 8000 });
+    markClipPlayPending(PROD, INPUT); // genuine Play from Open Live (issue #350)
     applyReactiveState(PROD, INPUT, 'playing', 120, 8000);
     expect(clipStates().at(-1)).toMatchObject({ type: 'CLIP_STATE', mixerInput: INPUT, state: 'playing', positionMs: 120, durationMs: 8000, clipId: 'c1' });
     expect(getClipStateEntry(PROD, INPUT)?.state).toBe('playing');
@@ -105,10 +106,23 @@ describe('reactive MediaPlayerStateChanged mapping', () => {
     expect(clipStates()).toHaveLength(0);
   });
 
-  it('allows a cued clip to transition to playing on a play push', () => {
+  // Issue #350: Cue's `goto` starts Strom's pipeline briefly, so a `playing`
+  // push can arrive while the clip is still tracked as `cued`. That edge must be
+  // suppressed unless Open Live has itself just sent Play (play-pending flag).
+  it('does NOT flip a cued clip to playing on a goto-induced play push (no play pending)', () => {
     setClipStateEntry(PROD, { mixerInput: INPUT, state: 'cued', clipId: 'c1' });
     applyReactiveState(PROD, INPUT, 'playing', 10);
+    expect(clipStates()).toHaveLength(0);
+    expect(getClipStateEntry(PROD, INPUT)?.state).toBe('cued');
+  });
+
+  it('allows a cued clip to transition to playing when Play is pending, and consumes the flag', () => {
+    setClipStateEntry(PROD, { mixerInput: INPUT, state: 'cued', clipId: 'c1' });
+    markClipPlayPending(PROD, INPUT);
+    applyReactiveState(PROD, INPUT, 'playing', 10);
     expect(clipStates().at(-1)).toMatchObject({ state: 'playing' });
+    // The flag is single-use: a subsequent cue's goto edge must not sneak through.
+    expect(isClipPlayPending(PROD, INPUT)).toBe(false);
   });
 });
 
@@ -153,6 +167,7 @@ describe('raw Strom frame through connectWebSocket -> clip-relay', () => {
 
   it('routes MediaPlayerStateChanged by block_id to a playing CLIP_STATE', async () => {
     setClipStateEntry(PROD, { mixerInput: INPUT, state: 'cued', clipId: 'c1' });
+    markClipPlayPending(PROD, INPUT); // a real Play, so the cued-clip guard lets it through
     await startRelay();
     pushRawFrame(JSON.stringify({
       type: 'MediaPlayerStateChanged',
