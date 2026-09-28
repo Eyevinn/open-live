@@ -31,9 +31,11 @@ import {
   ClipNotFoundError,
   ClipNotActivatedError,
   ClipNotCuedError,
+  ClipMediaError,
 } from '../lib/clip-control.js';
 import { setClipStateEntry, getClipStateEntry } from '../services/clip-state.service.js';
 import { persistClipCue, clearPersistedClipCue } from '../services/clip-cue-store.js';
+import { startClipPoll, stopClipPoll } from '../ws/controller.js';
 
 // mixerInput path param — same shape as the WS mixerInputSchema.
 const mixerInputSchema = z.string().regex(/^video_in_\d{1,2}$/).max(20);
@@ -99,6 +101,17 @@ const clipsRoutes: FastifyPluginAsync = async (fastify) => {
         }
         return reply.send(state);
       } catch (err) {
+        if (err instanceof ClipMediaError) {
+          // Keep the shared in-memory registry consistent with the WS CLIP_CUE
+          // error path (issue #351): a REST-triggered cue failure must also
+          // read `error` for a WS client that connects/is already attached.
+          setClipStateEntry(doc._id, {
+            mixerInput,
+            state: 'error',
+            error: err.message,
+            ...(body.clipId ? { clipId: body.clipId } : {}),
+          });
+        }
         return handleClipError(err, reply);
       }
     },
@@ -121,6 +134,12 @@ const clipsRoutes: FastifyPluginAsync = async (fastify) => {
         const strom = await makeStromClient();
         const state = await playClip(strom, doc, mixerInput, source._id);
         setClipStateEntry(doc._id, state);
+        // Start the completion/stall-watchdog poll (issue #351) — mirrors the
+        // WS CLIP_PLAY handler. Without this, a clip played over the REST
+        // surface never converged to `completed` on end-of-media (relay push
+        // events aside) nor got the stalled-playhead watchdog, since only the
+        // WS handler previously called startClipPoll.
+        startClipPoll(doc._id, mixerInput, state.clipId ?? source._id);
         return reply.send(state);
       } catch (err) {
         return handleClipError(err, reply);
@@ -139,6 +158,7 @@ const clipsRoutes: FastifyPluginAsync = async (fastify) => {
         const strom = await makeStromClient();
         const state = await stopClip(strom, doc, mixerInput, source._id);
         setClipStateEntry(doc._id, state);
+        stopClipPoll(doc._id, mixerInput);
         // A stop clears the cue — mirror the WS CLIP_STOP handler so a REST stop
         // also drops the persisted cue point, leaving nothing to restore on the
         // next reactivate (issue #307 / OQ3, issue #336).

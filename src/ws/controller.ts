@@ -8,7 +8,7 @@ import { getTally, setTally, subscribe, unsubscribe, broadcast, nextSeq, current
 import {
   cueClip, playClip, stopClip, pauseClip, seekClip,
   resolveClipSource, resolveClipTarget,
-  ClipNotFoundError, ClipNotActivatedError, ClipNotCuedError,
+  ClipNotFoundError, ClipNotActivatedError, ClipNotCuedError, ClipMediaError,
 } from '../lib/clip-control.js';
 import { getClipStateEntry, getAllClipStates, setClipStateEntry, clearClipState } from '../services/clip-state.service.js';
 import { persistClipCue, clearPersistedClipCue } from '../services/clip-cue-store.js';
@@ -802,21 +802,31 @@ export function clearFxState(productionId: string): void {
 // (a poll error stranding the clip as `playing`) is exactly what OQ2 called out.
 // Timers are keyed `productionId:mixerInput` and cleaned up on
 // stop/disconnect/deactivate.
+//
+// The same tick also runs the stall WATCHDOG (issue #351): Strom's
+// `MediaPlayerState::state()` reports `playing` whenever the player is not
+// paused and the playlist is non-empty, even if the pipeline never produced a
+// frame — the root cause of "PLAYING at 0:00/0:00 indefinitely" with no error.
+// A `position_ms` that hasn't moved for `config.clipStallTimeoutMs` moves the
+// clip to `error` instead of leaving it stuck as `playing` forever.
 // ---------------------------------------------------------------------------
 const clipPollTimers = new Map<string, ReturnType<typeof setInterval>>()
+/** Last observed position + when it was last seen to change, keyed like clipPollTimers. */
+const clipLastPosition = new Map<string, { positionMs: number; since: number }>()
 
 function clipPollKey(productionId: string, mixerInput: string): string {
   return `${productionId}:${mixerInput}`
 }
 
 /** Stops (and forgets) the completion poll timer for a clip, if one is running. */
-function stopClipPoll(productionId: string, mixerInput: string): void {
+export function stopClipPoll(productionId: string, mixerInput: string): void {
   const key = clipPollKey(productionId, mixerInput)
   const timer = clipPollTimers.get(key)
   if (timer) {
     clearInterval(timer)
     clipPollTimers.delete(key)
   }
+  clipLastPosition.delete(key)
 }
 
 /**
@@ -832,7 +842,7 @@ function stopClipPoll(productionId: string, mixerInput: string): void {
  * has done its job (converged to `completed`) or when the clip is no longer
  * locally `playing` (relay/stop/pause already took it out of the playing state).
  */
-function startClipPoll(productionId: string, mixerInput: string, clipId?: string): void {
+export function startClipPoll(productionId: string, mixerInput: string, clipId?: string): void {
   stopClipPoll(productionId, mixerInput)
   const key = clipPollKey(productionId, mixerInput)
   const timer = setInterval(() => {
@@ -862,6 +872,37 @@ function startClipPoll(productionId: string, mixerInput: string, clipId?: string
           stopClipPoll(productionId, mixerInput)
           // A completed clip is no longer cued — drop the persisted cue point.
           await clearPersistedClipCue(productionId, mixerInput)
+          return
+        }
+        if (player.state !== 'playing') {
+          // Paused (or another non-terminal state): nothing to watchdog this
+          // tick — reset the stall tracker so a resumed play doesn't inherit a
+          // stale "unchanged since" timestamp from before the pause.
+          clipLastPosition.delete(key)
+          return
+        }
+        // Stall watchdog (issue #351): `player.state === 'playing'` here can
+        // still mean the pipeline never produced a frame (root cause of the
+        // reported bug) — a position that hasn't advanced for
+        // `clipStallTimeoutMs` is the only observable signal available.
+        const positionMs = player.position_ms ?? 0
+        const last = clipLastPosition.get(key)
+        const now = Date.now()
+        if (!last || last.positionMs !== positionMs) {
+          clipLastPosition.set(key, { positionMs, since: now })
+        } else if (now - last.since >= config.clipStallTimeoutMs) {
+          const state: ClipState = {
+            mixerInput,
+            state: 'error',
+            error: 'Clip playback stalled — position has not advanced',
+            ...(clipId !== undefined ? { clipId } : {}),
+            positionMs,
+            ...(player.duration_ms !== undefined ? { durationMs: player.duration_ms } : {}),
+          }
+          setClipStateEntry(productionId, state)
+          broadcast(productionId, { type: 'CLIP_STATE', ...state })
+          stopClipPoll(productionId, mixerInput)
+          await clearPersistedClipCue(productionId, mixerInput)
         }
       } catch (err) {
         // Transient error: log and keep polling. Never self-terminate on a single
@@ -887,6 +928,7 @@ export function clearClipStateForProduction(productionId: string): void {
     if (key.startsWith(`${productionId}:`)) {
       clearInterval(clipPollTimers.get(key)!)
       clipPollTimers.delete(key)
+      clipLastPosition.delete(key)
     }
   }
   clearClipState(productionId)
@@ -2178,7 +2220,12 @@ export async function handleMessage(
         // Typed clip errors carry a human-readable message; Strom transport
         // errors are surfaced via stromErrorMessage (502/503-style text).
         let errText: string;
-        if (err instanceof ClipNotFoundError || err instanceof ClipNotActivatedError || err instanceof ClipNotCuedError) {
+        if (
+          err instanceof ClipNotFoundError ||
+          err instanceof ClipNotActivatedError ||
+          err instanceof ClipNotCuedError ||
+          err instanceof ClipMediaError
+        ) {
           errText = err.message;
         } else {
           errText = `Clip: ${stromErrorMessage(err)}`;

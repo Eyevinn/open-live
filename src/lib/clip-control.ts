@@ -22,6 +22,8 @@
  *   - {@link ClipNotFoundError}     → 404 (no clip source / player block for this input)
  *   - {@link ClipNotActivatedError} → 409 (production not activated)
  *   - {@link ClipNotCuedError}      → 409 (play requested with nothing cued)
+ *   - {@link ClipMediaError}        → 502 (clip URL unreachable, or media never
+ *     loaded — issue #351)
  *   - `ClipReferenceNotImplementedError` (from clip-reference.ts) → 501 (tams)
  *   - `StromClientError` propagates (callers map status 0 → 503, else 502)
  */
@@ -57,6 +59,22 @@ export class ClipNotCuedError extends Error {
   constructor(message = 'No clip cued') {
     super(message);
     this.name = 'ClipNotCuedError';
+  }
+}
+
+/**
+ * Thrown when a clip's media cannot be fetched or loaded (→ 502; issue #351).
+ * Covers both the pre-cue reachability preflight (unfetchable URL — HTTP
+ * error, DNS failure, refused connection, timeout) and the post-cue readiness
+ * check (URL was reachable but Strom never reported a loaded duration). Either
+ * way, without this the operator saw an indefinite `cued`/`playing` at
+ * 0:00/0:00 with no error surfaced (the reported bug).
+ */
+export class ClipMediaError extends Error {
+  readonly statusCode = 502;
+  constructor(message: string) {
+    super(message);
+    this.name = 'ClipMediaError';
   }
 }
 
@@ -156,6 +174,74 @@ export function resolveClipFile(source: SourceDoc): string {
   }
 }
 
+/** Poll cadence (ms) for {@link waitForClipReady}'s post-cue duration wait. */
+const CUE_READY_POLL_INTERVAL_MS = 250;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Preflight-checks that a clip's resolved URL is actually fetchable before
+ * committing it to Strom (issue #351). `setPlaylist`/`goto` accept the load
+ * optimistically — Strom fetches the file asynchronously inside its own
+ * pipeline — so without this check an unfetchable URL (HTTP 403, DNS
+ * failure, connection refused, …) silently cues the operator into a clip
+ * that will never load.
+ *
+ * Issues a `HEAD` request first; an origin that rejects `HEAD` (405/501 —
+ * some presigned-URL / CDN configurations) falls back to a ranged GET of the
+ * first byte so this never downloads the whole file just to check
+ * reachability. Operates on `url` as already resolved by {@link resolveClipFile}
+ * — for a `url` reference this is SSRF-validated by `deserializeClipReference`
+ * (`httpUrlOnly`) before it ever reaches here; for `s3` it is a presigned URL
+ * against the configured object store. This performs no additional host
+ * validation of its own, only a liveness check of the already-approved URL.
+ */
+async function preflightClipUrl(url: string, timeoutMs: number): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(timeoutMs) });
+    if (res.status === 405 || res.status === 501) {
+      res = await fetch(url, {
+        method: 'GET',
+        headers: { Range: 'bytes=0-0' },
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    }
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new ClipMediaError(`Clip URL could not be reached: ${reason}`);
+  }
+  if (!res.ok) {
+    throw new ClipMediaError(`Clip URL returned HTTP ${res.status}`);
+  }
+}
+
+/**
+ * Polls `player.getState` until Strom reports a non-zero `duration_ms` — the
+ * only reliable "media actually loaded" signal, since `MediaPlayerState::
+ * state()` reports a ready/playing state regardless (issue #351's root
+ * cause) — or `timeoutMs` elapses, in which case the cue is failed rather
+ * than left reporting `cued` for media that never loaded.
+ */
+async function waitForClipReady(
+  strom: StromClient,
+  flowId: string,
+  blockId: string,
+  timeoutMs: number,
+): Promise<PlayerStateResponse> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const player = await strom.player.getState(flowId, blockId);
+    if (player.duration_ms) return player;
+    if (Date.now() >= deadline) {
+      throw new ClipMediaError('Clip media could not be loaded');
+    }
+    await sleep(CUE_READY_POLL_INTERVAL_MS);
+  }
+}
+
 /**
  * Maps Strom's `PlayerStateResponse` to the camelCased `ClipState` contract.
  *
@@ -196,6 +282,13 @@ export function mapPlayerState(
  *
  * The clip source is resolved from the production's source assignments for this
  * mixer input; `clipId`, when supplied, must match the assigned source id.
+ *
+ * Before touching Strom, the resolved URL is preflight-checked for
+ * reachability, and after `setPlaylist`/`goto` the cue blocks until Strom
+ * confirms a loaded duration (or fails) — see {@link preflightClipUrl} /
+ * {@link waitForClipReady} (issue #351). This means `cueClip` throws
+ * {@link ClipMediaError} instead of ever reporting `cued` for a clip whose
+ * media cannot be fetched or loaded.
  */
 export async function cueClip(
   strom: StromClient,
@@ -206,9 +299,10 @@ export async function cueClip(
 ): Promise<ClipState> {
   const { flowId, blockId } = resolveClipTarget(doc, mixerInput);
   const file = resolveClipFile(source);
+  await preflightClipUrl(file, config.clipPreflightTimeoutMs);
   await strom.player.setPlaylist(flowId, blockId, { files: [file] });
   await strom.player.goto(flowId, blockId, { index: 0 });
-  const player = await strom.player.getState(flowId, blockId);
+  const player = await waitForClipReady(strom, flowId, blockId, config.clipCueReadyTimeoutMs);
   return mapPlayerState(mixerInput, player, { clipId: clipId ?? source._id, justCued: true });
 }
 

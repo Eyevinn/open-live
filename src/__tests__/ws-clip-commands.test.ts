@@ -93,6 +93,31 @@ await new Promise<void>((resolve) => stromServer.listen(0, '127.0.0.1', () => re
 process.env['STROM_URL'] = `http://127.0.0.1:${(stromServer.address() as AddressInfo).port}`;
 afterAll(() => stromServer.close());
 
+// ---------------------------------------------------------------------------
+// Clip URL preflight (issue #351): cueClip now does a real HEAD/GET fetch
+// against the clip's resolved URL before touching Strom. The fixture source
+// address below is a public-looking hostname (required to pass httpUrlOnly's
+// SSRF check — a loopback/private literal would be rejected there), so it is
+// not actually reachable from the test sandbox. Intercept fetch ONLY for that
+// exact URL and answer with a controllable status; everything else (the real
+// StromClient traffic to the throwaway server above) passes through to the
+// real fetch untouched.
+// ---------------------------------------------------------------------------
+const CLIP_URL = 'https://media.example.com/story-a.mp4';
+const realFetch = globalThis.fetch;
+let clipUrlStatus = 200;
+vi.spyOn(globalThis, 'fetch').mockImplementation(((input: RequestInfo | URL, init?: RequestInit) => {
+  const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+  if (url === CLIP_URL) return Promise.resolve(new Response(null, { status: clipUrlStatus }));
+  return realFetch(input as never, init);
+}) as typeof fetch);
+afterAll(() => { globalThis.fetch = realFetch; });
+
+// Short stall-watchdog / cue-readiness timeouts so the new tests below don't
+// have to wait out the production defaults (5s each).
+process.env['CLIP_STALL_TIMEOUT_MS'] = '300';
+process.env['CLIP_CUE_READY_TIMEOUT_MS'] = '300';
+
 const { handleMessage, clearClipStateForProduction } = await import('../ws/controller.js');
 const { config } = await import('../config.js');
 
@@ -156,6 +181,7 @@ beforeEach(() => {
   broadcasts.length = 0;
   stromRequests.length = 0;
   playerState = { state: 'stopped' };
+  clipUrlStatus = 200;
   (ws.send as unknown as ReturnType<typeof vi.fn>).mockClear();
   updateProductionDoc.mockClear();
   productionDocs.clear();
@@ -290,4 +316,108 @@ describe('completion poll fallback', () => {
     expect(completed).toBeDefined();
     expect(completed).toMatchObject({ mixerInput: 'video_in_0', state: 'completed', durationMs: 8000 });
   });
+});
+
+// Regression coverage for issue #351: "Unfetchable clip URL gives the
+// operator no error" — Cue reported CUED and Play reported PLAYING at
+// 0:00/0:00 indefinitely because nothing checked the clip's media actually
+// loaded. These three describe blocks cover the three fixes: a preflight
+// reachability check at cue time, a post-cue readiness wait for a loaded
+// duration, and a stalled-playhead watchdog while playing.
+describe('clip URL preflight (issue #351)', () => {
+  it('fails CLIP_CUE with CLIP_STATE error when the clip URL returns a non-2xx status', async () => {
+    clipUrlStatus = 403;
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+
+    expect(errorFrames().length).toBeGreaterThan(0);
+    expect(clipStates().at(-1)).toMatchObject({
+      mixerInput: 'video_in_0',
+      state: 'error',
+      error: 'Clip URL returned HTTP 403',
+    });
+    // The preflight must fail BEFORE the playlist is ever handed to Strom.
+    expect(playerReqs('playlist')).toHaveLength(0);
+    expect(playerReqs('goto')).toHaveLength(0);
+  });
+
+  it('cues normally when the clip URL preflight succeeds', async () => {
+    clipUrlStatus = 200;
+    playerState = { state: 'paused', duration_ms: 12000, position_ms: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+
+    expect(errorFrames()).toHaveLength(0);
+    expect(clipStates().at(-1)).toMatchObject({ state: 'cued', durationMs: 12000 });
+    expect(playerReqs('playlist')).toHaveLength(1);
+  });
+});
+
+describe('clip cue readiness timeout (issue #351)', () => {
+  it('fails CLIP_CUE with CLIP_STATE error when Strom never reports a loaded duration', async () => {
+    // Strom accepts the playlist/goto but never reports a non-zero duration —
+    // exactly the async-load-never-completes case from the bug report.
+    playerState = { state: 'paused', position_ms: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+
+    expect(errorFrames().length).toBeGreaterThan(0);
+    expect(clipStates().at(-1)).toMatchObject({
+      mixerInput: 'video_in_0',
+      state: 'error',
+      error: 'Clip media could not be loaded',
+    });
+    // Unlike the preflight failure, setPlaylist/goto DID happen — Strom
+    // accepted the load optimistically before failing to actually load it.
+    expect(playerReqs('playlist')).toHaveLength(1);
+  }, 10000);
+});
+
+describe('clip playback stall watchdog (issue #351)', () => {
+  it('moves a playing clip to CLIP_STATE error when the position never advances', async () => {
+    playerState = { state: 'paused', duration_ms: 12000, position_ms: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+    // Strom reports `playing` (per the bug's root cause: state() is `playing`
+    // whenever not paused and the playlist is non-empty) but the position
+    // never moves off 0 — the pipeline never actually produced a frame.
+    playerState = { state: 'playing', position_ms: 0, duration_ms: 12000 };
+    await send({ type: 'CLIP_PLAY', mixerInput: 'video_in_0' });
+    broadcasts.length = 0;
+
+    const deadline = Date.now() + config.clipStallTimeoutMs + config.clipStatePollMs * 6 + 500;
+    let errored: Record<string, unknown> | undefined;
+    while (Date.now() < deadline) {
+      errored = clipStates().find((m) => m.state === 'error');
+      if (errored) break;
+      await new Promise((r) => setTimeout(r, config.clipStatePollMs / 4 + 5));
+    }
+
+    expect(errored).toBeDefined();
+    expect(errored).toMatchObject({
+      mixerInput: 'video_in_0',
+      state: 'error',
+      error: 'Clip playback stalled — position has not advanced',
+    });
+  }, 10000);
+
+  it('does not error a playing clip whose position is advancing normally', async () => {
+    playerState = { state: 'paused', duration_ms: 12000, position_ms: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+    playerState = { state: 'playing', position_ms: 100, duration_ms: 12000 };
+    await send({ type: 'CLIP_PLAY', mixerInput: 'video_in_0' });
+    broadcasts.length = 0;
+
+    // Advance the reported position on a tight interval — well under both the
+    // poll cadence and the stall timeout — so the watchdog never observes two
+    // consecutive poll ticks with an identical position.
+    let positionMs = 100;
+    const advance = setInterval(() => {
+      positionMs += 40;
+      playerState = { state: 'playing', position_ms: positionMs, duration_ms: 12000 };
+    }, 40);
+    try {
+      await new Promise((r) => setTimeout(r, config.clipStallTimeoutMs + config.clipStatePollMs * 4));
+    } finally {
+      clearInterval(advance);
+    }
+
+    expect(clipStates().find((m) => m.state === 'error')).toBeUndefined();
+  }, 10000);
 });

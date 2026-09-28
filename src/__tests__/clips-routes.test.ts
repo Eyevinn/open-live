@@ -110,6 +110,29 @@ process.env['STROM_URL'] = `http://127.0.0.1:${(stromServer.address() as Address
 
 afterAll(() => stromServer.close());
 
+// ---------------------------------------------------------------------------
+// Clip URL preflight (issue #351): cueClip now does a real HEAD/GET fetch
+// against the clip's resolved URL before touching Strom. The fixture source
+// address below is a public-looking hostname (required to pass httpUrlOnly's
+// SSRF check), not actually reachable from the test sandbox. Intercept fetch
+// ONLY for that exact URL with a controllable status; everything else (the
+// real StromClient traffic to the throwaway server above) passes through to
+// the real fetch untouched.
+// ---------------------------------------------------------------------------
+const CLIP_URL = 'https://media.example.com/story-a.mp4';
+const realFetch = globalThis.fetch;
+let clipUrlStatus = 200;
+vi.spyOn(globalThis, 'fetch').mockImplementation(((input: RequestInfo | URL, init?: RequestInit) => {
+  const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+  if (url === CLIP_URL) return Promise.resolve(new Response(null, { status: clipUrlStatus }));
+  return realFetch(input as never, init);
+}) as typeof fetch);
+afterAll(() => { globalThis.fetch = realFetch; });
+
+// Short cue-readiness timeout so the readiness-timeout test below doesn't
+// have to wait out the production default (5s).
+process.env['CLIP_CUE_READY_TIMEOUT_MS'] = '300';
+
 const AUTH = { authorization: `Bearer ${TEST_API_KEY}` };
 const PROD = 'prod-clip-abcdef01';
 const FLOW = 'flow-clip';
@@ -151,11 +174,16 @@ function makeSource(overrides: Partial<SourceDoc> = {}): SourceDoc {
 
 let app: FastifyInstance;
 let clearClipState: (productionId: string) => void;
+let getClipStateEntry: (productionId: string, mixerInput: string) => { state: string; error?: string } | undefined;
+let stopClipPoll: (productionId: string, mixerInput: string) => void;
+let config: { clipStatePollMs: number };
 
 beforeAll(async () => {
   const { buildServer } = await import('../server.js');
   app = await buildServer();
-  ({ clearClipState } = await import('../services/clip-state.service.js'));
+  ({ clearClipState, getClipStateEntry } = await import('../services/clip-state.service.js'));
+  ({ stopClipPoll } = await import('../ws/controller.js'));
+  ({ config } = await import('../config.js'));
 });
 
 beforeEach(() => {
@@ -164,6 +192,11 @@ beforeEach(() => {
   stromRequests.length = 0;
   playerState = { state: 'stopped' };
   controlReturnsEmpty200 = false;
+  clipUrlStatus = 200;
+  // A prior test's REST /play may have started the completion/stall-watchdog
+  // poll (issue #351); stop it so it doesn't keep ticking — and polluting
+  // stromRequests / clip state — across test boundaries.
+  stopClipPoll(PROD, 'video_in_0');
   clearClipState(PROD);
   productionStore.set(PROD, makeProduction());
   sourceStore.set('src-clip', makeSource());
@@ -188,6 +221,7 @@ describe('POST /clips/:mixerInput/cue', () => {
   });
 
   it('accepts an explicit clipId in the body', async () => {
+    playerState = { state: 'paused', duration_ms: 12000, position_ms: 0 };
     const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: { clipId: 'story-42' } });
     expect(res.statusCode).toBe(200);
     expect(res.json().clipId).toBe('story-42');
@@ -224,6 +258,30 @@ describe('POST /clips/:mixerInput/cue', () => {
     const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, payload: {} });
     expect(res.statusCode).toBe(401);
   });
+
+  // Regression coverage for issue #351: an unfetchable clip URL (or media that
+  // never actually loads) must fail the cue rather than silently report
+  // `cued` forever. See the WS-surface equivalents in ws-clip-commands.test.ts.
+  it('502s and registers a CLIP_STATE error when the clip URL preflight fails', async () => {
+    clipUrlStatus = 403;
+    const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: {} });
+    expect(res.statusCode).toBe(502);
+    // The preflight must fail BEFORE the playlist is ever handed to Strom.
+    expect(playerReqs('playlist')).toHaveLength(0);
+    expect(getClipStateEntry(PROD, 'video_in_0')).toMatchObject({
+      state: 'error',
+      error: 'Clip URL returned HTTP 403',
+    });
+  });
+
+  it('502s when Strom never reports a loaded duration', async () => {
+    // Strom accepts the playlist/goto but never reports a non-zero duration.
+    playerState = { state: 'paused', position_ms: 0 };
+    const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: {} });
+    expect(res.statusCode).toBe(502);
+    expect(playerReqs('playlist')).toHaveLength(1);
+    expect(getClipStateEntry(PROD, 'video_in_0')).toMatchObject({ state: 'error', error: 'Clip media could not be loaded' });
+  }, 10000);
 });
 
 // Regression for issue #336: a clip cued over the REST /cue endpoint must
@@ -249,6 +307,7 @@ describe('POST /clips/:mixerInput/cue persists the cue point (issue #336)', () =
   });
 
   it('persists the explicit clipId given in the body', async () => {
+    playerState = { state: 'paused', duration_ms: 12000, position_ms: 0 };
     const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: { clipId: 'story-42' } });
     expect(res.statusCode).toBe(200);
     expect(productionStore.get(PROD)?.clipCues?.['video_in_0']?.clipId).toBe('story-42');
@@ -256,6 +315,7 @@ describe('POST /clips/:mixerInput/cue persists the cue point (issue #336)', () =
 
   it('drops the persisted cue on stop, leaving nothing to restore', async () => {
     // Cue first so there is a persisted cue to clear.
+    playerState = { state: 'paused', duration_ms: 12000, position_ms: 0 };
     await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: {} });
     expect(productionStore.get(PROD)?.clipCues?.['video_in_0']).toBeDefined();
 
@@ -280,6 +340,27 @@ describe('POST /clips/:mixerInput/play', () => {
     expect(res.json()).toMatchObject({ mixerInput: 'video_in_0', state: 'playing', durationMs: 12000 });
     expect(playerReqs('control').at(-1)?.body).toEqual({ action: 'play' });
   });
+
+  // Regression for issue #351: only the WS CLIP_PLAY handler used to start the
+  // completion/stall-watchdog poll, so a clip played over REST never
+  // converged to `completed` on end-of-media and never got the stalled-
+  // playhead watchdog either. REST /play must start the same poll.
+  it('converges to CLIP_STATE completed via the poll after a REST play (issue #351)', async () => {
+    await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: { clipId: 'src-clip' }, });
+    playerState = { state: 'playing', position_ms: 10, duration_ms: 8000 };
+    await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/play`, headers: AUTH });
+
+    playerState = { state: 'stopped', position_ms: 8000, duration_ms: 8000 };
+
+    const deadline = Date.now() + config.clipStatePollMs * 8 + 500;
+    let entry = getClipStateEntry(PROD, 'video_in_0');
+    while (Date.now() < deadline && entry?.state !== 'completed') {
+      await new Promise((r) => setTimeout(r, config.clipStatePollMs / 4 + 5));
+      entry = getClipStateEntry(PROD, 'video_in_0');
+    }
+
+    expect(entry).toMatchObject({ state: 'completed' });
+  }, 10000);
 });
 
 describe('POST /clips/:mixerInput/stop', () => {
