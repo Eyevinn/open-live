@@ -864,8 +864,9 @@ export function startClipPoll(productionId: string, mixerInput: string, clipId?:
             mixerInput,
             state: 'completed',
             ...(clipId !== undefined ? { clipId } : {}),
-            ...(player.position_ms !== undefined ? { positionMs: player.position_ms } : {}),
-            ...(player.duration_ms !== undefined ? { durationMs: player.duration_ms } : {}),
+            // Strom reports position/duration in nanoseconds; the contract is ms.
+            ...(player.position_ns !== undefined ? { positionMs: Math.round(player.position_ns / 1e6) } : {}),
+            ...(player.duration_ns !== undefined ? { durationMs: Math.round(player.duration_ns / 1e6) } : {}),
           }
           setClipStateEntry(productionId, state)
           broadcast(productionId, { type: 'CLIP_STATE', ...state })
@@ -885,7 +886,8 @@ export function startClipPoll(productionId: string, mixerInput: string, clipId?:
         // still mean the pipeline never produced a frame (root cause of the
         // reported bug) — a position that hasn't advanced for
         // `clipStallTimeoutMs` is the only observable signal available.
-        const positionMs = player.position_ms ?? 0
+        // Strom reports position/duration in nanoseconds; the contract is ms.
+        const positionMs = player.position_ns !== undefined ? Math.round(player.position_ns / 1e6) : 0
         const last = clipLastPosition.get(key)
         const now = Date.now()
         if (!last || last.positionMs !== positionMs) {
@@ -897,7 +899,7 @@ export function startClipPoll(productionId: string, mixerInput: string, clipId?:
             error: 'Clip playback stalled — position has not advanced',
             ...(clipId !== undefined ? { clipId } : {}),
             positionMs,
-            ...(player.duration_ms !== undefined ? { durationMs: player.duration_ms } : {}),
+            ...(player.duration_ns !== undefined ? { durationMs: Math.round(player.duration_ns / 1e6) } : {}),
           }
           setClipStateEntry(productionId, state)
           broadcast(productionId, { type: 'CLIP_STATE', ...state })
@@ -2702,7 +2704,7 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               // at the cue point, then seek to a non-zero cue position if any.
               await cueClip(clipStrom, connectDoc, source, mixerInput, persistedCue.clipId);
               if (persistedCue.positionMs && persistedCue.positionMs > 0) {
-                await clipStrom.player.seek(connectDoc.stromFlowId!, resolveClipTarget(connectDoc, mixerInput).blockId, { position_ms: persistedCue.positionMs });
+                await clipStrom.player.seek(connectDoc.stromFlowId!, resolveClipTarget(connectDoc, mixerInput).blockId, { position_ns: persistedCue.positionMs * 1e6 });
               }
               const state: ClipState = {
                 mixerInput,
@@ -2727,8 +2729,9 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             const state: ClipState = {
               mixerInput,
               state: player.state === 'playing' ? 'playing' : player.state === 'paused' ? 'paused' : 'stopped',
-              ...(player.position_ms !== undefined ? { positionMs: player.position_ms } : {}),
-              ...(player.duration_ms !== undefined ? { durationMs: player.duration_ms } : {}),
+              // Strom reports position/duration in nanoseconds; the contract is ms.
+              ...(player.position_ns !== undefined ? { positionMs: Math.round(player.position_ns / 1e6) } : {}),
+              ...(player.duration_ns !== undefined ? { durationMs: Math.round(player.duration_ns / 1e6) } : {}),
             };
             setClipStateEntry(id, state);
             socket.send(JSON.stringify({ type: 'CLIP_STATE', ...state }));

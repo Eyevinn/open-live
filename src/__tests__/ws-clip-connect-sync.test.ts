@@ -161,7 +161,7 @@ afterEach(async () => {
 
 describe('WS connect snapshot — CLIP_STATE (spec §3)', () => {
   it('restores CLIP_STATE from Strom player.getState on a cold registry', async () => {
-    playerState = { state: 'paused', position_ms: 5000, duration_ms: 12000 };
+    playerState = { state: 'paused', position_ns: 5_000_000_000, duration_ns: 12_000_000_000 };
 
     const messages = await connectAndCollect(PROD);
     const clip = messages.find((m) => m.type === 'CLIP_STATE');
@@ -181,7 +181,7 @@ describe('WS connect snapshot — CLIP_STATE (spec §3)', () => {
   });
 
   it('reflects a stopped player as CLIP_STATE stopped', async () => {
-    playerState = { state: 'stopped', position_ms: 0 };
+    playerState = { state: 'stopped', position_ns: 0 };
 
     const messages = await connectAndCollect(PROD);
     const clip = messages.find((m) => m.type === 'CLIP_STATE');
@@ -195,7 +195,7 @@ describe('WS connect snapshot — CLIP_STATE (spec §3)', () => {
     // state (paused/stopped) cannot itself represent. The connect snapshot must
     // echo the tracked `cued`.
     const cueWs = { send: vi.fn() } as unknown as import('@fastify/websocket').WebSocket;
-    playerState = { state: 'paused', duration_ms: 8000, position_ms: 0 };
+    playerState = { state: 'paused', duration_ns: 8_000_000_000, position_ns: 0 };
     await handleMessage(PROD, cueWs, JSON.stringify({ type: 'CLIP_CUE', mixerInput: 'video_in_0' }), {});
 
     const messages = await connectAndCollect(PROD);
@@ -214,7 +214,7 @@ describe('WS connect snapshot — CLIP_STATE (spec §3)', () => {
     }));
     // Strom would report the re-cued player as paused/ready; the restore must
     // still surface `cued`, not the raw Strom state.
-    playerState = { state: 'paused', position_ms: 4000, duration_ms: 12000 };
+    playerState = { state: 'paused', position_ns: 4_000_000_000, duration_ns: 12_000_000_000 };
 
     const messages = await connectAndCollect(PROD);
     const clip = messages.find((m) => m.type === 'CLIP_STATE');

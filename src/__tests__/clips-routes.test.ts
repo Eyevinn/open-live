@@ -208,7 +208,7 @@ function playerReqs(suffix: string) {
 
 describe('POST /clips/:mixerInput/cue', () => {
   it('sets the playlist, gotos index 0, and returns a cued ClipState', async () => {
-    playerState = { state: 'paused', duration_ms: 12000, position_ms: 0 };
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
     const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: {} });
     expect(res.statusCode).toBe(200);
     const body = res.json();
@@ -221,7 +221,7 @@ describe('POST /clips/:mixerInput/cue', () => {
   });
 
   it('accepts an explicit clipId in the body', async () => {
-    playerState = { state: 'paused', duration_ms: 12000, position_ms: 0 };
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
     const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: { clipId: 'story-42' } });
     expect(res.statusCode).toBe(200);
     expect(res.json().clipId).toBe('story-42');
@@ -276,7 +276,7 @@ describe('POST /clips/:mixerInput/cue', () => {
 
   it('502s when Strom never reports a loaded duration', async () => {
     // Strom accepts the playlist/goto but never reports a non-zero duration.
-    playerState = { state: 'paused', position_ms: 0 };
+    playerState = { state: 'paused', position_ns: 0 };
     const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: {} });
     expect(res.statusCode).toBe(502);
     expect(playerReqs('playlist')).toHaveLength(1);
@@ -292,7 +292,7 @@ describe('POST /clips/:mixerInput/cue', () => {
 // reactivate and the clip read `stopped`.
 describe('POST /clips/:mixerInput/cue persists the cue point (issue #336)', () => {
   it('writes ProductionDoc.clipCues so the cue survives deactivate/reactivate', async () => {
-    playerState = { state: 'paused', duration_ms: 12000, position_ms: 0 };
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
     const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: {} });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({ mixerInput: 'video_in_0', state: 'cued' });
@@ -307,7 +307,7 @@ describe('POST /clips/:mixerInput/cue persists the cue point (issue #336)', () =
   });
 
   it('persists the explicit clipId given in the body', async () => {
-    playerState = { state: 'paused', duration_ms: 12000, position_ms: 0 };
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
     const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: { clipId: 'story-42' } });
     expect(res.statusCode).toBe(200);
     expect(productionStore.get(PROD)?.clipCues?.['video_in_0']?.clipId).toBe('story-42');
@@ -315,11 +315,11 @@ describe('POST /clips/:mixerInput/cue persists the cue point (issue #336)', () =
 
   it('drops the persisted cue on stop, leaving nothing to restore', async () => {
     // Cue first so there is a persisted cue to clear.
-    playerState = { state: 'paused', duration_ms: 12000, position_ms: 0 };
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
     await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: {} });
     expect(productionStore.get(PROD)?.clipCues?.['video_in_0']).toBeDefined();
 
-    playerState = { state: 'stopped', position_ms: 0 };
+    playerState = { state: 'stopped', position_ns: 0 };
     const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/stop`, headers: AUTH });
     expect(res.statusCode).toBe(200);
     expect(productionStore.get(PROD)?.clipCues?.['video_in_0']).toBeUndefined();
@@ -334,7 +334,7 @@ describe('POST /clips/:mixerInput/play', () => {
 
   it('plays after a cue and returns a playing ClipState', async () => {
     await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: {} });
-    playerState = { state: 'playing', position_ms: 40, duration_ms: 12000 };
+    playerState = { state: 'playing', position_ns: 40_000_000, duration_ns: 12_000_000_000 };
     const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/play`, headers: AUTH });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({ mixerInput: 'video_in_0', state: 'playing', durationMs: 12000 });
@@ -347,10 +347,10 @@ describe('POST /clips/:mixerInput/play', () => {
   // playhead watchdog either. REST /play must start the same poll.
   it('converges to CLIP_STATE completed via the poll after a REST play (issue #351)', async () => {
     await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: { clipId: 'src-clip' }, });
-    playerState = { state: 'playing', position_ms: 10, duration_ms: 8000 };
+    playerState = { state: 'playing', position_ns: 10_000_000, duration_ns: 8_000_000_000 };
     await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/play`, headers: AUTH });
 
-    playerState = { state: 'stopped', position_ms: 8000, duration_ms: 8000 };
+    playerState = { state: 'stopped', position_ns: 8_000_000_000, duration_ns: 8_000_000_000 };
 
     const deadline = Date.now() + config.clipStatePollMs * 8 + 500;
     let entry = getClipStateEntry(PROD, 'video_in_0');
@@ -365,7 +365,7 @@ describe('POST /clips/:mixerInput/play', () => {
 
 describe('POST /clips/:mixerInput/stop', () => {
   it('stops and returns a stopped ClipState', async () => {
-    playerState = { state: 'stopped', position_ms: 0 };
+    playerState = { state: 'stopped', position_ns: 0 };
     const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/stop`, headers: AUTH });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({ mixerInput: 'video_in_0', state: 'stopped' });
@@ -375,7 +375,7 @@ describe('POST /clips/:mixerInput/stop', () => {
 
 describe('GET /clips/:mixerInput/state', () => {
   it('returns the current mapped clip state', async () => {
-    playerState = { state: 'playing', position_ms: 3000, duration_ms: 9000 };
+    playerState = { state: 'playing', position_ns: 3_000_000_000, duration_ns: 9_000_000_000 };
     const res = await app.inject({ method: 'GET', url: `/api/v1/productions/${PROD}/clips/video_in_0/state`, headers: AUTH });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({ mixerInput: 'video_in_0', state: 'playing', positionMs: 3000, durationMs: 9000 });
@@ -398,7 +398,7 @@ describe('clip control against a shared Strom that returns empty 200s', () => {
   });
 
   it('cues (empty-200 setPlaylist + goto) and returns a cued ClipState', async () => {
-    playerState = { state: 'paused', duration_ms: 12000, position_ms: 0 };
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
     const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: {} });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({ mixerInput: 'video_in_0', state: 'cued' });
@@ -406,14 +406,14 @@ describe('clip control against a shared Strom that returns empty 200s', () => {
 
   it('plays (empty-200 control) after a cue', async () => {
     await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: {} });
-    playerState = { state: 'playing', position_ms: 40, duration_ms: 12000 };
+    playerState = { state: 'playing', position_ns: 40_000_000, duration_ns: 12_000_000_000 };
     const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/play`, headers: AUTH });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({ mixerInput: 'video_in_0', state: 'playing' });
   });
 
   it('stops (empty-200 control) and returns a stopped ClipState', async () => {
-    playerState = { state: 'stopped', position_ms: 0 };
+    playerState = { state: 'stopped', position_ns: 0 };
     const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/stop`, headers: AUTH });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({ mixerInput: 'video_in_0', state: 'stopped' });
