@@ -441,22 +441,27 @@ async function makeStromClient(): Promise<StromClient> {
   return new StromClient({ baseUrl: config.stromUrl, token })
 }
 
+// Returns true when the transition either reached Strom successfully or there
+// was nothing to send (no flow configured / a degenerate skip) — i.e. nothing
+// Strom could disagree with. Returns false only when Strom actively rejected
+// the /transition call, so callers can suppress the PiP-displacement broadcast
+// and the preview restore that would otherwise contradict Strom (issue #355).
 async function stromTransition(
   doc: ProductionDoc,
   fromMixerInput: string | null,
   toMixerInput: string | null,
   transitionType: StromTransitionType,
   durationMs?: number,
-): Promise<void> {
-  if (!doc.stromFlowId || !doc.mixerBlockId) return;
+): Promise<boolean> {
+  if (!doc.stromFlowId || !doc.mixerBlockId) return true;
   if (!toMixerInput) {
     console.warn('[controller] Strom transition skipped — no toMixerInput');
-    return;
+    return true;
   }
   const toIndex = padToIndex(toMixerInput);
   if (toIndex === null) {
     console.warn('[controller] Strom transition skipped — cannot parse index from pad:', toMixerInput);
-    return;
+    return true;
   }
   // Set Strom's PVW to the target input first, then fire the transition.
   // Strom's trigger_transition uses from_input/to_input directly — selectPreview
@@ -482,7 +487,9 @@ async function stromTransition(
     });
   } catch (err) {
     console.warn('[controller] Strom transition error:', err);
+    return false;
   }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,32 +1123,42 @@ export async function handleMessage(
       const newTally = { pgm: msg.mixerInput, pvw: tally.pgm };
       setTally(productionId, newTally);
       const curPvwPipCut = pvwPipByProduction.get(productionId) ?? null;
+      // Update the in-memory PiP maps now — the Strom round trip below reads them
+      // for the #341 concurrent-PVW guard — but defer the PIP_STATE broadcast
+      // until the persist and Strom transition have both succeeded so clients are
+      // never told a PiP left program when the DB write throws or Strom rejects
+      // the cut (issue #355).
+      let cutPipEvent: { pvwPip: number | null } | null = null;
       if (curPgmPipCut !== null) {
         // PiP was on PGM → moves to PVW
         pgmPipByProduction.set(productionId, null);
         pvwPipByProduction.set(productionId, curPgmPipCut);
         pvwBeforePipByProduction.set(productionId, pgmBgByProduction.get(productionId) ?? null);
         pgmBgByProduction.delete(productionId);
-        broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: curPgmPipCut, pips: pipConfigsByProduction.get(productionId) ?? [] });
+        cutPipEvent = { pvwPip: curPgmPipCut };
       } else if (curPvwPipCut !== null) {
         // PiP was in PVW — cutting a real source to PGM replaces PVW, so clear it
         pvwPipByProduction.set(productionId, null);
-        broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: null, pips: pipConfigsByProduction.get(productionId) ?? [] });
+        cutPipEvent = { pvwPip: null };
       }
       await persistMixerMutation(productionId, 'CUT', (d) => ({ ...d, tally: newTally }));
       broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
-      await stromTransition(doc, fromPadCut, msg.mixerInput, 'cut');
-      // Only restore the displaced PiP into Strom's preview if the operator has
-      // not changed PVW during the Strom round trip. Without this guard a
-      // SET_PVW / SELECT_PVW_PIP that lands while /transition is in flight is
-      // overwritten by a stale restore (issue #341).
-      if (curPgmPipCut !== null && doc.stromFlowId && doc.mixerBlockId
-          && (pvwPipByProduction.get(productionId) ?? null) === curPgmPipCut) {
-        try {
-          const strom = await makeStromClient();
-          await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: curPgmPipCut } });
-        } catch (err) {
-          console.warn('[controller] Strom selectPreview (pip restore after cut) error:', err);
+      const cutTransitionOk = await stromTransition(doc, fromPadCut, msg.mixerInput, 'cut');
+      // Announce the PiP move and restore it into Strom's preview only after the
+      // transition succeeded (#355) and only if the operator has not changed PVW
+      // during the Strom round trip (#341): a concurrent SET_PVW / SELECT_PVW_PIP
+      // has already broadcast the authoritative PVW, so a stale displacement
+      // broadcast or restore must not clobber it.
+      if (cutTransitionOk && cutPipEvent
+          && (pvwPipByProduction.get(productionId) ?? null) === cutPipEvent.pvwPip) {
+        broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: cutPipEvent.pvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
+        if (curPgmPipCut !== null && doc.stromFlowId && doc.mixerBlockId) {
+          try {
+            const strom = await makeStromClient();
+            await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: curPgmPipCut } });
+          } catch (err) {
+            console.warn('[controller] Strom selectPreview (pip restore after cut) error:', err);
+          }
         }
       }
       if (doc.stromFlowId && ctx.audioBlockId) {
@@ -1163,31 +1180,35 @@ export async function handleMessage(
       const newTally = { pgm: msg.mixerInput, pvw: tally.pgm };
       setTally(productionId, newTally);
       const curPvwPipTrans = pvwPipByProduction.get(productionId) ?? null;
+      // Defer the PIP_STATE broadcast until persist and the Strom transition have
+      // both succeeded (issue #355); the maps update now for the #341 guard.
+      let transPipEvent: { pvwPip: number | null } | null = null;
       if (curPgmPipTrans !== null) {
         pgmPipByProduction.set(productionId, null);
         pvwPipByProduction.set(productionId, curPgmPipTrans);
         pvwBeforePipByProduction.set(productionId, pgmBgByProduction.get(productionId) ?? null);
         pgmBgByProduction.delete(productionId);
-        broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: curPgmPipTrans, pips: pipConfigsByProduction.get(productionId) ?? [] });
+        transPipEvent = { pvwPip: curPgmPipTrans };
       } else if (curPvwPipTrans !== null) {
         // PiP was in PVW — transitioning a real source to PGM replaces PVW, so clear it (matches CUT)
         pvwPipByProduction.set(productionId, null);
-        broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: null, pips: pipConfigsByProduction.get(productionId) ?? [] });
+        transPipEvent = { pvwPip: null };
       }
       await persistMixerMutation(productionId, 'TRANSITION', (d) => ({ ...d, tally: newTally }));
       broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc), transitionType: msg.transitionType, durationMs: msg.durationMs });
-      await stromTransition(doc, fromPadTrans, msg.mixerInput, toStromTransition(msg.transitionType), msg.durationMs);
-      // Only restore the displaced PiP into Strom's preview if the operator has
-      // not changed PVW during the Strom round trip. Without this guard a
-      // SET_PVW / SELECT_PVW_PIP that lands while /transition is in flight is
-      // overwritten by a stale restore (issue #341).
-      if (curPgmPipTrans !== null && doc.stromFlowId && doc.mixerBlockId
-          && (pvwPipByProduction.get(productionId) ?? null) === curPgmPipTrans) {
-        try {
-          const strom = await makeStromClient();
-          await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: curPgmPipTrans } });
-        } catch (err) {
-          console.warn('[controller] Strom selectPreview (pip restore after transition) error:', err);
+      const transTransitionOk = await stromTransition(doc, fromPadTrans, msg.mixerInput, toStromTransition(msg.transitionType), msg.durationMs);
+      // Announce + restore only after the transition succeeded (#355) and only if
+      // PVW was not changed during the Strom round trip (#341).
+      if (transTransitionOk && transPipEvent
+          && (pvwPipByProduction.get(productionId) ?? null) === transPipEvent.pvwPip) {
+        broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: transPipEvent.pvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
+        if (curPgmPipTrans !== null && doc.stromFlowId && doc.mixerBlockId) {
+          try {
+            const strom = await makeStromClient();
+            await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: curPgmPipTrans } });
+          } catch (err) {
+            console.warn('[controller] Strom selectPreview (pip restore after transition) error:', err);
+          }
         }
       }
       if (doc.stromFlowId && ctx.audioBlockId) {
@@ -1496,28 +1517,36 @@ export async function handleMessage(
               const newTally = { pgm: mixerInput, pvw: tally.pgm };
               setTally(productionId, newTally);
               const curPvwPip = pvwPipByProduction.get(productionId) ?? null;
+              // Defer the PIP_STATE broadcast until persist and the Strom
+              // transition have both succeeded (issue #355); the maps update now
+              // for the #341 guard.
+              let macroCutPipEvent: { pvwPip: number | null } | null = null;
               if (curPgmPip !== null) {
                 // PiP was on PGM → moves to PVW
                 pgmPipByProduction.set(productionId, null);
                 pvwPipByProduction.set(productionId, curPgmPip);
                 pvwBeforePipByProduction.set(productionId, pgmBgByProduction.get(productionId) ?? null);
                 pgmBgByProduction.delete(productionId);
-                broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: curPgmPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
+                macroCutPipEvent = { pvwPip: curPgmPip };
               } else if (curPvwPip !== null) {
                 // PiP was in PVW — cutting a real source to PGM replaces PVW, so clear it
                 pvwPipByProduction.set(productionId, null);
-                broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: null, pips: pipConfigsByProduction.get(productionId) ?? [] });
+                macroCutPipEvent = { pvwPip: null };
               }
               await persistMixerMutation(productionId, 'MACRO_EXEC:CUT', (d) => ({ ...d, tally: newTally }));
               broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, currentDoc) });
-              await stromTransition(currentDoc, fromPad, mixerInput, 'cut');
-              // Skip the restore if PVW changed during the Strom round trip.
-              if (curPgmPip !== null && currentDoc.stromFlowId && currentDoc.mixerBlockId
-                  && (pvwPipByProduction.get(productionId) ?? null) === curPgmPip) {
-                try {
-                  await strom.mixer.selectPreview(currentDoc.stromFlowId, currentDoc.mixerBlockId, { source: { pip: curPgmPip } });
-                } catch (err) {
-                  console.warn('[controller] Strom selectPreview (pip restore after macro cut) error:', err);
+              const macroCutTransitionOk = await stromTransition(currentDoc, fromPad, mixerInput, 'cut');
+              // Announce + restore only after the transition succeeded (#355) and
+              // only if PVW was not changed during the Strom round trip (#341).
+              if (macroCutTransitionOk && macroCutPipEvent
+                  && (pvwPipByProduction.get(productionId) ?? null) === macroCutPipEvent.pvwPip) {
+                broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: macroCutPipEvent.pvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
+                if (curPgmPip !== null && currentDoc.stromFlowId && currentDoc.mixerBlockId) {
+                  try {
+                    await strom.mixer.selectPreview(currentDoc.stromFlowId, currentDoc.mixerBlockId, { source: { pip: curPgmPip } });
+                  } catch (err) {
+                    console.warn('[controller] Strom selectPreview (pip restore after macro cut) error:', err);
+                  }
                 }
               }
             }
@@ -1533,27 +1562,36 @@ export async function handleMessage(
               const newTally = { pgm: mixerInput, pvw: tally.pgm };
               setTally(productionId, newTally);
               const curPvwPip = pvwPipByProduction.get(productionId) ?? null;
+              // Defer the PIP_STATE broadcast until persist and the Strom
+              // transition have both succeeded (issue #355); the maps update now
+              // for the #341 guard.
+              let macroTransPipEvent: { pvwPip: number | null } | null = null;
               if (curPgmPip !== null) {
                 // PiP was on PGM → moves to PVW
                 pgmPipByProduction.set(productionId, null);
                 pvwPipByProduction.set(productionId, curPgmPip);
                 pvwBeforePipByProduction.set(productionId, pgmBgByProduction.get(productionId) ?? null);
                 pgmBgByProduction.delete(productionId);
-                broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: curPgmPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
+                macroTransPipEvent = { pvwPip: curPgmPip };
               } else if (curPvwPip !== null) {
                 // PiP was in PVW — transitioning a real source to PGM replaces PVW, so clear it
                 pvwPipByProduction.set(productionId, null);
-                broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: null, pips: pipConfigsByProduction.get(productionId) ?? [] });
+                macroTransPipEvent = { pvwPip: null };
               }
               await persistMixerMutation(productionId, 'MACRO_EXEC:TRANSITION', (d) => ({ ...d, tally: newTally }));
               broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, currentDoc), transitionType: action.transitionType, durationMs: action.durationMs });
-              await stromTransition(currentDoc, fromPad, mixerInput, toStromTransition(action.transitionType ?? 'cut'), action.durationMs);
-              if (curPgmPip !== null && currentDoc.stromFlowId && currentDoc.mixerBlockId
-                  && (pvwPipByProduction.get(productionId) ?? null) === curPgmPip) {
-                try {
-                  await strom.mixer.selectPreview(currentDoc.stromFlowId, currentDoc.mixerBlockId, { source: { pip: curPgmPip } });
-                } catch (err) {
-                  console.warn('[controller] Strom selectPreview (pip restore after macro transition) error:', err);
+              const macroTransTransitionOk = await stromTransition(currentDoc, fromPad, mixerInput, toStromTransition(action.transitionType ?? 'cut'), action.durationMs);
+              // Announce + restore only after the transition succeeded (#355) and
+              // only if PVW was not changed during the Strom round trip (#341).
+              if (macroTransTransitionOk && macroTransPipEvent
+                  && (pvwPipByProduction.get(productionId) ?? null) === macroTransPipEvent.pvwPip) {
+                broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: macroTransPipEvent.pvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
+                if (curPgmPip !== null && currentDoc.stromFlowId && currentDoc.mixerBlockId) {
+                  try {
+                    await strom.mixer.selectPreview(currentDoc.stromFlowId, currentDoc.mixerBlockId, { source: { pip: curPgmPip } });
+                  } catch (err) {
+                    console.warn('[controller] Strom selectPreview (pip restore after macro transition) error:', err);
+                  }
                 }
               }
             }
