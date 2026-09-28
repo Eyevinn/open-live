@@ -83,11 +83,19 @@ describe('flow-generator — recorder wiring (#41)', () => {
     expect(recorder).toBeDefined();
     const recId = recorder!['id'] as string;
     expect(result.recorderBlockId).toBe(recId);
-    // output_dir is keyed by production id so segments are locatable for upload
-    expect((recorder!['properties'] as Record<string, unknown>)['output_dir']).toBe(
-      'recordings/prod-rec-1',
+    // output_dir is a per-activation subdirectory of the production's directory
+    const outputDir = (recorder!['properties'] as Record<string, unknown>)['output_dir'] as string;
+    expect(outputDir).toMatch(/^recordings\/prod-rec-1\/[0-9a-f-]{36}$/);
+    expect(result.recorderOutputDir).toBe(outputDir);
+
+    // A second activation of the same production writes somewhere else
+    const again = await activateStromFlow(
+      production as never,
+      strom as never,
+      'http://localhost:7000',
+      [recordingOutput] as never,
     );
-    expect(result.recorderOutputDir).toBe('recordings/prod-rec-1');
+    expect(again.recorderOutputDir).not.toBe(outputDir);
 
     // Recorder receives the PGM video feed and the main audio bus
     const videoIn = links.find((l) => l['to'] === `${recId}:video_in`);
