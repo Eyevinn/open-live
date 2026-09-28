@@ -154,6 +154,7 @@ function makeActivationResult(flowId: string, mixerBlockId: string) {
     recorderBlockId: undefined,
     whepOutputEntries: [],
     pgmWhepEndpointId: undefined,
+    warnings: [],
     sourceOffsetBlockIds: {},
     sourceAudioOffsetBlockIds: {},
     clipPlayerBlockIds: {},
