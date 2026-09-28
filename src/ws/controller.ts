@@ -1648,10 +1648,16 @@ export async function handleMessage(
             if (!currentDoc.stromFlowId || !currentDoc.mixerBlockId) {
               throw new Error('Pipeline not active or mixer block not resolved');
             }
-            await strom.mixer.toggleDsk(currentDoc.stromFlowId, currentDoc.mixerBlockId, {
+            const result = await strom.mixer.toggleDsk(currentDoc.stromFlowId, currentDoc.mixerBlockId, {
               dsk: (action.layer ?? 0) + 1,
               enabled: action.visible ?? true,
             });
+            // Mirror the interactive DSK_TOGGLE handler: record the keyed layer
+            // so buildTallyPayload includes it, and tell clients it changed.
+            const layer0 = result.dsk - 1;
+            const dskMap = dskLayersByProduction.get(productionId) ?? {};
+            dskLayersByProduction.set(productionId, { ...dskMap, [layer0]: result.enabled });
+            broadcast(productionId, { type: 'DSK_STATE', layer: layer0, visible: result.enabled });
           }
         } catch (err) {
           failedAt = i;
