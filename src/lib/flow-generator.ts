@@ -1043,7 +1043,10 @@ export async function activateStromFlow(
         // Per-production output directory: recorder writes
         // {media_path}/{output_dir}/{filename_prefix}_{timestamp}_%05d.{ext} (Strom recorder.rs). We key
         // it by production id so segments are trivially locatable + uploadable.
-        const outputDir = `recordings/${production._id}`;
+        // Each activation gets its own subdirectory: deactivate uploads every file
+        // under output_dir and nothing deletes them, so a shared directory would
+        // re-upload earlier activations' recordings.
+        const outputDir = `recordings/${production._id}/${randomUUID()}`;
         flow.blocks.push({
           id: blockId,
           block_definition_id: 'builtin.recorder',

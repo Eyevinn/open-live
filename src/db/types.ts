@@ -345,7 +345,7 @@ export interface ProductionOutputAssignment {
  * between upload and persist does not permanently hide an object (spec §Risks).
  */
 export interface RecordingDoc {
-  _id: string;            // "recording-<uuid>"
+  _id: string;            // "recording-<hash of bucket/key>"
   _rev?: string;
   type: 'recording';
   productionId: string;   // references ProductionDoc._id
@@ -619,6 +619,8 @@ export interface ProductionDoc {
   stromFlowId?: string;
   /** ID of the builtin.recorder block — set on activate when a 'recording' output is assigned, cleared on deactivate */
   recorderBlockId?: string;
+  /** Strom media directory this activation's recorder writes into — set on activate alongside recorderBlockId, cleared on deactivate */
+  recorderOutputDir?: string;
   /** WHEP multiview endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */
   whepEndpoint?: string;
   /** WHEP PGM output endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */

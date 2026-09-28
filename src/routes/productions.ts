@@ -1,5 +1,5 @@
 import type { FastifyBaseLogger, FastifyPluginAsync } from 'fastify';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { z } from 'zod';
 import { getDb, getOutputsDb, getRecordingsDb } from '../db/index.js';
 import { sweepGuestsOnProductionEnd } from '../services/guest-sweep.js';
@@ -190,6 +190,7 @@ function deactivatedDoc(
     audioMixerBlockId: undefined,
     loudnessMainBlockId: undefined,
     recorderBlockId: undefined,
+    recorderOutputDir: undefined,
     sourceOffsetBlockIds: undefined,
     sourceAudioOffsetBlockIds: undefined,
     clipPlayerBlockIds: undefined,
@@ -269,6 +270,14 @@ async function firstRecordingOutputId(
     }
   }
   return undefined;
+}
+
+/**
+ * RecordingDoc id for an uploaded object. Deterministic so that registering the
+ * same object again hits a CouchDB conflict rather than creating a duplicate.
+ */
+function recordingDocId(bucket: string, key: string): string {
+  return `recording-${createHash('sha256').update(`${bucket}/${key}`).digest('hex').slice(0, 32)}`;
 }
 
 /**
@@ -395,6 +404,7 @@ async function runActivationFlow(
       ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
       ...(loudnessMainBlockId !== undefined && { loudnessMainBlockId }),
       ...(activation.recorderBlockId !== undefined && { recorderBlockId: activation.recorderBlockId }),
+      ...(activation.recorderOutputDir !== undefined && { recorderOutputDir: activation.recorderOutputDir }),
       ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
       ...(Object.keys(activation.sourceAudioOffsetBlockIds).length > 0 && { sourceAudioOffsetBlockIds: activation.sourceAudioOffsetBlockIds }),
       ...(Object.keys(activation.clipPlayerBlockIds).length > 0 && { clipPlayerBlockIds: activation.clipPlayerBlockIds }),
@@ -1025,7 +1035,9 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
               strom,
               stromUrl: config.stromUrl,
               stromToken,
-              outputDir: `recordings/${doc._id}`,
+              // Productions activated before per-activation directories
+              // have no recorderOutputDir; their recorder used the shared one.
+              outputDir: doc.recorderOutputDir ?? `recordings/${doc._id}`,
               productionId: doc._id,
               target,
               // Guard (issue #366): re-check the production doc immediately
@@ -1056,7 +1068,10 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
             const finalizedAt = new Date().toISOString();
             for (const seg of uploadRes.uploaded) {
               try {
-                const recId = `recording-${randomUUID()}`;
+                // Derived from the object key so a retried deactivate
+                // (e.g. after a failed Strom teardown) conflicts instead of
+                // registering the same object twice.
+                const recId = recordingDocId(target.bucket, seg.key);
                 const recDoc: RecordingDoc = {
                   _id: recId,
                   type: 'recording',
@@ -1072,6 +1087,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
                 };
                 await getRecordingsDb().insert(recDoc);
               } catch (persistErr) {
+                if (isConflict(persistErr)) continue;
                 log.error({ persistErr, productionId: doc._id, key: seg.key }, 'RecordingDoc persist failed — object uploaded but unlisted');
               }
             }
