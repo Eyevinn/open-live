@@ -82,6 +82,12 @@ vi.mock('../lib/strom.js', async (importOriginal) => {
   };
 });
 
+const mockBroadcast = vi.fn();
+vi.mock('../services/tally.service.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../services/tally.service.js')>();
+  return { ...actual, broadcast: (...args: unknown[]) => mockBroadcast(...args) };
+});
+
 // Mock strom-token
 vi.mock('../lib/strom-token.js', () => ({
   getStromToken: vi.fn().mockResolvedValue('test-token'),
@@ -165,6 +171,36 @@ describe('POST /api/v1/productions/:id/activate', () => {
     const body = JSON.parse(res.body);
     expect(body.status).toBe('activating');
     expect(body.id).toBe('prod-test-1');
+  });
+
+  it('saves activation warnings, and sends each as an ERROR frame to the production', async () => {
+    const doc = makeProductionDoc();
+    mockGet.mockResolvedValue(doc);
+    mockInsert.mockResolvedValue({ rev: '2-bcd', ok: true, id: doc._id });
+    const warning = { type: 'recording-no-audio', message: 'Recording "VOD" has no sound' };
+    mockActivateStromFlow.mockResolvedValue({
+      flowId: 'flow-abc',
+      mixerBlockId: null,
+      audioMixerBlockId: null,
+      loudnessMainBlockId: null,
+      warnings: [warning],
+      sourceOffsetBlockIds: {},
+      sourceAudioOffsetBlockIds: {},
+      clipPlayerBlockIds: {},
+      returnBuses: [],
+      returnWhepEntries: [],
+    });
+    mockStromFlowsGet.mockResolvedValue({ flow: { id: 'flow-abc', state: 'idle' } });
+
+    const app = await buildServer();
+    await app.inject({ method: 'POST', url: '/api/v1/productions/prod-test-1/activate' });
+
+    await vi.waitFor(() => {
+      expect(mockBroadcast).toHaveBeenCalledWith('prod-test-1', { type: 'ERROR', error: warning.message });
+    });
+    const saved = mockInsert.mock.calls.map((c) => c[0] as Record<string, unknown>);
+    expect(saved.some((d) => d['stromFlowId'] === 'flow-abc' && (d['activationWarnings'] as unknown[])?.length === 1)).toBe(true);
+    await app.close();
   });
 
   it('returns 409 if production is already active', async () => {

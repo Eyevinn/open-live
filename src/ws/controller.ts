@@ -2952,6 +2952,15 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
         }));
       }
 
+      // Warnings from activation (e.g. a recording with no sound), re-sent on
+      // every connect while the production is live so a controller opened after
+      // activation still sees them. Studio shows ERROR frames as a toast.
+      if (connectDoc?.stromFlowId) {
+        for (const w of connectDoc.activationWarnings ?? []) {
+          socket.send(JSON.stringify({ type: 'ERROR', error: w.message }));
+        }
+      }
+
       // -----------------------------------------------------------------------
       // Clip state snapshot + reactive relay (epic #206, issues #278/#307).
       // For each clip source (a mixerInput present in clipPlayerBlockIds) send the
