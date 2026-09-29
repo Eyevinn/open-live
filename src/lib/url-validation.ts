@@ -97,7 +97,7 @@ function isPrivateIPv6(host: string): boolean {
  * Hostnames that resolve to loopback/link-local/internal addresses but are not
  * themselves IP literals, so `isPrivateHost()` cannot catch them.
  */
-const BLOCKED_HOSTNAMES = new Set([
+export const BLOCKED_HOSTNAMES = new Set([
   'localhost',
   'metadata.google.internal', // GCP metadata endpoint
 ]);
