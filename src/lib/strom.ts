@@ -560,9 +560,10 @@ export interface ExportGstLaunchResponse {
 export interface MediaEntry {
   name: string
   path: string
-  is_dir: boolean
+  is_directory: boolean
   size?: number
-  modified?: string
+  /** Last modified, UNIX epoch seconds (0 when unknown) */
+  modified?: number
 }
 
 export interface ListMediaResponse {
