@@ -5,6 +5,8 @@ import { deserializeClipReference } from './clip-reference.js';
 import { StromClient } from './strom.js';
 import { DEFAULT_FLOW, type FlowTopology } from './default-flow.js';
 import { decryptAddressPassphrase } from './srt-passphrase-crypto.js';
+import { decryptStreamKey } from './rtmp-credentials-crypto.js';
+import { composeRtmpUrl } from './rtmp.js';
 import { safeFlowProjection } from './log-redact.js';
 import { VIRTUAL_SOURCES, assignAudioChannels } from './audio-channels.js';
 import { assignReturnBuses, returnSendMatrix } from './return-feeds.js';
@@ -913,6 +915,30 @@ export async function activateStromFlow(
         }
         whepOutputEntries.push({ outputId: outputDoc._id, endpointId });
         outputBlockIndex++;
+      } else if (outputDoc.outputType === 'rtmp') {
+        // RTMP multi-destination (spec: rtmp-multi-destination.md, ADR-004).
+        // One builtin.rtmp_output per assigned rtmp output, wired from the
+        // program feed pad + main audio bus exactly like the SRT output. The
+        // stream key is decrypted and composed into rtmp_url ONLY here, at
+        // generation time — never persisted composed. Skip a destination with
+        // no key/ingestUrl (nothing to publish), mirroring the SRT no-url skip.
+        const rtmp = outputDoc.rtmp;
+        if (!rtmp || !rtmp.ingestUrl || !rtmp.streamKeyEnc) continue;
+        const rtmpUrl = composeRtmpUrl(rtmp.ingestUrl, decryptStreamKey(rtmp.streamKeyEnc));
+        flow.blocks.push({
+          id: blockId,
+          block_definition_id: 'builtin.rtmp_output',
+          name: outputDoc.name,
+          properties: {
+            // Composed key-bearing URL — NEVER logged (safeFlowProjection strips
+            // all block properties) and NEVER persisted (spec §Configuration).
+            rtmp_url: rtmpUrl,
+          },
+          position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
+        });
+        outputBlockIndex++;
+        if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
+        if (mainAudioSource) flow.links.push({ from: mainAudioSource, to: `${blockId}:audio_in_0` });
       } else {
         // mpegtssrt or efpsrt — both use the MPEG-TS/SRT output block.
         // Skip if no URL — an empty srt_uri fails at GStreamer READY state.

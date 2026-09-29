@@ -2,11 +2,13 @@ import type { FastifyPluginAsync } from 'fastify';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { getOutputsDb, getDb } from '../db/index.js';
-import type { OutputDoc, ProductionDoc, OutputStatus } from '../db/types.js';
+import type { OutputDoc, ProductionDoc, OutputStatus, RtmpDestination } from '../db/types.js';
 import { updateProductionDoc } from './productions.js';
 import { deriveOutputStatus } from '../lib/production-health.js';
 import { srtUrl } from '../lib/url-validation.js';
 import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
+import { encryptStreamKey } from '../lib/rtmp-credentials-crypto.js';
+import { resolveIngestUrl, validateStreamKey } from '../lib/rtmp.js';
 import { resolveSrtConnect } from '../lib/srt-connect.js';
 import { config, isRecordingEnabled } from '../config.js';
 import { getPortLease } from '../services/port-lease.js';
@@ -54,11 +56,55 @@ function outputStatusFor(outputId: string, live: Set<string> | null): OutputStat
   return deriveOutputStatus({ stromKnown: true, productionActive: isLive, flowRunning: isLive });
 }
 
+/**
+ * True if `outputId` is assigned to any active/activating production. Used to
+ * block a destructive mutation (delete, or an RTMP key/platform change) while a
+ * production is live — the composed rtmp_url is baked into the running flow at
+ * activation time and there is no live-inject primitive, so a change would not
+ * take effect until restart and must not silently diverge from what is on air
+ * (spec §Error codes 409, ADR-004 security condition 10).
+ */
+async function outputInActiveProduction(outputId: string): Promise<boolean> {
+  const allProds = await getDb().find({
+    selector: { type: 'production' },
+    fields: ['_id', 'status', 'outputAssignments'],
+    limit: 200,
+  });
+  return allProds.docs.some((p) => {
+    const prod = p as unknown as ProductionDoc;
+    return (prod.status === 'active' || prod.status === 'activating') &&
+      prod.outputAssignments?.some((a) => a.outputId === outputId);
+  });
+}
+
+// RTMP destination fields on create/patch. `streamKey` is write-only (accepted
+// here, never returned); `ingestUrl` is only honoured for the 'custom' platform
+// — named presets resolve their ingest URL server-side from the static table.
+const RtmpInput = z.object({
+  platform: z.enum(['youtube', 'twitch', 'facebook', 'custom']),
+  streamKey: z.string().optional(),
+  ingestUrl: z.string().optional(),
+});
+
 const OutputInput = z.object({
   name: z.string().min(1).max(256),
-  outputType: z.enum(['mpegtssrt', 'efpsrt', 'whep', 'recording']),
+  outputType: z.enum(['mpegtssrt', 'efpsrt', 'whep', 'recording', 'rtmp']),
   url: z.string().optional(),
+  rtmp: RtmpInput.optional(),
 }).superRefine((data, ctx) => {
+  const isRtmp = data.outputType === 'rtmp';
+  // `rtmp` must be present on an rtmp output and absent on every other type.
+  if (isRtmp && !data.rtmp) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['rtmp'], message: 'rtmp is required for an rtmp output' });
+  }
+  if (!isRtmp && data.rtmp) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['rtmp'], message: 'rtmp is only valid on an rtmp output' });
+  }
+  // `url` is an SRT-only field — reject it on an rtmp output so the key can
+  // never be smeared into a URL / the derived connect address.
+  if (isRtmp && data.url !== undefined) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['url'], message: 'url is not valid on an rtmp output' });
+  }
   if (SRT_OUTPUT_TYPES.has(data.outputType) && data.url) {
     try {
       srtUrl(data.url);
@@ -66,11 +112,31 @@ const OutputInput = z.object({
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['url'], message: err instanceof Error ? err.message : 'Invalid SRT URL' });
     }
   }
+  if (isRtmp && data.rtmp) {
+    // streamKey is required on create (non-empty, no control chars, no encv1:).
+    try {
+      validateStreamKey(data.rtmp.streamKey ?? '');
+    } catch (err) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['rtmp', 'streamKey'], message: err instanceof Error ? err.message : 'Invalid streamKey' });
+    }
+    // Resolve/validate the ingest URL (named preset → static table; custom →
+    // rtmp(s)-only, SSRF-checked operator URL).
+    try {
+      resolveIngestUrl(data.rtmp.platform, data.rtmp.ingestUrl);
+    } catch (err) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['rtmp', 'ingestUrl'], message: err instanceof Error ? err.message : 'Invalid ingestUrl' });
+    }
+  }
 });
 
 const OutputPatch = z.object({
   name: z.string().min(1).max(256).optional(),
   url: z.string().optional(),
+  rtmp: z.object({
+    platform: z.enum(['youtube', 'twitch', 'facebook', 'custom']).optional(),
+    streamKey: z.string().optional(),
+    ingestUrl: z.string().optional(),
+  }).optional(),
 });
 
 /** Masks passphrase values in SRT URIs so credentials are never returned to clients. */
@@ -79,8 +145,19 @@ function maskSrtPassphrase(url: string): string {
 }
 
 function toApi(doc: OutputDoc, status?: OutputStatus) {
-  const { _id, _rev, type, status: _persistedStatus, ...rest } = doc;
+  // Destructure `rtmp` out of the spread so the stored object (which holds
+  // `streamKeyEnc`) is NEVER echoed. We re-add an explicit, key-free projection
+  // below — the API only ever exposes platform, ingestUrl, and a streamKeySet
+  // boolean (ADR-004 security condition 1).
+  const { _id, _rev, type, status: _persistedStatus, rtmp, ...rest } = doc;
   const api: Record<string, unknown> = { id: _id, ...rest };
+  if (rtmp) {
+    api['rtmp'] = {
+      platform: rtmp.platform,
+      ingestUrl: rtmp.ingestUrl,
+      streamKeySet: !!rtmp.streamKeyEnc,
+    };
+  }
   // Passphrases are stored encrypted (encv1:...); decrypt before masking so the
   // mask matches on the "passphrase=" param regardless of storage form. Legacy
   // plaintext passphrases pass through decryption unchanged (issue #260).
@@ -132,8 +209,37 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
     if (body.outputType === 'recording' && !isRecordingEnabled()) {
       return reply.status(400).send({ error: 'Recording is disabled — MinIO/S3 is not configured', statusCode: 400 });
     }
-    const isSrt = SRT_OUTPUT_TYPES.has(body.outputType) && !!body.url;
     const id = `output-${randomUUID()}`;
+    // RTMP is an outbound connect to the platform — it leases NO SRT listener
+    // port (unlike the SRT-listener path below), so skip that branch entirely.
+    // The ingest URL is resolved server-side (named preset → static table; a
+    // 'custom' URL was scheme/SSRF-validated in the schema) and the stream key
+    // is encrypted at rest under RTMP_CREDENTIALS_KEY. `url` is never populated.
+    if (body.outputType === 'rtmp') {
+      const rtmpBody = body.rtmp!; // superRefine guarantees presence + valid key
+      const ingestUrl = resolveIngestUrl(rtmpBody.platform, rtmpBody.ingestUrl);
+      const now = new Date().toISOString();
+      const doc: OutputDoc = {
+        _id: id,
+        type: 'output',
+        name: body.name,
+        outputType: 'rtmp',
+        rtmp: {
+          platform: rtmpBody.platform,
+          ingestUrl,
+          // Encrypt the raw key before it touches CouchDB. Validation already
+          // rejected an `encv1:` prefix, so this always produces ciphertext
+          // (given a configured key) — a key beginning with `encv1:` can never
+          // be stored plaintext (ADR-004 security condition 4).
+          streamKeyEnc: encryptStreamKey(rtmpBody.streamKey!),
+        },
+        createdAt: now,
+        updatedAt: now,
+      };
+      await getOutputsDb().insert(doc);
+      return reply.status(201).send(toApi(doc));
+    }
+    const isSrt = SRT_OUTPUT_TYPES.has(body.outputType) && !!body.url;
     // A listener output binds a port on the shared Strom, like a listener source
     // does: same range, same uniqueness, same port-0 assignment, same re-check.
     let used = isSrt ? await usedListenerPorts() : [];
@@ -185,6 +291,59 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
     const body = OutputPatch.parse(req.body);
     try {
       const doc = await getOutputsDb().get(req.params.id);
+
+      // Separate the rtmp patch from the generic field spread so a plaintext
+      // streamKey is NEVER written straight onto the persisted doc.
+      const { rtmp: rtmpPatch, ...scalarPatch } = body;
+
+      // Field/type coherence: rtmp fields only on an rtmp output; url only off it.
+      if (rtmpPatch && doc.outputType !== 'rtmp') {
+        return reply.status(400).send({ error: 'rtmp is only valid on an rtmp output', statusCode: 400 });
+      }
+      if (doc.outputType === 'rtmp' && body.url !== undefined) {
+        return reply.status(400).send({ error: 'url is not valid on an rtmp output', statusCode: 400 });
+      }
+
+      // ---- RTMP patch: re-resolve ingestUrl, re-encrypt/clear/keep key ----
+      let rtmpDoc: RtmpDestination | undefined = doc.rtmp;
+      if (doc.outputType === 'rtmp' && rtmpPatch) {
+        const mutatesCredential =
+          rtmpPatch.platform !== undefined || rtmpPatch.streamKey !== undefined || rtmpPatch.ingestUrl !== undefined;
+        // Block key/platform mutation while the destination is live (409) — the
+        // composed rtmp_url is baked into the running flow at activation time and
+        // there is no live-inject primitive (ADR-004 security condition 10).
+        if (mutatesCredential && (await outputInActiveProduction(doc._id))) {
+          return reply.status(409).send({ error: 'Output is used in an active production', statusCode: 409 });
+        }
+        const current = doc.rtmp ?? { platform: 'custom' as const, ingestUrl: '' };
+        const platform = rtmpPatch.platform ?? current.platform;
+        // Re-resolve the ingest URL (named preset → static table; custom → the
+        // new or existing operator URL). 400 on unknown platform / bad custom URL.
+        let ingestUrl: string;
+        try {
+          const customUrl = rtmpPatch.ingestUrl ?? (current.platform === 'custom' ? current.ingestUrl : undefined);
+          ingestUrl = resolveIngestUrl(platform, customUrl);
+        } catch (err) {
+          return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid rtmp destination', statusCode: 400 });
+        }
+        // streamKey: omitted → keep stored ciphertext; "" → clear; else validate
+        // + re-encrypt (mirrors the SRT "leave URL as-is when patch omits it").
+        let streamKeyEnc = current.streamKeyEnc;
+        if (rtmpPatch.streamKey !== undefined) {
+          if (rtmpPatch.streamKey === '') {
+            streamKeyEnc = undefined;
+          } else {
+            try {
+              validateStreamKey(rtmpPatch.streamKey);
+            } catch (err) {
+              return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid streamKey', statusCode: 400 });
+            }
+            streamKeyEnc = encryptStreamKey(rtmpPatch.streamKey);
+          }
+        }
+        rtmpDoc = { platform, ingestUrl, ...(streamKeyEnc !== undefined ? { streamKeyEnc } : {}) };
+      }
+
       // Validate the effective URL if output type is SRT-based. Validate against
       // the plaintext form — a new body.url is already plaintext, while the
       // stored doc.url may hold an encrypted passphrase.
@@ -213,7 +372,12 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       const urlPatch = body.url !== undefined
         ? { url: encryptAddressPassphrase(body.url) }
         : {};
-      const updated: OutputDoc = { ...doc, ...body, ...urlPatch, updatedAt: new Date().toISOString() };
+      // Spread only the scalar patch (name/url) — never the raw rtmp patch, which
+      // would smear a plaintext streamKey onto the doc. The rtmp object is
+      // rebuilt above (ciphertext only) and replaces the stored one wholesale so
+      // a cleared key does not linger.
+      const rtmpUpdate = doc.outputType === 'rtmp' ? { rtmp: rtmpDoc } : {};
+      const updated: OutputDoc = { ...doc, ...scalarPatch, ...urlPatch, ...rtmpUpdate, updatedAt: new Date().toISOString() };
       await getOutputsDb().insert(updated);
       return reply.send(toApi(updated));
     } catch (err: unknown) {
