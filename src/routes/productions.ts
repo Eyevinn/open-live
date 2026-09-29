@@ -869,6 +869,25 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
                 outputDir: `recordings/${doc._id}`,
                 productionId: doc._id,
                 target,
+                // Guard (issue #366): re-check the production doc immediately
+                // before uploadRecordings' delete-after-upload pass. Nothing
+                // else in this handler writes to the production doc before its
+                // own final status update below, which runs after this block —
+                // so `doc._rev` cannot legitimately change between the read at
+                // the top of this handler and here. A different _rev means
+                // something else (most plausibly a reactivation) touched the
+                // doc while the upload was in flight; treat the activation as
+                // still live and skip deletion rather than risk deleting
+                // recordings it still needs.
+                isStillRecording: async () => {
+                  try {
+                    const current = await getDb().get(doc._id);
+                    return current._rev !== doc._rev;
+                  } catch {
+                    // Doc gone entirely — nothing left to protect.
+                    return false;
+                  }
+                },
               });
               // Persist one RecordingDoc per uploaded object so #42's listing/
               // playback endpoint can enumerate and presign recordings without
