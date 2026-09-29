@@ -677,6 +677,20 @@ export type FlowEvent =
   // the clip-relay converts ns -> ms for the CLIP_STATE contract.
   | { type: 'MediaPlayerStateChanged'; data: { flow_id: string; block_id: string; state: 'playing' | 'paused' | 'stopped'; current_file?: string | null } }
   | { type: 'MediaPlayerPosition'; data: { flow_id: string; block_id: string; position_ns: number; duration_ns?: number; current_file_index?: number; total_files?: number } }
+  // Strom pushes a `PipelineError` when an element in the running pipeline fails
+  // (e.g. an appsink/appsrc negotiation failure on a clip's decode branch). The
+  // media_player block can keep reporting `playing` while its branch is dead and
+  // no picture reaches the mixer, so open-live consumes this to flip the owning
+  // clip to `CLIP_STATE` error (issue #360). Same `#[serde(tag="type",
+  // content="data")]` envelope as the media-player events. `source` is the id of
+  // the failing element, qualified by its pad (e.g.
+  // `b-clip-0-<suffix>:appsrc_video`), which the clip-relay matches back to a
+  // clip player block id; `error` is the human-readable GStreamer message.
+  // `flow_id` is filtered when present but not required to route (the source id
+  // is already flow-unique). Shape per issue #360 — the Strom companion change
+  // that emits it is not yet merged, so field names follow the issue, not a
+  // verified `events.rs` variant.
+  | { type: 'PipelineError'; data: { flow_id?: string; source: string; error: string } }
   | { type: 'ping' }
 
 // ---------------------------------------------------------------------------
