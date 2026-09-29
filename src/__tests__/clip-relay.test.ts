@@ -54,7 +54,7 @@ function pushRawFrame(json: string): void {
   handler(Buffer.from(json));
 }
 
-const { applyReactiveState, applyReactivePosition, startClipRelay, forceStopClipRelay } = await import('../services/clip-relay.js');
+const { applyReactiveState, applyReactivePosition, applyReactiveError, startClipRelay, forceStopClipRelay } = await import('../services/clip-relay.js');
 const { setClipStateEntry, getClipStateEntry, clearClipState, markClipPlayPending, isClipPlayPending } = await import('../services/clip-state.service.js');
 
 const PROD = 'prod-relay-01';
@@ -123,6 +123,35 @@ describe('reactive MediaPlayerStateChanged mapping', () => {
     expect(clipStates().at(-1)).toMatchObject({ state: 'playing' });
     // The flag is single-use: a subsequent cue's goto edge must not sneak through.
     expect(isClipPlayPending(PROD, INPUT)).toBe(false);
+  });
+});
+
+// Issue #360: a Strom PipelineError on a clip's decode branch must flip the clip
+// to CLIP_STATE error, and a subsequent raw `playing` push (the media_player
+// block can keep reporting playing after its branch dies) must never read back
+// as PLAYING in Studio.
+describe('reactive PipelineError mapping', () => {
+  it('flips a playing clip to error and preserves clipId/duration', () => {
+    setClipStateEntry(PROD, { mixerInput: INPUT, state: 'playing', clipId: 'c1', durationMs: 8000, positionMs: 1200 });
+    applyReactiveError(PROD, INPUT, 'appsrc_video: negotiation failed');
+    expect(clipStates().at(-1)).toMatchObject({
+      type: 'CLIP_STATE',
+      mixerInput: INPUT,
+      state: 'error',
+      error: 'appsrc_video: negotiation failed',
+      clipId: 'c1',
+      durationMs: 8000,
+    });
+    expect(getClipStateEntry(PROD, INPUT)?.state).toBe('error');
+  });
+
+  it('does NOT let a later raw playing push resurrect an errored (dead) branch', () => {
+    setClipStateEntry(PROD, { mixerInput: INPUT, state: 'playing', clipId: 'c1' });
+    applyReactiveError(PROD, INPUT, 'queue_video: internal data stream error');
+    markClipPlayPending(PROD, INPUT); // even a play-pending playing push is refused
+    applyReactiveState(PROD, INPUT, 'playing', 3000);
+    expect(getClipStateEntry(PROD, INPUT)?.state).toBe('error');
+    expect(clipStates().at(-1)).toMatchObject({ state: 'error' });
   });
 });
 
@@ -196,6 +225,28 @@ describe('raw Strom frame through connectWebSocket -> clip-relay', () => {
     }));
     expect(clipStates()).toHaveLength(0);
     expect(getClipStateEntry(PROD, INPUT)?.state).toBe('cued');
+  });
+
+  it('routes a PipelineError whose source is a clip block pad to CLIP_STATE error (issue #360)', async () => {
+    setClipStateEntry(PROD, { mixerInput: INPUT, state: 'playing', clipId: 'c1' });
+    await startRelay();
+    pushRawFrame(JSON.stringify({
+      type: 'PipelineError',
+      data: { flow_id: FLOW, source: `${BLOCK}:appsrc_video`, error: 'negotiation failed' },
+    }));
+    expect(clipStates().at(-1)).toMatchObject({ type: 'CLIP_STATE', mixerInput: INPUT, state: 'error', error: 'negotiation failed' });
+    expect(getClipStateEntry(PROD, INPUT)?.state).toBe('error');
+  });
+
+  it('ignores a PipelineError whose source is not a known clip block', async () => {
+    setClipStateEntry(PROD, { mixerInput: INPUT, state: 'playing', clipId: 'c1' });
+    await startRelay();
+    pushRawFrame(JSON.stringify({
+      type: 'PipelineError',
+      data: { flow_id: FLOW, source: 'b-mixer-main:sink', error: 'unrelated failure' },
+    }));
+    expect(getClipStateEntry(PROD, INPUT)?.state).toBe('playing');
+    expect(clipStates()).toHaveLength(0);
   });
 
   it('converts MediaPlayerPosition position_ns (ns) to positionMs (ms) while playing', async () => {
