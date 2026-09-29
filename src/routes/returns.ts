@@ -1,6 +1,6 @@
 import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { getDb, getGuestInvitesDb } from '../db/index.js';
+import { getDb, getGuestInvitesDb, getGuestSessionsDb } from '../db/index.js';
 import type { GuestInviteDoc, ProductionDoc } from '../db/types.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { assertSameStromOrigin } from '../lib/url-validation.js';
@@ -148,12 +148,30 @@ const returnsRoutes: FastifyPluginAsync = async (fastify) => {
       // Scope teardown back through THIS route's session subpath (not a raw target
       // param) so a guest cannot tear down another endpoint (spec §Scoping).
       const stromLocation = upstream.headers.get('Location');
+      let sessionId = '';
       if (stromLocation) {
-        const sessionId = stromLocation.split('/').pop() ?? '';
+        sessionId = stromLocation.split('/').pop() ?? '';
         reply.header(
           'Location',
           `/api/v1/productions/${doc._id}/returns/${encodeURIComponent(req.params.mixerInput)}/picture/whep/${encodeURIComponent(sessionId)}`,
         );
+      }
+      // Bind this WHEP session id to the guest's live session (issue #380) so
+      // the matching DELETE can verify a guest caller only tears down their
+      // OWN return session — never another guest's :sessionId. Best-effort: a
+      // persist failure here does not fail the (already-established) upstream
+      // session; the guest just fails closed on their next DELETE instead of
+      // silently trusting an unbound id (see the DELETE handler below).
+      if (req.guestScope && sessionId) {
+        try {
+          await getGuestSessionsDb().insert({
+            ...req.guestScope.session,
+            returnWhepSessionId: sessionId,
+            updatedAt: new Date().toISOString(),
+          });
+        } catch (err) {
+          fastify.log.warn({ err }, 'return picture WHEP: guest session-id bind failed');
+        }
       }
       reply.header('Content-Type', 'application/sdp');
       return reply.status(201).send(answerSdp);
@@ -163,6 +181,15 @@ const returnsRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.delete<{ Params: { id: string; mixerInput: string; sessionId: string } }>(
     '/api/v1/productions/:id/returns/:mixerInput/picture/whep/:sessionId',
     async (req, reply) => {
+      // Guest callers may only tear down the WHEP session bound to THEIR OWN
+      // live session (issue #380) — the crew/API_KEY path below (unbound,
+      // origin + :sessionId) is unchanged and still available to full-access
+      // callers, who are trusted operators scoped by the shared API_KEY.
+      if (req.guestScope) {
+        if (req.guestScope.session.returnWhepSessionId !== req.params.sessionId) {
+          return reply.status(403).send({ error: 'Session does not belong to this guest', statusCode: 403 });
+        }
+      }
       let doc: ProductionDoc;
       try {
         doc = await getDb().get(req.params.id);

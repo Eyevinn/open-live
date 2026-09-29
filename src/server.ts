@@ -7,8 +7,14 @@ import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
 import { timingSafeEqual } from 'crypto';
 import { ZodError } from 'zod';
-import { config } from './config.js';
+import { config, isGuestCallingEnabled } from './config.js';
 import { isExposableError } from './lib/config-error.js';
+import {
+  isGuestEligibleWhipReturnPath,
+  looksLikeGuestToken,
+  resolveGuestScope,
+  type ResolvedGuestScope,
+} from './lib/guest-scope.js';
 import { isDbConnected } from './db/index.js';
 import healthRoutes from './routes/health.js';
 import statusRoutes from './routes/status.js';
@@ -32,6 +38,20 @@ import guestsRoutes from './routes/guests.js';
 import returnsRoutes from './routes/returns.js';
 import controllerWs from './ws/controller.js';
 import gatewayHeartbeatWs from './ws/gateway-heartbeat.js';
+
+/**
+ * Set by the shared-key onRequest gate below when a request on a guest-eligible
+ * WHIP/return-picture path (issue #380) authenticates as a scoped guest invite
+ * rather than the shared API_KEY. Route handlers (`whip.ts`, `returns.ts`) use
+ * its presence to know the caller is guest-scoped — not full-access crew — and
+ * apply the extra session-ownership checks that guest callers need (binding
+ * `?session=` / `:sessionId` to their own resource) that crew callers do not.
+ */
+declare module 'fastify' {
+  interface FastifyRequest {
+    guestScope?: ResolvedGuestScope;
+  }
+}
 
 // Routes exempt from the DB-availability guard (don't touch the DB).
 // /api/v1/auth/token performs a SAT exchange and never touches CouchDB, so it
@@ -386,9 +406,40 @@ export async function buildServer() {
 
       const a = Buffer.from(provided ?? '');
       const b = Buffer.from(apiKey);
-      if (a.length !== b.length || !timingSafeEqual(a, b)) {
-        return reply.status(401).send({ error: 'Unauthorized', statusCode: 401 });
+      const isApiKey = a.length === b.length && timingSafeEqual(a, b);
+      if (isApiKey) return; // crew / OSC upstream — full access, any mixerInput, unchanged.
+
+      // Guest invite token on the two guest-eligible WHIP/return-picture route
+      // families (issue #380). This branch is mutually exclusive with the
+      // API_KEY branch above and must never fall through to shared-key
+      // semantics: it either fully authorizes the request (scoped to the
+      // guest's own production + mixerInput) or replies 401/403 itself. A
+      // caller that is neither a valid API_KEY nor an eligible guest token
+      // still falls through to the default 401 below — this predicate must
+      // never be widened to routes beyond the two families in guest-scope.ts.
+      if (
+        isGuestCallingEnabled() &&
+        provided &&
+        looksLikeGuestToken(provided) &&
+        isGuestEligibleWhipReturnPath(path)
+      ) {
+        // Routing resolves before onRequest fires (Fastify life cycle), so
+        // req.params is already populated here.
+        const params = req.params as { id?: string; mixerInput?: string };
+        const productionId = params.id;
+        const mixerInput = params.mixerInput;
+        if (!productionId || !mixerInput) {
+          return reply.status(401).send({ error: 'Unauthorized', statusCode: 401 });
+        }
+        const scope = await resolveGuestScope(provided, productionId, mixerInput);
+        if (!scope.ok) {
+          return reply.status(scope.status).send({ error: scope.error, statusCode: scope.status });
+        }
+        req.guestScope = scope;
+        return;
       }
+
+      return reply.status(401).send({ error: 'Unauthorized', statusCode: 401 });
     });
   }
 
