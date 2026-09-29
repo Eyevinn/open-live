@@ -34,14 +34,20 @@ affected.
   (`POST .../assign`), so they are not reclaimed under a running pipeline if
   this instance dies without releasing. Best effort — the reservation is what
   actually holds the ports.
-- **If Strom hands out no ports**, the server logs one warning, stops enforcing
-  ports, and re-checks every 10 minutes. Two answers mean this:
-  - `409` **and** `GET /api/ports` reporting `enabled: false` — Strom has the
-    routes but no pool configured. The fix is `STROM_PORTS` on Strom, no
-    upgrade needed. (A `409` with a pool that *is* enabled means the pool is
-    full instead, and the server keeps retrying.)
+- **If Strom hands out no ports**, the server logs one warning and stops
+  enforcing ports. Two answers mean this:
+  - `503` **and** `GET /api/ports` reporting `enabled: false` — Strom has the
+    routes but no pool configured. Reservation is switched off (`disabled`)
+    for the life of the process, as if `STROM_PORT_LEASE_DISABLED` were set,
+    and the same happens if the pool disappears under a held reservation. The
+    fix is `STROM_PORTS` on Strom and a restart here, no upgrade needed. (A
+    `503` with a pool that *is* enabled, or with no answer from
+    `GET /api/ports`, is treated as a proxy in front of a Strom that is briefly
+    down, and retried. A `409` always means the pool is full, and the server
+    keeps retrying.)
   - `404` — nothing serves the pool routes at `STROM_URL` at all: a Strom older
-    than the feature, or a proxy in front of one.
+    than the feature, or a proxy in front of one. The state is `unsupported`
+    and the server re-checks every 10 minutes.
 
 ## Ports inside the range
 
@@ -79,8 +85,8 @@ sources they register:
 |---|---|---|
 | `reserved` | Ports held; `srtPorts` lists them | Must use one of them, otherwise `422` |
 | `pending` | Not held yet (Strom unreachable or pool full) | Rejected with `503` until they are |
-| `unsupported` | Strom hands out no ports: no pool configured, or no pool routes | Accepted, not checked |
-| `disabled` | `STROM_PORT_LEASE_DISABLED=true` | Accepted, not checked |
+| `unsupported` | Strom has no pool routes, or kept failing; re-checked every 10 min | Accepted, not checked |
+| `disabled` | `STROM_PORT_LEASE_DISABLED=true`, or Strom has no pool configured | Accepted, not checked |
 
 `POST`/`PATCH` on `/api/v1/sources` and `/api/v1/outputs` apply the checks when
 the address or URL is a hostless SRT listener. A `422` names the ports this instance holds,
@@ -102,7 +108,7 @@ a `409` names the source or output that already holds the port.
 - `GET /api/ports` on Strom answers whether it hands out ports and how much of
   its pool is free, whether or not a pool is configured — the quickest way to
   tell "Strom will never hand out ports" from "Strom is briefly unreachable",
-  and what the server itself uses to tell the two meanings of `409` apart.
+  and what the server itself uses to tell the two meanings of `503` apart.
 - Size the reservation for the number of listener sources the instance will have
   active at once; the pool on Strom is shared, so do not over-allocate.
 - If the server logs that Strom has no free ports left,

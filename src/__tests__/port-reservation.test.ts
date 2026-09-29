@@ -14,6 +14,7 @@ import {
   parseListenerPort,
   isPortReserved,
   getPortReservation,
+  reservedPorts,
   tickPortReservation,
   stopPortReservation,
   _setStromClientFactory,
@@ -128,9 +129,9 @@ describe('port reservation service', () => {
     acquire.mockReset();
     renew.mockReset();
     release.mockReset();
-    // Strom answers 409 both for "no pool configured" and "pool full", so the
-    // service asks the pool endpoint to tell them apart. Default to a
-    // configured pool; the tests that care override it.
+    // Strom answers 503 for "no pool configured", and so does a proxy whose
+    // Strom is down, so the service asks the pool endpoint to tell them apart.
+    // Default to a configured pool; the tests that care override it.
     pool.mockReset();
     pool.mockResolvedValue({ enabled: true, ports: [], total: 0, free: 0, entries: [] });
     log = makeLog();
@@ -282,31 +283,37 @@ describe('port reservation service', () => {
     expect(log.warn).toHaveBeenCalledTimes(1);
   });
 
-  it('marks a Strom with no port pool configured as unsupported, and says so', async () => {
-    // Strom answers 409 both for "no pool configured" and "pool full", so the
-    // status alone cannot decide; the pool endpoint does. It must not be
-    // treated as a transient failure: retrying every minute would never
-    // succeed, and `pending` blocks every listener write.
+  it('disables reservation on a Strom with no port pool configured, and says so', async () => {
+    // Strom answers 503 with the pool reporting itself disabled. It must not
+    // be treated as a transient failure: retrying every minute would never
+    // succeed, and `pending` blocks every listener write — so this has to land
+    // on the first tick, not after MAX_ACQUIRE_FAILURES.
     pool.mockResolvedValue({ enabled: false, ports: [], total: 0, free: 0, entries: [] });
     acquire.mockRejectedValue(
-      new StromClientError(409, 'no port pool is configured on this Strom; set ports.ports or STROM_PORTS'),
+      new StromClientError(503, 'no port pool is configured on this Strom; set ports.ports or STROM_PORTS'),
     );
     await tickPortReservation(log);
-    expect(getPortReservation()).toEqual({ status: 'unsupported' });
+    expect(getPortReservation()).toEqual({ status: 'disabled' });
     expect(acquire).toHaveBeenCalledTimes(1);
     expect(log.warn).toHaveBeenCalledTimes(1);
     // The warning has to name the setting; a 501 and a 404 need different fixes.
     const [, message] = (log.warn as unknown as { mock: { calls: unknown[][] } }).mock.calls[0]!;
     expect(message).toContain('STROM_PORTS');
 
-    // Still inside the back-off, so no further calls.
-    await tickPortReservation(log);
-    expect(acquire).toHaveBeenCalledTimes(1);
+    // Disabled for good: later ticks, even well past the back-off, never ask again.
+    vi.useFakeTimers();
+    try {
+      vi.advanceTimersByTime(60 * 60 * 1000);
+      await tickPortReservation(log);
+      expect(acquire).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('keeps retrying when the pool exists but has nothing free', async () => {
-    // The other meaning of 409. An operator can grow the pool, or another
-    // owner can give ports back, so this must stay `pending` and retry rather
+    // 409 only ever means the pool is full. An operator can grow the pool, or
+    // another owner can give ports back, so this must stay `pending` and retry rather
     // than switching enforcement off.
     pool.mockResolvedValue({ enabled: true, ports: [], total: 10, free: 0, entries: [] });
     acquire.mockRejectedValue(new StromClientError(409, 'only 0 ports free in the pool, 10 requested'));
@@ -316,31 +323,35 @@ describe('port reservation service', () => {
     expect(acquire).toHaveBeenCalledTimes(2);
   });
 
-  it('drops the restriction when the pool is taken away under a live reservation', async () => {
+  it('does not probe the pool on a 409', async () => {
+    // 409 no longer doubles as "no pool configured", so there is nothing to
+    // disambiguate — even a pool reporting itself disabled must not switch
+    // enforcement off here.
+    pool.mockResolvedValue({ enabled: false, ports: [], total: 0, free: 0, entries: [] });
+    acquire.mockRejectedValue(new StromClientError(409, 'only 0 ports free in the pool, 10 requested'));
+    await tickPortReservation(log);
+    expect(getPortReservation()).toEqual({ status: 'pending' });
+    expect(pool).not.toHaveBeenCalled();
+  });
+
+  it('disables reservation when the pool is taken away under a live reservation', async () => {
     acquire.mockResolvedValueOnce(RESERVATION);
     await tickPortReservation(log);
     expect(getPortReservation()).toEqual({ status: 'reserved', reservation: RESERVATION });
 
-    // A 409 on renew against a pool that reports itself disabled is not "this
+    // A 503 on renew against a pool that reports itself disabled is not "this
     // reservation is gone" (that is 404) — the pool itself is gone, so
-    // re-reserving would 409 forever.
+    // re-reserving would 503 forever.
     pool.mockResolvedValue({ enabled: false, ports: [], total: 0, free: 0, entries: [] });
-    renew.mockRejectedValueOnce(new StromClientError(409, 'no port pool is configured on this Strom'));
+    renew.mockRejectedValueOnce(new StromClientError(503, 'no port pool is configured on this Strom'));
     await tickPortReservation(log);
-    expect(getPortReservation()).toEqual({ status: 'unsupported' });
-    expect(acquire).toHaveBeenCalledTimes(1);
+    expect(getPortReservation()).toEqual({ status: 'disabled' });
+    expect(reservedPorts()).toEqual([]);
 
-    // And the 10-minute re-probe picks the range back up once a pool returns.
-    vi.useFakeTimers();
-    try {
-      vi.advanceTimersByTime(10 * 60 * 1000 + 1);
-      pool.mockResolvedValue({ enabled: true, ports: [], total: 10, free: 10, entries: [] });
-      acquire.mockResolvedValueOnce(RESERVATION);
-      await tickPortReservation(log);
-      expect(getPortReservation()).toEqual({ status: 'reserved', reservation: RESERVATION });
-    } finally {
-      vi.useRealTimers();
-    }
+    // Disabled, so later ticks neither renew nor re-reserve.
+    await tickPortReservation(log);
+    expect(renew).toHaveBeenCalledTimes(1);
+    expect(acquire).toHaveBeenCalledTimes(1);
   });
 
   it('treats any 404 on create as unsupported, whatever the body says', async () => {

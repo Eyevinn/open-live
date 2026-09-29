@@ -851,9 +851,9 @@ export class StromClient {
   ports = {
     /**
      * Answers whether this Strom hands out ports at all, and how much of its
-     * pool is free — on an unconfigured server too, which is what lets a 409
-     * from `reservations.create` be told apart: no pool at all, or a pool with
-     * nothing left in it.
+     * pool is free — on an unconfigured server too, which is what lets a 503
+     * from the reservation routes be told apart: no pool at all, or a proxy
+     * whose Strom is briefly down.
      */
     pool: () => this.get<PortPoolStatus>('/api/ports'),
     reservations: {

@@ -960,9 +960,10 @@ paths:
                     description: >-
                       State of this instance's port reservation. `pending` — not held yet,
                       listener sources are rejected with 503 until they are; `unsupported` —
-                      Strom hands out no ports (no pool configured, or no port pool API at
-                      all), ports are not enforced; `disabled` — turned off via
-                      STROM_PORT_LEASE_DISABLED.
+                      Strom has no port pool API, or reserving kept failing; ports are not
+                      enforced and Strom is re-checked every 10 min; `disabled` — turned off
+                      via STROM_PORT_LEASE_DISABLED, or Strom has no port pool configured;
+                      ports are not enforced.
 
   /api/v1/reconnect:
     post:

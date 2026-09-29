@@ -10,9 +10,10 @@
  * holds, so a restart keeps the numbers gateways are configured to dial.
  *
  * Strom hands out ports only once an operator configures a pool. A Strom that
- * will not is detected and left alone, with a low-frequency retry, since both
- * reasons for it are things an operator can change underneath us: no pool
- * configured, or a Strom too old to have the routes at all.
+ * says it has none switches reservation off for this process, as if
+ * STROM_PORT_LEASE_DISABLED were set. A Strom too old to have the routes at
+ * all is left alone with a low-frequency retry, since an upgrade can land
+ * underneath us.
  */
 
 import os from 'os';
@@ -130,15 +131,21 @@ function isNotFound(err: unknown): boolean {
   return err instanceof StromClientError && err.status === 404;
 }
 
-/**
- * A 409 from the pool routes. Strom uses it for two different things — no pool
- * configured, and a pool with nothing free — which need opposite reactions:
- * the first should stop enforcing, the second should keep retrying. The status
- * alone cannot tell them apart, so `GET /api/ports` is asked; it answers on an
- * unconfigured server too, which is the whole reason it exists.
- */
+/** A 409 from the pool routes: the pool exists but cannot fit the request. */
 function isConflict(err: unknown): boolean {
   return err instanceof StromClientError && err.status === 409;
+}
+
+/**
+ * A 503 from the pool routes. Strom uses it for "no pool configured", but a
+ * proxy in front of Strom answers 503 too when Strom is briefly down, and those
+ * need opposite reactions: the first should switch reservation off, the second
+ * should keep retrying. The status alone cannot tell them apart, so `GET /api/ports`
+ * is asked; it answers on an unconfigured server too, which is the whole reason
+ * it exists.
+ */
+function isUnavailable(err: unknown): boolean {
+  return err instanceof StromClientError && err.status === 503;
 }
 
 /** Whether Strom says it has no pool at all. Unreachable counts as "cannot tell". */
@@ -148,6 +155,14 @@ async function poolIsUnconfigured(client: PortReservationClient): Promise<boolea
   } catch {
     return false;
   }
+}
+
+/** Strom has no pool: switch reservation off for the life of this process. */
+function disableForUnconfiguredPool(log: FastifyBaseLogger, message: string, fields: object): void {
+  log.warn(fields, message);
+  state = { status: 'disabled' };
+  unsupportedSince = null;
+  consecutiveAcquireFailures = 0;
 }
 
 function fallBackToUnsupported(log: FastifyBaseLogger, message: string, fields: object): void {
@@ -185,10 +200,10 @@ async function acquire(log: FastifyBaseLogger): Promise<void> {
       );
       return;
     }
-    if (isConflict(err) && client && (await poolIsUnconfigured(client))) {
-      fallBackToUnsupported(
+    if (isUnavailable(err) && client && (await poolIsUnconfigured(client))) {
+      disableForUnconfiguredPool(
         log,
-        '[ports] Strom has no port pool configured — listener ports are not enforced. Set STROM_PORTS on Strom if several Open Live instances share it. Will re-check every 10 min',
+        '[ports] Strom has no port pool configured — SRT port reservation disabled, listener ports are not enforced. Set STROM_PORTS on Strom if several Open Live instances share it, then restart',
         { ownerId },
       );
       return;
@@ -205,7 +220,7 @@ async function acquire(log: FastifyBaseLogger): Promise<void> {
     }
     // Anything else is ambiguous: a proxy 502/503, a gateway 405, a 401/403, a
     // timeout, DNS, or a client-construction error. Unlike a clean 404 or a
-    // 409 with a disabled pool it does not prove this Strom will not reserve,
+    // 503 with a disabled pool it does not prove this Strom will not reserve,
     // so we do not switch the restriction off on the first try. But `pending`
     // blocks all listener writes, so it must not persist indefinitely (#294):
     // after MAX_ACQUIRE_FAILURES consecutive inconclusive failures, fall back
@@ -238,13 +253,12 @@ async function renew(log: FastifyBaseLogger, current: PortReservation): Promise<
     state = { status: 'reserved', reservation };
     log.debug({ reservationId: reservation.id, expiresAt: reservation.expires_at }, '[ports] Renewed SRT port reservation');
   } catch (err) {
-    if (isConflict(err) && client && (await poolIsUnconfigured(client))) {
-      // The pool was taken away under us. Re-reserving would 409 on every
-      // tick, so stop enforcing and let the 10-minute re-probe pick the ports
-      // back up once a pool returns.
-      fallBackToUnsupported(
+    if (isUnavailable(err) && client && (await poolIsUnconfigured(client))) {
+      // The pool was taken away under us. Re-reserving would 503 on every
+      // tick, so switch reservation off, same as on boot.
+      disableForUnconfiguredPool(
         log,
-        '[ports] Strom no longer has a port pool configured — listener ports are no longer enforced. Will re-check every 10 min',
+        '[ports] Strom no longer has a port pool configured — SRT port reservation disabled, listener ports are no longer enforced. Restart once a pool is configured',
         { reservationId: current.id },
       );
       return;
