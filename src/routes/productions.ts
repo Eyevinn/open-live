@@ -516,7 +516,14 @@ async function runActivationFlow(
 
     notifyProductionDeactivated(productionId);
   } finally {
-    activationAbortControllers.delete(productionId);
+    // Only remove the entry if it still points to *this* run's controller.
+    // A slow aborted run can otherwise finish after a newer activation has
+    // registered its own controller and delete that entry, leaving the newer
+    // run uncancellable — deactivate finds nothing to abort and the run writes
+    // status 'active' over the deactivated doc (see #371).
+    if (activationAbortControllers.get(productionId)?.signal === signal) {
+      activationAbortControllers.delete(productionId);
+    }
   }
 }
 

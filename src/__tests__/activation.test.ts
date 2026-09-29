@@ -109,6 +109,33 @@ function makeProductionDoc(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/** A promise whose resolution we control, to park an async run mid-flight. */
+function makeDeferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/** Minimal shape returned by activateStromFlow, enough to drive runActivationFlow. */
+function makeActivationResult(flowId: string, mixerBlockId: string) {
+  return {
+    flowId,
+    mixerBlockId,
+    audioMixerBlockId: undefined,
+    loudnessMainBlockId: undefined,
+    recorderBlockId: undefined,
+    whepOutputEntries: [],
+    pgmWhepEndpointId: undefined,
+    sourceOffsetBlockIds: {},
+    sourceAudioOffsetBlockIds: {},
+    clipPlayerBlockIds: {},
+    returnBuses: [],
+    returnWhepEntries: [],
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Tests: POST /api/v1/productions/:id/activate
 // ---------------------------------------------------------------------------
@@ -266,6 +293,81 @@ describe('POST /api/v1/productions/:id/deactivate', () => {
     });
 
     expect(res.statusCode).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: activate → deactivate → activate → deactivate abort race (#371)
+// ---------------------------------------------------------------------------
+
+describe('activate → deactivate → activate → deactivate abort-controller race (issue #371)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockFind.mockResolvedValue({ docs: [] });
+  });
+
+  it('a slow aborted first run must not delete the second run\'s abort controller', async () => {
+    // Stateful doc store so status transitions written by one route are seen by
+    // the next (both routes and updateProductionDoc go through get + insert).
+    let currentDoc: Record<string, unknown> = makeProductionDoc();
+    mockGet.mockImplementation(async () => ({ ...currentDoc }));
+    mockInsert.mockImplementation(async (d: Record<string, unknown>) => {
+      currentDoc = { ...d };
+      return { rev: `rev-${Date.now()}`, ok: true, id: d._id as string };
+    });
+
+    // Both activation runs park at `await activateStromFlow(...)` until we
+    // resolve their deferreds — this lets us interleave the routes precisely so
+    // the FIRST (aborted) run's `finally` fires only after the SECOND run has
+    // registered its own controller.
+    const firstRun = makeDeferred<ReturnType<typeof makeActivationResult>>();
+    const secondRun = makeDeferred<ReturnType<typeof makeActivationResult>>();
+    mockActivateStromFlow
+      .mockReturnValueOnce(firstRun.promise)
+      .mockReturnValueOnce(secondRun.promise);
+    mockDeactivateStromFlow.mockResolvedValue(undefined);
+    // If the second run is (wrongly) left un-aborted, it polls a running flow and
+    // writes status 'active' — exactly the bug this guard prevents.
+    mockStromFlowsGet.mockResolvedValue({ flow: { id: 'flow-2', running: true, blocks: [] } });
+    mockStromMixerMultiviewEndpoint.mockResolvedValue({ endpoint: '/whep/flow-2/mixer-2' });
+
+    const app = await buildServer();
+    const flush = async (n = 6) => {
+      for (let i = 0; i < n; i++) await new Promise((r) => setTimeout(r, 0));
+    };
+
+    // 1) First activation — parks at activateStromFlow with controller #1 registered.
+    const act1 = await app.inject({ method: 'POST', url: '/api/v1/productions/prod-test-1/activate' });
+    expect(act1.statusCode).toBe(200);
+    await flush();
+
+    // 2) First deactivation — aborts and removes controller #1.
+    const deact1 = await app.inject({ method: 'POST', url: '/api/v1/productions/prod-test-1/deactivate' });
+    expect(deact1.statusCode).toBe(200);
+    await flush();
+
+    // 3) Second activation — parks at activateStromFlow with controller #2 registered.
+    const act2 = await app.inject({ method: 'POST', url: '/api/v1/productions/prod-test-1/activate' });
+    expect(act2.statusCode).toBe(200);
+    await flush();
+
+    // 4) The slow first run now completes. Its `finally` must NOT delete
+    //    controller #2 (it is aborted, so it just returns cleanly).
+    firstRun.resolve(makeActivationResult('flow-1', 'mixer-1'));
+    await flush();
+
+    // 5) Second deactivation — must still find controller #2 in the map to abort it.
+    const deact2 = await app.inject({ method: 'POST', url: '/api/v1/productions/prod-test-1/deactivate' });
+    expect(deact2.statusCode).toBe(200);
+    await flush();
+
+    // 6) Let the second run resume. Because step 5 aborted it, it must bail out
+    //    and must NOT overwrite the deactivated doc with status 'active'.
+    secondRun.resolve(makeActivationResult('flow-2', 'mixer-2'));
+    await flush();
+
+    expect(currentDoc.status).toBe('inactive');
+    expect(currentDoc.status).not.toBe('active');
   });
 });
 
