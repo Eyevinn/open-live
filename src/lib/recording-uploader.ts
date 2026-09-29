@@ -17,6 +17,16 @@
  * `crypto`, same as src/lib/srt-passphrase-crypto.ts) so the pinned lockfile
  * stays untouched — no aws-sdk / minio client is pulled in.
  *
+ * Delete-after-upload (issue #366): Strom has no retention/TTL for recorder
+ * output — confirmed against Strom main, see #366 — so local segments would
+ * otherwise accumulate on its media volume forever. Once a segment is
+ * successfully uploaded, `uploadRecordings` deletes it from Strom via
+ * `DELETE /api/media/file/:path`, then removes the now-empty output directory
+ * via `DELETE /api/media/directory/:path` (which only succeeds on an empty
+ * directory). Segments that failed to upload are left in place so the next
+ * deactivate's sweep retries them. This mirrors the precedent set by Strom's
+ * own TAMS output block (delete-after-registration, keep-on-failure).
+ *
  * Persisting a RecordingDoc and the listing/playback endpoint are issue #42 and
  * deliberately NOT implemented here.
  */
@@ -37,6 +47,12 @@ export interface UploadedSegment {
   /** object key written into the bucket */
   key: string;
   sizeBytes: number;
+  /**
+   * Strom media path the segment was read from (e.g.
+   * `recordings/<productionId>/seg_00001.mp4`) — retained so a successfully
+   * uploaded segment can be deleted from Strom afterward (issue #366).
+   */
+  stromPath: string;
 }
 
 export interface UploadResult {
@@ -272,18 +288,33 @@ export interface UploadRecordingsArgs {
   outputDir: string;
   productionId: string;
   target: MinioTarget;
+  /**
+   * Checked once, immediately before the delete-after-upload pass (issue
+   * #366). Must resolve `true` when the production this `outputDir` belongs
+   * to has (or may have) a live/recording activation right now — e.g. it was
+   * reactivated while this upload sweep was still in flight. A `true` result
+   * leaves every segment (uploaded or not) and the output directory in place:
+   * deleting out from under a running recorder risks removing segments it
+   * still needs, or racing its own writes into the same directory. Required
+   * (not optional/defaulted) so a caller cannot silently skip the guard.
+   */
+  isStillRecording: () => Promise<boolean> | boolean;
 }
 
 /**
- * Uploads every recorded segment under `outputDir` to MinIO/S3.
+ * Uploads every recorded segment under `outputDir` to MinIO/S3, then deletes
+ * each successfully uploaded segment from Strom and removes the output
+ * directory once it is empty (issue #366).
  *
  * Object keys are `${RECORDING_KEY_PREFIX}${productionId}/${fileName}` so #42's
- * listing endpoint can reconcile by prefix. Per-file failures are collected and
- * returned rather than aborting the whole upload — a partial VOD is better than
- * none, and deactivate must not fail because one segment errored.
+ * listing endpoint can reconcile by prefix. Per-file upload failures are
+ * collected and returned rather than aborting the whole upload — a partial VOD
+ * is better than none, and deactivate must not fail because one segment
+ * errored. Failed segments are also never deleted, so the next deactivate's
+ * sweep retries them.
  */
 export async function uploadRecordings(args: UploadRecordingsArgs): Promise<UploadResult> {
-  const { strom, stromUrl, stromToken, outputDir, productionId, target } = args;
+  const { strom, stromUrl, stromToken, outputDir, productionId, target, isStillRecording } = args;
   const result: UploadResult = { uploaded: [], failed: [] };
 
   const listing = await strom.media.list(outputDir);
@@ -298,13 +329,39 @@ export async function uploadRecordings(args: UploadRecordingsArgs): Promise<Uplo
       const bytes = await downloadFromStrom(stromUrl, stromToken, entry.path);
       const key = `${prefix}${productionId}/${entry.name}`;
       await putObject(target, key, bytes, contentTypeForFile(entry.name));
-      result.uploaded.push({ key, sizeBytes: bytes.length });
+      result.uploaded.push({ key, sizeBytes: bytes.length, stromPath: entry.path });
     } catch (err) {
       result.failed.push({
         file: entry.path,
         error: err instanceof Error ? err.message : String(err),
       });
     }
+  }
+
+  if (await isStillRecording()) {
+    return result;
+  }
+
+  // Delete only the segments that made it safely into object storage — a
+  // failed upload's local copy is the only remaining copy, so it must survive
+  // for the next sweep's retry (result.failed already drives that contract).
+  let allDeleted = result.failed.length === 0;
+  for (const seg of result.uploaded) {
+    try {
+      await strom.media.deleteFile(seg.stromPath);
+    } catch {
+      // Best-effort — the object is already safely in MinIO, so a stale local
+      // copy is a disk-cleanliness problem, not data loss. Leave it (and skip
+      // the directory cleanup below) for the next sweep to retry.
+      allDeleted = false;
+    }
+  }
+
+  // deleteDirectory only succeeds on an empty directory — only attempt it once
+  // every listed file was both uploaded and deleted; otherwise leave the
+  // (non-empty) folder for the next deactivate to retry.
+  if (allDeleted) {
+    await strom.media.deleteDirectory(outputDir).catch(() => undefined);
   }
 
   return result;

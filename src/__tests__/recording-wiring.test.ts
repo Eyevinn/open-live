@@ -168,11 +168,20 @@ describe('recording-uploader — SigV4 PutObject + upload-from-local (#41)', () 
     await expect(putObject(target, 'k', Buffer.from('x'))).rejects.toThrow(/403/);
   });
 
-  it('downloads every segment from Strom and uploads it, collecting per-file failures', async () => {
-    // First N fetches are Strom media downloads, subsequent are S3 PUTs.
+  function makeStromMediaClient(entries: Array<Record<string, unknown>>) {
+    return {
+      media: {
+        list: vi.fn().mockResolvedValue({ entries }),
+        deleteFile: vi.fn().mockResolvedValue({ success: true }),
+        deleteDirectory: vi.fn().mockResolvedValue({ success: true }),
+      },
+    };
+  }
+
+  function stubDownloadAndPutFetch(failOn?: string) {
     const fetchMock = vi.fn().mockImplementation((url: string) => {
       if (url.includes('/api/media/file/')) {
-        if (url.includes('seg_00002')) {
+        if (failOn && url.includes(failOn)) {
           return Promise.resolve({ ok: false, status: 500, arrayBuffer: async () => new ArrayBuffer(0) });
         }
         return Promise.resolve({ ok: true, arrayBuffer: async () => new TextEncoder().encode('data').buffer });
@@ -181,18 +190,17 @@ describe('recording-uploader — SigV4 PutObject + upload-from-local (#41)', () 
       return Promise.resolve({ ok: true, text: async () => '' });
     });
     vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
 
-    const strom = {
-      media: {
-        list: vi.fn().mockResolvedValue({
-          entries: [
-            { name: 'seg_00001.mp4', path: 'recordings/prod-rec-1/seg_00001.mp4', is_dir: false, size: 4 },
-            { name: 'seg_00002.mp4', path: 'recordings/prod-rec-1/seg_00002.mp4', is_dir: false, size: 4 },
-            { name: 'sub', path: 'recordings/prod-rec-1/sub', is_dir: true },
-          ],
-        }),
-      },
-    };
+  it('downloads every segment from Strom and uploads it, collecting per-file failures', async () => {
+    stubDownloadAndPutFetch('seg_00002');
+
+    const strom = makeStromMediaClient([
+      { name: 'seg_00001.mp4', path: 'recordings/prod-rec-1/seg_00001.mp4', is_dir: false, size: 4 },
+      { name: 'seg_00002.mp4', path: 'recordings/prod-rec-1/seg_00002.mp4', is_dir: false, size: 4 },
+      { name: 'sub', path: 'recordings/prod-rec-1/sub', is_dir: true },
+    ]);
 
     const { uploadRecordings } = await import('../lib/recording-uploader.js');
     const res = await uploadRecordings({
@@ -202,6 +210,7 @@ describe('recording-uploader — SigV4 PutObject + upload-from-local (#41)', () 
       outputDir: 'recordings/prod-rec-1',
       productionId: 'prod-rec-1',
       target,
+      isStillRecording: () => false,
     });
 
     expect(strom.media.list).toHaveBeenCalledWith('recordings/prod-rec-1');
@@ -209,6 +218,84 @@ describe('recording-uploader — SigV4 PutObject + upload-from-local (#41)', () 
     expect(res.uploaded.map((u) => u.key)).toEqual(['prod-rec-1/seg_00001.mp4']);
     expect(res.failed).toHaveLength(1);
     expect(res.failed[0]!.file).toBe('recordings/prod-rec-1/seg_00002.mp4');
+  });
+
+  it('deletes a successfully uploaded segment from Strom (issue #366)', async () => {
+    stubDownloadAndPutFetch();
+
+    const strom = makeStromMediaClient([
+      { name: 'seg_00001.mp4', path: 'recordings/prod-rec-1/seg_00001.mp4', is_dir: false, size: 4 },
+    ]);
+
+    const { uploadRecordings } = await import('../lib/recording-uploader.js');
+    const res = await uploadRecordings({
+      strom: strom as never,
+      stromUrl: 'http://localhost:7000',
+      stromToken: 'tok',
+      outputDir: 'recordings/prod-rec-1',
+      productionId: 'prod-rec-1',
+      target,
+      isStillRecording: () => false,
+    });
+
+    expect(res.uploaded).toHaveLength(1);
+    expect(strom.media.deleteFile).toHaveBeenCalledWith('recordings/prod-rec-1/seg_00001.mp4');
+    // Every listed file uploaded + deleted successfully — folder is now empty.
+    expect(strom.media.deleteDirectory).toHaveBeenCalledWith('recordings/prod-rec-1');
+  });
+
+  it('keeps a failed segment on Strom and skips directory cleanup (issue #366)', async () => {
+    stubDownloadAndPutFetch('seg_00002');
+
+    const strom = makeStromMediaClient([
+      { name: 'seg_00001.mp4', path: 'recordings/prod-rec-1/seg_00001.mp4', is_dir: false, size: 4 },
+      { name: 'seg_00002.mp4', path: 'recordings/prod-rec-1/seg_00002.mp4', is_dir: false, size: 4 },
+    ]);
+
+    const { uploadRecordings } = await import('../lib/recording-uploader.js');
+    const res = await uploadRecordings({
+      strom: strom as never,
+      stromUrl: 'http://localhost:7000',
+      stromToken: 'tok',
+      outputDir: 'recordings/prod-rec-1',
+      productionId: 'prod-rec-1',
+      target,
+      isStillRecording: () => false,
+    });
+
+    expect(res.uploaded).toHaveLength(1);
+    expect(res.failed).toHaveLength(1);
+    // Only the successfully uploaded segment is deleted; the failed one's local
+    // copy is the only remaining copy and must survive for the next retry.
+    expect(strom.media.deleteFile).toHaveBeenCalledTimes(1);
+    expect(strom.media.deleteFile).toHaveBeenCalledWith('recordings/prod-rec-1/seg_00001.mp4');
+    // Directory is non-empty (the failed segment is still there) — never attempt cleanup.
+    expect(strom.media.deleteDirectory).not.toHaveBeenCalled();
+  });
+
+  it('skips delete entirely when the activation is still live/recording (issue #366)', async () => {
+    stubDownloadAndPutFetch();
+
+    const strom = makeStromMediaClient([
+      { name: 'seg_00001.mp4', path: 'recordings/prod-rec-1/seg_00001.mp4', is_dir: false, size: 4 },
+    ]);
+
+    const { uploadRecordings } = await import('../lib/recording-uploader.js');
+    const res = await uploadRecordings({
+      strom: strom as never,
+      stromUrl: 'http://localhost:7000',
+      stromToken: 'tok',
+      outputDir: 'recordings/prod-rec-1',
+      productionId: 'prod-rec-1',
+      target,
+      isStillRecording: () => true,
+    });
+
+    // Upload still happens (registration must succeed independent of the guard)...
+    expect(res.uploaded).toHaveLength(1);
+    // ...but nothing is deleted while the activation may still be live.
+    expect(strom.media.deleteFile).not.toHaveBeenCalled();
+    expect(strom.media.deleteDirectory).not.toHaveBeenCalled();
   });
 });
 
