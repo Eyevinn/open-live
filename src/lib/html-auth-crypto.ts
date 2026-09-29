@@ -36,6 +36,7 @@
 
 import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
 import { decodeKey } from './srt-passphrase-crypto.js';
+import { ConfigurationError } from './config-error.js';
 
 const SCHEME_PREFIX = 'encv1:';
 const ALGORITHM = 'aes-256-gcm';
@@ -61,8 +62,14 @@ export function loadHtmlAuthKey(): Buffer | null {
   const raw = process.env['HTML_AUTH_KEY'] ?? process.env['SRT_PASSPHRASE_KEY'];
   if (!raw) {
     if (isProduction()) {
-      throw new Error(
-        'HTML_AUTH_KEY (or SRT_PASSPHRASE_KEY fallback) is required in production to encrypt HTML-source auth material at rest',
+      // Fail closed (ADR-003 Decision 4) — never store a header credential in
+      // plaintext. A ConfigurationError surfaces as a clear 503 rather than a
+      // generic 500 (issue #349), so operators/clients can tell a
+      // misconfiguration from a bug.
+      throw new ConfigurationError(
+        'Credential storage is not configured on this deployment (HTML_AUTH_KEY). ' +
+          'Set HTML_AUTH_KEY (or the SRT_PASSPHRASE_KEY fallback) to a 32-byte base64/hex key ' +
+          'to store HTML-source header credentials at rest.',
       );
     }
     // eslint-disable-next-line no-console

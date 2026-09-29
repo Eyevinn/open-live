@@ -25,6 +25,7 @@
  */
 
 import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
+import { ConfigurationError } from './config-error.js';
 
 const SCHEME_PREFIX = 'encv1:';
 const ALGORITHM = 'aes-256-gcm';
@@ -82,8 +83,12 @@ export function loadKey(): Buffer | null {
   const raw = process.env['SRT_PASSPHRASE_KEY'];
   if (!raw) {
     if (isProduction()) {
-      throw new Error(
-        'SRT_PASSPHRASE_KEY is required in production to encrypt SRT passphrases at rest',
+      // Fail closed (ADR-003 Decision 4) — never store a passphrase in plaintext.
+      // A ConfigurationError surfaces as a clear 503 rather than a generic 500
+      // (issue #349), so operators/clients can tell a misconfiguration from a bug.
+      throw new ConfigurationError(
+        'Credential storage is not configured on this deployment (SRT_PASSPHRASE_KEY). ' +
+          'Set SRT_PASSPHRASE_KEY to a 32-byte base64/hex key to store SRT passphrases at rest.',
       );
     }
     // Non-production: allow running without a key but make the risk visible.

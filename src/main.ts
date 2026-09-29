@@ -53,6 +53,26 @@ async function main() {
     }
   }
 
+  // Credential storage (issue #349): the crypto modules fail closed in
+  // production (ADR-003 Decision 4) — with no encryption key set, any request
+  // that would store an HTML-source header credential or an SRT passphrase is
+  // refused with a 503 config error rather than stored in plaintext. Warn once
+  // at startup so operators learn about the misconfiguration before a user hits
+  // it, instead of only discovering it from a failed save. HTML_AUTH_KEY falls
+  // back to SRT_PASSPHRASE_KEY, so either one satisfies both crypto paths.
+  if (
+    process.env['NODE_ENV'] === 'production' &&
+    !process.env['HTML_AUTH_KEY'] &&
+    !process.env['SRT_PASSPHRASE_KEY']
+  ) {
+    console.warn(
+      '[credential-storage] Neither HTML_AUTH_KEY nor SRT_PASSPHRASE_KEY is set. ' +
+      'Storing HTML-source header credentials or SRT passphrases will fail closed ' +
+      'with a 503 (credentials are never stored in plaintext). Set HTML_AUTH_KEY ' +
+      '(or SRT_PASSPHRASE_KEY) to a 32-byte base64/hex key to enable credential storage.'
+    );
+  }
+
   const app = await buildServer();
 
   try {
