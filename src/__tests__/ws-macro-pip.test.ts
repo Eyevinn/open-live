@@ -370,6 +370,30 @@ describe('PiP on program when the Strom transition is rejected (issue #355)', ()
     expect(pipStates()).toHaveLength(0);
     expect(restoredPip0()).toBe(false);
   });
+
+  it('interactive TAKE: does not announce the move or restore the PiP on a /transition 500', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+    await arrangePgmPip();
+    transitionStatus = 500;
+
+    await send({ type: 'TAKE' });
+
+    expect(requestsTo(TRANSITION)).toHaveLength(1);
+    expect(pipStates()).toHaveLength(0);
+    expect(restoredPip0()).toBe(false);
+  });
+
+  it('macro TAKE: does not announce the move or restore the PiP on a /transition 500', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([{ type: 'TAKE' }]));
+    await arrangePgmPip();
+    transitionStatus = 500;
+
+    await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
+
+    expect(requestsTo(TRANSITION)).toHaveLength(1);
+    expect(pipStates()).toHaveLength(0);
+    expect(restoredPip0()).toBe(false);
+  });
 });
 
 describe('PiP on program when the DB write fails (issue #355)', () => {
@@ -405,6 +429,33 @@ describe('PiP on program when the DB write fails (issue #355)', () => {
 
     // The macro loop catches the failed action and reports MACRO_ERROR rather
     // than rejecting, but the persist still throws before any TALLY/PIP_STATE.
+    await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
+
+    expect(tallies()).toHaveLength(0);
+    expect(pipStates()).toHaveLength(0);
+  });
+
+  it('interactive TAKE: leaves no PIP_STATE broadcast without a matching TALLY on a non-conflict DB throw', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+    await arrangePgmPip();
+    // The persist for the TAKE below fails with a non-conflict error, which
+    // propagates out of handleMessage (matches ws-persist-error-propagation).
+    mockInsert.mockRejectedValue(serverError());
+
+    await expect(send({ type: 'TAKE' })).rejects.toThrow('Internal Server Error');
+
+    // The persist runs before the TALLY and the deferred PIP_STATE, so a failed
+    // write leaves neither a TALLY nor a dangling PIP_STATE behind.
+    expect(tallies()).toHaveLength(0);
+    expect(pipStates()).toHaveLength(0);
+    if (pipStates().length > 0) expect(tallies().length).toBeGreaterThan(0);
+  });
+
+  it('macro TAKE: leaves no PIP_STATE broadcast without a matching TALLY on a non-conflict DB throw', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([{ type: 'TAKE' }]));
+    await arrangePgmPip();
+    mockInsert.mockRejectedValue(serverError());
+
     await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
 
     expect(tallies()).toHaveLength(0);
