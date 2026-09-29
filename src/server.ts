@@ -8,6 +8,7 @@ import swaggerUi from '@fastify/swagger-ui';
 import { timingSafeEqual } from 'crypto';
 import { ZodError } from 'zod';
 import { config } from './config.js';
+import { isExposableError } from './lib/config-error.js';
 import { isDbConnected } from './db/index.js';
 import healthRoutes from './routes/health.js';
 import statusRoutes from './routes/status.js';
@@ -430,8 +431,12 @@ export async function buildServer() {
     const statusCode = error.statusCode ?? 500;
     fastify.log.error(error);
     // For 4xx we expose the message (it's validation/not-found feedback for the caller).
-    // For 5xx we return a generic message to avoid leaking internals.
-    const clientMessage = statusCode < 500 ? error.message : 'An internal error occurred';
+    // For 5xx we return a generic message to avoid leaking internals — except an
+    // error that explicitly opts in via `expose: true` (e.g. ConfigurationError,
+    // #349), whose message is a deliberately safe operator-facing config hint
+    // (names the missing env var, never a secret or stack trace).
+    const clientMessage =
+      statusCode < 500 || isExposableError(error) ? error.message : 'An internal error occurred';
     reply.status(statusCode).send({ error: clientMessage, statusCode });
   });
 
