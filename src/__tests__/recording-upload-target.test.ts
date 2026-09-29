@@ -111,7 +111,7 @@ vi.mock('../services/guest-sweep.js', () => ({ sweepGuestsOnProductionEnd: vi.fn
 const mockUploadRecordings = vi.fn();
 vi.mock('../lib/recording-uploader.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/recording-uploader.js')>();
-  return { ...actual, uploadRecordings: (...args: unknown[]) => mockUploadRecordings(...args) };
+  return { ...actual, uploadProductionRecordings: (...args: unknown[]) => mockUploadRecordings(...args) };
 });
 
 const { buildServer } = await import('../server.js');

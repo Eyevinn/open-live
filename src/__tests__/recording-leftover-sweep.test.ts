@@ -19,7 +19,10 @@ vi.mock('../db/index.js', () => ({
   getDb: () => ({ get: mockGet, insert: mockInsert, find: mockFind, findTrusted: mockFindTrusted }),
   getOutputsDb: () => ({ get: mockOutputGet, insert: mockOutputInsert, find: mockOutputFind, destroy: vi.fn() }),
   getSourcesDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn().mockResolvedValue({ docs: [] }), destroy: vi.fn() }),
-  getRecordingsDb: () => ({ insert: mockRecordingInsert }),
+  getRecordingsDb: () => ({
+    insert: mockRecordingInsert,
+    get: vi.fn().mockRejectedValue(Object.assign(new Error('missing'), { statusCode: 404 })),
+  }),
   getGuestInvitesDb: () => ({ find: vi.fn().mockResolvedValue({ docs: [] }), destroy: vi.fn() }),
   getGuestSessionsDb: () => ({ find: vi.fn().mockResolvedValue({ docs: [] }), insert: vi.fn() }),
   connectDb: vi.fn().mockResolvedValue(undefined),
