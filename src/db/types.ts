@@ -405,6 +405,14 @@ export interface GuestSessionDoc {
   /** Reference into intercom-manager, when a talkback line is provisioned (later sub-issue). */
   intercomLineId?: string;
   whipSessionId?: string;
+  /**
+   * Strom WHEP session id of this guest's most recent return-picture feed
+   * (issue #380). Bound on `POST .../returns/:mixerInput/picture/whep` so the
+   * matching `DELETE .../picture/whep/:sessionId` can verify a guest caller is
+   * tearing down THEIR OWN return session rather than an arbitrary
+   * caller-supplied :sessionId for another guest's feed.
+   */
+  returnWhepSessionId?: string;
   createdAt: string;
   updatedAt: string;
 }
