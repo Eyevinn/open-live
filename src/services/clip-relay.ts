@@ -59,7 +59,12 @@ export function applyReactiveState(
     if ((tracked.state === 'cued' || tracked.state === 'completed') && stromState !== 'playing') {
       return;
     }
-    if (tracked.state === 'error' && stromState !== 'playing') {
+    // A clip in `error` (a preflight/stall failure, or a dead decode branch
+    // surfaced from a Strom PipelineError — issue #360) is never downgraded to a
+    // raw Strom state, including `playing`: a media_player block can keep
+    // reporting `playing` after its branch has died, and that must never read
+    // back as PLAYING in Studio. Recovery requires an explicit re-cue.
+    if (tracked.state === 'error') {
       return;
     }
     // A `cued` clip transiently reports `playing` in Strom because Cue's `goto`
@@ -94,6 +99,32 @@ export function applyReactiveState(
   if (mapped === 'completed') {
     void clearPersistedClipCue(productionId, mixerInput);
   }
+}
+
+/**
+ * Records an authoritative playback failure for a clip and broadcasts a
+ * `CLIP_STATE` error (issue #360). Unlike a raw Strom state edge, a pipeline
+ * error overrides whatever the clip was tracked as — a dead decode branch is
+ * fatal regardless of the media_player's own reported state — and the `error`
+ * guard in `applyReactiveState` then keeps a later raw `playing` push from
+ * clobbering it. Pre-existing clipId/position/duration are preserved for context.
+ */
+export function applyReactiveError(
+  productionId: string,
+  mixerInput: string,
+  error?: string,
+): void {
+  const tracked = getClipStateEntry(productionId, mixerInput);
+  const next: ClipState = {
+    mixerInput,
+    state: 'error',
+    ...(tracked?.clipId !== undefined ? { clipId: tracked.clipId } : {}),
+    ...(tracked?.positionMs !== undefined ? { positionMs: tracked.positionMs } : {}),
+    ...(tracked?.durationMs !== undefined ? { durationMs: tracked.durationMs } : {}),
+    ...(error !== undefined ? { error } : {}),
+  };
+  setClipStateEntry(productionId, next);
+  broadcast(productionId, { type: 'CLIP_STATE', ...next });
 }
 
 /**
@@ -175,6 +206,26 @@ export function startClipRelay(productionId: string, flowId: string, blockToInpu
             const positionMs = Math.round(position_ns / 1e6);
             const durationMs = duration_ns !== undefined ? Math.round(duration_ns / 1e6) : undefined;
             applyReactivePosition(productionId, mixerInput, positionMs, durationMs);
+            return;
+          }
+          if (event.type === 'PipelineError') {
+            // A failing pipeline element (e.g. an appsink/appsrc negotiation
+            // failure on a clip's decode branch) means no picture reaches the
+            // mixer even while the media_player block may still report
+            // `playing`. Match the failing `source` back to a clip player block
+            // and surface CLIP_STATE error so the dead branch is visible to the
+            // operator instead of reading PLAYING forever (issue #360).
+            const { flow_id, source, error } = event.data;
+            if (flow_id !== undefined && flow_id !== entry.flowId) return;
+            if (typeof source !== 'string') return;
+            for (const [blockId, mixerInput] of entry.blockToInput) {
+              // Strom qualifies the element by pad (`<blockId>:appsrc_video`,
+              // `<blockId>:queue_video`, …) or reports the block id itself.
+              if (source === blockId || source.startsWith(`${blockId}:`)) {
+                applyReactiveError(productionId, mixerInput, error);
+                break;
+              }
+            }
             return;
           }
         },

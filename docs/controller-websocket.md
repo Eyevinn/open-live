@@ -285,8 +285,19 @@ checks close this gap, all implemented in the shared `src/lib/clip-control.ts` /
    advanced' }` instead of being left `playing` indefinitely. Both the WS `CLIP_PLAY` handler
    and the REST `POST .../play` endpoint start this poll on a successful play.
 
-Out of scope: mapping a Strom-side player pipeline error (e.g. a codec failure after the
-file loaded and reported a valid duration) directly to `CLIP_STATE` `error` depends on a
-Strom companion change (`StromEvent::PipelineError`) that does not exist yet — tracked
-separately as issue #360. The three checks above fully cover the reachability/never-loaded
-class of failure reported in issue #351.
+4. **Pipeline-error mapping (while playing, issue #360).** The clip relay
+   (`src/services/clip-relay.ts`) subscribes to Strom's `PipelineError` event on the flow
+   WebSocket it already holds. When the failing element's `source` resolves to a clip player
+   block id — the block id itself or a pad-qualified form such as
+   `b-clip-<n>-<suffix>:appsrc_video` / `:queue_video` — the owning clip is moved to
+   `CLIP_STATE { state: 'error', error: <GStreamer message> }`. This covers a decode branch
+   that dies after the media loaded (e.g. an appsink/appsrc negotiation failure), which the
+   `media_player` block does not reflect: it can keep reporting `playing` while no picture
+   reaches the mixer. Because `error` is a controller-owned state the relay never downgrades,
+   a subsequent raw `playing` push can no longer resurrect a dead branch — recovery requires
+   an explicit re-cue.
+
+   Note: the field names (`source`, `error`) follow issue #360; the Strom companion change
+   that emits `StromEvent::PipelineError` was not yet merged when this consumer landed, so an
+   unrecognised `source` is simply ignored. The three checks above still fully cover the
+   reachability/never-loaded class of failure reported in issue #351.
