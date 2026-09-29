@@ -83,9 +83,9 @@ describe('flow-generator — recorder wiring (#41)', () => {
     expect(recorder).toBeDefined();
     const recId = recorder!['id'] as string;
     expect(result.recorderBlockId).toBe(recId);
-    // output_dir is a per-activation subdirectory of the production's directory
+    // output_dir is a per-activation subdirectory named by the activation start
     const outputDir = (recorder!['properties'] as Record<string, unknown>)['output_dir'] as string;
-    expect(outputDir).toMatch(/^recordings\/prod-rec-1\/[0-9a-f-]{36}$/);
+    expect(outputDir).toMatch(/^recordings\/prod-rec-1\/\d{8}T\d{6}Z-[0-9a-f-]{36}$/);
     expect(result.recorderOutputDir).toBe(outputDir);
 
     // A second activation of the same production writes somewhere else
@@ -205,9 +205,9 @@ describe('recording-uploader — SigV4 PutObject + upload-from-local (#41)', () 
     stubDownloadAndPutFetch('seg_00002');
 
     const strom = makeStromMediaClient([
-      { name: 'seg_00001.mp4', path: 'recordings/prod-rec-1/seg_00001.mp4', is_dir: false, size: 4 },
-      { name: 'seg_00002.mp4', path: 'recordings/prod-rec-1/seg_00002.mp4', is_dir: false, size: 4 },
-      { name: 'sub', path: 'recordings/prod-rec-1/sub', is_dir: true },
+      { name: 'seg_00001.mp4', path: 'recordings/prod-rec-1/seg_00001.mp4', is_directory: false, size: 4 },
+      { name: 'seg_00002.mp4', path: 'recordings/prod-rec-1/seg_00002.mp4', is_directory: false, size: 4 },
+      { name: 'sub', path: 'recordings/prod-rec-1/sub', is_directory: true },
     ]);
 
     const { uploadRecordings } = await import('../lib/recording-uploader.js');
@@ -232,7 +232,7 @@ describe('recording-uploader — SigV4 PutObject + upload-from-local (#41)', () 
     stubDownloadAndPutFetch();
 
     const strom = makeStromMediaClient([
-      { name: 'seg_00001.mp4', path: 'recordings/prod-rec-1/seg_00001.mp4', is_dir: false, size: 4 },
+      { name: 'seg_00001.mp4', path: 'recordings/prod-rec-1/seg_00001.mp4', is_directory: false, size: 4 },
     ]);
 
     const { uploadRecordings } = await import('../lib/recording-uploader.js');
@@ -256,8 +256,8 @@ describe('recording-uploader — SigV4 PutObject + upload-from-local (#41)', () 
     stubDownloadAndPutFetch('seg_00002');
 
     const strom = makeStromMediaClient([
-      { name: 'seg_00001.mp4', path: 'recordings/prod-rec-1/seg_00001.mp4', is_dir: false, size: 4 },
-      { name: 'seg_00002.mp4', path: 'recordings/prod-rec-1/seg_00002.mp4', is_dir: false, size: 4 },
+      { name: 'seg_00001.mp4', path: 'recordings/prod-rec-1/seg_00001.mp4', is_directory: false, size: 4 },
+      { name: 'seg_00002.mp4', path: 'recordings/prod-rec-1/seg_00002.mp4', is_directory: false, size: 4 },
     ]);
 
     const { uploadRecordings } = await import('../lib/recording-uploader.js');
@@ -285,7 +285,7 @@ describe('recording-uploader — SigV4 PutObject + upload-from-local (#41)', () 
     stubDownloadAndPutFetch();
 
     const strom = makeStromMediaClient([
-      { name: 'seg_00001.mp4', path: 'recordings/prod-rec-1/seg_00001.mp4', is_dir: false, size: 4 },
+      { name: 'seg_00001.mp4', path: 'recordings/prod-rec-1/seg_00001.mp4', is_directory: false, size: 4 },
     ]);
 
     const { uploadRecordings } = await import('../lib/recording-uploader.js');
