@@ -129,6 +129,10 @@ and fill in the values:
 | `STROM_PORT_LEASE_DISABLED` | Set to `true` to turn off port reservation | `false` |
 | `IDLE_TIMEOUT_SEC` | Seconds a production may have zero connected clients before it is auto-deactivated (`endedReason: 'idle'`). A `KEEP_ALIVE` from any client resets this timer | `300` |
 | `IDLE_WARNING_LEAD_SEC` | Lead time before the idle deadline at which the backend emits a single `IDLE_WARNING` (with `remainingSec` + `deadlineMs`) over the controller WS so clients can keep the show up. Clamped to `IDLE_TIMEOUT_SEC` | `60` |
+| `GUEST_INVITE_SECRET` | HMAC secret used to sign production-scoped guest invite tokens. **Required to enable guest calling**: when unset, the invite/join/guest-management routes return `503` (feature disabled) rather than minting unsigned tokens. Only the SHA-256 hash of each token is persisted; the raw token is returned once and never stored. Generate with `openssl rand -base64 32` | _(empty — guest calling disabled)_ |
+| `GUEST_INVITE_TTL_S` | Default guest invite lifetime in seconds (invites stay short-lived on purpose) | `86400` |
+| `INTERCOM_MANAGER_URL` | Base URL of the Open Intercom manager ([`Eyevinn/intercom-manager`](https://github.com/Eyevinn/intercom-manager)) for operator↔guest talkback. Optional: when unset, guest calling still works with WHIP video + WHEP return but no talkback line | _(empty — talkback disabled)_ |
+| `INTERCOM_MANAGER_TOKEN` | Auth token for the Open Intercom manager. Optional; held server-side only and redacted from logs | _(empty)_ |
 
 > **Never commit `.env`** — it is gitignored. Use `.env.example` as the reference.
 

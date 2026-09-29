@@ -17,6 +17,7 @@ import {
   loadHtmlAuthKey,
   resetHtmlAuthKeyCache,
 } from '../lib/html-auth-crypto.js';
+import { ConfigurationError } from '../lib/config-error.js';
 
 // 32 bytes of 0x01..0x20 — base64 form used as the default test key.
 const KEY_BYTES = Buffer.from(Array.from({ length: 32 }, (_, i) => i + 1));
@@ -61,12 +62,30 @@ describe('key loading & fallback', () => {
     expect(loadHtmlAuthKey()?.equals(Buffer.from(KEY_B64, 'base64'))).toBe(true);
   });
 
-  it('fails closed in production when neither key is set', () => {
+  it('fails closed in production when neither key is set (typed 503 config error, not a 500)', () => {
     delete process.env['HTML_AUTH_KEY'];
     delete process.env['SRT_PASSPHRASE_KEY'];
     process.env['NODE_ENV'] = 'production';
     resetHtmlAuthKeyCache();
-    expect(() => loadHtmlAuthKey()).toThrow(/required in production/);
+    let caught: unknown;
+    try {
+      loadHtmlAuthKey();
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(ConfigurationError);
+    expect((caught as ConfigurationError).statusCode).toBe(503);
+    expect((caught as ConfigurationError).expose).toBe(true);
+    expect((caught as ConfigurationError).message).toMatch(/not configured/);
+    expect((caught as ConfigurationError).message).toMatch(/HTML_AUTH_KEY/);
+  });
+
+  it('encryptHtmlAuthValue surfaces the typed 503 config error when no key is set in production', () => {
+    delete process.env['HTML_AUTH_KEY'];
+    delete process.env['SRT_PASSPHRASE_KEY'];
+    process.env['NODE_ENV'] = 'production';
+    resetHtmlAuthKeyCache();
+    expect(() => encryptHtmlAuthValue(SECRET, SOURCE_ID)).toThrow(ConfigurationError);
   });
 
   it('returns null (loud no-op) in non-production when no key is set', () => {

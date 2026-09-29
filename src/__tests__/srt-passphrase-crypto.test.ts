@@ -18,6 +18,7 @@ import {
   loadKey,
   resetKeyCache,
 } from '../lib/srt-passphrase-crypto.js';
+import { ConfigurationError } from '../lib/config-error.js';
 
 // 32 bytes of 0x01..0x20 — base64 form used as the default test key.
 const KEY_BYTES = Buffer.from(Array.from({ length: 32 }, (_, i) => i + 1));
@@ -62,11 +63,21 @@ describe('key loading', () => {
     expect(() => decodeKey('   ')).toThrow(/empty/);
   });
 
-  it('fails closed in production when the key is unset', () => {
+  it('fails closed in production when the key is unset (typed 503 config error, not a 500)', () => {
     resetKeyCache();
     delete process.env['SRT_PASSPHRASE_KEY'];
     process.env['NODE_ENV'] = 'production';
-    expect(() => loadKey()).toThrow(/required in production/);
+    let caught: unknown;
+    try {
+      loadKey();
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(ConfigurationError);
+    expect((caught as ConfigurationError).statusCode).toBe(503);
+    expect((caught as ConfigurationError).expose).toBe(true);
+    expect((caught as ConfigurationError).message).toMatch(/not configured/);
+    expect((caught as ConfigurationError).message).toMatch(/SRT_PASSPHRASE_KEY/);
   });
 
   it('returns null (dev fallback) when the key is unset outside production', () => {
@@ -75,6 +86,13 @@ describe('key loading', () => {
     // warn is expected — silence it
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     expect(loadKey()).toBeNull();
+  });
+
+  it('encryptAddressPassphrase surfaces the typed 503 config error when no key is set in production', () => {
+    resetKeyCache();
+    delete process.env['SRT_PASSPHRASE_KEY'];
+    process.env['NODE_ENV'] = 'production';
+    expect(() => encryptAddressPassphrase(SRT_ADDR)).toThrow(ConfigurationError);
   });
 });
 
