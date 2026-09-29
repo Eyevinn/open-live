@@ -17,9 +17,16 @@
  * The "encv1:" prefix lets decrypt distinguish ciphertext from legacy plaintext
  * and gives us a version handle for future scheme changes.
  *
- * Key: 32 bytes (AES-256) supplied via the SRT_PASSPHRASE_KEY env var, encoded
- * as base64 or hex. Missing key fails closed in production; in non-production it
- * degrades to a loud no-op so local dev without a key still works.
+ * Key: 32 bytes (AES-256) supplied via an env var (SRT_PASSPHRASE_KEY by
+ * default), encoded as base64 or hex. Missing key fails closed in production;
+ * in non-production it degrades to a loud no-op so local dev without a key
+ * still works.
+ *
+ * The key-loading / encrypt / decrypt core is parameterised by a `KeySource`
+ * (which env var to read) so other at-rest credentials — e.g. the dedicated
+ * `RTMP_CREDENTIALS_KEY` for RTMP stream keys (ADR-004 Resolved Decision 2) —
+ * can reuse the exact same AES-256-GCM / `encv1:` / fail-closed-in-prod contract
+ * without weakening it. SRT callers keep the historic no-argument signatures.
  *
  * NEVER log the plaintext passphrase or the raw key from this module.
  */
@@ -36,7 +43,21 @@ const TAG_BYTES = 16;
 /** Matches the passphrase param in an SRT URI query string (case-insensitive). */
 const PASSPHRASE_RE = /([?&]passphrase=)([^&]*)/gi;
 
-let cachedKey: Buffer | null | undefined;
+/**
+ * Identifies which env var holds the AES-256 key for a given credential kind.
+ * A dedicated source per credential kind keeps rotation blast-radius isolated
+ * (ADR-004 Resolved Decision 2 — RTMP does NOT reuse `SRT_PASSPHRASE_KEY`).
+ */
+export interface KeySource {
+  /** Env var name holding the base64/hex 32-byte key. */
+  envVar: string;
+}
+
+/** Default source — the historic SRT passphrase key. */
+export const SRT_PASSPHRASE_KEY_SOURCE: KeySource = { envVar: 'SRT_PASSPHRASE_KEY' };
+
+// Per-env-var key cache so distinct credential kinds (SRT, RTMP) never collide.
+const keyCache = new Map<string, Buffer | null>();
 
 function isProduction(): boolean {
   return process.env['NODE_ENV'] === 'production';
@@ -47,10 +68,10 @@ function isProduction(): boolean {
  * hex; both must decode to exactly KEY_BYTES. Throws with a clear (secret-free)
  * message otherwise.
  */
-export function decodeKey(raw: string): Buffer {
+export function decodeKey(raw: string, envVar = 'SRT_PASSPHRASE_KEY'): Buffer {
   const value = raw.trim();
   if (value.length === 0) {
-    throw new Error('SRT_PASSPHRASE_KEY is empty');
+    throw new Error(`${envVar} is empty`);
   }
 
   // Hex form: exactly 64 hex chars → 32 bytes. Check this first because a 64-char
@@ -65,7 +86,7 @@ export function decodeKey(raw: string): Buffer {
   }
 
   throw new Error(
-    `SRT_PASSPHRASE_KEY must decode to ${KEY_BYTES} bytes (base64 or hex); ` +
+    `${envVar} must decode to ${KEY_BYTES} bytes (base64 or hex); ` +
       `got ${fromBase64.length} bytes after base64 decode`,
   );
 }
@@ -77,36 +98,38 @@ export function decodeKey(raw: string): Buffer {
  * - When the var is unset: throws in production (fail closed), returns null in
  *   non-production so local dev keeps working with plaintext.
  */
-export function loadKey(): Buffer | null {
-  if (cachedKey !== undefined) return cachedKey;
+export function loadKey(source: KeySource = SRT_PASSPHRASE_KEY_SOURCE): Buffer | null {
+  const cached = keyCache.get(source.envVar);
+  if (cached !== undefined) return cached;
 
-  const raw = process.env['SRT_PASSPHRASE_KEY'];
+  const raw = process.env[source.envVar];
   if (!raw) {
     if (isProduction()) {
-      // Fail closed (ADR-003 Decision 4) — never store a passphrase in plaintext.
+      // Fail closed (ADR-003 Decision 4) — never store a credential in plaintext.
       // A ConfigurationError surfaces as a clear 503 rather than a generic 500
       // (issue #349), so operators/clients can tell a misconfiguration from a bug.
       throw new ConfigurationError(
-        'Credential storage is not configured on this deployment (SRT_PASSPHRASE_KEY). ' +
-          'Set SRT_PASSPHRASE_KEY to a 32-byte base64/hex key to store SRT passphrases at rest.',
+        `Credential storage is not configured on this deployment (${source.envVar}). ` +
+          `Set ${source.envVar} to a 32-byte base64/hex key to store credentials at rest.`,
       );
     }
     // Non-production: allow running without a key but make the risk visible.
     // eslint-disable-next-line no-console
     console.warn(
-      '[srt-crypto] SRT_PASSPHRASE_KEY is not set — SRT passphrases will be stored in plaintext. Set it before deploying.',
+      `[srt-crypto] ${source.envVar} is not set — credentials will be stored in plaintext. Set it before deploying.`,
     );
-    cachedKey = null;
-    return cachedKey;
+    keyCache.set(source.envVar, null);
+    return null;
   }
 
-  cachedKey = decodeKey(raw);
-  return cachedKey;
+  const key = decodeKey(raw, source.envVar);
+  keyCache.set(source.envVar, key);
+  return key;
 }
 
-/** Test-only: clear the cached key so env changes take effect. */
+/** Test-only: clear all cached keys so env changes take effect. */
 export function resetKeyCache(): void {
-  cachedKey = undefined;
+  keyCache.clear();
 }
 
 /** True if the value is an encv1 ciphertext bundle (vs legacy plaintext). */
@@ -119,8 +142,8 @@ export function isEncrypted(value: string): boolean {
  * Returns the plaintext unchanged when no key is configured (non-production
  * dev fallback) so callers can persist without special-casing.
  */
-export function encryptPassphrase(plaintext: string): string {
-  const key = loadKey();
+export function encryptPassphrase(plaintext: string, source: KeySource = SRT_PASSPHRASE_KEY_SOURCE): string {
+  const key = loadKey(source);
   if (!key) return plaintext;
   if (isEncrypted(plaintext)) return plaintext; // already encrypted — don't double-wrap
 
@@ -138,13 +161,15 @@ export function encryptPassphrase(plaintext: string): string {
  * that predate encryption keep working.
  * Throws on tampering (GCM auth failure) or a malformed bundle.
  */
-export function decryptPassphrase(value: string): string {
+export function decryptPassphrase(value: string, source: KeySource = SRT_PASSPHRASE_KEY_SOURCE): string {
   if (!isEncrypted(value)) return value; // legacy plaintext pass-through
 
-  const key = loadKey();
+  const key = loadKey(source);
   if (!key) {
+    // Fail closed — a stored ciphertext exists but no key is configured. Never
+    // fall through to returning the ciphertext or an empty string (ADR-004).
     throw new Error(
-      'Encountered an encrypted SRT passphrase but SRT_PASSPHRASE_KEY is not set',
+      `Encountered an encrypted credential but ${source.envVar} is not set`,
     );
   }
 

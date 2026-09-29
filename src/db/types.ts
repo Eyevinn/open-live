@@ -253,7 +253,41 @@ export interface GraphicDoc {
 
 // --------------- Output types ---------------
 
-export type OutputType = 'mpegtssrt' | 'efpsrt' | 'whep' | 'recording';
+export type OutputType = 'mpegtssrt' | 'efpsrt' | 'whep' | 'recording' | 'rtmp';
+
+/**
+ * Platform preset for an RTMP destination (spec: rtmp-multi-destination.md,
+ * ADR-004; Resolved Decision 1). The three named presets resolve their ingest
+ * URL from a static server-side table; `'custom'` carries an operator-supplied
+ * `rtmp(s)://` ingest URL validated for scheme + SSRF at the API boundary.
+ */
+export type RtmpPlatform = 'youtube' | 'twitch' | 'facebook' | 'custom';
+
+/**
+ * RTMP destination fields on an `OutputDoc` (present only when
+ * `outputType === 'rtmp'`). Each RTMP destination is its own `OutputDoc`
+ * (ADR-004 Decision 1); multiple destinations per production are expressed
+ * through `ProductionDoc.outputAssignments[]`.
+ */
+export interface RtmpDestination {
+  /** Which platform preset supplied (or, for 'custom', framed) the ingest URL. */
+  platform: RtmpPlatform;
+  /**
+   * The resolved RTMP(S) ingest URL, WITHOUT the stream key, e.g.
+   * "rtmps://a.rtmp.youtube.com/live2". For a named preset it is resolved
+   * server-side from the static preset table at write time; for 'custom' it is
+   * the validated operator-supplied URL. Never carries the key.
+   */
+  ingestUrl: string;
+  /**
+   * The platform stream key, encrypted at rest with the `encv1:` bundle
+   * (`src/lib/rtmp-credentials-crypto.ts`, dedicated `RTMP_CREDENTIALS_KEY` —
+   * ADR-004 Resolved Decision 2). WRITE-ONLY over the API: accepted on
+   * create/patch, never returned. Stored on the doc, never composed into
+   * `ingestUrl` or `OutputDoc.url`.
+   */
+  streamKeyEnc?: string; // encv1:<...> — never the plaintext, never returned
+}
 
 /**
  * Output health surfaced to single-source downstream consumers (issue #255).
@@ -274,8 +308,16 @@ export interface OutputDoc {
   outputType: OutputType;
   // SRT URI for mpegtssrt/efpsrt; undefined for whep. A 'recording' output
   // carries no url — its destination is derived from the MinIO config plus the
-  // production id (spec: vod-recording-minio.md).
+  // production id (spec: vod-recording-minio.md). NEVER populated for 'rtmp'
+  // outputs — the ingest URL + key live in the structured `rtmp` object so the
+  // key is never smeared into a free-text URL or the derived `connect` field.
   url?: string;
+  /**
+   * RTMP destination fields (spec: rtmp-multi-destination.md, ADR-004). Present
+   * only when `outputType === 'rtmp'`; absent on all other output types and on
+   * all pre-existing docs (additive, no migration).
+   */
+  rtmp?: RtmpDestination;
   /**
    * Derived output health (issue #255). Optional; when absent, read as
    * `unknown`. Computed on read from the owning production's live flow state
