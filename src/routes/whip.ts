@@ -1,6 +1,7 @@
-import type { FastifyPluginAsync } from 'fastify'
+import type { FastifyPluginAsync, FastifyRequest } from 'fastify'
 import { getStromToken } from '../lib/strom-token.js'
 import { assertSameStromOrigin } from '../lib/url-validation.js'
+import { isUnderEndpointPath } from '../lib/guest-scope.js'
 import { config } from '../config.js'
 
 /**
@@ -9,6 +10,55 @@ import { config } from '../config.js'
  */
 function validateSessionUrl(sessionUrl: string): void {
   assertSameStromOrigin(sessionUrl, config.stromUrl, 'Session URL');
+}
+
+type WhipSessionRequest = FastifyRequest<{
+  Params: { id: string; mixerInput: string }
+  Querystring: { session?: string }
+}>
+
+type TargetResolution =
+  | { ok: true; target: string }
+  | { ok: false; status: number; body: { error: string; statusCode?: number } }
+
+/**
+ * Resolves the Strom WHIP target for a PATCH/DELETE call.
+ *
+ * `?session=` is client-supplied, and `validateSessionUrl` only checks it is
+ * on the Strom host — not that it belongs to THIS caller (issue #380). For a
+ * guest caller (`req.guestScope` set by the shared-key gate in server.ts) that
+ * is not enough: a guest could otherwise PATCH/DELETE another guest's session
+ * by supplying its URL. So for guest callers we additionally require the
+ * decoded session URL's path to be the scoped endpoint
+ * (`resolveStromWhipUrl(:id, :mixerInput)`) or a sub-path of it — rejecting
+ * anything else with 403. Crew/API_KEY callers are unaffected (unchanged
+ * behaviour — full access, any mixerInput).
+ */
+function resolveWhipSessionTarget(req: WhipSessionRequest): TargetResolution {
+  if (!req.query.session) {
+    return { ok: true, target: resolveStromWhipUrl(req.params.id, req.params.mixerInput) }
+  }
+  const decoded = decodeURIComponent(req.query.session)
+  try {
+    validateSessionUrl(decoded)
+  } catch (err) {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: err instanceof Error ? err.message : 'Invalid session URL' },
+    }
+  }
+  if (req.guestScope) {
+    const expectedEndpoint = resolveStromWhipUrl(req.params.id, req.params.mixerInput)
+    if (!isUnderEndpointPath(decoded, expectedEndpoint)) {
+      return {
+        ok: false,
+        status: 403,
+        body: { error: 'Session does not belong to this guest', statusCode: 403 },
+      }
+    }
+  }
+  return { ok: true, target: decoded }
 }
 
 /**
@@ -90,18 +140,11 @@ const whipRoutes: FastifyPluginAsync = async (fastify) => {
   }>(
     '/api/v1/productions/:id/whip/:mixerInput',
     async (req, reply) => {
-      let target: string;
-      if (req.query.session) {
-        const decoded = decodeURIComponent(req.query.session);
-        try {
-          validateSessionUrl(decoded);
-        } catch (err) {
-          return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid session URL' });
-        }
-        target = decoded;
-      } else {
-        target = resolveStromWhipUrl(req.params.id, req.params.mixerInput);
+      const resolved = resolveWhipSessionTarget(req)
+      if (!resolved.ok) {
+        return reply.status(resolved.status).send(resolved.body)
       }
+      const target = resolved.target
 
       const token = await getStromToken(config.stromToken).catch(() => undefined)
       const headers: Record<string, string> = {
@@ -121,18 +164,11 @@ const whipRoutes: FastifyPluginAsync = async (fastify) => {
   }>(
     '/api/v1/productions/:id/whip/:mixerInput',
     async (req, reply) => {
-      let target: string;
-      if (req.query.session) {
-        const decoded = decodeURIComponent(req.query.session);
-        try {
-          validateSessionUrl(decoded);
-        } catch (err) {
-          return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid session URL' });
-        }
-        target = decoded;
-      } else {
-        target = resolveStromWhipUrl(req.params.id, req.params.mixerInput);
+      const resolved = resolveWhipSessionTarget(req)
+      if (!resolved.ok) {
+        return reply.status(resolved.status).send(resolved.body)
       }
+      const target = resolved.target
 
       const token = await getStromToken(config.stromToken).catch(() => undefined)
       const headers: Record<string, string> = {}
