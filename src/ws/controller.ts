@@ -366,17 +366,15 @@ const InboundMessageSchema = z.discriminatedUnion('type', [
  * True when `mixerInput` is already the on-air source. A CUT or TRANSITION
  * to it is a no-op, like pressing the PGM button of the source that is
  * already on air. Without this guard the tally became `{pgm: X, pvw: X}` and
- * the Strom take ran with `from_input === to_input`, which Strom treats as a
- * PGM/PVW swap, so the picture flipped to the previous preview.
+ * the Strom take swapped Strom's own PGM/PVW buses, so the picture flipped to
+ * the previous preview.
  *
  * While a PiP is on PGM this always returns false (the pre-#347 rule, restored
- * in #353): a CUT/TRANSITION to *any* real input — including the background
- * tracked behind the PiP — is a genuine change, because it must take the PiP off
- * program. The target-equals-background case is handled explicitly by the
- * CUT/TRANSITION/macro paths via `takePipOffToBackground`, which avoids the
- * degenerate `from_input === to_input` take (issue #342) without dropping the
- * command. #347 returned true here when the target equalled the background,
- * which silently dropped the command and left the Studio tally split (#353).
+ * in #353): a CUT/TRANSITION to *any* real input — including the PiP's own
+ * background — is a genuine change, because it must take the PiP off program.
+ * The target-equals-background case is handled by `takePipOffToBackground`.
+ * #347 returned true here when the target equalled the background, which
+ * silently dropped the command and left the Studio tally split (#353).
  */
 function isAlreadyOnProgram(productionId: string, mixerInput: string): boolean {
   const pgmPip = pgmPipByProduction.get(productionId) ?? null;
@@ -389,6 +387,19 @@ function isAlreadyOnProgram(productionId: string, mixerInput: string): boolean {
 function padToIndex(mixerInput: string): number | null {
   const match = /video_in_(\d+)$/.exec(mixerInput);
   return match ? parseInt(match[1], 10) : null;
+}
+
+/**
+ * `from_input` / `to_input` for a Strom take between two backgrounds. Strom's
+ * vision mixer ignores both and swaps its own PGM/PVW buses (input and PiP),
+ * so they only describe the take; equal values are harmless. An unknown end
+ * is sent as 0, as Strom's own web UI does.
+ */
+function takeInputIndices(from: string | null, to: string | null): { from_input: number; to_input: number } {
+  return {
+    from_input: from ? (padToIndex(from) ?? 0) : 0,
+    to_input: to ? (padToIndex(to) ?? 0) : 0,
+  };
 }
 
 /**
@@ -495,36 +506,15 @@ async function stromTransition(
 }
 
 /**
- * #353: a CUT/TRANSITION whose target is exactly the real input already tracked
- * behind an on-program PiP (`pgmBgByProduction`). Pre-#347 this took the PiP off
- * program; #347 re-classified it as "already on program" in `isAlreadyOnProgram`,
- * so the CUT/TRANSITION handlers only acked and broke — no TALLY, no PIP_STATE,
- * no Strom call. The command was silently dropped, so the client's optimistic
- * swap was never corrected and the Studio tally was left split (PGM showing both
- * the real source and the PiP, PVW empty). This restores the pre-#347 behaviour:
- * the background stays on PGM, PVW clears, and the PiP moves to PVW.
+ * #353: a CUT/TRANSITION whose target is the background of the on-program PiP.
+ * The background stays on PGM, PVW clears, and the PiP moves to PVW.
  *
- * Tally + PiP state are mutated and broadcast synchronously (before any Strom
- * await), matching the non-background PiP path in the CUT/TRANSITION handlers.
- *
- * Strom: we deliberately do NOT fire a mixer transition here. The target input
- * equals the on-air background, so a transition would carry
- * `from_input === to_input`, which Strom treats as a degenerate PGM/PVW swap
- * (issue #342) and which flips the picture to the previous preview. This client's
- * Strom mixer API (`src/lib/strom.ts`) exposes only `transition` and
- * `selectPreview`; there is no dedicated "clear the on-program PiP overlay"
- * endpoint, and the transition model swaps the PVW/PGM buses, so removing the
- * overlay while keeping the same background on program cannot be expressed
- * without that forbidden degenerate transition. We therefore select the PiP on
- * Strom's preview (mirroring the `pvwPip` state we just broadcast and the
- * pip-restore step the other PiP paths use), treating any error as non-fatal.
- *
- * OPEN QUESTION: fully decompositing the on-program PiP inside Strom for this
- * exact "take the background out from under the PiP" case likely needs a
- * Strom-side primitive this client does not yet expose (a non-degenerate
- * program-overlay clear). Until then the controller tally/PiP state and the
- * TALLY/PIP_STATE broadcasts are always corrected so optimistically-swapped
- * clients are made consistent. See issue #353.
+ * The PiP's insets only leave the picture when Strom actually takes, so this
+ * is a real take, not just a state change. `stromTransition` previews the target
+ * input (allowed while a PiP is on PGM) and then fires the take, which swaps
+ * Strom's buses: the target goes to PGM and the PiP to PVW, matching the state
+ * broadcast here. As in CUT/TRANSITION, PIP_STATE waits for the take to succeed
+ * (#355) and is skipped if PVW changed during the round trip (#341).
  */
 async function takePipOffToBackground(
   productionId: string,
@@ -536,25 +526,23 @@ async function takePipOffToBackground(
 ): Promise<void> {
   const newTally = { pgm: target, pvw: null };
   setTally(productionId, newTally);
-  // PiP leaves PGM and lands on PVW; the background it sat over stays on PGM.
   pgmPipByProduction.set(productionId, null);
   pvwPipByProduction.set(productionId, pgmPip);
-  pvwBeforePipByProduction.set(productionId, target);
-  pgmBgByProduction.delete(productionId);
-  broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: pgmPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
   await persistMixerMutation(productionId, persistLabel, (d) => ({ ...d, tally: newTally }));
   broadcast(productionId, {
     type: 'TALLY',
     ...buildTallyPayload(productionId, newTally, doc),
     ...(transitionMeta?.transitionType ? { transitionType: transitionMeta.transitionType, durationMs: transitionMeta.durationMs } : {}),
   });
-  if (doc.stromFlowId && doc.mixerBlockId) {
-    try {
-      const strom = await makeStromClient();
-      await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: pgmPip } });
-    } catch (err) {
-      console.debug('[controller] Strom selectPreview (PiP off to background, non-fatal):', err);
-    }
+  const ok = await stromTransition(
+    doc,
+    target,
+    target,
+    toStromTransition(transitionMeta?.transitionType ?? 'cut'),
+    transitionMeta?.durationMs,
+  );
+  if (ok && (pvwPipByProduction.get(productionId) ?? null) === pgmPip) {
+    broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: pgmPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
   }
 }
 
@@ -703,21 +691,16 @@ const htmlSourceParamsByProduction = new Map<string, Map<string, HtmlSourceState
 const HTML_SOURCE_MAX_QUERY_LENGTH = 4096;
 
 /**
- * PVW mixer-input pad that was on PVW immediately before SELECT_PVW_PIP was
- * received.  Stored so the PiP TAKE can pass it as `to_input` to Strom,
- * which becomes Strom's `pgm_input` (real background behind the PiP) after
- * the swap — keeping pgm_input ≠ pvw_input and avoiding the 400 "sole
- * program source" error on the next selectPreview call.
+ * The mixer input a PiP is composited over: its configured `bg` (SET_PIP), or
+ * null when it has none and Strom draws it over black. Strom never composites
+ * a PiP over whatever else was on program or preview, so this is the only
+ * source of truth for the background.
  */
-const pvwBeforePipByProduction = new Map<string, string | null>()
-
-/**
- * Strom's real pgm_input (background behind the PiP) while a PiP is on PGM.
- * Set when a PiP TAKE completes; cleared when a real-source CUT/TRANSITION
- * removes the PiP from PGM.  Used as `fromMixerInput` in stromTransition so
- * the cut has the correct from_input instead of defaulting to toIndex.
- */
-const pgmBgByProduction = new Map<string, string | null>()
+function pipBgInput(productionId: string, pip: number | null): string | null {
+  if (pip === null) return null;
+  const bg = pipConfigsByProduction.get(productionId)?.[pip]?.bg ?? null;
+  return bg === null ? null : `video_in_${bg}`;
+}
 
 /**
  * The real input sitting behind a PiP that is on program, or null.
@@ -728,7 +711,7 @@ const pgmBgByProduction = new Map<string, string | null>()
  * way to recover it.
  */
 const pgmBgOf = (productionId: string): string | null =>
-  pgmBgByProduction.get(productionId) ?? null
+  pipBgInput(productionId, pgmPipByProduction.get(productionId) ?? null)
 
 /**
  * Builds the contribution-based tally payload (automation contract §3).
@@ -756,7 +739,6 @@ function buildTallyPayload(
   const pgmBg = pgmBgOf(productionId);
   const pgmPip = pgmPipByProduction.get(productionId) ?? null;
   const pvwPip = pvwPipByProduction.get(productionId) ?? null;
-  const pvwBefore = pvwBeforePipByProduction.get(productionId) ?? null;
   const pipConfigs = pipConfigsByProduction.get(productionId);
   const dskLayers = dskLayersByProduction.get(productionId);
   const activeGraphics = (doc.graphics ?? []).filter((g) => g.active).map((g) => g.id);
@@ -767,7 +749,7 @@ function buildTallyPayload(
     pgmPip,
     pvwPip,
     pgmBg,
-    pvwBefore,
+    pipBgInput(productionId, pvwPip),
     pipConfigs,
     dskLayers,
     activeGraphics,
@@ -792,8 +774,6 @@ export function clearAudioState(productionId: string): void {
   grpSendByProduction.delete(productionId)
   grpMasterByProduction.delete(productionId)
   monitorByProduction.delete(productionId)
-  pvwBeforePipByProduction.delete(productionId)
-  pgmBgByProduction.delete(productionId)
   pgmPipByProduction.delete(productionId)
   pvwPipByProduction.delete(productionId)
 }
@@ -808,8 +788,6 @@ export function clearPipState(productionId: string): void {
   pipConfigsByProduction.delete(productionId)
   pgmPipByProduction.delete(productionId)
   pvwPipByProduction.delete(productionId)
-  pvwBeforePipByProduction.delete(productionId)
-  pgmBgByProduction.delete(productionId)
   overlayAlphaByProduction.delete(productionId)
   dskLayersByProduction.delete(productionId)
   htmlSourceParamsByProduction.delete(productionId)
@@ -1238,7 +1216,7 @@ export async function handleMessage(
       // equals the tracked background). Handle before the general path so we
       // never fall through to a degenerate from_input === to_input take.
       const curPgmPipBgCut = pgmPipByProduction.get(productionId) ?? null;
-      if (curPgmPipBgCut !== null && (pgmBgByProduction.get(productionId) ?? null) === msg.mixerInput) {
+      if (curPgmPipBgCut !== null && pgmBgOf(productionId) === msg.mixerInput) {
         await takePipOffToBackground(productionId, doc, msg.mixerInput, curPgmPipBgCut, 'CUT');
         if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
         break;
@@ -1255,7 +1233,7 @@ export async function handleMessage(
       // background input so stromTransition has a valid from_input.
       const curPgmPipCut = pgmPipByProduction.get(productionId) ?? null;
       const fromPadCut = (curPgmPipCut !== null && tally.pgm === null)
-        ? (pgmBgByProduction.get(productionId) ?? null)
+        ? pgmBgOf(productionId)
         : tally.pgm;
       const newTally = { pgm: msg.mixerInput, pvw: tally.pgm };
       setTally(productionId, newTally);
@@ -1270,8 +1248,6 @@ export async function handleMessage(
         // PiP was on PGM → moves to PVW
         pgmPipByProduction.set(productionId, null);
         pvwPipByProduction.set(productionId, curPgmPipCut);
-        pvwBeforePipByProduction.set(productionId, pgmBgByProduction.get(productionId) ?? null);
-        pgmBgByProduction.delete(productionId);
         cutPipEvent = { pvwPip: curPgmPipCut };
       } else if (curPvwPipCut !== null) {
         // PiP was in PVW — cutting a real source to PGM replaces PVW, so clear it
@@ -1308,7 +1284,7 @@ export async function handleMessage(
       // #353: same as CUT — a TRANSITION whose target is the background under an
       // on-program PiP takes the PiP off program instead of being dropped.
       const curPgmPipBgTrans = pgmPipByProduction.get(productionId) ?? null;
-      if (curPgmPipBgTrans !== null && (pgmBgByProduction.get(productionId) ?? null) === msg.mixerInput) {
+      if (curPgmPipBgTrans !== null && pgmBgOf(productionId) === msg.mixerInput) {
         await takePipOffToBackground(productionId, doc, msg.mixerInput, curPgmPipBgTrans, 'TRANSITION', { transitionType: msg.transitionType, durationMs: msg.durationMs });
         if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
         break;
@@ -1322,7 +1298,7 @@ export async function handleMessage(
       const tally = getTally(productionId);
       const curPgmPipTrans = pgmPipByProduction.get(productionId) ?? null;
       const fromPadTrans = (curPgmPipTrans !== null && tally.pgm === null)
-        ? (pgmBgByProduction.get(productionId) ?? null)
+        ? pgmBgOf(productionId)
         : tally.pgm;
       const newTally = { pgm: msg.mixerInput, pvw: tally.pgm };
       setTally(productionId, newTally);
@@ -1333,8 +1309,6 @@ export async function handleMessage(
       if (curPgmPipTrans !== null) {
         pgmPipByProduction.set(productionId, null);
         pvwPipByProduction.set(productionId, curPgmPipTrans);
-        pvwBeforePipByProduction.set(productionId, pgmBgByProduction.get(productionId) ?? null);
-        pgmBgByProduction.delete(productionId);
         transPipEvent = { pvwPip: curPgmPipTrans };
       } else if (curPvwPipTrans !== null) {
         // PiP was in PVW — transitioning a real source to PGM replaces PVW, so clear it (matches CUT)
@@ -1370,46 +1344,22 @@ export async function handleMessage(
       // avoiding the concurrent-broadcast race that puts the PiP in both PGM and PVW.
       if (msg.pip !== undefined) {
         if (tally.pvw !== null) {
-          // Save the real PVW source as the background behind the PiP, then
-          // null out the tally PVW so the swap below produces { pgm: null, pvw: old_pgm }.
-          pvwBeforePipByProduction.set(productionId, tally.pvw);
+          // Null out the tally PVW so the swap below produces { pgm: null, pvw: old_pgm }.
           (tally as { pvw: string | null }).pvw = null;
         }
         pvwPipByProduction.set(productionId, msg.pip);
       }
       const curPvwPip = pvwPipByProduction.get(productionId) ?? null;
       const curPgmPip = pgmPipByProduction.get(productionId) ?? null;
+      const oldPgmBg = pgmBgOf(productionId);
       const newTally = { pgm: tally.pvw, pvw: tally.pgm };
       const newPgmPip = curPvwPip;
       const newPvwPip = curPgmPip;
       setTally(productionId, newTally);
       pgmPipByProduction.set(productionId, newPgmPip);
       pvwPipByProduction.set(productionId, newPvwPip);
-      // The background behind the PiP after this take. Derived from what is in
-      // scope, because `pgmBgByProduction` still holds the previous state here.
-      // Read before the persist await: a SELECT_PVW_PIP or another take landing
-      // during the write overwrites it.
-      const pvwBeforePip = pvwBeforePipByProduction.get(productionId) ?? null;
-      // Falls back to the outgoing PGM input, matching the `to_input` the Strom
-      // transition below computes: with no PVW source displaced, the mixer
-      // composites the PiP over whatever was already on program.
-      const newPgmBg = newPgmPip !== null ? (pvwBeforePip ?? tally.pgm) : null;
-      // Set here rather than in the Strom block below: the connect handler
-      // reads this map, and it must hold the background the take just
-      // broadcast even when Strom is unconfigured or its call throws.
-      if (newPgmPip !== null) pgmBgByProduction.set(productionId, newPgmBg);
-      // When the PiP was on PGM (curPgmPip set, curPvwPip null) this take moves
-      // it to PVW. Update the PiP maps *before* building the TALLY so the
-      // broadcast reflects the new state (`pgmBg: null` and the background that
-      // was under the PiP now surfaced in `preview`) rather than the stale
-      // pre-take state. Mirrors the ordering CUT / TRANSITION and the macro TAKE
-      // already use. (issue #356)
-      const reversePipTake = curPvwPip === null && curPgmPip !== null;
-      const reversePgmBg = reversePipTake ? (pgmBgByProduction.get(productionId) ?? null) : null;
-      if (reversePipTake) {
-        pvwBeforePipByProduction.set(productionId, reversePgmBg);
-        pgmBgByProduction.delete(productionId);
-      }
+      // Read before the persist await, which another take can land during.
+      const newPgmBg = pgmBgOf(productionId);
       await persistMixerMutation(productionId, 'TAKE', (d) => ({ ...d, tally: newTally }));
       broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
       // Defer the PIP_STATE displacement broadcast until the Strom round trip
@@ -1420,29 +1370,16 @@ export async function handleMessage(
       const takeTransition = toStromTransition(msg.transitionType ?? 'cut');
       let takeTransitionOk = true;
       if (curPvwPip !== null) {
-        // PiP is on PVW → moving to PGM.
-        // from_input: the real source currently on PGM (will move to PVW).
-        // to_input: the real source that was on PVW *before* the PiP was
-        //   selected.  This becomes Strom's pgm_input (background behind the
-        //   PiP) after the swap, ensuring pgm_input ≠ pvw_input so subsequent
-        //   selectPreview calls don't hit the "sole program source" 400.
+        // PiP is on PVW → moving to PGM, over its own configured background.
         if (doc.stromFlowId && doc.mixerBlockId) {
           try {
             const strom = await makeStromClient();
-            const fromInputIndex = tally.pgm ? (padToIndex(tally.pgm) ?? 0) : 0;
-            const toInputIndex = pvwBeforePip !== null ? (padToIndex(pvwBeforePip) ?? fromInputIndex) : fromInputIndex;
             await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: curPvwPip } });
             await strom.mixer.transition(doc.stromFlowId, doc.mixerBlockId, {
-              from_input: fromInputIndex,
-              to_input: toInputIndex,
+              ...takeInputIndices(tally.pgm ?? oldPgmBg, newPgmBg),
               transition_type: takeTransition,
               ...(msg.durationMs !== undefined ? { duration_ms: msg.durationMs } : {}),
             });
-            // A PVW change during the round trip (#341) has stored its own
-            // pre-PiP source; keep it.
-            if ((pvwPipByProduction.get(productionId) ?? null) === newPvwPip) {
-              pvwBeforePipByProduction.delete(productionId);
-            }
           } catch (err) {
             console.warn('[controller] Strom PiP transition error:', err);
             takeTransitionOk = false;
@@ -1450,20 +1387,11 @@ export async function handleMessage(
         }
       } else if (curPgmPip !== null) {
         // PiP is on PGM → taking to a real input; PiP moves to PVW.
-        // Use the tracked PGM background as from_input (tally.pgm is null while a
-        // PiP occupies PGM). `pvwBeforePipByProduction` was already set to this
-        // background and `pgmBgByProduction` cleared above (before the TALLY
-        // broadcast), so the next forward PiP take has a valid to_input ≠
-        // from_input (avoids "sole program source" 400). Reuse the captured value.
-        const pgmBg = reversePgmBg;
         if (doc.stromFlowId && doc.mixerBlockId) {
           try {
             const strom = await makeStromClient();
-            const fromInputIndex = pgmBg ? (padToIndex(pgmBg) ?? 0) : 0;
-            const toInputIndex = tally.pvw ? (padToIndex(tally.pvw) ?? fromInputIndex) : fromInputIndex;
             await strom.mixer.transition(doc.stromFlowId, doc.mixerBlockId, {
-              from_input: fromInputIndex,
-              to_input: toInputIndex,
+              ...takeInputIndices(oldPgmBg, tally.pvw),
               transition_type: takeTransition,
               ...(msg.durationMs !== undefined ? { duration_ms: msg.durationMs } : {}),
             });
@@ -1473,8 +1401,6 @@ export async function handleMessage(
           }
         }
       } else {
-        // No PiP involved: clear any stale PGM background tracking.
-        pgmBgByProduction.delete(productionId);
         takeTransitionOk = await stromTransition(doc, tally.pgm, tally.pvw, takeTransition, msg.durationMs);
       }
       // Announce the take's new PiP state, and restore a displaced PGM PiP into
@@ -1504,8 +1430,6 @@ export async function handleMessage(
     case 'SET_PVW': {
       const tally = getTally(productionId);
       pvwPipByProduction.set(productionId, null);
-      // A real source is going on PVW: discard any saved pre-PiP PVW reference.
-      pvwBeforePipByProduction.delete(productionId);
       const newTally = { pgm: tally.pgm, pvw: msg.mixerInput };
       setTally(productionId, newTally);
       await persistMixerMutation(productionId, 'SET_PVW', (d) => ({ ...d, tally: newTally }));
@@ -1527,10 +1451,6 @@ export async function handleMessage(
     }
     case 'SELECT_PVW_PIP': {
       const tally = getTally(productionId);
-      // Save the current PVW real source before the PiP takes over. The TAKE
-      // handler uses this as to_input in trigger_transition so Strom ends up
-      // with pgm_input ≠ pvw_input (avoids "sole program source" 400 errors).
-      pvwBeforePipByProduction.set(productionId, tally.pvw);
       pvwPipByProduction.set(productionId, msg.pip);
       const newTally = { pgm: tally.pgm, pvw: null };
       setTally(productionId, newTally);
@@ -1682,7 +1602,7 @@ export async function handleMessage(
             const mixerInput = resolveInput(action.sourceId);
             if (!mixerInput) break;
             const curPgmPipBg = pgmPipByProduction.get(productionId) ?? null;
-            if (curPgmPipBg !== null && (pgmBgByProduction.get(productionId) ?? null) === mixerInput) {
+            if (curPgmPipBg !== null && pgmBgOf(productionId) === mixerInput) {
               // #353: macro CUT to the background under an on-program PiP takes
               // the PiP off program instead of being silently skipped.
               await takePipOffToBackground(productionId, currentDoc, mixerInput, curPgmPipBg, 'MACRO_EXEC:CUT');
@@ -1693,7 +1613,7 @@ export async function handleMessage(
               // background input. Strom takes from its own overlay state and
               // reads from_input only when that state is missing.
               const fromPad = (curPgmPip !== null && tally.pgm === null)
-                ? (pgmBgByProduction.get(productionId) ?? null)
+                ? pgmBgOf(productionId)
                 : tally.pgm;
               const newTally = { pgm: mixerInput, pvw: tally.pgm };
               setTally(productionId, newTally);
@@ -1706,8 +1626,6 @@ export async function handleMessage(
                 // PiP was on PGM → moves to PVW
                 pgmPipByProduction.set(productionId, null);
                 pvwPipByProduction.set(productionId, curPgmPip);
-                pvwBeforePipByProduction.set(productionId, pgmBgByProduction.get(productionId) ?? null);
-                pgmBgByProduction.delete(productionId);
                 macroCutPipEvent = { pvwPip: curPgmPip };
               } else if (curPvwPip !== null) {
                 // PiP was in PVW — cutting a real source to PGM replaces PVW, so clear it
@@ -1735,14 +1653,14 @@ export async function handleMessage(
             const mixerInput = resolveInput(action.sourceId);
             if (!mixerInput) break;
             const curPgmPipBg = pgmPipByProduction.get(productionId) ?? null;
-            if (curPgmPipBg !== null && (pgmBgByProduction.get(productionId) ?? null) === mixerInput) {
+            if (curPgmPipBg !== null && pgmBgOf(productionId) === mixerInput) {
               // #353: macro TRANSITION to the background under an on-program PiP.
               await takePipOffToBackground(productionId, currentDoc, mixerInput, curPgmPipBg, 'MACRO_EXEC:TRANSITION', { transitionType: action.transitionType, durationMs: action.durationMs });
             } else if (!isAlreadyOnProgram(productionId, mixerInput)) {
               const tally = getTally(productionId);
               const curPgmPip = pgmPipByProduction.get(productionId) ?? null;
               const fromPad = (curPgmPip !== null && tally.pgm === null)
-                ? (pgmBgByProduction.get(productionId) ?? null)
+                ? pgmBgOf(productionId)
                 : tally.pgm;
               const newTally = { pgm: mixerInput, pvw: tally.pgm };
               setTally(productionId, newTally);
@@ -1755,8 +1673,6 @@ export async function handleMessage(
                 // PiP was on PGM → moves to PVW
                 pgmPipByProduction.set(productionId, null);
                 pvwPipByProduction.set(productionId, curPgmPip);
-                pvwBeforePipByProduction.set(productionId, pgmBgByProduction.get(productionId) ?? null);
-                pgmBgByProduction.delete(productionId);
                 macroTransPipEvent = { pvwPip: curPgmPip };
               } else if (curPvwPip !== null) {
                 // PiP was in PVW — transitioning a real source to PGM replaces PVW, so clear it
@@ -1788,18 +1704,15 @@ export async function handleMessage(
             // Non-null: the branch condition checked it.
             const curPvwPip = pvwPipByProduction.get(productionId) as number;
             const curPgmPip = pgmPipByProduction.get(productionId) ?? null;
+            const oldPgmBg = pgmBgOf(productionId);
             const newTally = { pgm: tally.pvw, pvw: tally.pgm };
             const newPgmPip = curPvwPip;
             const newPvwPip = curPgmPip;
             setTally(productionId, newTally);
             pgmPipByProduction.set(productionId, newPgmPip);
             pvwPipByProduction.set(productionId, newPvwPip);
-            // The real source that was in PVW before the PiP was selected becomes
-            // the background behind it, falling back to the outgoing PGM input
-            // as the interactive TAKE does. Read before the persist await, which
-            // a SELECT_PVW_PIP or another take can land during.
-            const pvwBeforePip = pvwBeforePipByProduction.get(productionId) ?? null;
-            pgmBgByProduction.set(productionId, pvwBeforePip ?? tally.pgm);
+            // Read before the persist await, which another take can land during.
+            const newPgmBg = pgmBgOf(productionId);
             await persistMixerMutation(productionId, 'MACRO_EXEC:TAKE', (d) => ({ ...d, tally: newTally }));
             broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, currentDoc) });
             // Defer the PIP_STATE broadcast until the Strom transition has
@@ -1807,18 +1720,11 @@ export async function handleMessage(
             let macroPipTakeOk = true;
             if (currentDoc.stromFlowId && currentDoc.mixerBlockId) {
               try {
-                const fromInputIndex = tally.pgm ? (padToIndex(tally.pgm) ?? 0) : 0;
-                const toInputIndex = pvwBeforePip !== null ? (padToIndex(pvwBeforePip) ?? fromInputIndex) : fromInputIndex;
                 await strom.mixer.selectPreview(currentDoc.stromFlowId, currentDoc.mixerBlockId, { source: { pip: curPvwPip } });
                 await strom.mixer.transition(currentDoc.stromFlowId, currentDoc.mixerBlockId, {
-                  from_input: fromInputIndex,
-                  to_input: toInputIndex,
+                  ...takeInputIndices(tally.pgm ?? oldPgmBg, newPgmBg),
                   transition_type: 'cut',
                 });
-                // Keep a pre-PiP source stored by a PVW change during the round trip (#341).
-                if ((pvwPipByProduction.get(productionId) ?? null) === newPvwPip) {
-                  pvwBeforePipByProduction.delete(productionId);
-                }
               } catch (err) {
                 console.warn('[controller] Strom PiP transition error (macro take):', err);
                 macroPipTakeOk = false;
@@ -1836,7 +1742,7 @@ export async function handleMessage(
               ? (pgmPipByProduction.get(productionId) ?? null)
               : null;
             const fromPad = (curPgmPip !== null && tally.pgm === null)
-              ? (pgmBgByProduction.get(productionId) ?? null)
+              ? pgmBgOf(productionId)
               : tally.pgm;
             const newTally = { pgm: tally.pvw, pvw: tally.pgm };
             setTally(productionId, newTally);
@@ -1848,8 +1754,6 @@ export async function handleMessage(
               // PiP was on PGM → moves to PVW
               pgmPipByProduction.set(productionId, null);
               pvwPipByProduction.set(productionId, curPgmPip);
-              pvwBeforePipByProduction.set(productionId, pgmBgByProduction.get(productionId) ?? null);
-              pgmBgByProduction.delete(productionId);
               macroTakePipEvent = { pvwPip: curPgmPip };
             }
             await persistMixerMutation(productionId, 'MACRO_EXEC:TAKE', (d) => ({ ...d, tally: newTally }));

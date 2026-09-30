@@ -123,7 +123,7 @@ afterAll(() => {
 });
 
 // Imported after STROM_URL is set so config picks up the throwaway server.
-const { handleMessage, clearPipState } = await import('../ws/controller.js');
+const { handleMessage, clearPipState, setPipConfigSlot } = await import('../ws/controller.js');
 const { setTally } = await import('../services/tally.service.js');
 
 // ---------------------------------------------------------------------------
@@ -191,9 +191,20 @@ function resetRecordings() {
   stromRequests.length = 0;
 }
 
-beforeEach(() => {
+/**
+ * No PiP selected, video_in_0 on program, video_in_1 in preview. Strom
+ * composites each PiP over its configured background: PiP 0 over input 1,
+ * PiP 1 over input 2.
+ */
+function resetMixer() {
   clearPipState(PROD);
+  setPipConfigSlot(PROD, 0, { bg: 1, zones: [], transforms: {} });
+  setPipConfigSlot(PROD, 1, { bg: 2, zones: [], transforms: {} });
   setTally(PROD, { pgm: 'video_in_0', pvw: 'video_in_1' });
+}
+
+beforeEach(() => {
+  resetMixer();
   resetRecordings();
   transitionDelayMs = 0;
   transitionStatus = 200;
@@ -220,10 +231,10 @@ describe('pgmBg with no Strom flow configured', () => {
     await send({ type: 'TAKE' });
     resetRecordings();
 
-    // `pgmBgByProduction` is what a connecting client is served from. The
-    // connect sync lives in the plugin rather than handleMessage, so observe
-    // the map through a later TALLY, which reads it instead of recomputing it.
-    // SET_PVW leaves the PiP on program, so the background is still current.
+    // `pgmBgOf` is what a connecting client is served from. The connect sync
+    // lives in the plugin rather than handleMessage, so observe it through a
+    // later TALLY. SET_PVW leaves the PiP on program, so the background is
+    // still current.
     await send({ type: 'SET_PVW', mixerInput: 'video_in_2' });
 
     expect(tallies()[0]).toMatchObject({ pgmBg: 'video_in_1' });
@@ -520,23 +531,22 @@ describe('macro TAKE with a PiP in preview', () => {
   it('takes the PiP to program instead of reporting an empty bus', async () => {
     mockGet.mockResolvedValue(makeProductionDoc([{ type: 'TAKE' }]));
 
-    // PiP 1 into preview over video_in_1; video_in_0 stays on program.
+    // PiP 1 into preview; video_in_0 stays on program.
     await send({ type: 'SELECT_PVW_PIP', pip: 1 });
     resetRecordings();
 
     await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
 
-    // The PiP is selected into Strom's preview, then taken over the source
-    // that was in preview before it.
+    // The PiP is selected into Strom's preview, then taken.
     expect(requestsTo(PREVIEW)).toEqual([
       { method: 'PUT', path: PREVIEW, body: { source: { pip: 1 } } },
     ]);
     expect(requestsTo(TRANSITION)).toHaveLength(1);
-    expect(requestsTo(TRANSITION)[0]?.body).toMatchObject({ from_input: 0, to_input: 1, transition_type: 'cut' });
+    expect(requestsTo(TRANSITION)[0]?.body).toMatchObject({ from_input: 0, to_input: 2, transition_type: 'cut' });
 
     // Clients see the PiP on program over its background, not an empty bus.
     expect(tallies()).toHaveLength(1);
-    expect(tallies()[0]).toMatchObject({ pgm: null, pvw: 'video_in_0', pgmBg: 'video_in_1' });
+    expect(tallies()[0]).toMatchObject({ pgm: null, pvw: 'video_in_0', pgmBg: 'video_in_2' });
     expect(pipStates()).toHaveLength(1);
     expect(pipStates()[0]).toMatchObject({ pgmPip: 1, pvwPip: null });
   });
@@ -545,8 +555,7 @@ describe('macro TAKE with a PiP in preview', () => {
     mockGet.mockResolvedValue(makeProductionDoc([{ type: 'TAKE' }]));
 
     const broadcastsAfter = async (msg: Record<string, unknown>) => {
-      clearPipState(PROD);
-      setTally(PROD, { pgm: 'video_in_0', pvw: 'video_in_1' });
+      resetMixer();
       await send({ type: 'SELECT_PVW_PIP', pip: 1 });
       resetRecordings();
       await send(msg);
@@ -618,7 +627,7 @@ describe('macro TAKE with a PiP in preview', () => {
 });
 
 // A PiP selected into PVW while a take is still writing to CouchDB must not
-// change what that take sends to Strom, nor lose its own pre-PiP source.
+// change what that take sends to Strom or reports as its background.
 describe('TAKE of a PVW PiP vs. SELECT_PVW_PIP during the DB write', () => {
   const takes: Array<[string, Record<string, unknown>, Array<Record<string, unknown>>]> = [
     ['macro', { type: 'MACRO_EXEC', macroId: 'macro-1' }, [{ type: 'TAKE' }]],
@@ -626,30 +635,29 @@ describe('TAKE of a PVW PiP vs. SELECT_PVW_PIP during the DB write', () => {
   ];
 
   for (const [name, msg, actions] of takes) {
-    it(`${name} TAKE cuts to the source that was under the PiP`, async () => {
+    it(`${name} TAKE reports the background of the PiP it took`, async () => {
       mockGet.mockResolvedValue(makeProductionDoc(actions));
-      // PiP 1 over video_in_1; video_in_0 on program.
+      // PiP 1 (over video_in_2) in PVW; video_in_0 on program.
       await send({ type: 'SELECT_PVW_PIP', pip: 1 });
       resetRecordings();
       mockInsert.mockImplementation(() => delay(60).then(() => ({ ok: true })));
 
       const take = send(msg);
       await delay(20);
-      // Next PiP into PVW, over video_in_0, while the take is persisting.
+      // PiP 0 (over video_in_1) into PVW while the take is persisting.
       await send({ type: 'SELECT_PVW_PIP', pip: 0 });
       await take;
 
-      expect(requestsTo(TRANSITION)[0]?.body).toMatchObject({ from_input: 0, to_input: 1 });
+      expect(requestsTo(TRANSITION)[0]?.body).toMatchObject({ from_input: 0, to_input: 2 });
       const takeTally = tallies().find((t) => t.pvw === 'video_in_0');
-      expect(takeTally).toMatchObject({ pgm: null, pgmBg: 'video_in_1' });
+      expect(takeTally).toMatchObject({ pgm: null, pgmBg: 'video_in_2' });
 
-      // The next take of PiP 0 composites it over video_in_0, the source it
-      // was selected over.
+      // The next take puts PiP 0 on program over its own background.
       mockInsert.mockResolvedValue({ ok: true });
       resetRecordings();
       await send({ type: 'TAKE' });
-      expect(requestsTo(TRANSITION)[0]?.body).toMatchObject({ to_input: 0 });
-      expect(tallies()[0]).toMatchObject({ pgmBg: 'video_in_0' });
+      expect(requestsTo(TRANSITION)[0]?.body).toMatchObject({ to_input: 1 });
+      expect(tallies()[0]).toMatchObject({ pgmBg: 'video_in_1' });
     });
   }
 });
@@ -677,8 +685,7 @@ describe('macro TAKE with a PiP on program and nothing in preview', () => {
 describe('macro TALLY over a PiP on program', () => {
   /** Put PiP 0 on program from a fresh state, send `msg`, return its first TALLY. */
   const tallyFromPgmPip = async (msg: Record<string, unknown>) => {
-    clearPipState(PROD);
-    setTally(PROD, { pgm: 'video_in_0', pvw: 'video_in_1' });
+    resetMixer();
     await send({ type: 'SELECT_PVW_PIP', pip: 0 });
     await send({ type: 'TAKE' });
     resetRecordings();
@@ -950,5 +957,103 @@ describe('interactive send of a real source over a preview-only PiP', () => {
     expect(states).toHaveLength(1);
     expect(states[0]).toMatchObject({ pgmPip: null, pvwPip: null });
     expect(tallies()[0]).toMatchObject({ pgm: 'video_in_2', pvw: 'video_in_0' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Strom composites a PiP over its own configured background and ignores the
+// take's from_input / to_input, swapping its PGM and PVW buses instead. The
+// TALLY must report that background, whatever was on program or in preview
+// before the PiP was selected.
+// ---------------------------------------------------------------------------
+
+describe('TAKE of a PiP reports the background Strom composites it over', () => {
+  /** Mixer calls in order: `preview <source>` or `transition`. */
+  const mixerCalls = () =>
+    stromRequests
+      .filter((r) => r.path === PREVIEW || r.path === TRANSITION)
+      .map((r) => (r.path === TRANSITION ? 'transition' : `preview ${JSON.stringify((r.body as { source: unknown }).source)}`));
+
+  const takes: Array<[string, () => Promise<void>]> = [
+    ['interactive', () => send({ type: 'TAKE' })],
+    ['macro', () => send({ type: 'MACRO_EXEC', macroId: 'macro-1' })],
+  ];
+
+  for (const [name, take] of takes) {
+    it(`${name}: a PiP selected over an empty preview is on program over its own background`, async () => {
+      mockGet.mockResolvedValue(makeProductionDoc([{ type: 'TAKE' }]));
+      setTally(PROD, { pgm: 'video_in_0', pvw: null });
+      await send({ type: 'SELECT_PVW_PIP', pip: 1 });
+      resetRecordings();
+
+      await take();
+
+      expect(tallies()).toHaveLength(1);
+      expect(tallies()[0]).toMatchObject({ pgm: null, pvw: 'video_in_0', pgmBg: 'video_in_2', program: ['video_in_2'] });
+      expect(pipStates().at(-1)).toMatchObject({ pgmPip: 1, pvwPip: null });
+    });
+
+    it(`${name}: swapping two PiPs lists each PiP's own background`, async () => {
+      mockGet.mockResolvedValue(makeProductionDoc([{ type: 'TAKE' }]));
+      await send({ type: 'SELECT_PVW_PIP', pip: 0 });
+      await send({ type: 'TAKE' });
+      await send({ type: 'SELECT_PVW_PIP', pip: 1 });
+      resetRecordings();
+
+      await take();
+
+      expect(tallies()).toHaveLength(1);
+      expect(tallies()[0]).toMatchObject({ pgmBg: 'video_in_2', program: ['video_in_2'], preview: ['video_in_1'] });
+      expect(pipStates().at(-1)).toMatchObject({ pgmPip: 1, pvwPip: 0 });
+    });
+
+    it(`${name}: a PiP with no background reports none`, async () => {
+      mockGet.mockResolvedValue(makeProductionDoc([{ type: 'TAKE' }]));
+      setPipConfigSlot(PROD, 1, { bg: null, zones: [], transforms: {} });
+      await send({ type: 'SELECT_PVW_PIP', pip: 1 });
+      resetRecordings();
+
+      await take();
+
+      expect(tallies()[0]).toMatchObject({ pgm: null, pgmBg: null, program: [] });
+    });
+  }
+
+  const cutThenTakes: Array<[string, () => Promise<void>]> = [
+    ['interactive', async () => {
+      await send({ type: 'CUT', mixerInput: 'video_in_1' });
+      await send({ type: 'TAKE' });
+    }],
+    ['macro', () => send({ type: 'MACRO_EXEC', macroId: 'macro-1' })],
+  ];
+
+  for (const [name, cutThenTake] of cutThenTakes) {
+    it(`${name}: CUT to the program PiP's background then TAKE takes the PiP off and back on`, async () => {
+      mockGet.mockResolvedValue(makeProductionDoc([{ type: 'CUT', sourceId: 'cam2' }, { type: 'TAKE' }]));
+      await arrangePgmPip();
+
+      await cutThenTake();
+
+      // The CUT previews the background and takes, so Strom puts it on
+      // program and the PiP in preview; the TAKE then puts the PiP back.
+      expect(mixerCalls()).toEqual([
+        'preview {"input":1}',
+        'transition',
+        'preview {"pip":0}',
+        'transition',
+      ]);
+      expect(pipStates().map((p) => [p.pgmPip, p.pvwPip])).toEqual([[null, 0], [0, null]]);
+      expect(tallies().map((t) => [t.pgm, t.pgmBg])).toEqual([['video_in_1', null], [null, 'video_in_1']]);
+    });
+  }
+
+  it('a background changed with SET_PIP while the PiP is on program shows in the next TALLY', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+    await arrangePgmPip();
+
+    await send({ type: 'SET_PIP', pip: 0, bg: 3, zones: [] });
+    await send({ type: 'SET_PVW', mixerInput: 'video_in_2' });
+
+    expect(tallies().at(-1)).toMatchObject({ pgmBg: 'video_in_3', program: ['video_in_3'] });
   });
 });
