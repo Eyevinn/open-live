@@ -404,6 +404,13 @@ export interface GuestSessionDoc {
   state: GuestSessionState;
   /** Reference into intercom-manager, when a talkback line is provisioned (later sub-issue). */
   intercomLineId?: string;
+  /**
+   * Whether the guest has muted their microphone from the guest page (issue #382).
+   * The guest reports every mute change via `PUT /guests/:inviteId/session/mute`;
+   * this is surfaced to the operator in `GUEST_STATE` and the guests projection.
+   * A rejoin resets it to unmuted.
+   */
+  muted?: boolean;
   whipSessionId?: string;
   /**
    * Strom WHEP session id of this guest's most recent return-picture feed
