@@ -600,9 +600,25 @@ const mixerInputSchema = z.string().regex(/^video_in_\d{1,2}$/, 'mixerInput must
 // the mixerInput allowlist so only well-formed pad names reach the Strom pipeline.
 const dskInputSchema = z.string().regex(/^dsk_in_\d+$/, 'dskInput must match dsk_in_N format').max(20);
 
+/**
+ * Declares a source assignment as a guest slot (issue #381 item 1): a return
+ * feed (program-minus by default) reserved for a guest and built into the flow
+ * as a per-guest return bus at activation (`assignReturnBuses`,
+ * `src/lib/flow-generator.ts`). Present ⇒ the input is a guest slot invites can
+ * target; absent ⇒ an ordinary source assignment. v1 accepts `lowLatency: false`
+ * only (the fast/low-latency return is a post-v1 feature).
+ */
+const ReturnFeedInput = z
+  .object({
+    synced: z.enum(['program', 'program-minus']).default('program-minus'),
+    lowLatency: z.literal(false).optional(),
+  })
+  .optional();
+
 const SourceAssignmentInput = z.object({
   sourceId: z.string().min(1).max(128),
   mixerInput: mixerInputSchema,
+  returnFeed: ReturnFeedInput,
 });
 
 const GraphicAssignmentInput = z.object({
@@ -990,7 +1006,15 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
   // Assign a source to a mixer input
   fastify.post<{ Params: { id: string } }>('/api/v1/productions/:id/sources', async (req, reply) => {
     const body = SourceAssignmentInput.parse(req.body);
-    const assignment: ProductionSourceAssignment = { sourceId: body.sourceId, mixerInput: body.mixerInput };
+    const assignment: ProductionSourceAssignment = {
+      sourceId: body.sourceId,
+      mixerInput: body.mixerInput,
+      // A returnFeed makes this a guest slot (#381 item 1). Normalise lowLatency
+      // to false — v1 builds only the synced (picture-switch) return.
+      ...(body.returnFeed
+        ? { returnFeed: { synced: body.returnFeed.synced, lowLatency: false as const } }
+        : {}),
+    };
     for (let attempt = 0; attempt < MAX_DB_WRITE_RETRIES; attempt++) {
       try {
         const doc = await getDb().get(req.params.id);

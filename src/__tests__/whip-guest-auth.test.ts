@@ -99,6 +99,7 @@ vi.mock('../ws/controller.js', () => ({
   clearAudioState: vi.fn(),
   clearPipState: vi.fn(),
   clearFxState: vi.fn(),
+  applyReturnMode: vi.fn().mockResolvedValue({ ok: true }),
 }));
 
 vi.mock('../lib/strom-token.js', () => ({
@@ -117,7 +118,13 @@ function seedProduction(id = 'prod-1'): ProductionDoc {
     type: 'production',
     name: 'Test show',
     status: 'inactive',
-    sources: [],
+    // Two declared guest slots (#381): source assignments carrying a returnFeed.
+    // Invites can only target a declared guest slot, so the suite's invites pin
+    // video_in_0 / video_in_1.
+    sources: [
+      { sourceId: 'Whip', mixerInput: 'video_in_0', returnFeed: { synced: 'program-minus' as const, lowLatency: false } },
+      { sourceId: 'Whip', mixerInput: 'video_in_1', returnFeed: { synced: 'program-minus' as const, lowLatency: false } },
+    ],
     pipeline: { stromConfig: null, status: 'stopped' },
     graphics: [],
     macros: [],
@@ -197,9 +204,9 @@ describe('WHIP guest-token auth (issue #380)', () => {
     expect(res.statusCode).toBe(201);
   });
 
-  it('a live guest token authorizes WHIP POST on its own (auto-allocated) slot', async () => {
+  it('a live guest token authorizes WHIP POST on its own pinned slot', async () => {
     seedProduction();
-    const invite = await createInvite('prod-1');
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
     const { whipUrl } = await joinGuest(invite.id, invite.token);
     const path = new URL(whipUrl).pathname;
     const res = await app.inject({
