@@ -87,25 +87,42 @@ vi.mock('../db/index.js', () => ({
   isDbConnected: vi.fn().mockReturnValue(true),
 }));
 
+const applyReturnModeMock = vi.fn().mockResolvedValue({ ok: true, mixerInput: 'video_in_0', mode: 'program-minus' });
 vi.mock('../ws/controller.js', () => ({
   default: async () => {},
   clearAudioState: vi.fn(),
   clearPipState: vi.fn(),
   clearFxState: vi.fn(),
+  applyReturnMode: (...args: unknown[]) => applyReturnModeMock(...args),
 }));
 
 const AUTH = { authorization: `Bearer ${TEST_API_KEY}` };
 
 let app: FastifyInstance;
 
-function seedProduction(id = 'prod-1'): ProductionDoc {
+/**
+ * Seed a production with N declared guest slots (#381). A guest slot is a source
+ * assignment carrying a `returnFeed` (program-minus) — the same shape the flow
+ * generator turns into a per-guest return bus at activation. Invites can only
+ * target a declared slot, so tests seed the slots they pin.
+ */
+function seedProduction(
+  id = 'prod-1',
+  opts: { slots?: string[]; status?: string; stromFlowId?: string } = {},
+): ProductionDoc {
+  const slots = opts.slots ?? ['video_in_0', 'video_in_1', 'video_in_2', 'video_in_3'];
   const doc = {
     _id: id,
     _rev: '1-a',
     type: 'production',
     name: 'Test show',
-    status: 'inactive',
-    sources: [],
+    status: opts.status ?? 'inactive',
+    ...(opts.stromFlowId ? { stromFlowId: opts.stromFlowId } : {}),
+    sources: slots.map((mixerInput) => ({
+      sourceId: 'Whip',
+      mixerInput,
+      returnFeed: { synced: 'program-minus' as const, lowLatency: false },
+    })),
     pipeline: { stromConfig: null, status: 'stopped' },
     graphics: [],
     macros: [],
@@ -126,6 +143,7 @@ beforeEach(() => {
   invitesStore.clear();
   sessionsStore.clear();
   productionsStore.clear();
+  applyReturnModeMock.mockClear();
 });
 
 describe('POST /api/v1/productions/:id/guests/invites', () => {
@@ -135,7 +153,7 @@ describe('POST /api/v1/productions/:id/guests/invites', () => {
       method: 'POST',
       url: '/api/v1/productions/prod-1/guests/invites',
       headers: AUTH,
-      payload: { label: 'Remote guest' },
+      payload: { label: 'Remote guest', mixerInput: 'video_in_0' },
     });
     expect(res.statusCode).toBe(201);
     const body = res.json();
@@ -185,6 +203,33 @@ describe('POST /api/v1/productions/:id/guests/invites', () => {
     });
     expect(res.statusCode).toBe(400);
   });
+
+  // #381 item 2: an invite must target a declared guest slot — allocateMixerInput
+  // is gone, so a guest can never be handed an input the running flow lacks.
+  it('400s an invite with no guest slot (mixerInput omitted)', async () => {
+    seedProduction();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/productions/prod-1/guests/invites',
+      headers: AUTH,
+      payload: { label: 'No slot' },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toMatch(/guest slot/i);
+  });
+
+  it('400s an invite targeting an input that is not a guest slot (no returnFeed)', async () => {
+    // video_in_9 is not one of the declared slots (video_in_0..3).
+    seedProduction();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/productions/prod-1/guests/invites',
+      headers: AUTH,
+      payload: { mixerInput: 'video_in_9' },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toMatch(/not a guest slot/i);
+  });
 });
 
 describe('POST /api/v1/guests/:inviteId/join', () => {
@@ -194,7 +239,8 @@ describe('POST /api/v1/guests/:inviteId/join', () => {
       method: 'POST',
       url: '/api/v1/productions/prod-1/guests/invites',
       headers: AUTH,
-      payload,
+      // Pin the seed's first declared guest slot unless a test overrides it.
+      payload: { mixerInput: 'video_in_0', ...payload },
     });
     return res.json() as { id: string; token: string };
   }
@@ -312,7 +358,7 @@ describe('guest management + revocation', () => {
       method: 'POST',
       url: '/api/v1/productions/prod-1/guests/invites',
       headers: AUTH,
-      payload: {},
+      payload: { mixerInput: 'video_in_0' },
     });
     const invite = inviteRes.json() as { id: string; token: string };
     const joinRes = await app.inject({
@@ -357,5 +403,109 @@ describe('guest management + revocation', () => {
     });
     expect(ok.statusCode).toBe(204);
     expect(invitesStore.has(invite.id)).toBe(false);
+  });
+});
+
+describe('guest slots — one guest per slot, reconnect, server-side teardown (#381)', () => {
+  // A fresh server per test: the join route's per-route rate limiter (max 10/min)
+  // otherwise accumulates across the several joins these scenarios drive.
+  let slotApp: FastifyInstance;
+  beforeEach(async () => {
+    const { buildServer } = await import('../server.js');
+    slotApp = await buildServer();
+  });
+
+  async function mkInvite(mixerInput: string, prodId = 'prod-1') {
+    const res = await slotApp.inject({
+      method: 'POST',
+      url: `/api/v1/productions/${prodId}/guests/invites`,
+      headers: AUTH,
+      payload: { mixerInput },
+    });
+    expect(res.statusCode).toBe(201);
+    return res.json() as { id: string; token: string };
+  }
+  function join(invite: { id: string; token: string }) {
+    return slotApp.inject({
+      method: 'POST',
+      url: `/api/v1/guests/${invite.id}/join`,
+      headers: { authorization: `Bearer ${invite.token}` },
+    });
+  }
+
+  it('409s a second invite trying to join a slot another live guest holds', async () => {
+    seedProduction();
+    const a = await mkInvite('video_in_0');
+    const b = await mkInvite('video_in_0');
+    expect((await join(a)).statusCode).toBe(200);
+    const res = await join(b);
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toMatch(/occupied/i);
+  });
+
+  it('lets a guest reconnect on the same invite while holding the slot (reuses the session)', async () => {
+    seedProduction();
+    const a = await mkInvite('video_in_0');
+    const first = await join(a);
+    expect(first.statusCode).toBe(200);
+    const guestId = (first.json() as { guestId: string }).guestId;
+    // A reconnect on the SAME invite reuses the same session and keeps working.
+    const second = await join(a);
+    expect(second.statusCode).toBe(200);
+    expect((second.json() as { guestId: string }).guestId).toBe(guestId);
+  });
+
+  it('resets a new occupant to program-minus (per-slot config, not inherited state)', async () => {
+    // The slot was left on `program` by a previous guest; a NEW occupant must be
+    // reset to program-minus via the shared applyReturnMode entry point.
+    seedProduction('prod-1', { slots: [] });
+    const prod = productionsStore.get('prod-1')!;
+    (prod as unknown as { sources: unknown[] }).sources = [
+      { sourceId: 'Whip', mixerInput: 'video_in_0', returnFeed: { synced: 'program', lowLatency: false } },
+    ];
+    const a = await mkInvite('video_in_0');
+    const res = await join(a);
+    expect(res.statusCode).toBe(200);
+    expect(applyReturnModeMock).toHaveBeenCalledWith('prod-1', 'video_in_0', 'program-minus');
+    expect((res.json() as { returnMode: string }).returnMode).toBe('program-minus');
+  });
+
+  it('frees the slot on the server on kick, so the next guest can take it', async () => {
+    // Active production with a live flow: kick must tear down the WHIP publisher
+    // in Strom from the backend (not the browser) and free the slot.
+    seedProduction('prod-1', { status: 'active', stromFlowId: 'flow-1' });
+    const whipDeletes: string[] = [];
+    const fetchMock = vi.fn(async (url: unknown, init?: { method?: string }) => {
+      if (init?.method === 'DELETE') whipDeletes.push(String(url));
+      return new Response(null, { status: 204 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const a = await mkInvite('video_in_0');
+      const joinA = await join(a);
+      expect(joinA.statusCode).toBe(200);
+      const guestId = (joinA.json() as { guestId: string }).guestId;
+
+      // A different guest cannot take the occupied slot yet.
+      const b = await mkInvite('video_in_0');
+      expect((await join(b)).statusCode).toBe(409);
+
+      // Operator kicks guest A — the server tears down the Strom WHIP session
+      // (does not wait for the guest's browser).
+      const kick = await slotApp.inject({
+        method: 'DELETE',
+        url: `/api/v1/productions/prod-1/guests/${guestId}`,
+        headers: AUTH,
+      });
+      expect(kick.statusCode).toBe(204);
+      expect(sessionsStore.get(guestId)?.state).toBe('left');
+      // Teardown hit the slot's WHIP endpoint on Strom, server-side.
+      expect(whipDeletes.some((u) => u.includes('/whip/whip-0-'))).toBe(true);
+
+      // The slot is now free: guest B can join.
+      expect((await join(b)).statusCode).toBe(200);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
