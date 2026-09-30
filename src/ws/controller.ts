@@ -3063,6 +3063,7 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
                 guestId: s._id,
                 mixerInput: s.mixerInput,
                 state: deriveGuestDisplayState(s.state, s.mixerInput, program, preview),
+                muted: !!s.muted,
                 ...(label ? { label } : {}),
                 ...(s.intercomLineId ? { intercomLine: s.intercomLineId } : {}),
                 seq: nextSeq(id),

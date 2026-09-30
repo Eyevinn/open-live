@@ -160,7 +160,11 @@ describe('POST /api/v1/productions/:id/guests/invites', () => {
     expect(body.id).toMatch(/^guest-invite-/);
     expect(body.productionId).toBe('prod-1');
     expect(body.token).toMatch(/^olgi_v1_/);
-    expect(body.joinUrl).toBe(`https://live.example.com/api/v1/guests/${body.id}/join`);
+    // joinUrl is now the backend-served guest page with the token in the URL
+    // fragment (issue #382) — never the raw API endpoint, and the token never
+    // lands in a query string / server log.
+    expect(body.joinUrl).toBe(`https://live.example.com/guest/${body.id}#${body.token}`);
+    expect(body.joinUrl).not.toContain('?');
     expect(typeof body.expiresAt).toBe('string');
 
     // Only the hash is persisted — never the raw token.

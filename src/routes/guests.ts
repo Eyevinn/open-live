@@ -70,6 +70,9 @@ const CreateInviteBody = z.object({
   mixerInput: z.string().min(1).max(64).optional(),
 });
 
+/** Mic mute toggle reported by the guest page while live (issue #382). */
+const MuteBody = z.object({ muted: z.boolean() });
+
 // ---------------------------------------------------------------------------
 // Return-feed metadata (stable contract; feed URLs land in a later sub-issue)
 // ---------------------------------------------------------------------------
@@ -114,7 +117,9 @@ function sessionToApi(doc: GuestSessionDoc) {
   const { _id, _rev, type, ...rest } = doc;
   void _rev;
   void type;
-  return { id: _id, ...rest };
+  // `muted` is always projected (default false) so the operator's guest list
+  // reflects mute state even for a guest who has not toggled it yet (issue #382).
+  return { id: _id, ...rest, muted: !!doc.muted };
 }
 
 /**
@@ -129,6 +134,9 @@ function broadcastGuestState(session: GuestSessionDoc, label?: string): void {
     guestId: session._id,
     mixerInput: session.mixerInput,
     state: session.state,
+    // Always carry mute state so the operator UI (studio#163) can render the
+    // muted badge from any GUEST_STATE, not only mute-change events (issue #382).
+    muted: !!session.muted,
     ...(label ? { label } : {}),
     ...(session.intercomLineId ? { intercomLine: session.intercomLineId } : {}),
   });
@@ -265,7 +273,11 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
       }
 
       const base = resolvePublicBaseUrl(req);
-      const joinUrl = `${base}/api/v1/guests/${inviteId}/join`;
+      // The guest opens this page (served by THIS backend — shares origin with
+      // join/WHIP/returns, no CORS; issue #382). The token rides the URL fragment
+      // (`#`) so it never reaches server or proxy access logs, unlike a query
+      // string. The page reads it from `location.hash` and calls join itself.
+      const joinUrl = `${base}/guest/${inviteId}#${token}`;
       // The raw token is returned here and NEVER again — only its hash is stored.
       return reply.status(201).send({
         id: inviteId,
@@ -420,7 +432,8 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
           (s) => s.inviteId === invite._id && s.state !== 'left',
         );
         if (ownLive) {
-          session = { ...ownLive, mixerInput, state: 'joined', updatedAt: now };
+          // A rejoin starts unmuted — the mute state resets (issue #382).
+          session = { ...ownLive, mixerInput, state: 'joined', muted: false, updatedAt: now };
         } else {
           const occupant = docs.find(
             (s) => s.mixerInput === mixerInput && s.inviteId !== invite._id && s.state !== 'left',
@@ -436,6 +449,7 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
             inviteId: invite._id,
             mixerInput,
             state: 'joined',
+            muted: false,
             createdAt: now,
             updatedAt: now,
           };
@@ -593,6 +607,61 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
       }
       return reply.status(204).send();
+    },
+  );
+
+  // Guest toggles their mic mute while live (token-authed, issue #382). The page
+  // mutes locally by disabling the audio track (the WHIP session stays up); this
+  // call only tells the backend so the operator sees it. Persists `muted` on the
+  // live session and broadcasts an updated GUEST_STATE so the studio (studio#163)
+  // reflects it within a second.
+  fastify.put<{ Params: { inviteId: string } }>(
+    '/api/v1/guests/:inviteId/session/mute',
+    async (req, reply) => {
+      if (!isGuestCallingEnabled()) return reply.status(503).send(guestsDisabled());
+      const secret = config.guestInviteSecret!;
+      const body = MuteBody.parse(req.body);
+      const token = bearerToken(req);
+      if (!token) {
+        return reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
+      }
+      const verified = verifyGuestInviteToken(token, secret);
+      if (!verified.ok || verified.claims.inviteId !== req.params.inviteId) {
+        return reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
+      }
+      let invite: GuestInviteDoc;
+      try {
+        invite = await getGuestInvitesDb().get(req.params.inviteId);
+      } catch {
+        return reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
+      }
+      if (invite.tokenHash !== hashGuestInviteToken(token)) {
+        return reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
+      }
+
+      try {
+        const existing = await getGuestSessionsDb().find({
+          selector: { type: 'guest-session', inviteId: invite._id },
+        });
+        const live = (Array.isArray(existing?.docs) ? existing.docs : []).find(
+          (s) => s.state !== 'left',
+        );
+        // No live session to mute — the guest must join first (spec §"Error codes").
+        if (!live) {
+          return reply.status(404).send({ error: 'No active guest session', statusCode: 404 });
+        }
+        const updated: GuestSessionDoc = {
+          ...live,
+          muted: body.muted,
+          updatedAt: new Date().toISOString(),
+        };
+        await getGuestSessionsDb().insert(updated);
+        broadcastGuestState(updated, invite.label);
+        return reply.send({ guestId: updated._id, muted: updated.muted });
+      } catch (err) {
+        fastify.log.warn({ err }, 'PUT guests/:id/session/mute — DB write failed');
+        return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
+      }
     },
   );
 
