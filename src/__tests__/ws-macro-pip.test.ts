@@ -78,6 +78,9 @@ let transitionDelayMs = 0;
 // (e.g. /preview) keep answering 200.
 let transitionStatus = 200;
 
+// When >= 400, the fake Strom fails PUT /pip/{idx} (a PiP layout it rejects).
+let pipConfigStatus = 200;
+
 const stromServer: Server = createServer((req, res) => {
   const chunks: Buffer[] = [];
   req.on('data', (c: Buffer) => chunks.push(c));
@@ -93,6 +96,11 @@ const stromServer: Server = createServer((req, res) => {
       if (isTransition && transitionStatus >= 400) {
         res.writeHead(transitionStatus, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'transition rejected' }));
+        return;
+      }
+      if ((req.url ?? '').includes('/pip/') && pipConfigStatus >= 400) {
+        res.writeHead(pipConfigStatus, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'pip config rejected' }));
         return;
       }
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -216,6 +224,7 @@ beforeEach(() => {
   resetRecordings();
   transitionDelayMs = 0;
   transitionStatus = 200;
+  pipConfigStatus = 200;
   mockGet.mockReset();
   mockInsert.mockReset();
   mockInsert.mockResolvedValue({ ok: true });
@@ -1255,13 +1264,83 @@ describe('TAKE of a PiP reports the background Strom composites it over', () => 
     });
   }
 
-  it('a background changed with SET_PIP while the PiP is on program shows in the next TALLY', async () => {
+  it('SET_PIP changing the background of the PiP on program sends a TALLY naming it', async () => {
     mockGet.mockResolvedValue(makeProductionDoc([]));
     await arrangePgmPip();
 
     await send({ type: 'SET_PIP', pip: 0, bg: 3, zones: [] });
-    await send({ type: 'SET_PVW', mixerInput: 'video_in_2' });
 
-    expect(tallies().at(-1)).toMatchObject({ pgmBg: 'video_in_3', program: ['video_in_3'] });
+    expect(tallies()).toHaveLength(1);
+    expect(tallies()[0]).toMatchObject({ pgm: null, pgmBg: 'video_in_3', program: ['video_in_3'] });
+  });
+
+  for (const [name, take] of takes) {
+    it(`${name}: the take sends compact Strom pads (#463)`, async () => {
+      mockGet.mockResolvedValue({
+        ...makeProductionDoc([{ type: 'TAKE' }]),
+        mixerInputMap: { video_in_0: 0, video_in_2: 1 },
+      });
+      setTally(PROD, { pgm: 'video_in_0', pvw: null });
+      await send({ type: 'SELECT_PVW_PIP', pip: 1 });
+      resetRecordings();
+
+      await take();
+
+      expect(requestsTo(TRANSITION)[0]?.body).toMatchObject({ from_input: 0, to_input: 1 });
+      expect(tallies()[0]).toMatchObject({ pgmBg: 'video_in_2' });
+    });
+  }
+
+  it('SET_PIP that Strom rejects leaves the reported background unchanged', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await arrangePgmPip();
+    pipConfigStatus = 400;
+
+    await send({ type: 'SET_PIP', pip: 0, bg: 3, zones: [] });
+    await send({ type: 'SET_PVW', mixerInput: 'video_in_2' });
+    warn.mockRestore();
+
+    // Strom still composites PiP 0 over input 1, and clients get the old layout back.
+    expect(tallies().at(-1)).toMatchObject({ pgmBg: 'video_in_1', program: ['video_in_1'] });
+    expect((pipStates().at(-1)?.pips as Array<{ bg: number | null }>)[0]?.bg).toBe(1);
+  });
+
+  it('CUT to the PiP\'s background that Strom rejects rolls back and NACKs (#430)', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await arrangePgmPip();
+    vi.mocked(ws.send).mockClear();
+    transitionStatus = 500;
+
+    await send({ type: 'CUT', mixerInput: 'video_in_1', cmdId: 'cmd-1' });
+    warn.mockRestore();
+
+    expect(requestsTo(TRANSITION)).toHaveLength(1);
+    // The PiP is never announced in preview; the rollback re-sends it on program.
+    expect(pipStates()).toEqual([expect.objectContaining({ pgmPip: 0, pvwPip: null })]);
+    expect(tallies().at(-1)).toMatchObject({ pgm: null, pgmBg: 'video_in_1', program: ['video_in_1'] });
+    expect(framesOfType('NACK')).toContainEqual(
+      expect.objectContaining({ type: 'NACK', cmdId: 'cmd-1', error: 'Switch rejected by Strom' }),
+    );
+    expect(framesOfType('ACK').some((f) => f.cmdId === 'cmd-1' && f.phase === 'executed')).toBe(false);
+  });
+
+  it('macro CUT to the PiP\'s background that Strom rejects rolls back and reports MACRO_ERROR (#430)', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([{ type: 'CUT', sourceId: 'cam2' }]));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await arrangePgmPip();
+    vi.mocked(ws.send).mockClear();
+    transitionStatus = 500;
+
+    await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
+    warn.mockRestore();
+
+    expect(requestsTo(TRANSITION)).toHaveLength(1);
+    expect(pipStates()).toEqual([expect.objectContaining({ pgmPip: 0, pvwPip: null })]);
+    expect(tallies().at(-1)).toMatchObject({ pgm: null, pgmBg: 'video_in_1' });
+    expect(framesOfType('MACRO_ERROR')).toContainEqual(
+      expect.objectContaining({ type: 'MACRO_ERROR', macroId: 'macro-1', failedActionIndex: 0 }),
+    );
   });
 });
