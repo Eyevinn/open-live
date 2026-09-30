@@ -10,6 +10,7 @@ import type {
   GuestInviteDoc,
   GuestSessionDoc,
   ProductionDoc,
+  ProductionSourceAssignment,
 } from '../db/types.js';
 import {
   generateGuestInviteToken,
@@ -19,6 +20,9 @@ import {
 import { config, isGuestCallingEnabled } from '../config.js';
 import { broadcast } from '../services/tally.service.js';
 import { resolvePublicBaseUrl, updateProductionDoc } from './productions.js';
+import { applyReturnMode } from '../ws/controller.js';
+import { resolveStromWhipUrl } from './whip.js';
+import { getStromToken } from '../lib/strom-token.js';
 import {
   isIntercomEnabled,
   provisionGuestLine,
@@ -56,9 +60,18 @@ const CreateInviteBody = z.object({
   label: z.string().min(1).max(256).optional(),
   /** Override the default TTL. Bounded to keep invites short-lived (spec §Risks). */
   expiresInS: z.number().int().min(60).max(7 * 86400).optional(),
-  /** Optional pre-allocated input the guest will occupy; allocated on join if absent. */
+  /**
+   * The guest slot this invite pins the guest to (#381 item 2). Required in
+   * practice: an invite with no slot, or one whose input is not a declared guest
+   * slot on the production, is rejected at create time (kept optional in the
+   * schema so that rejection returns a clear, domain-specific 400 rather than a
+   * generic zod error).
+   */
   mixerInput: z.string().min(1).max(64).optional(),
 });
+
+/** Mic mute toggle reported by the guest page while live (issue #382). */
+const MuteBody = z.object({ muted: z.boolean() });
 
 // ---------------------------------------------------------------------------
 // Return-feed metadata (stable contract; feed URLs land in a later sub-issue)
@@ -104,7 +117,9 @@ function sessionToApi(doc: GuestSessionDoc) {
   const { _id, _rev, type, ...rest } = doc;
   void _rev;
   void type;
-  return { id: _id, ...rest };
+  // `muted` is always projected (default false) so the operator's guest list
+  // reflects mute state even for a guest who has not toggled it yet (issue #382).
+  return { id: _id, ...rest, muted: !!doc.muted };
 }
 
 /**
@@ -119,6 +134,9 @@ function broadcastGuestState(session: GuestSessionDoc, label?: string): void {
     guestId: session._id,
     mixerInput: session.mixerInput,
     state: session.state,
+    // Always carry mute state so the operator UI (studio#163) can render the
+    // muted badge from any GUEST_STATE, not only mute-change events (issue #382).
+    muted: !!session.muted,
     ...(label ? { label } : {}),
     ...(session.intercomLineId ? { intercomLine: session.intercomLineId } : {}),
   });
@@ -142,6 +160,50 @@ function guestsDisabled(): { error: string; statusCode: 503 } {
   };
 }
 
+/**
+ * A guest slot (issue #381) is a mixer input reserved for guests: a source
+ * assignment carrying a `returnFeed` (program-minus), declared before air and
+ * built into the flow as a per-guest return bus at activation
+ * (`assignReturnBuses`, `src/lib/flow-generator.ts`). Its presence is the single
+ * determinant of "is this a guest slot" for invite-create and join validation —
+ * the same `mixerInput` + `returnFeed` check the return routes already use
+ * (`src/routes/returns.ts`). Returns the assignment, or undefined if the input
+ * is not a declared guest slot on this production.
+ */
+function guestSlotAssignment(
+  production: ProductionDoc,
+  mixerInput: string | undefined,
+): ProductionSourceAssignment | undefined {
+  if (!mixerInput) return undefined;
+  return (production.sources ?? []).find(
+    (s) => s.mixerInput === mixerInput && !!s.returnFeed,
+  );
+}
+
+/**
+ * Free a guest slot on the server (issue #381 item 4): tear down the slot's WHIP
+ * publisher in Strom from the backend, rather than leaving teardown to the
+ * guest's browser, so a crashed or lingering browser cannot keep the slot busy
+ * for the next guest. Reuses the existing WHIP endpoint contract
+ * (`resolveStromWhipUrl`) and the shared Strom token. No-op when the production
+ * has no live flow — there is nothing to tear down. Best-effort: teardown
+ * failures are swallowed (a stale session in Strom must not block the kick/leave
+ * that frees the slot in our own state).
+ */
+async function teardownGuestWhip(
+  production: ProductionDoc,
+  mixerInput: string,
+): Promise<void> {
+  if (production.status !== 'active' || !production.stromFlowId) return;
+  const target = resolveStromWhipUrl(production._id, mixerInput);
+  const token = await getStromToken(config.stromToken).catch(() => undefined);
+  const headers: Record<string, string> = {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  await fetch(target, { method: 'DELETE', headers }).catch(() => {
+    /* ignore teardown errors — the slot is freed in our own session state regardless */
+  });
+}
+
 const guestsRoutes: FastifyPluginAsync = async (fastify) => {
   // -------------------------------------------------------------------------
   // Invites (production-scoped, API_KEY gated)
@@ -157,10 +219,30 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
       const body = CreateInviteBody.parse(req.body);
 
       // 404 if the production does not exist.
+      let production: ProductionDoc;
       try {
-        await getDb().get(req.params.id);
+        production = await getDb().get(req.params.id);
       } catch {
         return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+      }
+
+      // v1 (#381 item 2): an invite must target a pre-declared guest slot — a
+      // source assignment carrying a `returnFeed`. The placeholder join-time
+      // allocation (allocateMixerInput) is gone, so a guest can never be handed
+      // an input the running flow does not have. Reject a missing slot or a
+      // non-guest-slot input with a clear, actionable error.
+      if (!body.mixerInput) {
+        return reply.status(400).send({
+          error:
+            'A guest invite must target a guest slot: set mixerInput to a guest slot declared on this production',
+          statusCode: 400,
+        });
+      }
+      if (!guestSlotAssignment(production, body.mixerInput)) {
+        return reply.status(400).send({
+          error: `mixerInput '${body.mixerInput}' is not a guest slot on this production (a guest slot is a source assignment with a returnFeed)`,
+          statusCode: 400,
+        });
       }
 
       const inviteId = `guest-invite-${randomUUID()}`;
@@ -191,7 +273,11 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
       }
 
       const base = resolvePublicBaseUrl(req);
-      const joinUrl = `${base}/api/v1/guests/${inviteId}/join`;
+      // The guest opens this page (served by THIS backend — shares origin with
+      // join/WHIP/returns, no CORS; issue #382). The token rides the URL fragment
+      // (`#`) so it never reaches server or proxy access logs, unlike a query
+      // string. The page reads it from `location.hash` and calls join itself.
+      const joinUrl = `${base}/guest/${inviteId}#${token}`;
       // The raw token is returned here and NEVER again — only its hash is stored.
       return reply.status(201).send({
         id: inviteId,
@@ -314,25 +400,48 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
       if (production.status === 'ended') {
         return reply.status(409).send({ error: 'Production is not active', statusCode: 409 });
       }
-      // Allocate a mixer input if the invite did not pin one: reuse the invite's
-      // preset, else the first unassigned `video_in_N` on the production.
-      const mixerInput = invite.mixerInput ?? allocateMixerInput(production);
+      // 3b. Resolve the guest slot the invite is pinned to (#381 item 2). v1 has
+      //     no allocation fallback: an invite with no slot, or one whose input is
+      //     no longer a guest slot (returnFeed removed) on this production, cannot
+      //     join. Invite-create already enforces this, so this is defence in depth
+      //     against a slot removed between create and join.
+      const slot = guestSlotAssignment(production, invite.mixerInput);
+      if (!invite.mixerInput || !slot) {
+        return reply.status(409).send({
+          error: 'Invite is not bound to an available guest slot',
+          statusCode: 409,
+        });
+      }
+      const mixerInput = invite.mixerInput;
 
-      // 4. Create (or reuse) the guest session for this invite. A rejoin on the
-      //    same invite reuses the existing non-`left` session so a reconnect does
-      //    not orphan sessions.
+      // 4. Create (or reuse) the guest session, enforcing one guest per slot
+      //    (#381 item 3):
+      //      - a rejoin on THIS invite reuses its own non-`left` session, so a
+      //        reconnect (network drop / page reload) keeps working as before;
+      //      - another invite's live (non-`left`) session on the same slot means
+      //        the slot is taken → 409 "Guest slot occupied".
       const now = new Date().toISOString();
       let session: GuestSessionDoc;
+      let isNewOccupant = false;
       try {
         const existing = await getGuestSessionsDb().find({
-          selector: { type: 'guest-session', inviteId: invite._id },
+          selector: { type: 'guest-session', productionId: invite.productionId },
         });
-        const live = (Array.isArray(existing?.docs) ? existing.docs : []).find(
-          (s) => s.state !== 'left',
+        const docs = Array.isArray(existing?.docs) ? existing.docs : [];
+        const ownLive = docs.find(
+          (s) => s.inviteId === invite._id && s.state !== 'left',
         );
-        if (live) {
-          session = { ...live, mixerInput, state: 'joined', updatedAt: now };
+        if (ownLive) {
+          // A rejoin starts unmuted — the mute state resets (issue #382).
+          session = { ...ownLive, mixerInput, state: 'joined', muted: false, updatedAt: now };
         } else {
+          const occupant = docs.find(
+            (s) => s.mixerInput === mixerInput && s.inviteId !== invite._id && s.state !== 'left',
+          );
+          if (occupant) {
+            return reply.status(409).send({ error: 'Guest slot occupied', statusCode: 409 });
+          }
+          isNewOccupant = true;
           session = {
             _id: `guest-session-${randomUUID()}`,
             type: 'guest-session',
@@ -340,6 +449,7 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
             inviteId: invite._id,
             mixerInput,
             state: 'joined',
+            muted: false,
             createdAt: now,
             updatedAt: now,
           };
@@ -350,24 +460,20 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
       }
 
-      // 5a. Ensure the guest's assignment carries a return feed (issue #300). The
-      //    return belongs to the assignment, so a rejoin keeps it; default is
-      //    program-minus (OQ2). Only persist when an assignment on this input
-      //    already exists — the operator assigns the WHIP source to the input.
-      const guestAssignment = production.sources.find((s) => s.mixerInput === mixerInput);
-      const returnMode = guestAssignment?.returnFeed?.synced ?? 'program-minus';
-      if (guestAssignment && !guestAssignment.returnFeed) {
+      // 5a. Fresh return per guest (#381 item 5): return mode is per-slot config,
+      //     not carried-over state. A NEW occupant resets the slot to its default
+      //     program-minus so it never inherits the previous guest's mode; a
+      //     reconnect (same invite) keeps the slot's current mode. Uses the shared
+      //     applyReturnMode entry point (persists on the assignment + returnBuses,
+      //     applies the live send matrix when the flow is active, broadcasts
+      //     RETURN_STATE) — the same path the crew/guest mode routes use.
+      let returnMode: 'program' | 'program-minus' = slot.returnFeed!.synced;
+      if (isNewOccupant && returnMode !== 'program-minus') {
         try {
-          await updateProductionDoc(invite.productionId, {
-            sources: production.sources.map((s) =>
-              s.mixerInput === mixerInput
-                ? { ...s, returnFeed: { synced: 'program-minus', lowLatency: false } }
-                : s,
-            ),
-          });
+          await applyReturnMode(invite.productionId, mixerInput, 'program-minus');
+          returnMode = 'program-minus';
         } catch (err) {
-          // Non-fatal: the guest can still join; the return is built on next activate.
-          fastify.log.warn({ err }, 'POST guests/:id/join — return-feed persist failed');
+          fastify.log.warn({ err }, 'POST guests/:id/join — return-mode reset failed');
         }
       }
 
@@ -486,12 +592,76 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
           };
           await getGuestSessionsDb().insert(leftSession);
           broadcastGuestState(leftSession, invite.label);
+          // Free the slot server-side (#381 item 4): tear down the guest's WHIP
+          // publisher in Strom from the backend so the next guest can take the
+          // slot even if this guest's browser lingers or crashed.
+          try {
+            const production = await getDb().get(invite.productionId);
+            await teardownGuestWhip(production, leftSession.mixerInput);
+          } catch (err) {
+            fastify.log.warn({ err }, 'DELETE guests/:id/session — WHIP teardown skipped');
+          }
         }
       } catch (err) {
         fastify.log.warn({ err }, 'DELETE guests/:id/session — DB write failed');
         return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
       }
       return reply.status(204).send();
+    },
+  );
+
+  // Guest toggles their mic mute while live (token-authed, issue #382). The page
+  // mutes locally by disabling the audio track (the WHIP session stays up); this
+  // call only tells the backend so the operator sees it. Persists `muted` on the
+  // live session and broadcasts an updated GUEST_STATE so the studio (studio#163)
+  // reflects it within a second.
+  fastify.put<{ Params: { inviteId: string } }>(
+    '/api/v1/guests/:inviteId/session/mute',
+    async (req, reply) => {
+      if (!isGuestCallingEnabled()) return reply.status(503).send(guestsDisabled());
+      const secret = config.guestInviteSecret!;
+      const body = MuteBody.parse(req.body);
+      const token = bearerToken(req);
+      if (!token) {
+        return reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
+      }
+      const verified = verifyGuestInviteToken(token, secret);
+      if (!verified.ok || verified.claims.inviteId !== req.params.inviteId) {
+        return reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
+      }
+      let invite: GuestInviteDoc;
+      try {
+        invite = await getGuestInvitesDb().get(req.params.inviteId);
+      } catch {
+        return reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
+      }
+      if (invite.tokenHash !== hashGuestInviteToken(token)) {
+        return reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
+      }
+
+      try {
+        const existing = await getGuestSessionsDb().find({
+          selector: { type: 'guest-session', inviteId: invite._id },
+        });
+        const live = (Array.isArray(existing?.docs) ? existing.docs : []).find(
+          (s) => s.state !== 'left',
+        );
+        // No live session to mute — the guest must join first (spec §"Error codes").
+        if (!live) {
+          return reply.status(404).send({ error: 'No active guest session', statusCode: 404 });
+        }
+        const updated: GuestSessionDoc = {
+          ...live,
+          muted: body.muted,
+          updatedAt: new Date().toISOString(),
+        };
+        await getGuestSessionsDb().insert(updated);
+        broadcastGuestState(updated, invite.label);
+        return reply.send({ guestId: updated._id, muted: updated.muted });
+      } catch (err) {
+        fastify.log.warn({ err }, 'PUT guests/:id/session/mute — DB write failed');
+        return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
+      }
     },
   );
 
@@ -523,8 +693,10 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
     },
   );
 
-  // Kick a guest (operator). Marks the session `left`; the guest's WHIP teardown
-  // rides the existing WHIP DELETE contract.
+  // Kick a guest (operator). Marks the session `left` AND tears down the guest's
+  // WHIP publisher in Strom from the backend (#381 item 4) — not left to the
+  // guest's browser — so a crashed or lingering browser cannot keep the slot busy
+  // for the next guest.
   fastify.delete<{ Params: { id: string; guestId: string } }>(
     '/api/v1/productions/:id/guests/:guestId',
     async (req, reply) => {
@@ -550,24 +722,18 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         fastify.log.warn({ err }, 'DELETE guests/:guestId — DB write failed');
         return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
       }
+
+      // Free the slot on the server so the next guest can join (#381 item 4).
+      try {
+        const production = await getDb().get(session.productionId);
+        await teardownGuestWhip(production, session.mixerInput);
+      } catch (err) {
+        fastify.log.warn({ err }, 'DELETE guests/:guestId — WHIP teardown skipped');
+      }
+
       return reply.status(204).send();
     },
   );
 };
-
-/**
- * Pick a mixer input for a guest whose invite did not pin one: the lowest
- * `video_in_N` not already taken by a source assignment. Falls back to
- * `video_in_0` when the production has no assignments. This is a placeholder
- * allocation — full capacity/allocation policy is a later sub-issue (OQ5).
- */
-function allocateMixerInput(production: ProductionDoc): string {
-  const taken = new Set((production.sources ?? []).map((s) => s.mixerInput));
-  for (let i = 0; i < 64; i++) {
-    const candidate = `video_in_${i}`;
-    if (!taken.has(candidate)) return candidate;
-  }
-  return 'video_in_0';
-}
 
 export default guestsRoutes;

@@ -1,0 +1,439 @@
+import type { FastifyPluginAsync } from 'fastify';
+
+/**
+ * Guest page served by the open-live backend itself (issue #382, guest calling
+ * v1). It shares this backend's origin with the guest join / WHIP / return-feed
+ * routes, so the browser makes same-origin calls — no CORS, and one set of paths
+ * for the OSC ingress gate to let through (osaas-app#6143).
+ *
+ * The invite link is `https://<backend>/guest/<inviteId>#<token>`: the token
+ * sits in the URL fragment so it never reaches server or proxy access logs. The
+ * page reads it from `location.hash`, calls `POST /api/v1/guests/:inviteId/join`
+ * with it as a bearer token, publishes camera+mic to the returned `whipUrl`
+ * (WHIP), and plays the return feed from `feeds[].url` (WHEP).
+ *
+ * This route is a plain static HTML document (no build step): the whole page is
+ * embedded as a string constant so the `tsc`-only build carries it into `dist/`
+ * without any asset-copy step. It is intentionally NOT under `/api/v1`, so the
+ * shared-API-key onRequest gate in `server.ts` lets it through unauthenticated
+ * (the page holds no secret — the token lives only in the caller's URL fragment,
+ * which the server never receives).
+ */
+
+// Content-Security-Policy for the guest page. The global Helmet policy
+// (`default-src 'none'`) is meant for the JSON API and would block this page's
+// own inline script/style and its media playback, so we override it here to the
+// minimum this page needs: same-origin everything, inline script/style for the
+// self-contained document, blob:/mediastream: media for the WebRTC <video>
+// elements, and same-origin connect for the join/WHIP/WHEP fetches (WebRTC ICE
+// itself is not governed by connect-src).
+const GUEST_PAGE_CSP = [
+  "default-src 'self'",
+  "script-src 'self' 'unsafe-inline'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data:",
+  "media-src 'self' blob: mediastream:",
+  "connect-src 'self'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "frame-ancestors 'none'",
+].join('; ');
+
+const GUEST_PAGE_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="robots" content="noindex" />
+  <title>Join the broadcast</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: #101014; color: #f4f4f6; min-height: 100vh;
+    }
+    header { padding: 16px 20px; border-bottom: 1px solid #26262e; }
+    header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+    main { max-width: 720px; margin: 0 auto; padding: 20px; }
+    .videos { position: relative; }
+    video {
+      width: 100%; background: #000; border-radius: 12px; display: block;
+      aspect-ratio: 16 / 9; object-fit: cover;
+    }
+    #return { margin-top: 12px; }
+    .hint { color: #a0a0ad; font-size: 13px; margin: 6px 2px 0; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    .field { flex: 1 1 220px; }
+    label { display: block; font-size: 12px; color: #a0a0ad; margin-bottom: 4px; }
+    select {
+      width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #33333d;
+      background: #1a1a20; color: #f4f4f6; font-size: 14px;
+    }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 20px; }
+    button {
+      flex: 1 1 auto; padding: 14px 18px; font-size: 15px; font-weight: 600;
+      border: 0; border-radius: 10px; cursor: pointer; color: #fff;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #golive { background: #2f9e44; }
+    #mute { background: #364fc7; }
+    #mute.muted { background: #c92a2a; }
+    #leave { background: #495057; }
+    #banner {
+      margin-top: 16px; padding: 12px 14px; border-radius: 10px; font-size: 14px;
+      background: #1a1a20; border: 1px solid #33333d;
+    }
+    #banner.live { background: #133a1e; border-color: #2f9e44; }
+    #banner.onair { background: #3a1313; border-color: #c92a2a; }
+    #banner.error { background: #3a1313; border-color: #c92a2a; }
+    #banner.left { background: #1a1a20; border-color: #33333d; }
+    #muted-indicator {
+      display: none; margin-top: 12px; padding: 12px 14px; border-radius: 10px;
+      background: #c92a2a; color: #fff; font-weight: 700; text-align: center;
+      letter-spacing: 0.5px;
+    }
+    #muted-indicator.show { display: block; }
+    .badge {
+      display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px;
+      font-weight: 700; margin-left: 8px; vertical-align: middle;
+    }
+    .badge.onair { background: #c92a2a; }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <header><h1>Join the broadcast <span id="onair-badge" class="badge onair hidden">ON AIR</span></h1></header>
+  <main>
+    <div id="banner">Checking your camera and microphone&hellip;</div>
+    <div id="muted-indicator">You are muted</div>
+
+    <div class="videos">
+      <video id="preview" autoplay playsinline muted></video>
+      <div class="hint">This is your camera preview. It is muted here so you don't hear yourself.</div>
+      <video id="return" autoplay playsinline class="hidden"></video>
+      <div id="return-hint" class="hint hidden">Return feed from the studio (program).</div>
+    </div>
+
+    <div id="pickers" class="row">
+      <div class="field">
+        <label for="cam">Camera</label>
+        <select id="cam"></select>
+      </div>
+      <div class="field">
+        <label for="mic">Microphone</label>
+        <select id="mic"></select>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button id="golive">Go live</button>
+      <button id="mute" class="hidden">Mute mic</button>
+      <button id="leave" class="hidden">Leave</button>
+    </div>
+  </main>
+
+  <script>
+  (function () {
+    "use strict";
+
+    // ---- Config from the URL: /guest/<inviteId>#<token> --------------------
+    var parts = location.pathname.split("/").filter(Boolean);
+    var inviteId = parts[parts.length - 1] || "";
+    var token = (location.hash || "").replace(/^#/, "");
+    var apiBase = location.origin;
+    // A public STUN server for srflx candidate discovery. TURN, when configured,
+    // is negotiated by the WHIP/WHEP server side; this only helps the browser
+    // find its own reflexive address behind NAT.
+    var ICE = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+    // ---- Elements ----------------------------------------------------------
+    var banner = document.getElementById("banner");
+    var mutedIndicator = document.getElementById("muted-indicator");
+    var onairBadge = document.getElementById("onair-badge");
+    var preview = document.getElementById("preview");
+    var returnVideo = document.getElementById("return");
+    var returnHint = document.getElementById("return-hint");
+    var camSel = document.getElementById("cam");
+    var micSel = document.getElementById("mic");
+    var pickers = document.getElementById("pickers");
+    var goLiveBtn = document.getElementById("golive");
+    var muteBtn = document.getElementById("mute");
+    var leaveBtn = document.getElementById("leave");
+
+    // ---- State -------------------------------------------------------------
+    var localStream = null;
+    var publishPc = null;
+    var publishResource = null;
+    var returnPc = null;
+    var muted = false;
+    var live = false;
+
+    function setBanner(text, cls) {
+      banner.textContent = text;
+      banner.className = cls || "";
+    }
+
+    function show(el) { el.classList.remove("hidden"); }
+    function hide(el) { el.classList.add("hidden"); }
+
+    // Map a join error status to a readable message (issue #382 states).
+    function joinErrorMessage(status, payload) {
+      if (status === 401) return "This invite link is invalid or has expired. Ask the producer for a new link.";
+      if (status === 409) {
+        var msg = (payload && payload.error) ? payload.error : "";
+        if (/expired/i.test(msg)) return "This invite has expired. Ask the producer for a new link.";
+        if (/not active|ended/i.test(msg)) return "The production has ended.";
+        return "Your slot is not available right now. Ask the producer for help.";
+      }
+      if (status === 503) return "Guest calling is not enabled on this server.";
+      return "Could not join the broadcast (error " + status + "). Please try again.";
+    }
+
+    // ---- Device setup ------------------------------------------------------
+    function selectedConstraints() {
+      var camId = camSel.value;
+      var micId = micSel.value;
+      return {
+        video: camId ? { deviceId: { exact: camId } } : true,
+        audio: micId ? { deviceId: { exact: micId } } : true
+      };
+    }
+
+    function fillDevicePickers() {
+      return navigator.mediaDevices.enumerateDevices().then(function (devices) {
+        camSel.innerHTML = "";
+        micSel.innerHTML = "";
+        var camN = 0, micN = 0;
+        devices.forEach(function (d) {
+          if (d.kind === "videoinput") {
+            var o = document.createElement("option");
+            o.value = d.deviceId; o.textContent = d.label || ("Camera " + (++camN));
+            camSel.appendChild(o);
+          } else if (d.kind === "audioinput") {
+            var o2 = document.createElement("option");
+            o2.value = d.deviceId; o2.textContent = d.label || ("Microphone " + (++micN));
+            micSel.appendChild(o2);
+          }
+        });
+      });
+    }
+
+    function startPreview() {
+      var old = localStream;
+      return navigator.mediaDevices.getUserMedia(selectedConstraints()).then(function (stream) {
+        if (old) old.getTracks().forEach(function (t) { t.stop(); });
+        localStream = stream;
+        preview.srcObject = stream;
+        // Re-apply the current mute state to the fresh audio track.
+        applyMuteToTrack();
+        return fillDevicePickers();
+      });
+    }
+
+    function applyMuteToTrack() {
+      if (!localStream) return;
+      localStream.getAudioTracks().forEach(function (t) { t.enabled = !muted; });
+    }
+
+    // ---- WebRTC helpers ----------------------------------------------------
+    function waitForIce(pc) {
+      return new Promise(function (resolve) {
+        if (pc.iceGatheringState === "complete") return resolve();
+        var done = false;
+        function finish() { if (!done) { done = true; resolve(); } }
+        pc.addEventListener("icegatheringstatechange", function () {
+          if (pc.iceGatheringState === "complete") finish();
+        });
+        // Don't wait forever for a TURN-less environment: cap gathering.
+        setTimeout(finish, 2000);
+      });
+    }
+
+    function whipPublish(url, stream) {
+      var pc = new RTCPeerConnection(ICE);
+      stream.getTracks().forEach(function (t) { pc.addTrack(t, stream); });
+      return pc.createOffer().then(function (offer) {
+        return pc.setLocalDescription(offer);
+      }).then(function () {
+        return waitForIce(pc);
+      }).then(function () {
+        return fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/sdp", "Authorization": "Bearer " + token },
+          body: pc.localDescription.sdp
+        });
+      }).then(function (res) {
+        if (!res.ok) throw new Error("WHIP publish failed: " + res.status);
+        publishResource = res.headers.get("Location");
+        return res.text();
+      }).then(function (answer) {
+        return pc.setRemoteDescription({ type: "answer", sdp: answer });
+      }).then(function () {
+        publishPc = pc;
+      });
+    }
+
+    function whepPlay(url) {
+      var pc = new RTCPeerConnection(ICE);
+      pc.addTransceiver("video", { direction: "recvonly" });
+      pc.addTransceiver("audio", { direction: "recvonly" });
+      pc.addEventListener("track", function (e) {
+        if (e.streams && e.streams[0]) returnVideo.srcObject = e.streams[0];
+      });
+      return pc.createOffer().then(function (offer) {
+        return pc.setLocalDescription(offer);
+      }).then(function () {
+        return waitForIce(pc);
+      }).then(function () {
+        return fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/sdp", "Authorization": "Bearer " + token },
+          body: pc.localDescription.sdp
+        });
+      }).then(function (res) {
+        if (!res.ok) throw new Error("WHEP play failed: " + res.status);
+        return res.text();
+      }).then(function (answer) {
+        return pc.setRemoteDescription({ type: "answer", sdp: answer });
+      }).then(function () {
+        returnPc = pc;
+        show(returnVideo);
+        show(returnHint);
+      });
+    }
+
+    // ---- Go live -----------------------------------------------------------
+    function goLive() {
+      goLiveBtn.disabled = true;
+      setBanner("Connecting\\u2026", "");
+      var joinData = null;
+      fetch(apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/join", {
+        method: "POST",
+        headers: { "Authorization": "Bearer " + token }
+      }).then(function (res) {
+        return res.json().catch(function () { return {}; }).then(function (payload) {
+          if (!res.ok) throw { handled: true, message: joinErrorMessage(res.status, payload) };
+          return payload;
+        });
+      }).then(function (data) {
+        joinData = data;
+        return whipPublish(data.whipUrl, localStream);
+      }).then(function () {
+        live = true;
+        hide(pickers);
+        hide(goLiveBtn);
+        show(muteBtn);
+        show(leaveBtn);
+        setBanner("You are live. The studio can see and hear you.", "live");
+        // Play the return feed(s), if any are live yet. Failure here is
+        // non-fatal: the guest is still contributing even without return video.
+        var feeds = (joinData && joinData.feeds) || [];
+        if (feeds.length && feeds[0].url) {
+          whepPlay(feeds[0].url).catch(function () {
+            returnHint.textContent = "Return feed not available yet.";
+            show(returnHint);
+          });
+        }
+      }).catch(function (err) {
+        goLiveBtn.disabled = false;
+        setBanner(err && err.handled ? err.message : "Could not go live. Please check your connection and try again.", "error");
+      });
+    }
+
+    // ---- Mute --------------------------------------------------------------
+    function setMuted(next) {
+      muted = next;
+      applyMuteToTrack();
+      muteBtn.textContent = muted ? "Unmute mic" : "Mute mic";
+      muteBtn.className = muted ? "muted" : "";
+      if (muted) mutedIndicator.classList.add("show");
+      else mutedIndicator.classList.remove("show");
+      // Report to the backend so the operator sees it (best-effort).
+      fetch(apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/session/mute", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+        body: JSON.stringify({ muted: muted })
+      }).catch(function () { /* keep local mute regardless */ });
+    }
+
+    // ---- Leave -------------------------------------------------------------
+    function teardown() {
+      if (publishPc) { try { publishPc.close(); } catch (e) {} publishPc = null; }
+      if (returnPc) { try { returnPc.close(); } catch (e) {} returnPc = null; }
+      if (localStream) { localStream.getTracks().forEach(function (t) { t.stop(); }); }
+    }
+
+    function leave() {
+      leaveBtn.disabled = true;
+      live = false;
+      fetch(apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/session", {
+        method: "DELETE",
+        headers: { "Authorization": "Bearer " + token },
+        keepalive: true
+      }).catch(function () {}).then(function () {
+        teardown();
+        hide(muteBtn);
+        hide(leaveBtn);
+        mutedIndicator.classList.remove("show");
+        setBanner("You have left the broadcast. You can close this page.", "left");
+      });
+    }
+
+    window.addEventListener("pagehide", function () {
+      if (!live) { teardown(); return; }
+      // Best-effort teardown on close; keepalive lets the request outlive the page.
+      try {
+        fetch(apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/session", {
+          method: "DELETE",
+          headers: { "Authorization": "Bearer " + token },
+          keepalive: true
+        });
+      } catch (e) {}
+      teardown();
+    });
+
+    // ---- Wire up -----------------------------------------------------------
+    goLiveBtn.addEventListener("click", goLive);
+    muteBtn.addEventListener("click", function () { setMuted(!muted); });
+    leaveBtn.addEventListener("click", leave);
+    camSel.addEventListener("change", function () { startPreview().catch(function () {}); });
+    micSel.addEventListener("change", function () { startPreview().catch(function () {}); });
+
+    // ---- Boot --------------------------------------------------------------
+    if (!token) {
+      goLiveBtn.disabled = true;
+      setBanner("This link is missing its access token. Ask the producer for the full invite link.", "error");
+    } else if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.RTCPeerConnection) {
+      goLiveBtn.disabled = true;
+      setBanner("This browser does not support live calling. Try a recent Chrome, Safari or Firefox.", "error");
+    } else {
+      startPreview().then(function () {
+        setBanner("Camera and microphone ready. Press \\u201cGo live\\u201d when you're set.", "");
+      }).catch(function () {
+        goLiveBtn.disabled = true;
+        setBanner("Could not access your camera or microphone. Check the browser permissions and reload.", "error");
+      });
+    }
+  })();
+  </script>
+</body>
+</html>
+`;
+
+const guestPageRoutes: FastifyPluginAsync = async (fastify) => {
+  // Serve the guest page for any invite id. The page itself holds no secret and
+  // does not need the invite to exist to render — the token (from the URL
+  // fragment, never sent here) drives the actual join, which returns the real
+  // authorization result. Serving unconditionally keeps the token out of any
+  // server-side lookup and lets the page render its own readable error states.
+  fastify.get<{ Params: { inviteId: string } }>('/guest/:inviteId', async (_req, reply) => {
+    reply
+      .header('Content-Security-Policy', GUEST_PAGE_CSP)
+      .header('Cache-Control', 'no-store')
+      .type('text/html; charset=utf-8')
+      .send(GUEST_PAGE_HTML);
+  });
+};
+
+export default guestPageRoutes;

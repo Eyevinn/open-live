@@ -531,6 +531,23 @@ components:
         mixerInput:
           type: string
           pattern: '^video_in_\d{1,2}$'
+        returnFeed:
+          type: object
+          description: >-
+            Present when this assignment is a guest slot (issue #381): a per-guest
+            mix-minus return built into the flow as a return bus at activation.
+            Absent for an ordinary source assignment. v1 supports the synced
+            (picture-switch) return only (`lowLatency: false`).
+          required: [synced]
+          properties:
+            synced:
+              type: string
+              enum: [program, program-minus]
+              default: program-minus
+            lowLatency:
+              type: boolean
+              enum: [false]
+              default: false
 
     ProductionGraphicAssignment:
       type: object
@@ -694,7 +711,13 @@ components:
           description: Override the default invite TTL (GUEST_INVITE_TTL_S). Bounded so invites stay short-lived.
         mixerInput:
           type: string
-          description: Optional pre-allocated input the guest will occupy (e.g. `video_in_1`); allocated on join if absent.
+          pattern: '^video_in_\d{1,2}$'
+          maxLength: 64
+          description: >-
+            The guest slot this invite pins the guest to (issue #381). Required in
+            practice: it must name a declared guest slot on this production (a
+            source assignment carrying a `returnFeed`); an invite with no slot, or
+            one whose input is not a guest slot, is rejected with 400.
 
     GuestInviteCreated:
       type: object
@@ -936,34 +959,34 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [stromHost, srtPortRange, srtPortLease]
+                required: [stromHost, srtPorts, srtPortState]
                 properties:
                   stromHost:
                     type: string
                     description: Hostname of the Strom media server
-                  srtPortRange:
-                    type: object
+                  srtPorts:
+                    type: array
                     nullable: true
                     description: >-
-                      SRT listener ports this instance has leased on the shared Strom.
-                      Hostless listener sources and outputs (`srt://:PORT?mode=listener`)
-                      must use a port in this range; `srt://:0?mode=listener` asks the
-                      server to assign the lowest free one. Null unless `srtPortLease`
-                      is `leased`.
-                    required: [first, last]
-                    properties:
-                      first:
-                        type: integer
-                      last:
-                        type: integer
-                  srtPortLease:
+                      SRT listener ports this instance has reserved from the shared
+                      Strom's port pool. Hostless listener sources and outputs
+                      (`srt://:PORT?mode=listener`) must use one of them;
+                      `srt://:0?mode=listener` asks the server to assign the lowest free
+                      one. An explicit list, not a range — Strom's pool can have holes,
+                      so these are not necessarily contiguous. Null unless
+                      `srtPortState` is `reserved`.
+                    items:
+                      type: integer
+                  srtPortState:
                     type: string
-                    enum: [leased, pending, unsupported, disabled]
+                    enum: [reserved, pending, unsupported, disabled]
                     description: >-
-                      State of the Strom port lease. `pending` — not yet acquired, listener
-                      sources are rejected with 503 until it is; `unsupported` — Strom has no
-                      port lease API, ports are not enforced; `disabled` — turned off via
-                      STROM_PORT_LEASE_DISABLED.
+                      State of this instance's port reservation. `pending` — not held yet,
+                      listener sources are rejected with 503 until they are; `unsupported` —
+                      Strom has no port pool API, or reserving kept failing; ports are not
+                      enforced and Strom is re-checked every 10 min; `disabled` — turned off
+                      via STROM_PORT_LEASE_DISABLED, or Strom has no port pool configured;
+                      ports are not enforced.
 
   /api/v1/reconnect:
     post:
@@ -1665,6 +1688,11 @@ paths:
           type: string
     post:
       summary: Assign source to production
+      description: >-
+        Assigns a catalogue source (or the virtual `Whip` source) to a mixer
+        input. Include `returnFeed` to declare the assignment as a guest slot
+        (issue #381): a mix-minus return reserved for a guest and built into the
+        flow at activation. Guest invites may only target a declared guest slot.
       operationId: assignSource
       tags: [Productions]
       requestBody:
@@ -1683,6 +1711,18 @@ paths:
                   type: string
                   pattern: '^video_in_\d{1,2}$'
                   maxLength: 20
+                returnFeed:
+                  type: object
+                  description: Declares this assignment as a guest slot (mix-minus return).
+                  properties:
+                    synced:
+                      type: string
+                      enum: [program, program-minus]
+                      default: program-minus
+                    lowLatency:
+                      type: boolean
+                      enum: [false]
+                      default: false
       responses:
         '200':
           description: Assignment created
@@ -2474,7 +2514,7 @@ paths:
       operationId: createGuestInvite
       tags: [Guests]
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema:
@@ -2487,7 +2527,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/GuestInviteCreated'
         '400':
-          description: Invalid body
+          description: >-
+            Invalid body, or the invite does not target a declared guest slot
+            (issue #381: `mixerInput` must name a source assignment with a
+            `returnFeed` on this production).
           content:
             application/json:
               schema:
@@ -2599,7 +2642,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '409':
-          description: Invite expired or capacity reached
+          description: >-
+            Invite expired, its guest slot is no longer available, or the slot is
+            occupied by another live guest (`Guest slot occupied` — issue #381:
+            one guest per slot; a reconnect on the same invite is not a conflict).
           content:
             application/json:
               schema:

@@ -102,6 +102,7 @@ vi.mock('../ws/controller.js', () => ({
   clearAudioState: vi.fn(),
   clearPipState: vi.fn(),
   clearFxState: vi.fn(),
+  applyReturnMode: vi.fn().mockResolvedValue({ ok: true }),
 }));
 
 const AUTH = { authorization: `Bearer ${TEST_API_KEY}` };
@@ -115,7 +116,10 @@ function seedProduction(id = 'prod-1'): ProductionDoc {
     type: 'production',
     name: 'Test show',
     status: 'inactive',
-    sources: [],
+    // One declared guest slot (#381): a source assignment carrying a returnFeed.
+    sources: [
+      { sourceId: 'Whip', mixerInput: 'video_in_0', returnFeed: { synced: 'program-minus' as const, lowLatency: false } },
+    ],
     pipeline: { stromConfig: null, status: 'stopped' },
     graphics: [],
     macros: [],
@@ -133,7 +137,9 @@ async function createInvite(payload: Record<string, unknown> = {}) {
     method: 'POST',
     url: '/api/v1/productions/prod-1/guests/invites',
     headers: AUTH,
-    payload,
+    // Invites must target a declared guest slot (#381); pin the seed's slot
+    // unless a test overrides it.
+    payload: { mixerInput: 'video_in_0', ...payload },
   });
   return res.json() as { id: string; token: string };
 }
@@ -211,7 +217,7 @@ describe('guest join — intercom configured', () => {
       method: 'POST',
       url: '/api/v1/productions/prod-1/guests/invites',
       headers: AUTH,
-      payload: {},
+      payload: { mixerInput: 'video_in_0' },
     });
     const invite = inviteRes.json() as { id: string; token: string };
     const res = await app.inject({
