@@ -1628,7 +1628,7 @@ paths:
                     type: string
                   status:
                     type: string
-                    enum: [inactive, ended]
+                    enum: [inactive]
         '404':
           description: Not found
 
