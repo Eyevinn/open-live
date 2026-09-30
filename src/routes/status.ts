@@ -3,7 +3,7 @@ import { isDbReady, connectDb, isDbConnected } from '../db/index.js';
 import { StromClient } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
-import { getPortLease } from '../services/port-lease.js';
+import { getPortReservation } from '../services/port-reservation.js';
 
 const statusRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get('/api/v1/ping', async (_req, reply) => {
@@ -17,13 +17,13 @@ const statusRoutes: FastifyPluginAsync = async (fastify) => {
     } catch {
       return reply.status(500).send({ error: 'Invalid STROM_URL configured' });
     }
-    // SRT listener ports this instance may bind on the shared Strom. Gateways
-    // use the range to pick ports for the sources they register.
-    const lease = getPortLease();
-    const srtPortRange = lease.status === 'leased'
-      ? { first: lease.lease.first_port, last: lease.lease.last_port }
-      : null;
-    return reply.send({ stromHost, srtPortRange, srtPortLease: lease.status });
+    // SRT listener ports this instance reserved on the shared Strom. Gateways
+    // use them to pick ports for the sources they register. An explicit list,
+    // not a range: Strom's pool can have holes, so the ports an instance holds
+    // are not necessarily contiguous.
+    const reservation = getPortReservation();
+    const srtPorts = reservation.status === 'reserved' ? reservation.reservation.ports : null;
+    return reply.send({ stromHost, srtPorts, srtPortState: reservation.status });
   });
 
   fastify.post(
