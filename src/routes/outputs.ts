@@ -11,7 +11,7 @@ import { encryptStreamKey } from '../lib/rtmp-credentials-crypto.js';
 import { resolveIngestUrl, validateStreamKey } from '../lib/rtmp.js';
 import { resolveSrtConnect } from '../lib/srt-connect.js';
 import { config, isRecordingEnabled } from '../config.js';
-import { getPortLease } from '../services/port-lease.js';
+import { getPortReservation } from '../services/port-reservation.js';
 import { clashesAfterWrite, listenerPortRequest, resolveListenerAddress, usedListenerPorts } from '../services/listener-ports.js';
 
 const SRT_OUTPUT_TYPES = new Set(['mpegtssrt', 'efpsrt']);
@@ -247,7 +247,7 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       let url = body.url;
       let port: number | null = null;
       if (isSrt && url) {
-        const resolved = resolveListenerAddress(url, getPortLease(), used);
+        const resolved = resolveListenerAddress(url, getPortReservation(), used);
         if (!resolved.ok) {
           return reply.status(resolved.statusCode).send({ error: resolved.error, statusCode: resolved.statusCode });
         }
@@ -357,7 +357,7 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
         // Re-check the port only when the URL changes — a rename must not fail
         // because an older output predates the lease. Port 0 keeps the current one.
         if (body.url !== undefined) {
-          const resolved = resolveListenerAddress(effectiveUrl, getPortLease(), await usedListenerPorts(), {
+          const resolved = resolveListenerAddress(effectiveUrl, getPortReservation(), await usedListenerPorts(), {
             exclude: { kind: 'output', id: doc._id },
             keep: doc.url ? listenerPortRequest(doc.url) : null,
           });

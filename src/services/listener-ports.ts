@@ -1,19 +1,21 @@
 /**
- * Port assignment inside this instance's leased block.
+ * Port assignment inside the set this instance reserved from Strom.
  *
- * The broker keeps Open Live instances apart; this keeps the sources and
+ * The reservation keeps Open Live instances apart; this keeps the sources and
  * outputs of one instance apart. Every hostless SRT listener address
  * (`srt://:PORT?mode=listener`) binds PORT on the shared Strom, so no two
  * documents may name the same one. A client that does not care which port it
- * gets sends `srt://:0?...` and is handed the lowest free port in the block,
- * which is how gateways register: several of them can then feed one instance
- * without knowing about each other.
+ * gets sends `srt://:0?...` and is handed the lowest free port this instance
+ * holds, which is how gateways register: several of them can then feed one
+ * instance without knowing about each other.
+ *
+ * Strom's set is not necessarily contiguous, so everything here works on
+ * membership rather than on a first/last range.
  */
 
 import { getOutputsDb, getSourcesDb } from '../db/index.js';
-import type { PortLease } from '../lib/strom.js';
-import { isPortInLease } from './port-lease.js';
-import type { PortLeaseState } from './port-lease.js';
+import { isPortReserved } from './port-reservation.js';
+import type { PortReservationState } from './port-reservation.js';
 
 /** The value of PORT in `srt://:PORT` that asks the server to choose. */
 export const ASSIGN_PORT = 0;
@@ -67,11 +69,24 @@ export async function usedListenerPorts(): Promise<ListenerPortUse[]> {
   return used;
 }
 
-export function lowestFreePort(lease: Pick<PortLease, 'first_port' | 'last_port'>, taken: Set<number>): number | null {
-  for (let p = lease.first_port; p <= lease.last_port; p++) {
+/** The lowest reserved port no document holds, or null when every one is taken. */
+export function lowestFreePort(reserved: readonly number[], taken: Set<number>): number | null {
+  for (const p of [...reserved].sort((a, b) => a - b)) {
     if (!taken.has(p)) return p;
   }
   return null;
+}
+
+/** How a set of ports reads in an error message: runs where it can, ports where it cannot. */
+export function describePorts(ports: readonly number[]): string {
+  const sorted = [...ports].sort((a, b) => a - b);
+  const runs: Array<[number, number]> = [];
+  for (const p of sorted) {
+    const last = runs[runs.length - 1];
+    if (last && last[1] + 1 === p) last[1] = p;
+    else runs.push([p, p]);
+  }
+  return runs.map(([a, b]) => (a === b ? `${a}` : `${a}-${b}`)).join(', ');
 }
 
 export type ListenerAddressResolution =
@@ -91,15 +106,16 @@ export interface ResolveOptions {
 /**
  * Decide the address a source or output may be stored with.
  *
- * Non-listener addresses pass through. A listener port must be inside the
- * leased block when there is one, and must not be bound by another document
- * either way. Port 0 asks for the lowest free port in the block; without a
- * block (no broker, or leasing disabled) there is nothing to choose from, and
- * while the lease is still pending the answer is "not yet".
+ * Non-listener addresses pass through. A listener port must be one this
+ * instance reserved when it holds any, and must not be bound by another
+ * document either way. Port 0 asks for the lowest free reserved port; without
+ * a reservation (Strom hands out no ports, or reservation is disabled here)
+ * there is nothing to choose from, and while one is still pending the answer
+ * is "not yet".
  */
 export function resolveListenerAddress(
   address: string,
-  lease: PortLeaseState,
+  reservation: PortReservationState,
   used: ListenerPortUse[],
   opts: ResolveOptions = {},
 ): ListenerAddressResolution {
@@ -108,31 +124,31 @@ export function resolveListenerAddress(
 
   const others = used.filter((u) => !(opts.exclude && u.kind === opts.exclude.kind && u.id === opts.exclude.id));
   const taken = new Set(others.map((u) => u.port));
-  const range = lease.status === 'leased' ? lease.lease : null;
-  const rangeText = range ? `${range.first_port}-${range.last_port}` : '';
+  const reserved = reservation.status === 'reserved' ? reservation.reservation.ports : null;
+  const portsText = reserved ? describePorts(reserved) : '';
 
   if (requested === ASSIGN_PORT) {
-    if (lease.status === 'pending') {
-      return { ok: false, statusCode: 503, error: 'SRT port range not yet allocated from Strom, retry shortly' };
+    if (reservation.status === 'pending') {
+      return { ok: false, statusCode: 503, error: 'SRT listener ports not yet reserved from Strom, retry shortly' };
     }
-    if (!range) {
-      return { ok: false, statusCode: 400, error: 'No SRT port range to assign from on this instance; give the listener address an explicit port' };
+    if (!reserved) {
+      return { ok: false, statusCode: 400, error: 'No reserved SRT ports to assign from on this instance; give the listener address an explicit port' };
     }
-    if (opts.keep && isPortInLease(opts.keep, range) && !taken.has(opts.keep)) {
+    if (opts.keep && isPortReserved(opts.keep, reserved) && !taken.has(opts.keep)) {
       return { ok: true, address: withListenerPort(address, opts.keep), port: opts.keep };
     }
-    const port = lowestFreePort(range, taken);
+    const port = lowestFreePort(reserved, taken);
     if (port === null) {
-      return { ok: false, statusCode: 409, error: `No free SRT listener port left in this instance's range ${rangeText}` };
+      return { ok: false, statusCode: 409, error: `No free SRT listener port left in this instance's reserved set ${portsText}` };
     }
     return { ok: true, address: withListenerPort(address, port), port };
   }
 
-  if (lease.status === 'pending') {
-    return { ok: false, statusCode: 503, error: 'SRT port range not yet allocated from Strom, retry shortly' };
+  if (reservation.status === 'pending') {
+    return { ok: false, statusCode: 503, error: 'SRT listener ports not yet reserved from Strom, retry shortly' };
   }
-  if (range && !isPortInLease(requested, range)) {
-    return { ok: false, statusCode: 422, error: `SRT listener port ${requested} is outside this instance's allocated range ${rangeText}` };
+  if (reserved && !isPortReserved(requested, reserved)) {
+    return { ok: false, statusCode: 422, error: `SRT listener port ${requested} is not reserved by this instance; it holds ${portsText}` };
   }
   const holder = others.find((u) => u.port === requested);
   if (holder) {
