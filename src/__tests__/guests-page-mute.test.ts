@@ -118,7 +118,15 @@ function seedProduction(id = 'prod-1'): ProductionDoc {
     type: 'production',
     name: 'Test show',
     status: 'inactive',
-    sources: [],
+    // A guest slot is a source assignment carrying a `returnFeed` (#381). Invites
+    // can only target a declared slot, so seed one for the mute flow to use.
+    sources: [
+      {
+        sourceId: 'Whip',
+        mixerInput: 'video_in_0',
+        returnFeed: { synced: 'program-minus' as const, lowLatency: false },
+      },
+    ],
     pipeline: { stromConfig: null, status: 'stopped' },
     graphics: [],
     macros: [],
@@ -136,7 +144,8 @@ async function createInvite(payload: Record<string, unknown> = {}) {
     method: 'POST',
     url: '/api/v1/productions/prod-1/guests/invites',
     headers: AUTH,
-    payload,
+    // An invite must pin a declared guest slot (#381); default to the seeded slot.
+    payload: { mixerInput: 'video_in_0', ...payload },
   });
   return res.json() as { id: string; token: string; joinUrl: string };
 }
