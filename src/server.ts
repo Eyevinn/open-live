@@ -35,6 +35,7 @@ import authRoutes from './routes/auth.js';
 import gatewaysRoutes from './routes/gateways.js';
 import clipsRoutes from './routes/clips.js';
 import guestsRoutes from './routes/guests.js';
+import guestPageRoutes from './routes/guest-page.js';
 import returnsRoutes from './routes/returns.js';
 import controllerWs from './ws/controller.js';
 import gatewayHeartbeatWs from './ws/gateway-heartbeat.js';
@@ -92,8 +93,9 @@ function isGatewayHeartbeatPath(path: string): boolean {
  * are operator/automation surfaces behind the shared key.
  */
 function isGuestTokenAuthedPath(path: string): boolean {
-  // join, session (leave), and session/return (guest return-mode switch, #300).
-  return /^\/api\/v1\/guests\/[^/]+\/(join|session|session\/return)$/.test(path);
+  // join, session (leave), session/return (guest return-mode switch, #300) and
+  // session/mute (guest mic mute toggle, #382).
+  return /^\/api\/v1\/guests\/[^/]+\/(join|session|session\/return|session\/mute)$/.test(path);
 }
 
 // Sentinel subprotocols used to carry the API key through the
@@ -510,6 +512,7 @@ export async function buildServer() {
   await fastify.register(gatewaysRoutes);
   await fastify.register(clipsRoutes);
   await fastify.register(guestsRoutes);
+  await fastify.register(guestPageRoutes);
   await fastify.register(returnsRoutes);
   await fastify.register(controllerWs);
   await fastify.register(gatewayHeartbeatWs);
