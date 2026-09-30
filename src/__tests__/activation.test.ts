@@ -241,9 +241,10 @@ describe('POST /api/v1/productions/:id/deactivate', () => {
 
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.body);
-    // Deactivating an *active* production now yields `ended` (issue #255): it ran
-    // a broadcast that has finished, distinct from a never-started `inactive`.
-    expect(body.status).toBe('ended');
+    // An explicit deactivate is a clean, operator-initiated teardown and always
+    // returns to `inactive` (issue #385). `ended` is reserved for the
+    // idle-watchdog auto-deactivate and reconcile flow-lost stop paths.
+    expect(body.status).toBe('inactive');
 
     // Verify the doc written to CouchDB cleared the fields
     const insertedDoc = mockInsert.mock.calls[0][0];
