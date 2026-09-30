@@ -476,17 +476,16 @@ async function stromTransition(
     console.warn('[controller] Strom transition skipped — cannot parse index from pad:', toMixerInput);
     return true;
   }
-  // Set Strom's PVW to the target input first, then fire the transition.
-  // Strom's trigger_transition uses from_input/to_input directly — selectPreview
-  // call is belt-and-suspenders so Strom's own UI also reflects the new PVW.
+  // Set Strom's PVW to the target input first, then fire the transition. A
+  // vision mixer ignores from_input/to_input and swaps PGM with whatever is in
+  // its preview, so the preview select is what picks the target.
   const fromIndex = fromMixerInput ? (padToIndex(fromMixerInput) ?? toIndex) : toIndex;
   const strom = await makeStromClient();
   try {
-    // selectPreview is belt-and-suspenders so Strom's own UI reflects the new
-    // PVW. It can legitimately fail (400) when the target input is already the
-    // sole program source (e.g. cutting away from a PiP overlay whose background
-    // is the same real input). Treat the failure as non-fatal and still fire the
-    // transition so the actual cut always reaches Strom.
+    // Strom rejects previewing the input that is already the sole program
+    // source (400); while a PiP is on program, previewing its background is
+    // accepted. Treat a failure as non-fatal and still fire the transition so
+    // the cut always reaches Strom.
     await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { input: toIndex } });
   } catch (err) {
     console.debug('[controller] Strom selectPreview (non-fatal, transition will still fire):', err);
@@ -1471,6 +1470,9 @@ export async function handleMessage(
     }
     case 'SET_PIP': {
       if (!doc.stromFlowId || !doc.mixerBlockId) break;
+      // The slot drives the TALLY background (`pipBgInput`), so a layout Strom
+      // rejects must not stay in it.
+      const prevPipCfg = pipConfigsByProduction.get(productionId)?.[msg.pip];
       try {
         const strom = await makeStromClient();
         const transforms: PipTransforms = msg.transforms ?? {};
@@ -1490,6 +1492,11 @@ export async function handleMessage(
             setPipConfigSlot(productionId, msg.pip, { ...current, transforms: resp.transforms });
           }
         }
+        // Strom re-composites a PiP that is on air, so its tally changes now.
+        if ((pgmPipByProduction.get(productionId) ?? null) === msg.pip
+            || (pvwPipByProduction.get(productionId) ?? null) === msg.pip) {
+          broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, getTally(productionId), doc) });
+        }
 
         // Persist the PiP layout to the ProductionDoc so it survives
         // deactivate/reactivate and server restarts (issue #177). The in-memory
@@ -1499,6 +1506,8 @@ export async function handleMessage(
         }).catch((err) => console.warn('[controller] persist pipConfigs error:', err));
       } catch (err) {
         console.warn('[controller] Strom SET_PIP error:', err);
+        const pips = setPipConfigSlot(productionId, msg.pip, prevPipCfg ?? { bg: null, zones: [], transforms: {} });
+        broadcast(productionId, { type: 'PIP_STATE', pgmPip: pgmPipByProduction.get(productionId) ?? null, pvwPip: pvwPipByProduction.get(productionId) ?? null, pips });
         ws.send(JSON.stringify({ type: 'ERROR', error: stromErrorMessage(err) }));
       }
       break;

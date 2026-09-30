@@ -78,6 +78,9 @@ let transitionDelayMs = 0;
 // (e.g. /preview) keep answering 200.
 let transitionStatus = 200;
 
+// When >= 400, the fake Strom fails PUT /pip/{idx} (a PiP layout it rejects).
+let pipConfigStatus = 200;
+
 const stromServer: Server = createServer((req, res) => {
   const chunks: Buffer[] = [];
   req.on('data', (c: Buffer) => chunks.push(c));
@@ -93,6 +96,11 @@ const stromServer: Server = createServer((req, res) => {
       if (isTransition && transitionStatus >= 400) {
         res.writeHead(transitionStatus, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'transition rejected' }));
+        return;
+      }
+      if ((req.url ?? '').includes('/pip/') && pipConfigStatus >= 400) {
+        res.writeHead(pipConfigStatus, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'pip config rejected' }));
         return;
       }
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -208,6 +216,7 @@ beforeEach(() => {
   resetRecordings();
   transitionDelayMs = 0;
   transitionStatus = 200;
+  pipConfigStatus = 200;
   mockGet.mockReset();
   mockInsert.mockReset();
   mockInsert.mockResolvedValue({ ok: true });
@@ -1047,13 +1056,41 @@ describe('TAKE of a PiP reports the background Strom composites it over', () => 
     });
   }
 
-  it('a background changed with SET_PIP while the PiP is on program shows in the next TALLY', async () => {
+  it('SET_PIP changing the background of the PiP on program sends a TALLY naming it', async () => {
     mockGet.mockResolvedValue(makeProductionDoc([]));
     await arrangePgmPip();
 
     await send({ type: 'SET_PIP', pip: 0, bg: 3, zones: [] });
-    await send({ type: 'SET_PVW', mixerInput: 'video_in_2' });
 
-    expect(tallies().at(-1)).toMatchObject({ pgmBg: 'video_in_3', program: ['video_in_3'] });
+    expect(tallies()).toHaveLength(1);
+    expect(tallies()[0]).toMatchObject({ pgm: null, pgmBg: 'video_in_3', program: ['video_in_3'] });
+  });
+
+  it('SET_PIP that Strom rejects leaves the reported background unchanged', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await arrangePgmPip();
+    pipConfigStatus = 400;
+
+    await send({ type: 'SET_PIP', pip: 0, bg: 3, zones: [] });
+    await send({ type: 'SET_PVW', mixerInput: 'video_in_2' });
+    warn.mockRestore();
+
+    // Strom still composites PiP 0 over input 1, and clients get the old layout back.
+    expect(tallies().at(-1)).toMatchObject({ pgmBg: 'video_in_1', program: ['video_in_1'] });
+    expect((pipStates().at(-1)?.pips as Array<{ bg: number | null }>)[0]?.bg).toBe(1);
+  });
+
+  it('CUT to the PiP\'s background does not announce the PiP in preview when Strom rejects the take', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await arrangePgmPip();
+    transitionStatus = 500;
+
+    await send({ type: 'CUT', mixerInput: 'video_in_1' });
+    warn.mockRestore();
+
+    expect(requestsTo(TRANSITION)).toHaveLength(1);
+    expect(pipStates()).toHaveLength(0);
   });
 });
