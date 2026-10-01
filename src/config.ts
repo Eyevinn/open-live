@@ -26,15 +26,19 @@ function parseBoolEnv(name: string, defaultValue: boolean): boolean {
   return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
 }
 
-function parsePositiveIntEnv(name: string, defaultValue: number): number {
+function parsePositiveIntEnv(name: string, defaultValue: number, max = Number.MAX_SAFE_INTEGER): number {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return defaultValue;
   const value = Number(raw);
-  if (!Number.isInteger(value) || value < 1) {
-    throw new Error(`Environment variable ${name} must be a positive integer, got "${raw}"`);
+  if (!Number.isInteger(value) || value < 1 || value > max) {
+    const limit = max < Number.MAX_SAFE_INTEGER ? ` up to ${max}` : '';
+    throw new Error(`Environment variable ${name} must be a positive integer${limit}, got "${raw}"`);
   }
   return value;
 }
+
+/** Longest delay Node's timers accept; a larger one fires after 1 ms. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
 
 /**
  * Redact any `user:pass@` userinfo segment from a URL-ish string so a malformed
@@ -94,7 +98,7 @@ export const config = {
    * How long (ms) a read of a Strom block's properties may wait for an answer;
    * past this the read counts as no answer. Writes have no limit. Default 5s.
    */
-  stromBlockPropertiesReadTimeoutMs: parsePositiveIntEnv('STROM_BLOCK_PROPERTIES_READ_TIMEOUT_MS', 5000),
+  stromBlockPropertiesReadTimeoutMs: parsePositiveIntEnv('STROM_BLOCK_PROPERTIES_READ_TIMEOUT_MS', 5000, MAX_TIMER_MS),
   logLevel: process.env['LOG_LEVEL'] ?? 'info',
   /**
    * Optional static API key. When set, all /api/v1 routes require:
