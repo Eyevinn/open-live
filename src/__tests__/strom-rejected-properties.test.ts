@@ -68,8 +68,10 @@ type PatchMode =
   | { kind: 'reject'; keys: string[]; when?: When; omitFromReply?: boolean; listUnwritten?: boolean }
   | { kind: 'httpError'; when?: When; applied?: boolean; status?: number };
 let patchMode: PatchMode = { kind: 'ok' };
-/** Reply delay per request; Strom's state changes on receipt. */
+/** Reply delay per request; Strom's state changes on receipt unless `patchAppliesLate` matches. */
 let patchDelayMs: (written: Record<string, unknown>) => number = () => 0;
+/** Writes Strom applies only when it replies, like one queued behind a stall. */
+let patchAppliesLate: When = () => false;
 /** Strom's view of the mixer's current values, returned by GET and PATCH. */
 let stromProps: Record<string, unknown> = {};
 const patches: Array<Record<string, unknown>> = [];
@@ -115,10 +117,18 @@ const stromServer: Server = createServer((req, res) => {
       }
       const refused = patchMode.kind === 'reject' && (patchMode.when?.(written) ?? true) ? patchMode.keys : [];
       const rejected: Record<string, string> = {};
+      const toApply: Record<string, unknown> = {};
       for (const key of Object.keys(written)) {
         if (refused.includes(key)) rejected[key] = 'property is not live (requires flow restart)';
-        else stromProps[key] = written[key];
+        else toApply[key] = written[key];
       }
+      if (patchAppliesLate(written)) {
+        return void setTimeout(() => {
+          Object.assign(stromProps, toApply);
+          send(200, { block_id: AUDIO_BLOCK, properties: { ...stromProps }, rejected });
+        }, delay);
+      }
+      Object.assign(stromProps, toApply);
       if (patchMode.kind === 'reject' && patchMode.listUnwritten) {
         for (const key of refused) rejected[key] ??= 'property is not live (requires flow restart)';
       }
@@ -134,6 +144,9 @@ const stromServer: Server = createServer((req, res) => {
 await new Promise<void>((resolve) => stromServer.listen(0, '127.0.0.1', () => resolve()));
 const STROM_URL = `http://127.0.0.1:${(stromServer.address() as AddressInfo).port}`;
 process.env['STROM_URL'] = STROM_URL;
+// Short limits so the timeout paths run within a test.
+process.env['STROM_BLOCK_PROPERTIES_TIMEOUT_MS'] = '1500';
+process.env['MUTE_TIMEOUT_RECHECK_MS'] = '600';
 
 // Imported after STROM_URL is set so config picks up the throwaway server.
 const { StromClient, StromClientError, StromPropertiesRejectedError } = await import('../lib/strom.js');
@@ -226,6 +239,7 @@ afterAll(async () => {
 beforeEach(() => {
   patchMode = { kind: 'ok' };
   patchDelayMs = () => 0;
+  patchAppliesLate = () => false;
   stromProps = { ch1_fader: 0.4, ch2_fader: 0.7, main_fader: 0.9 };
   patches.length = 0;
   blockGetFails = false;
@@ -703,6 +717,61 @@ describe('AUDIO_SET mute when the outcome is unclear', () => {
     c.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
     await waitFor(() => b.frames.some((f) => f.type === 'NACK' && f.cmdId === 'b1'));
     a.close(); b.close(); c.close();
+  });
+});
+
+describe('AUDIO_SET mute read-back', () => {
+  it('a newer write that finishes during the read-back is not undone by the stale answer', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    const b = await connect(prod);
+    // The mute lands but its reply is lost, so its outcome is read back slowly.
+    patchMode = { kind: 'httpError', applied: true, when: (w) => w['ch1_to_main'] === false };
+    blockGetDelayMs = 400;
+
+    const getsBefore = blockGets;
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => blockGets > getsBefore);
+    b.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: false });
+    await settle(700);
+
+    expect(stromProps['ch1_to_main']).toBe(true);
+    expect(audioStates(b.frames, 'ch1', 'mute').at(-1)).toBe(false);
+    blockGetDelayMs = 0;
+    patchMode = { kind: 'ok' };
+    const c = await connect(prod);
+    expect(audioStates(c.frames, 'ch1', 'mute')).toEqual([false]);
+    a.close(); b.close(); c.close();
+  });
+
+  it('a mute Strom applies only after the time limit is still shown as made', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    const b = await connect(prod);
+    // Strom applies the write at 1.7 s, after the 1.5 s limit and the first read.
+    patchAppliesLate = (w) => w['ch1_to_main'] === false;
+    patchDelayMs = (w) => (w['ch1_to_main'] === false ? 1700 : 0);
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => audioStates(b.frames, 'ch1', 'mute').includes(true), 3000);
+    expect(a.frames.some((f) => f.type === 'ERROR')).toBe(false);
+    patchDelayMs = () => 0;
+    const c = await connect(prod);
+    expect(audioStates(c.frames, 'ch1', 'mute')).toEqual([true]);
+    a.close(); b.close(); c.close();
+  });
+
+  it('a read-back Strom does not answer in time counts as no answer', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    patchMode = { kind: 'httpError' };
+    blockGetDelayMs = 4000;
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    // Without a limit the read would hold the settle for 4 s.
+    await waitFor(() => audioStates(a.frames, 'ch1', 'mute').includes(true), 2500);
+    blockGetDelayMs = 0;
+    a.close();
   });
 });
 

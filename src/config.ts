@@ -90,6 +90,18 @@ export const config = {
   /** 'osc' = PAT→SAT exchange via token.svc.prod.osaas.io (default for OSC-hosted Strom)
    *  'direct' = API key used as Bearer token directly (self-hosted / non-OSC Strom) */
   stromAuthMode: (process.env['STROM_AUTH_MODE'] ?? 'osc') as 'osc' | 'direct',
+  /**
+   * How long (ms) a read or write of a Strom block's properties may wait for an
+   * answer. Mixer writes normally answer in milliseconds; past this the outcome
+   * counts as unknown and the controller reads Strom back. Default 5s.
+   */
+  stromBlockPropertiesTimeoutMs: parsePositiveIntEnv('STROM_BLOCK_PROPERTIES_TIMEOUT_MS', 5000),
+  /**
+   * After a mute write timed out and a read shows Strom without the change, how
+   * long (ms) to wait before reading once more, in case Strom applies the stuck
+   * write late. Default 3s.
+   */
+  muteTimeoutRecheckMs: parsePositiveIntEnv('MUTE_TIMEOUT_RECHECK_MS', 3000),
   logLevel: process.env['LOG_LEVEL'] ?? 'info',
   /**
    * Optional static API key. When set, all /api/v1 routes require:

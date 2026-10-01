@@ -735,6 +735,14 @@ export class StromClientError extends Error {
   }
 }
 
+/** Strom did not answer within the request's time limit; the request may still take effect. */
+export class StromTimeoutError extends StromClientError {
+  constructor(message: string) {
+    super(0, message)
+    this.name = 'StromTimeoutError'
+  }
+}
+
 /**
  * Strom answers a block-properties PATCH with 200 even when it could not apply
  * some of the properties: it lists them under `rejected` with a reason each
@@ -759,7 +767,7 @@ export interface StromClientOptions {
   baseUrl: string
   /** Optional Bearer token — API key or SAT for OSC-hosted instances */
   token?: string
-  /** How long a block-properties write may wait for Strom's answer (default 5000 ms). */
+  /** How long a block-properties read or write may wait for Strom's answer (default 5000 ms). */
   blockPropertiesTimeoutMs?: number
 }
 
@@ -810,7 +818,7 @@ export class StromClient {
           continue
         }
         if (e.name === 'TimeoutError') {
-          throw new StromClientError(0, `Strom did not answer within ${timeoutMs} ms — ${method} ${url}`)
+          throw new StromTimeoutError(`Strom did not answer within ${timeoutMs} ms — ${method} ${url}`)
         }
         const cause = e.cause ? ` [cause: ${e.cause.message ?? String(e.cause)}${e.cause.code ? ` code=${e.cause.code}` : ''}]` : ''
         throw new StromClientError(0, `Strom unreachable: ${e.message}${cause} — ${method} ${url}`)
@@ -950,11 +958,13 @@ export class StromClient {
       return `${this.baseUrl}/api/flows/${id}/blocks/${blockId}/thumbnail${q}`
     },
     getBlockProperties: (flowId: string, blockId: string) =>
-      this.get<BlockPropertiesResponse>(`/api/flows/${flowId}/blocks/${blockId}/properties`),
+      this.request<BlockPropertiesResponse>(
+        'GET', `/api/flows/${flowId}/blocks/${blockId}/properties`, undefined, this.blockPropertiesTimeoutMs),
     /** Throws {@link StromPropertiesRejectedError} when Strom refuses any written key. */
     updateBlockProperties: async (flowId: string, blockId: string, body: UpdateBlockPropertiesRequest) => {
       // A mixer write normally answers in milliseconds. Without a limit, a
       // stalled Strom would leave the caller waiting on fetch's own timeouts.
+      // A timeout throws StromTimeoutError: the write may still land.
       const res = await this.request<BlockPropertiesResponse>(
         'PATCH', `/api/flows/${flowId}/blocks/${blockId}/properties`, body, this.blockPropertiesTimeoutMs)
       const refused = Object.entries(res?.rejected ?? {}).filter(([key]) => Object.hasOwn(body.properties, key))

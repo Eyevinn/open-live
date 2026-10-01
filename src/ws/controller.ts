@@ -15,7 +15,7 @@ import { persistClipCue, clearPersistedClipCue } from '../services/clip-cue-stor
 import { startClipRelay, stopClipRelay } from '../services/clip-relay.js';
 import { CONTRACT_VERSION, computeTallyContributions } from '../services/automation-contract.js';
 import { startMeterRelay, stopMeterRelay } from '../services/meter-relay.js';
-import { StromClient, StromClientError, StromPropertiesRejectedError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms, type VideoEffect, type EffectTarget, type SetVideoEffectRequest } from '../lib/strom.js';
+import { StromClient, StromClientError, StromPropertiesRejectedError, StromTimeoutError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms, type VideoEffect, type EffectTarget, type SetVideoEffectRequest } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { graphicUrl } from '../lib/url-validation.js';
 import { decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
@@ -440,7 +440,7 @@ function toStromTransition(type: string): StromTransitionType {
 
 async function makeStromClient(): Promise<StromClient> {
   const token = await getStromToken(config.stromToken).catch(() => undefined)
-  return new StromClient({ baseUrl: config.stromUrl, token })
+  return new StromClient({ baseUrl: config.stromUrl, token, blockPropertiesTimeoutMs: config.stromBlockPropertiesTimeoutMs })
 }
 
 // Returns true when the transition either reached Strom successfully or there
@@ -599,6 +599,8 @@ const muteWritesInFlight = new Map<string, {
   pending: number; latest: number; settled: boolean; overlapped: boolean; unclear: boolean; shown?: boolean;
 }>()
 let muteWriteCounter = 0
+/** Newest mute write per key, kept while a read-back is out so a stale answer is recognised. */
+const latestMuteWrite = new Map<string, number>()
 
 /** Strom's mute state for a mixer element from a block-properties reply, if present. */
 function stromMuteState(elementId: string, props: Record<string, unknown>): boolean | undefined {
@@ -2113,12 +2115,14 @@ export async function handleMessage(
           const writes = muteWritesInFlight.get(muteKey) ?? { pending: 0, latest: 0, settled: mutedSet?.has(elementId) ?? false, overlapped: false, unclear: false };
           if (++writes.pending > 1) writes.overlapped = true;
           const writeId = writes.latest = ++muteWriteCounter;
+          latestMuteWrite.set(muteKey, writeId);
           muteWritesInFlight.set(muteKey, writes);
           if (requested) mutedSet?.add(elementId);
           else mutedSet?.delete(elementId);
           let failure: unknown;
           let applied = false;
           let unclear = false;
+          let timedOut = false;
           try {
             await strom.flows.updateBlockProperties(flowId, blockId, {
               properties: props,
@@ -2149,6 +2153,7 @@ export async function handleMessage(
               failure = err;
               writes.settled = requested;
               writes.unclear = unclear = true;
+              timedOut = err instanceof StromTimeoutError;
             }
           }
           // Strom answered that the write was not applied: tell the sender now,
@@ -2167,12 +2172,20 @@ export async function handleMessage(
           muteWritesInFlight.delete(muteKey);
           let state = writes.settled;
           if (writes.overlapped || writes.unclear) {
-            const read = await strom.flows.getBlockProperties(flowId, blockId)
+            const readState = () => strom.flows.getBlockProperties(flowId, blockId)
               .then((res) => stromMuteState(elementId, res.properties ?? {}), () => undefined);
+            let read = await readState();
+            if (timedOut && read !== undefined && read !== requested && latestMuteWrite.get(muteKey) === writeId) {
+              // A write Strom did not answer in time may still be queued there.
+              await new Promise((resolve) => setTimeout(resolve, config.muteTimeoutRecheckMs));
+              if (latestMuteWrite.get(muteKey) === writeId) read = await readState();
+            }
             if (read !== undefined) state = read;
-            // A write that started during the read settles the state itself.
-            if (muteWritesInFlight.has(muteKey)) break;
+            // A write that started during the read, even one already finished,
+            // settles the state itself.
+            if (latestMuteWrite.get(muteKey) !== writes.latest) break;
           }
+          if (latestMuteWrite.get(muteKey) === writes.latest) latestMuteWrite.delete(muteKey);
           // Re-fetch the registry: a deactivate/reactivate while the write was
           // stalled replaces the Set captured above (#402). A miss means the
           // production is no longer active, so there is nothing to record.
