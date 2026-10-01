@@ -57,7 +57,7 @@ const AUDIO_BLOCK = 'mixer1';
 
 /**
  * What the block-properties PATCH answers: apply all, refuse some keys (200), or
- * fail (500). `when` limits a refusal or failure to matching requests.
+ * fail with `status` (default 500). `when` limits a refusal or failure to matching requests.
  * `omitFromReply` leaves the refused keys out of the reply's `properties`;
  * `listUnwritten` lists every key in `keys` as refused, written or not;
  * `applied` makes a 500 land the write first, like a reply lost after Strom acted.
@@ -66,7 +66,7 @@ type When = (written: Record<string, unknown>) => boolean;
 type PatchMode =
   | { kind: 'ok' }
   | { kind: 'reject'; keys: string[]; when?: When; omitFromReply?: boolean; listUnwritten?: boolean }
-  | { kind: 'http500'; when?: When; applied?: boolean };
+  | { kind: 'httpError'; when?: When; applied?: boolean; status?: number };
 let patchMode: PatchMode = { kind: 'ok' };
 /** Reply delay per request; Strom's state changes on receipt. */
 let patchDelayMs: (written: Record<string, unknown>) => number = () => 0;
@@ -75,6 +75,9 @@ let stromProps: Record<string, unknown> = {};
 const patches: Array<Record<string, unknown>> = [];
 /** Makes GET of the mixer's properties fail with 500. */
 let blockGetFails = false;
+/** Reply delay for GET of the mixer's properties, and how many have arrived (connects read it too). */
+let blockGetDelayMs = 0;
+let blockGets = 0;
 
 const stromServer: Server = createServer((req, res) => {
   const chunks: Buffer[] = [];
@@ -97,16 +100,18 @@ const stromServer: Server = createServer((req, res) => {
     }
     const blockProps = `/api/flows/${FLOW_ID}/blocks/${AUDIO_BLOCK}/properties`;
     if (req.method === 'GET' && url === blockProps) {
+      blockGets++;
       if (blockGetFails) return send(500, { error: 'boom' });
-      return send(200, { block_id: AUDIO_BLOCK, properties: stromProps, rejected: {} });
+      const properties = { ...stromProps };
+      return void setTimeout(() => send(200, { block_id: AUDIO_BLOCK, properties, rejected: {} }), blockGetDelayMs);
     }
     if (req.method === 'PATCH' && url === blockProps) {
       const written = body.properties ?? {};
       patches.push(written);
       const delay = patchDelayMs(written);
-      if (patchMode.kind === 'http500' && (patchMode.when?.(written) ?? true)) {
+      if (patchMode.kind === 'httpError' && (patchMode.when?.(written) ?? true)) {
         if (patchMode.applied) Object.assign(stromProps, written);
-        return void setTimeout(() => send(500, { error: 'boom' }), delay);
+        return void setTimeout(() => send(patchMode.kind === 'httpError' ? patchMode.status ?? 500 : 500, { error: 'boom' }), delay);
       }
       const refused = patchMode.kind === 'reject' && (patchMode.when?.(written) ?? true) ? patchMode.keys : [];
       const rejected: Record<string, string> = {};
@@ -131,7 +136,7 @@ const STROM_URL = `http://127.0.0.1:${(stromServer.address() as AddressInfo).por
 process.env['STROM_URL'] = STROM_URL;
 
 // Imported after STROM_URL is set so config picks up the throwaway server.
-const { StromClient, StromPropertiesRejectedError } = await import('../lib/strom.js');
+const { StromClient, StromClientError, StromPropertiesRejectedError } = await import('../lib/strom.js');
 const { buildServer } = await import('../server.js');
 const { clearAudioState } = await import('../ws/controller.js');
 
@@ -224,6 +229,8 @@ beforeEach(() => {
   stromProps = { ch1_fader: 0.4, ch2_fader: 0.7, main_fader: 0.9 };
   patches.length = 0;
   blockGetFails = false;
+  blockGetDelayMs = 0;
+  blockGets = 0;
   warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 });
 
@@ -256,6 +263,17 @@ describe('StromClient.flows.updateBlockProperties', () => {
     expect(res.properties).toMatchObject({ ch2_fader: 0.5 });
   });
 
+  it('gives up on a write Strom does not answer in time', async () => {
+    patchDelayMs = () => 500;
+    const slow = new StromClient({ baseUrl: STROM_URL, blockPropertiesTimeoutMs: 100 });
+    const err = await slow.flows
+      .updateBlockProperties(FLOW_ID, AUDIO_BLOCK, { properties: { ch2_fader: 0.5 } })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(StromClientError);
+    expect((err as InstanceType<typeof StromClientError>).status).toBe(0);
+    expect(String(err)).toContain('did not answer within 100 ms');
+  });
+
   it('resolves when nothing written was refused', async () => {
     const res = await client().flows.updateBlockProperties(FLOW_ID, AUDIO_BLOCK, { properties: { ch2_fader: 0.5 } });
     expect(res.rejected).toEqual({});
@@ -269,7 +287,7 @@ describe('StromClient.flows.updateBlockProperties', () => {
 describe('AUDIO_SET mute when Strom does not apply the routing', () => {
   it.each<[string, PatchMode]>([
     ['200 with ch1_to_main in rejected', { kind: 'reject', keys: ['ch1_to_main'] }],
-    ['HTTP 500', { kind: 'http500' }],
+    ['HTTP 500', { kind: 'httpError' }],
   ])('%s: sender gets ERROR + its mute put back, nobody sees the mute, registry unchanged', async (_label, mode) => {
     const prod = newProduction();
     const a = await connect(prod);
@@ -336,6 +354,43 @@ describe('AUDIO_SET mute when Strom does not apply the routing', () => {
     const c = await connect(prod);
     expect(audioStates(c.frames, 'ch1', 'mute')).toEqual([true]);
     a.close(); c.close();
+  });
+
+  it('a refused return-mirror send on an unmute says the guest return was not reopened', async () => {
+    const prod = newProduction({
+      returnBuses: [{ mixerInput: 'video_in_1', auxBus: 1, ownChannel: 1, mode: 'program' }],
+    });
+    const a = await connect(prod);
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => audioStates(a.frames, 'ch1', 'mute').includes(true));
+    patchMode = { kind: 'reject', keys: ['ch1_aux1_level'] };
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: false });
+    await waitFor(() => a.frames.some((f) => f.type === 'ERROR'));
+    expect(String(a.frames.find((f) => f.type === 'ERROR')?.error)).toMatch(/live on program, but a guest return did not reopen it/);
+    a.close();
+  });
+
+  it('a 404 from Strom counts as not applied, even when the read-back fails too', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    const b = await connect(prod);
+    const bBefore = b.frames.length;
+    patchMode = { kind: 'httpError', status: 404 };
+    blockGetFails = true;
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => a.frames.some((f) => f.type === 'ERROR'));
+    await settle(100);
+    const afterError = a.frames.slice(a.frames.findIndex((f) => f.type === 'ERROR'));
+    expect(audioStates(afterError, 'ch1', 'mute')).toEqual([false]);
+    expect(audioStates(b.frames.slice(bBefore), 'ch1', 'mute')).toEqual([]);
+
+    blockGetFails = false;
+    patchMode = { kind: 'ok' };
+    const c = await connect(prod);
+    expect(audioStates(c.frames, 'ch1', 'mute')).toEqual([false]);
+    a.close(); b.close(); c.close();
   });
 });
 
@@ -462,7 +517,7 @@ describe('AUDIO_SET races with a slow Strom', () => {
     const prod = newProduction();
     const a = await connect(prod);
     const b = await connect(prod);
-    patchMode = { kind: 'http500' };
+    patchMode = { kind: 'httpError' };
     // The second write fails last, after the first has already failed.
     patchDelayMs = (w) => ('ch1_to_main' in w ? 200 * patches.filter((p) => 'ch1_to_main' in p).length : 0);
 
@@ -509,7 +564,7 @@ describe('AUDIO_SET mute when the outcome is unclear', () => {
     const b = await connect(prod);
     a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
     await waitFor(() => audioStates(b.frames, 'ch1', 'mute').includes(true));
-    patchMode = { kind: 'http500', applied: true };
+    patchMode = { kind: 'httpError', applied: true };
 
     a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: false });
     await waitFor(() => audioStates(b.frames, 'ch1', 'mute').at(-1) === false);
@@ -527,7 +582,7 @@ describe('AUDIO_SET mute when the outcome is unclear', () => {
     const a = await connect(prod);
     const b = await connect(prod);
     const bBefore = b.frames.length;
-    patchMode = { kind: 'http500' };
+    patchMode = { kind: 'httpError' };
 
     a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
     await waitFor(() => a.frames.some((f) => f.type === 'ERROR'));
@@ -542,7 +597,7 @@ describe('AUDIO_SET mute when the outcome is unclear', () => {
   it('when Strom cannot be read back either, the change is treated as made', async () => {
     const prod = newProduction();
     const a = await connect(prod);
-    patchMode = { kind: 'http500' };
+    patchMode = { kind: 'httpError' };
     blockGetFails = true;
 
     a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
@@ -560,7 +615,7 @@ describe('AUDIO_SET mute when the outcome is unclear', () => {
     const prod = newProduction();
     const a = await connect(prod);
     const b = await connect(prod);
-    patchMode = { kind: 'http500', when: (w) => w['ch1_to_main'] === true };
+    patchMode = { kind: 'httpError', when: (w) => w['ch1_to_main'] === true };
     patchDelayMs = (w) => (w['ch1_to_main'] === false ? 400 : 0);
 
     a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
@@ -591,9 +646,63 @@ describe('AUDIO_SET mute when the outcome is unclear', () => {
 
     expect(stromProps['ch1_to_main']).toBe(true);
     expect(audioStates(a.frames, 'ch1', 'mute').at(-1)).toBe(false);
-    // One update once both writes have finished, not one per write.
+    // One update, not one per write.
     expect(audioStates(b.frames.slice(bBefore), 'ch1', 'mute')).toEqual([false]);
     a.close(); b.close();
+  });
+
+  it('the newest write is shown as soon as it applies, while an older one is still slow', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    const b = await connect(prod);
+    patchDelayMs = (w) => (w['ch1_to_main'] === false ? 1000 : 0);
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => patches.some((p) => p['ch1_to_main'] === false));
+    const bBefore = b.frames.length;
+    b.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: false });
+    await waitFor(() => audioStates(b.frames.slice(bBefore), 'ch1', 'mute').includes(false), 500);
+    a.close(); b.close();
+  });
+
+  it('an older write that finishes while a newer one is out is not shown', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    const b = await connect(prod);
+    patchDelayMs = (w) => (w['ch1_to_main'] === false ? 100 : w['ch1_to_main'] === true ? 400 : 0);
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => patches.some((p) => p['ch1_to_main'] === false));
+    const bBefore = b.frames.length;
+    b.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: false });
+    await settle(600);
+
+    expect(stromProps['ch1_to_main']).toBe(true);
+    expect(audioStates(b.frames.slice(bBefore), 'ch1', 'mute')).toEqual([false]);
+    a.close(); b.close();
+  });
+
+  it('a refused command still gets its NACK when a newer write starts during the read-back', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    const b = await connect(prod);
+    const c = await connect(prod);
+    // a's write applies; b's overlaps it, is refused and finishes last, so it
+    // reads Strom back. c's write starts during that read and is still out
+    // when the read returns.
+    let n = 0;
+    patchMode = { kind: 'reject', keys: ['ch1_to_main'], when: () => n === 2 };
+    patchDelayMs = (w) => ('ch1_to_main' in w ? [100, 300, 600][n++] ?? 0 : 0);
+    blockGetDelayMs = 300;
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => n === 1);
+    const getsBefore = blockGets;
+    b.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: false, cmdId: 'b1' });
+    await waitFor(() => blockGets > getsBefore);
+    c.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => b.frames.some((f) => f.type === 'NACK' && f.cmdId === 'b1'));
+    a.close(); b.close(); c.close();
   });
 });
 

@@ -591,9 +591,14 @@ const latestVolumeWrite = new Map<string, number>()
  * Mute writes in flight per `${productionId}:${elementId}`. `settled` is the
  * best known Strom state so far; when the last outstanding write finishes, the
  * mute registry is set from it. When writes overlapped or one got no clear
- * answer, Strom's state is read back before settling.
+ * answer, Strom's state is read back before settling. The newest write shows
+ * its result as soon as it applies; `shown` is the state last broadcast, so
+ * the settle only broadcasts a correction.
  */
-const muteWritesInFlight = new Map<string, { pending: number; settled: boolean; overlapped: boolean; unclear: boolean }>()
+const muteWritesInFlight = new Map<string, {
+  pending: number; latest: number; settled: boolean; overlapped: boolean; unclear: boolean; shown?: boolean;
+}>()
+let muteWriteCounter = 0
 
 /** Strom's mute state for a mixer element from a block-properties reply, if present. */
 function stromMuteState(elementId: string, props: Record<string, unknown>): boolean | undefined {
@@ -2105,42 +2110,58 @@ export async function handleMessage(
             else ws.send(JSON.stringify({ type: 'ERROR', error: errText }));
           };
           const muteKey = `${productionId}:${elementId}`;
-          const writes = muteWritesInFlight.get(muteKey) ?? { pending: 0, settled: mutedSet?.has(elementId) ?? false, overlapped: false, unclear: false };
+          const writes = muteWritesInFlight.get(muteKey) ?? { pending: 0, latest: 0, settled: mutedSet?.has(elementId) ?? false, overlapped: false, unclear: false };
           if (++writes.pending > 1) writes.overlapped = true;
+          const writeId = writes.latest = ++muteWriteCounter;
           muteWritesInFlight.set(muteKey, writes);
           if (requested) mutedSet?.add(elementId);
           else mutedSet?.delete(elementId);
           let failure: unknown;
+          let applied = false;
+          let unclear = false;
           try {
             await strom.flows.updateBlockProperties(flowId, blockId, {
               properties: props,
               ...(msg.ramp_ms !== undefined && { ramp_ms: msg.ramp_ms }),
             });
             writes.settled = requested;
+            applied = true;
           } catch (err) {
             console.warn('[controller] Strom audio update error:', err);
             if (err instanceof StromPropertiesRejectedError && !(primaryKey in err.rejected)) {
               // Program routing went through and only return-mirror sends were
-              // refused: the mute took effect, but a guest still hears the channel.
+              // refused: the change took effect on program, but not in a return.
               writes.settled = requested;
-              ws.send(JSON.stringify({
-                type: 'ERROR',
-                error: `Audio: ${elementId} is muted on program, but a guest return still carries it. ${err.message}`,
-              }));
+              applied = true;
+              const detail = requested
+                ? 'is muted on program, but a guest return still carries it'
+                : 'is live on program, but a guest return did not reopen it';
+              ws.send(JSON.stringify({ type: 'ERROR', error: `Audio: ${elementId} ${detail}. ${err.message}` }));
             } else if (err instanceof StromPropertiesRejectedError) {
               failure = err;
               writes.settled = stromMuteState(elementId, err.current) ?? writes.settled;
+            } else if (err instanceof StromClientError && err.status >= 400 && err.status < 500) {
+              // Strom answered and did not apply the write (block gone, bad request).
+              failure = err;
             } else {
               // No answer on whether the write landed: assume it did unless a
               // read-back below says otherwise.
               failure = err;
               writes.settled = requested;
-              writes.unclear = true;
+              writes.unclear = unclear = true;
             }
           }
+          // Strom answered that the write was not applied: tell the sender now,
+          // whatever the overlapping writes do.
+          const refused = failure !== undefined && !unclear;
+          if (refused) replyError(failure);
           if (--writes.pending > 0) {
-            // A newer write for this element is outstanding and settles the state.
-            if (failure instanceof StromPropertiesRejectedError) replyError(failure);
+            // Older writes are still outstanding and settle the state when they
+            // finish. The newest write shows its applied result now.
+            if (applied && writes.latest === writeId) {
+              writes.shown = requested;
+              broadcast(productionId, { type: 'AUDIO_STATE', elementId, property: 'mute', value: requested });
+            }
             break;
           }
           muteWritesInFlight.delete(muteKey);
@@ -2158,13 +2179,15 @@ export async function handleMessage(
           const currentMutedSet = elementId === 'main' ? undefined : mutedElementsByProduction.get(productionId);
           if (state) currentMutedSet?.add(elementId);
           else currentMutedSet?.delete(elementId);
-          const failed = failure instanceof StromPropertiesRejectedError || (failure !== undefined && state !== requested);
-          if (failed) replyError(failure);
+          const failed = refused || (failure !== undefined && state !== requested);
+          if (failed && !refused) replyError(failure);
           const frame = { type: 'AUDIO_STATE', elementId, property: 'mute', value: state };
           // A failure without overlapping writes changed nothing for other
-          // clients; only the sender flipped its toggle optimistically.
+          // clients; only the sender flipped its toggle optimistically. After
+          // overlap, other clients only need a frame if the shown state is wrong.
           if (failed && !writes.overlapped) ws.send(JSON.stringify(frame));
-          else broadcast(productionId, frame);
+          else if (state !== writes.shown) broadcast(productionId, frame);
+          else if (failed) ws.send(JSON.stringify(frame));
         }
       } catch (err) {
         console.warn('[controller] Strom audio update error:', err);

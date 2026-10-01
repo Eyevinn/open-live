@@ -759,15 +759,19 @@ export interface StromClientOptions {
   baseUrl: string
   /** Optional Bearer token — API key or SAT for OSC-hosted instances */
   token?: string
+  /** How long a block-properties write may wait for Strom's answer (default 5000 ms). */
+  blockPropertiesTimeoutMs?: number
 }
 
 export class StromClient {
   private readonly baseUrl: string
   private token: string | undefined
+  private readonly blockPropertiesTimeoutMs: number
 
   constructor(options: StromClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, '')
     this.token = options.token
+    this.blockPropertiesTimeoutMs = options.blockPropertiesTimeoutMs ?? 5000
   }
 
   private headers(): Record<string, string> {
@@ -776,7 +780,7 @@ export class StromClient {
     return h
   }
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async request<T>(method: string, path: string, body?: unknown, timeoutMs?: number): Promise<T> {
     const url = `${this.baseUrl}${path}`
     // Retry once on UND_ERR_SOCKET: undici doesn't auto-retry unsafe methods (PATCH/POST)
     // when a pooled connection was closed by the server. The stale connection is evicted on
@@ -794,6 +798,7 @@ export class StromClient {
             // always receives a JSON number with a fractional part.
             ? JSON.stringify(body).replace(/"value":(-?\d+)([,}])/g, '"value":$1.0$2')
             : undefined,
+          ...(timeoutMs !== undefined && { signal: AbortSignal.timeout(timeoutMs) }),
         })
         break
       } catch (err) {
@@ -803,6 +808,9 @@ export class StromClient {
           // first failure, so the immediate retry opens a fresh TCP connection — no
           // sleep needed (sleeping gave Strom time to close the fresh socket too).
           continue
+        }
+        if (e.name === 'TimeoutError') {
+          throw new StromClientError(0, `Strom did not answer within ${timeoutMs} ms — ${method} ${url}`)
         }
         const cause = e.cause ? ` [cause: ${e.cause.message ?? String(e.cause)}${e.cause.code ? ` code=${e.cause.code}` : ''}]` : ''
         throw new StromClientError(0, `Strom unreachable: ${e.message}${cause} — ${method} ${url}`)
@@ -945,7 +953,10 @@ export class StromClient {
       this.get<BlockPropertiesResponse>(`/api/flows/${flowId}/blocks/${blockId}/properties`),
     /** Throws {@link StromPropertiesRejectedError} when Strom refuses any written key. */
     updateBlockProperties: async (flowId: string, blockId: string, body: UpdateBlockPropertiesRequest) => {
-      const res = await this.patch<BlockPropertiesResponse>(`/api/flows/${flowId}/blocks/${blockId}/properties`, body)
+      // A mixer write normally answers in milliseconds. Without a limit, a
+      // stalled Strom would leave the caller waiting on fetch's own timeouts.
+      const res = await this.request<BlockPropertiesResponse>(
+        'PATCH', `/api/flows/${flowId}/blocks/${blockId}/properties`, body, this.blockPropertiesTimeoutMs)
       const refused = Object.entries(res?.rejected ?? {}).filter(([key]) => Object.hasOwn(body.properties, key))
       if (refused.length > 0) {
         throw new StromPropertiesRejectedError(blockId, Object.fromEntries(refused), res.properties ?? {})
