@@ -118,6 +118,7 @@ process.env['STROM_URL'] = STROM_URL;
 // Imported after STROM_URL is set so config picks up the throwaway server.
 const { StromClient, StromPropertiesRejectedError } = await import('../lib/strom.js');
 const { buildServer } = await import('../server.js');
+const { clearAudioState } = await import('../ws/controller.js');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -395,6 +396,85 @@ describe('AUDIO_SET races with a slow Strom', () => {
     const afterError = a.frames.slice(a.frames.findIndex((f) => f.type === 'ERROR'));
     expect(audioStates(afterError, 'main', 'mute')).toEqual([true]);
     a.close();
+  });
+
+  it('a refused channel mute with no mute registry resyncs to the channel\'s routing, not main_mute', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    clearAudioState(prod); // deactivate or idle stop while the tab stays open
+    stromProps['main_mute'] = true;
+    patchMode = { kind: 'reject', keys: ['ch1_to_main'] };
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => a.frames.some((f) => f.type === 'ERROR'));
+    await settle(50);
+    const afterError = a.frames.slice(a.frames.findIndex((f) => f.type === 'ERROR'));
+    expect(audioStates(afterError, 'ch1', 'mute')).toEqual([false]);
+    a.close();
+  });
+
+  it('a slow refused mute does not undo a later mute that applied', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    const b = await connect(prod);
+    let n = 0;
+    patchMode = { kind: 'reject', keys: ['ch1_to_main'], when: (w) => 'ch1_to_main' in w && ++n === 1 };
+    // Only the first write is slow (the delay is computed before `when` counts it).
+    patchDelayMs = (w) => ('ch1_to_main' in w && n === 0 ? 400 : 0);
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => patches.some((p) => p['ch1_to_main'] === false));
+    b.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => audioStates(b.frames, 'ch1', 'mute').includes(true));
+    await waitFor(() => a.frames.some((f) => f.type === 'ERROR'));
+
+    expect(stromProps['ch1_to_main']).toBe(false);
+    patchMode = { kind: 'ok' };
+    const c = await connect(prod);
+    expect(audioStates(c.frames, 'ch1', 'mute')).toEqual([true]);
+    a.close(); b.close(); c.close();
+  });
+
+  it('two overlapping mutes that both fail leave the registry unmuted', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    const b = await connect(prod);
+    patchMode = { kind: 'http500' };
+    // The second write fails last, after the first has already failed.
+    patchDelayMs = (w) => ('ch1_to_main' in w ? 200 * patches.filter((p) => 'ch1_to_main' in p).length : 0);
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => patches.some((p) => p['ch1_to_main'] === false));
+    b.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => a.frames.some((f) => f.type === 'ERROR') && b.frames.some((f) => f.type === 'ERROR'));
+
+    patchMode = { kind: 'ok' };
+    const c = await connect(prod);
+    expect(audioStates(c.frames, 'ch1', 'mute')).toEqual([false]);
+    a.close(); b.close(); c.close();
+  });
+
+  it('a refused fader resyncs even after a newer move back to the same level', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    stromProps['ch1_fader'] = 0.4;
+    let n = 0;
+    patchMode = { kind: 'reject', keys: ['ch1_fader'], when: (w) => w['ch1_fader'] === 0.5 && ++n === 1 };
+    // Only the first 0.5 is slow, so the second 0.5 applies before the refusal returns.
+    patchDelayMs = (w) => (w['ch1_fader'] === 0.5 && n === 0 ? 600 : 0);
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'volume', value: 0.5 });
+    await waitFor(() => patches.some((p) => p['ch1_fader'] === 0.5));
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'volume', value: 0.6 });
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'volume', value: 0.5 });
+    await waitFor(() => patches.filter((p) => p['ch1_fader'] === 0.5).length === 2);
+    await settle(700);
+
+    expect(stromProps['ch1_fader']).toBe(0.5);
+    expect(audioStates(a.frames, 'ch1', 'volume').at(-1)).toBe(0.5);
+    const c = await connect(prod);
+    expect(audioStates(c.frames, 'ch1', 'volume')).toEqual([0.5]);
+    a.close(); c.close();
   });
 });
 

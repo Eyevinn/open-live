@@ -582,6 +582,25 @@ function rebroadcastMixerState(productionId: string, doc: ProductionDoc): void {
 // flood Strom's HTTP connection pool. Mute changes skip the debounce.
 const pendingVolume = new Map<string, NodeJS.Timeout>()
 
+// Latest volume write per debounce key, numbered from one counter so a newer
+// move is recognised even when it repeats the refused level.
+let volumeWriteCounter = 0
+const latestVolumeWrite = new Map<string, number>()
+
+/**
+ * Mute writes in flight per `${productionId}:${elementId}`. `settled` is the
+ * mute state Strom is known to hold apart from the pending writes; when the
+ * latest write finishes, the mute registry is set from it.
+ */
+const muteWritesInFlight = new Map<string, { latest: number; settled: boolean }>()
+
+/** Strom's mute state for a mixer element from a block-properties reply, if present. */
+function stromMuteState(elementId: string, props: Record<string, unknown>): boolean | undefined {
+  if (elementId === 'main') return typeof props['main_mute'] === 'boolean' ? props['main_mute'] : undefined
+  const toMain = props[`${elementId}_to_main`]
+  return typeof toMain === 'boolean' ? !toMain : undefined
+}
+
 // ---------------------------------------------------------------------------
 // Audio follow — AFV registry
 // ---------------------------------------------------------------------------
@@ -2015,6 +2034,8 @@ export async function handleMessage(
           const capturedAudioBlockId = ctx.audioBlockId;
           const capturedValue = msg.value;
           const capturedLogicalId = msg.elementId;
+          const writeId = ++volumeWriteCounter;
+          latestVolumeWrite.set(debounceKey, writeId);
           pendingVolume.set(debounceKey, setTimeout(async () => {
             pendingVolume.delete(debounceKey);
             const propName = capturedLogicalId === 'main' ? 'main_fader' : `ch${ch}_fader`;
@@ -2030,12 +2051,14 @@ export async function handleMessage(
                 // newer fader move has already replaced the refused value.
                 const levels = channelLevelsByProduction.get(productionId);
                 const actual = err.current[propName];
-                if (!levels || typeof actual !== 'number' || levels.get(capturedLogicalId) !== capturedValue) return;
+                if (!levels || typeof actual !== 'number' || latestVolumeWrite.get(debounceKey) !== writeId) return;
                 levels.set(capturedLogicalId, actual);
                 broadcast(productionId, { type: 'AUDIO_STATE', elementId: capturedLogicalId, property: 'volume', value: actual });
                 return;
               }
               broadcast(productionId, { type: 'AUDIO_STATE', elementId: capturedLogicalId, property: 'volume', value: capturedValue });
+            } finally {
+              if (latestVolumeWrite.get(debounceKey) === writeId) latestVolumeWrite.delete(debounceKey);
             }
           }, 150));
         } else {
@@ -2063,17 +2086,26 @@ export async function handleMessage(
             ));
           }
           // Update the mute registry before the write so a concurrent RETURN_SET
-          // already sees the mute; put it back if Strom does not apply it.
+          // already sees the mute. When the latest write for this element
+          // finishes, the registry takes the state Strom is known to hold.
           const mutedSet = msg.elementId === 'main' ? undefined : mutedElementsByProduction.get(productionId);
-          const wasMuted = mutedSet?.has(msg.elementId) ?? false;
-          // Re-fetch the registry on each update: a deactivate/reactivate while
-          // the write was stalled replaces the Set (#402).
-          const setMuted = (muted: boolean) => {
-            const current = msg.elementId === 'main' ? undefined : mutedElementsByProduction.get(productionId);
-            if (muted) current?.add(msg.elementId);
-            else current?.delete(msg.elementId);
+          const elementId = msg.elementId;
+          const muteKey = `${productionId}:${elementId}`;
+          const inFlight = muteWritesInFlight.get(muteKey) ?? { latest: 0, settled: mutedSet?.has(elementId) ?? false };
+          const writeSeq = ++inFlight.latest;
+          muteWritesInFlight.set(muteKey, inFlight);
+          const finishWrite = (stromState: boolean | undefined) => {
+            if (stromState !== undefined) inFlight.settled = stromState;
+            if (inFlight.latest !== writeSeq) return;
+            muteWritesInFlight.delete(muteKey);
+            // Re-fetch the registry: a deactivate/reactivate while the write was
+            // stalled replaces the Set captured above (#402).
+            const current = elementId === 'main' ? undefined : mutedElementsByProduction.get(productionId);
+            if (inFlight.settled) current?.add(elementId);
+            else current?.delete(elementId);
           };
-          setMuted(msg.value === true);
+          if (msg.value === true) mutedSet?.add(elementId);
+          else mutedSet?.delete(elementId);
           try {
             await strom.flows.updateBlockProperties(doc.stromFlowId, ctx.audioBlockId, {
               properties: props,
@@ -2083,12 +2115,12 @@ export async function handleMessage(
             // Program routing went through and only return-mirror sends were
             // refused: the mute took effect, so report it as applied.
             if (!(err instanceof StromPropertiesRejectedError) || primaryKey in err.rejected) {
-              setMuted(wasMuted);
+              finishWrite(err instanceof StromPropertiesRejectedError ? stromMuteState(elementId, err.current) : undefined);
               throw err;
             }
             console.warn('[controller] AUDIO_SET return mirror refused:', err.message);
           }
-          setMuted(msg.value === true);
+          finishWrite(msg.value === true);
           broadcast(productionId, { type: 'AUDIO_STATE', elementId: msg.elementId, property: msg.property, value: msg.value });
         }
       } catch (err) {
@@ -2099,10 +2131,8 @@ export async function handleMessage(
         // The sender's UI flips mute optimistically; put it back on the unchanged state.
         if (msg.property === 'mute') {
           const mutedSet = msg.elementId === 'main' ? undefined : mutedElementsByProduction.get(productionId);
-          const stromMainMute = err instanceof StromPropertiesRejectedError ? err.current['main_mute'] : undefined;
-          const value = mutedSet ? mutedSet.has(msg.elementId)
-            : typeof stromMainMute === 'boolean' ? stromMainMute
-            : !msg.value;
+          const stromState = err instanceof StromPropertiesRejectedError ? stromMuteState(msg.elementId, err.current) : undefined;
+          const value = mutedSet ? mutedSet.has(msg.elementId) : stromState ?? !msg.value;
           ws.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: msg.elementId, property: 'mute', value }));
         }
       }
