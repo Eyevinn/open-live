@@ -35,6 +35,28 @@ Dedicated credential keys (RTMP) deliberately have **no** fallback to `SRT_PASSP
 (ADR-004 Resolved Decision 2) — do not add one, or a stream-key rotation would be coupled to the
 SRT passphrase key.
 
+## The guest-invite signing key is backend-generated and stored, not just an env var
+
+Guest calling is on by default (issue #391). The signing key is resolved via
+`src/lib/guest-signing-key.ts`, NOT by reading `config.guestInviteSecret` directly:
+
+- `getGuestSigningKey()` returns `config.guestInviteSecret ?? <cached stored key>`. Routes that
+  sign/verify invite tokens must call `getGuestSigningKey()`, never `config.guestInviteSecret`
+  (the env var is now only an optional override and is usually unset).
+- `isGuestCallingEnabled()` (`src/config.ts`) delegates to `isGuestSigningKeyAvailable()`, so it is
+  true once *either* the env override or the stored key is present.
+- `ensureGuestSigningKey()` runs once at startup (`src/main.ts`, after `connectDb()`). It is a
+  no-op when the env override is set; otherwise it reads the single fixed-id doc
+  (`GUEST_SIGNING_KEY_DOC_ID = 'guest-invite-signing-key'`) or creates it if absent. A
+  concurrent-create `409` is handled by re-reading the winner's key, so all processes converge on
+  one key. The key is cached in-memory so the route hot path stays synchronous.
+- `config.ts` imports `guest-signing-key.ts`, which imports `db/index.ts`, which imports
+  `config.ts` — an intentional ESM cycle. It is safe only because no binding is used at module-eval
+  time; keep it that way (do not call these at top level).
+- The stored key lives in `GuestSigningKeyDoc.signingSecret`. The `secret` substring makes it
+  redacted by `log-redact.ts`; `server.ts` also lists `signingSecret` / `*.signingSecret` in the
+  Fastify logger redact paths. Never add a route that returns the doc.
+
 ## RTMP outputs never populate `OutputDoc.url` and are never in `SRT_OUTPUT_TYPES`
 
 An `outputType: 'rtmp'` destination keeps its ingest URL + key in the structured `rtmp` object,

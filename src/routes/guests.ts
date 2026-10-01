@@ -18,6 +18,7 @@ import {
   hashGuestInviteToken,
 } from '../lib/guest-invite-token.js';
 import { config, isGuestCallingEnabled } from '../config.js';
+import { getGuestSigningKey } from '../lib/guest-signing-key.js';
 import { broadcast } from '../services/tally.service.js';
 import { resolvePublicBaseUrl, updateProductionDoc } from './productions.js';
 import { applyReturnMode } from '../ws/controller.js';
@@ -152,10 +153,15 @@ function bearerToken(req: FastifyRequest): string | undefined {
   return auth?.startsWith('Bearer ') ? auth.slice(7) : undefined;
 }
 
-/** 503 when the HMAC secret is unset — guest calling is disabled (spec §Configuration). */
+/**
+ * 503 when no guest-invite signing key is available. Guest calling is on by
+ * default (issue #391) — the backend generates and stores a key on first start —
+ * so this only fires if no key could be loaded at all (e.g. the DB was
+ * unreachable at startup and no `GUEST_INVITE_SECRET` override is set).
+ */
 function guestsDisabled(): { error: string; statusCode: 503 } {
   return {
-    error: 'Guest calling is disabled — set GUEST_INVITE_SECRET to enable it',
+    error: 'Guest calling is temporarily unavailable — the invite signing key could not be loaded',
     statusCode: 503,
   };
 }
@@ -215,7 +221,7 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
     '/api/v1/productions/:id/guests/invites',
     async (req, reply) => {
       if (!isGuestCallingEnabled()) return reply.status(503).send(guestsDisabled());
-      const secret = config.guestInviteSecret!;
+      const secret = getGuestSigningKey()!;
       const body = CreateInviteBody.parse(req.body);
 
       // 404 if the production does not exist.
@@ -350,7 +356,7 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
     { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
     async (req, reply) => {
       if (!isGuestCallingEnabled()) return reply.status(503).send(guestsDisabled());
-      const secret = config.guestInviteSecret!;
+      const secret = getGuestSigningKey()!;
       const token = bearerToken(req);
       if (!token) {
         return reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
@@ -558,7 +564,7 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
     '/api/v1/guests/:inviteId/session',
     async (req, reply) => {
       if (!isGuestCallingEnabled()) return reply.status(503).send(guestsDisabled());
-      const secret = config.guestInviteSecret!;
+      const secret = getGuestSigningKey()!;
       const token = bearerToken(req);
       if (!token) {
         return reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
@@ -619,7 +625,7 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
     '/api/v1/guests/:inviteId/session/mute',
     async (req, reply) => {
       if (!isGuestCallingEnabled()) return reply.status(503).send(guestsDisabled());
-      const secret = config.guestInviteSecret!;
+      const secret = getGuestSigningKey()!;
       const body = MuteBody.parse(req.body);
       const token = bearerToken(req);
       if (!token) {

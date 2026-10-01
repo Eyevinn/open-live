@@ -1,6 +1,6 @@
 import Nano from 'nano';
 import { config } from '../config.js';
-import type { ProductionDoc, SourceDoc, ProductionConfigDoc, GraphicDoc, OutputDoc, GatewayDoc, RecordingDoc, GuestInviteDoc, GuestSessionDoc } from './types.js';
+import type { ProductionDoc, SourceDoc, ProductionConfigDoc, GraphicDoc, OutputDoc, GatewayDoc, RecordingDoc, GuestInviteDoc, GuestSessionDoc, GuestSigningKeyDoc } from './types.js';
 
 
 let db: Nano.DocumentScope<ProductionDoc>;
@@ -154,6 +154,10 @@ export function getGuestInvitesDb(): GuardedScope<GuestInviteDoc> {
 
 export function getGuestSessionsDb(): GuardedScope<GuestSessionDoc> {
   return withTypeGuard(db as unknown as Nano.DocumentScope<GuestSessionDoc>, 'guest-session');
+}
+
+export function getGuestSigningKeysDb(): GuardedScope<GuestSigningKeyDoc> {
+  return withTypeGuard(db as unknown as Nano.DocumentScope<GuestSigningKeyDoc>, 'guest-signing-key');
 }
 
 const DB_NAME = 'open-live';

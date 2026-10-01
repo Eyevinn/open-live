@@ -3,6 +3,7 @@ import { startIdleWatchdog } from './services/idle-watchdog.js';
 import { startPortReservation, stopPortReservation } from './services/port-reservation.js';
 import { connectDb } from './db/index.js';
 import { cleanLegacyFixtures } from './db/seed.js';
+import { ensureGuestSigningKey } from './lib/guest-signing-key.js';
 import { buildServer } from './server.js';
 import { reconcileProductionStatuses } from './services/reconcile.js';
 
@@ -78,6 +79,20 @@ async function main() {
   try {
     await connectDb();
     app.log.info('[db] Connected to CouchDB');
+    // Guest calling is on by default (issue #391): ensure a signing key exists —
+    // generated and stored on first start, reused on every restart. The key is
+    // never logged. Env `GUEST_INVITE_SECRET`, if set, overrides it. Best-effort:
+    // a failure here must not block startup (guest routes degrade to 503 until a
+    // key is available), mirroring the DB-failure handling below.
+    try {
+      await ensureGuestSigningKey();
+      app.log.info('[guest-calling] Invite signing key ready');
+    } catch (err: any) {
+      app.log.error(
+        '[guest-calling] Failed to load/generate invite signing key — guest routes will 503 until it is available (reason: %s)',
+        err?.statusCode ?? err?.message ?? 'unknown',
+      );
+    }
     await cleanLegacyFixtures();
     await reconcileProductionStatuses(app.log);
   } catch (err: any) {

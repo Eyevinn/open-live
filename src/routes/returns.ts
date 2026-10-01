@@ -5,6 +5,7 @@ import type { GuestInviteDoc, ProductionDoc } from '../db/types.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { assertSameStromOrigin } from '../lib/url-validation.js';
 import { config, isGuestCallingEnabled } from '../config.js';
+import { getGuestSigningKey } from '../lib/guest-signing-key.js';
 import { verifyGuestInviteToken, hashGuestInviteToken } from '../lib/guest-invite-token.js';
 import { applyReturnMode } from '../ws/controller.js';
 import { returnModesFor } from './guests.js';
@@ -223,7 +224,7 @@ const returnsRoutes: FastifyPluginAsync = async (fastify) => {
       if (body.mode === 'low-latency-minus') {
         return reply.status(400).send({ error: 'low-latency-minus is not available in v1', statusCode: 400 });
       }
-      const secret = config.guestInviteSecret!;
+      const secret = getGuestSigningKey()!;
       const token = bearerToken(req);
       if (!token) {
         return reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
