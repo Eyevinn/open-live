@@ -48,7 +48,7 @@ The backend already fails clean and descriptively: `isGuestCallingEnabled()`
 (returned at `guests.ts:458,514,540,569,757,809,834`; the return-mode route does the same at
 `src/routes/returns.ts:192-194`). This is the intended design (`docs/specs/guest-calling-intercom.md`
 §Configuration, `.env.example`, `docs/openapi.yaml`) — a feature gate identical in shape to how
-VOD recording gates on its MinIO config (`isRecordingEnabled()`, `config.ts:295-302`).
+VOD recording gates on its MinIO config (`isObjectStorageConfigured()`, `config.ts:295-302`).
 
 The gate is correct; the problem is that **nothing sets the secret** on an OSC deployment:
 

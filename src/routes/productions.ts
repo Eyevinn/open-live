@@ -14,7 +14,7 @@ import { clearProductionPflState } from '../services/pfl-state.js';
 import { clearPipState, clearAudioState, clearFxState, clearClipStateForProduction, reinitConnectedControllers } from '../ws/controller.js';
 import { forceStopMeterRelay } from '../services/meter-relay.js';
 import { forceStopClipRelay } from '../services/clip-relay.js';
-import { config, isRecordingEnabled } from '../config.js';
+import { config, isObjectStorageConfigured } from '../config.js';
 import { uploadRecordings, type MinioTarget } from '../lib/recording-uploader.js';
 import { DEFAULT_CONNECTION_ID, resolveStorageTarget, StorageConnectionNotFoundError } from '../lib/storage-connection.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
@@ -342,7 +342,7 @@ async function uploadProductionRecording(
 
   // Resolve the target. Absent (or "default") connectionId = the env default (MINIO_*).
   const namedConnection = !!connectionId && connectionId !== DEFAULT_CONNECTION_ID;
-  if (!namedConnection && !isRecordingEnabled()) {
+  if (!namedConnection && !isObjectStorageConfigured()) {
     return nothingUploaded(
       'no-storage-target',
       'No storage connection is set on the recording output and MINIO_* object storage is not configured.',

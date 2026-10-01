@@ -10,7 +10,7 @@ import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-p
 import { encryptStreamKey } from '../lib/rtmp-credentials-crypto.js';
 import { resolveIngestUrl, validateStreamKey } from '../lib/rtmp.js';
 import { resolveSrtConnect } from '../lib/srt-connect.js';
-import { config, isRecordingEnabled } from '../config.js';
+import { config } from '../config.js';
 import { DEFAULT_CONNECTION_ID } from '../lib/storage-connection.js';
 import { isDocNotFoundError } from '../lib/db-errors.js';
 import { getPortReservation } from '../services/port-reservation.js';
@@ -80,15 +80,14 @@ async function outputInActiveProduction(outputId: string): Promise<boolean> {
 }
 
 /**
- * Why a `recording` output with this `connectionId` has nowhere to upload to,
- * or null when it does (issue #534). A real connection must exist and name a
- * bucket; no connection (or the reserved `"default"`) needs the MINIO_* env.
+ * Why a `recording` output with this `connectionId` names an unusable storage
+ * connection, or null when it is fine (issue #534). A named connection must
+ * exist and name a bucket. No connection (or the reserved `"default"`) is always
+ * accepted: without MINIO_* the recording stays on Strom and is not uploaded.
  */
 async function recordingTargetError(connectionId: string | undefined): Promise<string | null> {
   if (!connectionId || connectionId === DEFAULT_CONNECTION_ID) {
-    return isRecordingEnabled()
-      ? null
-      : 'Recording needs object storage: set the MINIO_* environment variables or choose a storage connection (connectionId)';
+    return null;
   }
   let conn: StorageConnectionDoc;
   try {
@@ -236,10 +235,8 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
 
   fastify.post('/api/v1/outputs', async (req, reply) => {
     const body = OutputInput.parse(req.body);
-    // A 'recording' output needs somewhere to upload to — Strom's recorder writes
-    // local files that open-live uploads to object storage on deactivate. Accept
-    // it when the named storage connection resolves, or (no connection) when the
-    // MINIO_* env store is configured; otherwise 400 (issues #41, #534).
+    // A named storage connection must resolve; with none, the recording stays on
+    // Strom's disk (issues #41, #534).
     if (body.outputType === 'recording') {
       const targetError = await recordingTargetError(body.connectionId);
       if (targetError) return reply.status(400).send({ error: targetError, statusCode: 400 });
