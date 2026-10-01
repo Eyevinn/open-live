@@ -15,7 +15,7 @@ import { persistClipCue, clearPersistedClipCue } from '../services/clip-cue-stor
 import { startClipRelay, stopClipRelay } from '../services/clip-relay.js';
 import { CONTRACT_VERSION, computeTallyContributions } from '../services/automation-contract.js';
 import { startMeterRelay, stopMeterRelay } from '../services/meter-relay.js';
-import { StromClient, StromClientError, StromPropertiesRejectedError, StromTimeoutError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms, type VideoEffect, type EffectTarget, type SetVideoEffectRequest } from '../lib/strom.js';
+import { StromClient, StromClientError, StromPropertiesRejectedError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms, type VideoEffect, type EffectTarget, type SetVideoEffectRequest } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { graphicUrl } from '../lib/url-validation.js';
 import { decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
@@ -440,7 +440,7 @@ function toStromTransition(type: string): StromTransitionType {
 
 async function makeStromClient(): Promise<StromClient> {
   const token = await getStromToken(config.stromToken).catch(() => undefined)
-  return new StromClient({ baseUrl: config.stromUrl, token, blockPropertiesTimeoutMs: config.stromBlockPropertiesTimeoutMs })
+  return new StromClient({ baseUrl: config.stromUrl, token, blockPropertiesReadTimeoutMs: config.stromBlockPropertiesReadTimeoutMs })
 }
 
 // Returns true when the transition either reached Strom successfully or there
@@ -2122,7 +2122,6 @@ export async function handleMessage(
           let failure: unknown;
           let applied = false;
           let unclear = false;
-          let timedOut = false;
           try {
             await strom.flows.updateBlockProperties(flowId, blockId, {
               properties: props,
@@ -2153,7 +2152,6 @@ export async function handleMessage(
               failure = err;
               writes.settled = requested;
               writes.unclear = unclear = true;
-              timedOut = err instanceof StromTimeoutError;
             }
           }
           // Strom answered that the write was not applied: tell the sender now,
@@ -2172,14 +2170,8 @@ export async function handleMessage(
           muteWritesInFlight.delete(muteKey);
           let state = writes.settled;
           if (writes.overlapped || writes.unclear) {
-            const readState = () => strom.flows.getBlockProperties(flowId, blockId)
+            const read = await strom.flows.getBlockProperties(flowId, blockId)
               .then((res) => stromMuteState(elementId, res.properties ?? {}), () => undefined);
-            let read = await readState();
-            if (timedOut && read !== undefined && read !== requested && latestMuteWrite.get(muteKey) === writeId) {
-              // A write Strom did not answer in time may still be queued there.
-              await new Promise((resolve) => setTimeout(resolve, config.muteTimeoutRecheckMs));
-              if (latestMuteWrite.get(muteKey) === writeId) read = await readState();
-            }
             if (read !== undefined) state = read;
             // A write that started during the read, even one already finished,
             // settles the state itself.

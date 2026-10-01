@@ -735,14 +735,6 @@ export class StromClientError extends Error {
   }
 }
 
-/** Strom did not answer within the request's time limit; the request may still take effect. */
-export class StromTimeoutError extends StromClientError {
-  constructor(message: string) {
-    super(0, message)
-    this.name = 'StromTimeoutError'
-  }
-}
-
 /**
  * Strom answers a block-properties PATCH with 200 even when it could not apply
  * some of the properties: it lists them under `rejected` with a reason each
@@ -767,19 +759,19 @@ export interface StromClientOptions {
   baseUrl: string
   /** Optional Bearer token — API key or SAT for OSC-hosted instances */
   token?: string
-  /** How long a block-properties read or write may wait for Strom's answer (default 5000 ms). */
-  blockPropertiesTimeoutMs?: number
+  /** How long a block-properties read may wait for Strom's answer (default 5000 ms). Writes have no limit. */
+  blockPropertiesReadTimeoutMs?: number
 }
 
 export class StromClient {
   private readonly baseUrl: string
   private token: string | undefined
-  private readonly blockPropertiesTimeoutMs: number
+  private readonly blockPropertiesReadTimeoutMs: number
 
   constructor(options: StromClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, '')
     this.token = options.token
-    this.blockPropertiesTimeoutMs = options.blockPropertiesTimeoutMs ?? 5000
+    this.blockPropertiesReadTimeoutMs = options.blockPropertiesReadTimeoutMs ?? 5000
   }
 
   private headers(): Record<string, string> {
@@ -818,7 +810,7 @@ export class StromClient {
           continue
         }
         if (e.name === 'TimeoutError') {
-          throw new StromTimeoutError(`Strom did not answer within ${timeoutMs} ms — ${method} ${url}`)
+          throw new StromClientError(0, `Strom did not answer within ${timeoutMs} ms — ${method} ${url}`)
         }
         const cause = e.cause ? ` [cause: ${e.cause.message ?? String(e.cause)}${e.cause.code ? ` code=${e.cause.code}` : ''}]` : ''
         throw new StromClientError(0, `Strom unreachable: ${e.message}${cause} — ${method} ${url}`)
@@ -959,14 +951,14 @@ export class StromClient {
     },
     getBlockProperties: (flowId: string, blockId: string) =>
       this.request<BlockPropertiesResponse>(
-        'GET', `/api/flows/${flowId}/blocks/${blockId}/properties`, undefined, this.blockPropertiesTimeoutMs),
+        'GET', `/api/flows/${flowId}/blocks/${blockId}/properties`, undefined, this.blockPropertiesReadTimeoutMs),
     /** Throws {@link StromPropertiesRejectedError} when Strom refuses any written key. */
     updateBlockProperties: async (flowId: string, blockId: string, body: UpdateBlockPropertiesRequest) => {
-      // A mixer write normally answers in milliseconds. Without a limit, a
-      // stalled Strom would leave the caller waiting on fetch's own timeouts.
-      // A timeout throws StromTimeoutError: the write may still land.
+      // No time limit: a write Strom has not answered may still land, and only
+      // its reply says how it ended. A stalled write waits on fetch's own
+      // timeouts (minutes), the same as every other Strom request.
       const res = await this.request<BlockPropertiesResponse>(
-        'PATCH', `/api/flows/${flowId}/blocks/${blockId}/properties`, body, this.blockPropertiesTimeoutMs)
+        'PATCH', `/api/flows/${flowId}/blocks/${blockId}/properties`, body)
       const refused = Object.entries(res?.rejected ?? {}).filter(([key]) => Object.hasOwn(body.properties, key))
       if (refused.length > 0) {
         throw new StromPropertiesRejectedError(blockId, Object.fromEntries(refused), res.properties ?? {})

@@ -91,17 +91,10 @@ export const config = {
    *  'direct' = API key used as Bearer token directly (self-hosted / non-OSC Strom) */
   stromAuthMode: (process.env['STROM_AUTH_MODE'] ?? 'osc') as 'osc' | 'direct',
   /**
-   * How long (ms) a read or write of a Strom block's properties may wait for an
-   * answer. Mixer writes normally answer in milliseconds; past this the outcome
-   * counts as unknown and the controller reads Strom back. Default 5s.
+   * How long (ms) a read of a Strom block's properties may wait for an answer;
+   * past this the read counts as no answer. Writes have no limit. Default 5s.
    */
-  stromBlockPropertiesTimeoutMs: parsePositiveIntEnv('STROM_BLOCK_PROPERTIES_TIMEOUT_MS', 5000),
-  /**
-   * After a mute write timed out and a read shows Strom without the change, how
-   * long (ms) to wait before reading once more, in case Strom applies the stuck
-   * write late. Default 3s.
-   */
-  muteTimeoutRecheckMs: parsePositiveIntEnv('MUTE_TIMEOUT_RECHECK_MS', 3000),
+  stromBlockPropertiesReadTimeoutMs: parsePositiveIntEnv('STROM_BLOCK_PROPERTIES_READ_TIMEOUT_MS', 5000),
   logLevel: process.env['LOG_LEVEL'] ?? 'info',
   /**
    * Optional static API key. When set, all /api/v1 routes require:

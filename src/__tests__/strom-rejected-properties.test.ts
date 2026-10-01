@@ -144,9 +144,8 @@ const stromServer: Server = createServer((req, res) => {
 await new Promise<void>((resolve) => stromServer.listen(0, '127.0.0.1', () => resolve()));
 const STROM_URL = `http://127.0.0.1:${(stromServer.address() as AddressInfo).port}`;
 process.env['STROM_URL'] = STROM_URL;
-// Short limits so the timeout paths run within a test.
-process.env['STROM_BLOCK_PROPERTIES_TIMEOUT_MS'] = '1500';
-process.env['MUTE_TIMEOUT_RECHECK_MS'] = '600';
+// A short read limit so the timeout path runs within a test.
+process.env['STROM_BLOCK_PROPERTIES_READ_TIMEOUT_MS'] = '1500';
 
 // Imported after STROM_URL is set so config picks up the throwaway server.
 const { StromClient, StromClientError, StromPropertiesRejectedError } = await import('../lib/strom.js');
@@ -277,15 +276,20 @@ describe('StromClient.flows.updateBlockProperties', () => {
     expect(res.properties).toMatchObject({ ch2_fader: 0.5 });
   });
 
-  it('gives up on a write Strom does not answer in time', async () => {
-    patchDelayMs = () => 500;
-    const slow = new StromClient({ baseUrl: STROM_URL, blockPropertiesTimeoutMs: 100 });
-    const err = await slow.flows
-      .updateBlockProperties(FLOW_ID, AUDIO_BLOCK, { properties: { ch2_fader: 0.5 } })
-      .catch((e: unknown) => e);
+  it('gives up on a read Strom does not answer in time', async () => {
+    blockGetDelayMs = 500;
+    const slow = new StromClient({ baseUrl: STROM_URL, blockPropertiesReadTimeoutMs: 100 });
+    const err = await slow.flows.getBlockProperties(FLOW_ID, AUDIO_BLOCK).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(StromClientError);
     expect((err as InstanceType<typeof StromClientError>).status).toBe(0);
     expect(String(err)).toContain('did not answer within 100 ms');
+  });
+
+  it('waits for a write however long Strom takes to answer', async () => {
+    patchDelayMs = () => 500;
+    const slow = new StromClient({ baseUrl: STROM_URL, blockPropertiesReadTimeoutMs: 100 });
+    const res = await slow.flows.updateBlockProperties(FLOW_ID, AUDIO_BLOCK, { properties: { ch2_fader: 0.5 } });
+    expect(res.properties).toMatchObject({ ch2_fader: 0.5 });
   });
 
   it('resolves when nothing written was refused', async () => {
@@ -744,11 +748,11 @@ describe('AUDIO_SET mute read-back', () => {
     a.close(); b.close(); c.close();
   });
 
-  it('a mute Strom applies only after the time limit is still shown as made', async () => {
+  it('a mute Strom answers only after the read limit is still shown as made', async () => {
     const prod = newProduction();
     const a = await connect(prod);
     const b = await connect(prod);
-    // Strom applies the write at 1.7 s, after the 1.5 s limit and the first read.
+    // Strom applies and answers the write at 1.7 s, past the 1.5 s read limit.
     patchAppliesLate = (w) => w['ch1_to_main'] === false;
     patchDelayMs = (w) => (w['ch1_to_main'] === false ? 1700 : 0);
 
