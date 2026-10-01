@@ -57,18 +57,24 @@ const AUDIO_BLOCK = 'mixer1';
 
 /**
  * What the block-properties PATCH answers: apply all, refuse some keys (200), or
- * fail (500). `when` limits a refusal to matching requests.
+ * fail (500). `when` limits a refusal or failure to matching requests.
+ * `omitFromReply` leaves the refused keys out of the reply's `properties`;
+ * `listUnwritten` lists every key in `keys` as refused, written or not;
+ * `applied` makes a 500 land the write first, like a reply lost after Strom acted.
  */
+type When = (written: Record<string, unknown>) => boolean;
 type PatchMode =
   | { kind: 'ok' }
-  | { kind: 'reject'; keys: string[]; when?: (written: Record<string, unknown>) => boolean }
-  | { kind: 'http500' };
+  | { kind: 'reject'; keys: string[]; when?: When; omitFromReply?: boolean; listUnwritten?: boolean }
+  | { kind: 'http500'; when?: When; applied?: boolean };
 let patchMode: PatchMode = { kind: 'ok' };
 /** Reply delay per request; Strom's state changes on receipt. */
 let patchDelayMs: (written: Record<string, unknown>) => number = () => 0;
 /** Strom's view of the mixer's current values, returned by GET and PATCH. */
 let stromProps: Record<string, unknown> = {};
 const patches: Array<Record<string, unknown>> = [];
+/** Makes GET of the mixer's properties fail with 500. */
+let blockGetFails = false;
 
 const stromServer: Server = createServer((req, res) => {
   const chunks: Buffer[] = [];
@@ -91,20 +97,29 @@ const stromServer: Server = createServer((req, res) => {
     }
     const blockProps = `/api/flows/${FLOW_ID}/blocks/${AUDIO_BLOCK}/properties`;
     if (req.method === 'GET' && url === blockProps) {
+      if (blockGetFails) return send(500, { error: 'boom' });
       return send(200, { block_id: AUDIO_BLOCK, properties: stromProps, rejected: {} });
     }
     if (req.method === 'PATCH' && url === blockProps) {
       const written = body.properties ?? {};
       patches.push(written);
       const delay = patchDelayMs(written);
-      if (patchMode.kind === 'http500') return void setTimeout(() => send(500, { error: 'boom' }), delay);
+      if (patchMode.kind === 'http500' && (patchMode.when?.(written) ?? true)) {
+        if (patchMode.applied) Object.assign(stromProps, written);
+        return void setTimeout(() => send(500, { error: 'boom' }), delay);
+      }
       const refused = patchMode.kind === 'reject' && (patchMode.when?.(written) ?? true) ? patchMode.keys : [];
       const rejected: Record<string, string> = {};
       for (const key of Object.keys(written)) {
         if (refused.includes(key)) rejected[key] = 'property is not live (requires flow restart)';
         else stromProps[key] = written[key];
       }
-      const reply = { block_id: AUDIO_BLOCK, properties: { ...stromProps }, rejected };
+      if (patchMode.kind === 'reject' && patchMode.listUnwritten) {
+        for (const key of refused) rejected[key] ??= 'property is not live (requires flow restart)';
+      }
+      const properties = { ...stromProps };
+      if (patchMode.kind === 'reject' && patchMode.omitFromReply) for (const key of Object.keys(rejected)) delete properties[key];
+      const reply = { block_id: AUDIO_BLOCK, properties, rejected };
       return void setTimeout(() => send(200, reply), delay);
     }
     send(200, {});
@@ -208,6 +223,7 @@ beforeEach(() => {
   patchDelayMs = () => 0;
   stromProps = { ch1_fader: 0.4, ch2_fader: 0.7, main_fader: 0.9 };
   patches.length = 0;
+  blockGetFails = false;
   warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 });
 
@@ -232,6 +248,12 @@ describe('StromClient.flows.updateBlockProperties', () => {
     expect(rejectedErr.rejected).toEqual({ ch1_to_main: 'property is not live (requires flow restart)' });
     expect(rejectedErr.message).toContain('ch1_to_main');
     expect(rejectedErr.current).toMatchObject({ ch2_fader: 0.5 });
+  });
+
+  it('ignores a refused key the request did not write', async () => {
+    patchMode = { kind: 'reject', keys: ['ch1_to_main'], listUnwritten: true };
+    const res = await client().flows.updateBlockProperties(FLOW_ID, AUDIO_BLOCK, { properties: { ch2_fader: 0.5 } });
+    expect(res.properties).toMatchObject({ ch2_fader: 0.5 });
   });
 
   it('resolves when nothing written was refused', async () => {
@@ -297,7 +319,7 @@ describe('AUDIO_SET mute when Strom does not apply the routing', () => {
     a.close(); c.close();
   });
 
-  it('a refused return-mirror send alone does not undo a mute program took', async () => {
+  it('a refused return-mirror send alone keeps the mute and warns the sender', async () => {
     const prod = newProduction({
       returnBuses: [{ mixerInput: 'video_in_1', auxBus: 1, ownChannel: 1, mode: 'program' }],
     });
@@ -307,8 +329,9 @@ describe('AUDIO_SET mute when Strom does not apply the routing', () => {
     a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
     await waitFor(() => audioStates(a.frames, 'ch1', 'mute').includes(true));
     expect(patches.at(-1)).toMatchObject({ ch1_to_main: false, ch1_aux1_level: expect.any(Number) });
-    expect(a.frames.some((f) => f.type === 'ERROR')).toBe(false);
-    expect(warn.mock.calls.some((c) => String(c[1]).includes('ch1_aux1_level'))).toBe(true);
+    // The sender is told the guest return still carries the channel.
+    await waitFor(() => a.frames.some((f) => f.type === 'ERROR'));
+    expect(String(a.frames.find((f) => f.type === 'ERROR')?.error)).toMatch(/guest return still carries it.*ch1_aux1_level/);
 
     const c = await connect(prod);
     expect(audioStates(c.frames, 'ch1', 'mute')).toEqual([true]);
@@ -446,7 +469,8 @@ describe('AUDIO_SET races with a slow Strom', () => {
     a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
     await waitFor(() => patches.some((p) => p['ch1_to_main'] === false));
     b.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
-    await waitFor(() => a.frames.some((f) => f.type === 'ERROR') && b.frames.some((f) => f.type === 'ERROR'));
+    // The last write to finish reports the error, after the registry has settled.
+    await waitFor(() => b.frames.some((f) => f.type === 'ERROR'));
 
     patchMode = { kind: 'ok' };
     const c = await connect(prod);
@@ -475,6 +499,143 @@ describe('AUDIO_SET races with a slow Strom', () => {
     const c = await connect(prod);
     expect(audioStates(c.frames, 'ch1', 'volume')).toEqual([0.5]);
     a.close(); c.close();
+  });
+});
+
+describe('AUDIO_SET mute when the outcome is unclear', () => {
+  it('an unmute Strom applied but answered with an error shows live, with no error', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    const b = await connect(prod);
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => audioStates(b.frames, 'ch1', 'mute').includes(true));
+    patchMode = { kind: 'http500', applied: true };
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: false });
+    await waitFor(() => audioStates(b.frames, 'ch1', 'mute').at(-1) === false);
+    expect(stromProps['ch1_to_main']).toBe(true);
+    expect(a.frames.some((f) => f.type === 'ERROR')).toBe(false);
+
+    patchMode = { kind: 'ok' };
+    const c = await connect(prod);
+    expect(audioStates(c.frames, 'ch1', 'mute')).toEqual([false]);
+    a.close(); b.close(); c.close();
+  });
+
+  it('a failed write Strom did not apply is reported to the sender and put back', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    const b = await connect(prod);
+    const bBefore = b.frames.length;
+    patchMode = { kind: 'http500' };
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => a.frames.some((f) => f.type === 'ERROR'));
+    await settle(50);
+    const afterError = a.frames.slice(a.frames.findIndex((f) => f.type === 'ERROR'));
+    expect(audioStates(afterError, 'ch1', 'mute')).toEqual([false]);
+    // Nothing changed for other clients, so they get no update.
+    expect(audioStates(b.frames.slice(bBefore), 'ch1', 'mute')).toEqual([]);
+    a.close(); b.close();
+  });
+
+  it('when Strom cannot be read back either, the change is treated as made', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    patchMode = { kind: 'http500' };
+    blockGetFails = true;
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => audioStates(a.frames, 'ch1', 'mute').includes(true));
+    expect(a.frames.some((f) => f.type === 'ERROR')).toBe(false);
+
+    blockGetFails = false;
+    patchMode = { kind: 'ok' };
+    const c = await connect(prod);
+    expect(audioStates(c.frames, 'ch1', 'mute')).toEqual([true]);
+    a.close(); c.close();
+  });
+
+  it('a slow mute that applies after a newer unmute failed leaves the channel shown muted', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    const b = await connect(prod);
+    patchMode = { kind: 'http500', when: (w) => w['ch1_to_main'] === true };
+    patchDelayMs = (w) => (w['ch1_to_main'] === false ? 400 : 0);
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => patches.some((p) => p['ch1_to_main'] === false));
+    b.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: false });
+    await waitFor(() => patches.some((p) => p['ch1_to_main'] === true));
+    await waitFor(() => audioStates(b.frames, 'ch1', 'mute').at(-1) === true);
+    await settle(100);
+
+    expect(stromProps['ch1_to_main']).toBe(false);
+    patchMode = { kind: 'ok' };
+    const c = await connect(prod);
+    expect(audioStates(c.frames, 'ch1', 'mute')).toEqual([true]);
+    a.close(); b.close(); c.close();
+  });
+
+  it('a slow mute overtaken by an unmute that applied last does not leave UIs showing muted', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    const b = await connect(prod);
+    patchDelayMs = (w) => (w['ch1_to_main'] === false ? 400 : 0);
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => patches.some((p) => p['ch1_to_main'] === false));
+    const bBefore = b.frames.length;
+    b.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: false });
+    await settle(600);
+
+    expect(stromProps['ch1_to_main']).toBe(true);
+    expect(audioStates(a.frames, 'ch1', 'mute').at(-1)).toBe(false);
+    // One update once both writes have finished, not one per write.
+    expect(audioStates(b.frames.slice(bBefore), 'ch1', 'mute')).toEqual([false]);
+    a.close(); b.close();
+  });
+});
+
+describe('AUDIO_SET refusals settle from Strom\'s reported state', () => {
+  it('a refused mute on a channel Strom already has off program records it as muted', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    stromProps['ch1_to_main'] = false; // muted in Strom, unknown to the registry
+    patchMode = { kind: 'reject', keys: ['ch1_to_main'] };
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => a.frames.some((f) => f.type === 'ERROR'));
+    patchMode = { kind: 'ok' };
+    const c = await connect(prod);
+    expect(audioStates(c.frames, 'ch1', 'mute')).toEqual([true]);
+    a.close(); c.close();
+  });
+
+  it('with no mute registry, the sender is resynced from the channel\'s routing in Strom', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    clearAudioState(prod);
+    stromProps['ch1_to_main'] = false; // the channel is muted
+    patchMode = { kind: 'reject', keys: ['ch1_to_main'] };
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => a.frames.some((f) => f.type === 'ERROR'));
+    await settle(50);
+    const afterError = a.frames.slice(a.frames.findIndex((f) => f.type === 'ERROR'));
+    expect(audioStates(afterError, 'ch1', 'mute')).toEqual([true]);
+    a.close();
+  });
+
+  it('a refused fader missing from the reply is read back from Strom', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    stromProps['ch1_fader'] = 0.4;
+    patchMode = { kind: 'reject', keys: ['ch1_fader'], omitFromReply: true };
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'volume', value: 0.9 });
+    await waitFor(() => audioStates(a.frames, 'ch1', 'volume').at(-1) === 0.4);
+    a.close();
   });
 });
 
