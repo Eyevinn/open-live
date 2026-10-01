@@ -32,7 +32,7 @@ import {
   hashGuestInviteToken,
   GUEST_INVITE_TOKEN_PREFIX,
 } from './guest-invite-token.js';
-import { config } from '../config.js';
+import { getGuestSigningKey } from './guest-signing-key.js';
 
 /** True if `value` has the guest-invite-token prefix (`olgi_v1_`). Cheap pre-filter — does not verify the signature. */
 export function looksLikeGuestToken(value: string): boolean {
@@ -81,7 +81,7 @@ export async function resolveGuestScope(
   productionId: string,
   mixerInput: string,
 ): Promise<GuestScopeResult> {
-  const secret = config.guestInviteSecret;
+  const secret = getGuestSigningKey();
   if (!secret) {
     // Guest calling is disabled — never attempt guest verification.
     return { ok: false, status: 401, error: INVALID_OR_EXPIRED };

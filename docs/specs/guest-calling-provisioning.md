@@ -1,13 +1,29 @@
 # Spec: Provision `GUEST_INVITE_SECRET` for OSC-deployed Open Live instances
 
-**Status: Accepted** (mirrors the already-decided `OscAccessToken` provisioning precedent —
-#318 → #320 / open-live-site#127 + service-schema refresh; "option 2: provision it")
+**Status: SUPERSEDED by issue #391** (the OSC-service-option + funnel approach in §2.1/§2.2 was
+replaced; see the note below and the per-section "SUPERSEDED" banners). The problem statement
+(§1) is still accurate as history.
 **Author:** architect agent
-**Related issues:** #348 (this defect); epic #208 and sub-issues #299 (introduced
-`GUEST_INVITE_SECRET`), #302 (intercom "degrade cleanly"); #318 / #320,
-open-live-site#126 / #127 (the same provisioning gap for `OscAccessToken`)
+**Related issues:** #348 (this defect); #391 (the replacement — backend self-generates and stores
+the key); epic #208 and sub-issues #299 (introduced `GUEST_INVITE_SECRET`), #302 (intercom
+"degrade cleanly"); #318 / #320, open-live-site#126 / #127 (the same provisioning gap for
+`OscAccessToken`)
 **Related spec:** `docs/specs/guest-calling-intercom.md` (the guest-calling feature this unblocks)
 
+> **SUPERSEDED (issue #391).** This spec proposed turning guest calling on by provisioning
+> `GUEST_INVITE_SECRET` through a new OSC service option (§2.1) plus a funnel change (§2.2).
+> @birme objected (osaas-app#6128) that this should be a runtime setting rather than instance-wide
+> configuration, and that was accepted. Issue #391 replaces §2.1 and §2.2: the backend now
+> **generates its own guest-invite signing key on first start and stores it in its own CouchDB**
+> (single fixed-id doc, created only if absent; a concurrent-create conflict re-reads the winner's
+> key), reusing it on every restart. `GUEST_INVITE_SECRET` remains an optional override that wins
+> when set, so self-hosted setups are unchanged. Guest calling is therefore **on by default** with
+> no OSC service option, no funnel change, and no remake of existing instances. The docs change in
+> §2.3 still applies (and was folded into #391). See `src/lib/guest-signing-key.ts` and
+> `isGuestCallingEnabled()` in `src/config.ts`.
+>
+> The original text of this spec follows for historical context.
+>
 > This is a provisioning/config spec, not a feature spec. Guest calling itself is already built
 > and accepted (`docs/specs/guest-calling-intercom.md`). The only gap is that no OSC deployment
 > path supplies the one required secret, so the feature is dark on every provisioned instance.
@@ -66,6 +82,10 @@ slice. The OSC-schema refresh and the funnel change are companion tasks tracked 
 
 ### 2.1 OSC service definition (`eyevinn-open-live`) — companion, not board-tracked
 
+> **SUPERSEDED by issue #391.** No OSC service option is added. The backend generates and stores
+> its own signing key, so guest calling is on by default with no service-schema change. The text
+> below is retained for history only.
+
 Add one config option to the `eyevinn-open-live` service definition:
 
 | Option name | Type | Required | Sensitive | Maps to env |
@@ -103,6 +123,10 @@ This is the exact defensive move `config.ts:99` makes for the token. The verific
 routes stop 503-ing) is a required part of the companion schema task, not an assumption.
 
 ### 2.2 Funnel (`open-live-site`) — companion, not board-tracked
+
+> **SUPERSEDED by issue #391.** No funnel change is needed: the backend self-generates and stores
+> the key, so the funnel does not generate, store, or pass a `GuestInviteSecret`. The text below is
+> retained for history only.
 
 Mirror the existing `dburl-` / `oltoken-` / `stromtoken-` secret pattern
 (`src/server.ts:913-965`):
