@@ -299,6 +299,21 @@ describe('recording-uploader — SigV4 PutObject + upload-from-local (#41)', () 
   });
 });
 
+describe('recording-uploader — recordingStartFromFileName', () => {
+  it('reads the session start from the timestamp Strom puts in a segment name', async () => {
+    const { recordingStartFromFileName } = await import('../lib/recording-uploader.js');
+    expect(recordingStartFromFileName('recording_20260110_090000_00000.mp4')).toBe('2026-01-10T09:00:00.000Z');
+    expect(recordingStartFromFileName('my_show_20261231_235959_00042.mkv')).toBe('2026-12-31T23:59:59.000Z');
+  });
+
+  it('returns undefined for a name without a valid timestamp', async () => {
+    const { recordingStartFromFileName } = await import('../lib/recording-uploader.js');
+    expect(recordingStartFromFileName('seg_00001.mp4')).toBeUndefined();
+    expect(recordingStartFromFileName('recording_20261301_090000_00000.mp4')).toBeUndefined();
+    expect(recordingStartFromFileName('recording_20260230_090000_00000.mp4')).toBeUndefined();
+  });
+});
+
 describe('recording-uploader — presignGetUrl (#42)', () => {
   const target = {
     endpoint: 'minio.example.com',
