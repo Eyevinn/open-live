@@ -424,6 +424,27 @@ export interface GuestSessionDoc {
   updatedAt: string;
 }
 
+/**
+ * The backend-generated HMAC signing key for guest invite tokens (issue #391).
+ *
+ * Stored under a SINGLE FIXED id (`GUEST_SIGNING_KEY_DOC_ID`) so there is at most
+ * one key per instance. The backend generates it the first time guest calling
+ * needs a key and reads it back on every subsequent start, so restarts keep
+ * existing invites valid. `GUEST_INVITE_SECRET` (env) still overrides it.
+ *
+ * `signingSecret` is a credential: it is NEVER logged (the `secret` substring is
+ * matched by `src/lib/log-redact.ts` and the Fastify logger redact paths in
+ * `src/server.ts`) and NEVER returned by any route.
+ */
+export interface GuestSigningKeyDoc {
+  _id: string;              // fixed: "guest-invite-signing-key"
+  _rev?: string;
+  type: 'guest-signing-key';
+  /** Randomly generated HMAC signing key (base64url). Never logged or returned. */
+  signingSecret: string;
+  createdAt: string;        // ISO 8601
+}
+
 // --------------- Production config types ---------------
 
 export interface ProductionConfigDoc {

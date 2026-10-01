@@ -1,3 +1,9 @@
+// NOTE: this import forms an intentional cycle (config ↔ guest-signing-key ↔ db).
+// It is safe under ESM because none of these bindings are used at module-eval
+// time — `isGuestCallingEnabled()` only calls `isGuestSigningKeyAvailable()` at
+// runtime, by which point every module in the cycle is fully initialised.
+import { isGuestSigningKeyAvailable } from './lib/guest-signing-key.js';
+
 function requireEnv(name: string): string {
   const value = process.env[name];
   if (!value) throw new Error(`Missing required environment variable: ${name}`);
@@ -285,11 +291,13 @@ export const config = {
   idleWarningLeadSec: parsePositiveIntEnv('IDLE_WARNING_LEAD_SEC', 60),
   // --- Guest calling (epic #208, issue #299, docs/specs/guest-calling-intercom.md) ---
   /**
-   * HMAC secret used to sign production-scoped guest invite tokens. REQUIRED to
-   * enable guest calling: when unset, the invite/join routes reject with 503
-   * (feature disabled) rather than minting unsigned tokens. Only the SHA-256
-   * hash of each token is persisted (`GuestInviteDoc.tokenHash`); the raw token
-   * is returned to the operator once and never stored (spec §Risks). Redacted in
+   * HMAC secret used to sign production-scoped guest invite tokens. Now an
+   * OPTIONAL override (issue #391): when set it wins over the backend-generated
+   * stored key (`src/lib/guest-signing-key.ts`), so existing self-hosted setups
+   * keep working unchanged. When unset, the backend generates and stores its own
+   * key, so guest calling is on by default. Only the SHA-256 hash of each token
+   * is persisted (`GuestInviteDoc.tokenHash`); the raw token is returned to the
+   * operator once and never stored (spec §Risks). Redacted in
    * `src/lib/log-redact.ts` and the Fastify logger's redact paths.
    */
   guestInviteSecret: process.env['GUEST_INVITE_SECRET'] ?? undefined,
@@ -310,12 +318,15 @@ export const config = {
 } as const;
 
 /**
- * True when guest calling is enabled, i.e. the HMAC signing secret is present.
- * The invite/join/guest-management routes degrade to 503 when this is false,
- * mirroring how VOD recording gates on its MinIO config.
+ * True once a guest-invite signing key is available — the env override
+ * (`GUEST_INVITE_SECRET`) OR the backend-generated stored key loaded at startup
+ * (issue #391, `src/lib/guest-signing-key.ts`). Because the backend generates
+ * and stores a key on first start, this is true by default on every instance;
+ * the invite/join/guest-management routes only degrade to 503 if no key is
+ * available at all (e.g. the DB was unreachable at startup and no env override).
  */
 export function isGuestCallingEnabled(): boolean {
-  return Boolean(config.guestInviteSecret);
+  return isGuestSigningKeyAvailable();
 }
 
 /**
