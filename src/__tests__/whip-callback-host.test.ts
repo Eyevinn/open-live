@@ -15,6 +15,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import Fastify from 'fastify';
 import { buildServer } from '../server.js';
 import { resolvePublicBaseUrl, UntrustedHostError } from '../routes/productions.js';
 
@@ -94,7 +95,7 @@ function makeProductionDoc(overrides: Record<string, unknown> = {}) {
 describe('resolvePublicBaseUrl', () => {
   it('prefers PUBLIC_BASE_URL and ignores the request host entirely', () => {
     const url = resolvePublicBaseUrl(
-      { protocol: 'http', hostname: 'attacker.com' },
+      { protocol: 'http', host: 'attacker.com' },
       { publicBaseUrl: 'https://live.example.com', trustedHosts: [] },
     );
     expect(url).toBe('https://live.example.com');
@@ -102,16 +103,27 @@ describe('resolvePublicBaseUrl', () => {
 
   it('allows a loopback host when no PUBLIC_BASE_URL / allow-list is set', () => {
     const url = resolvePublicBaseUrl(
-      { protocol: 'http', hostname: 'localhost' },
+      { protocol: 'http', host: 'localhost' },
       { publicBaseUrl: undefined, trustedHosts: [] },
     );
     expect(url).toBe('http://localhost');
   });
 
+  // Regression test for #397: `req.host` (unlike `req.hostname` under Fastify 5)
+  // retains the port, so a loopback request on a non-default port must keep it
+  // in the resolved base URL instead of silently dropping it.
+  it('preserves the port from a loopback host on a non-default port', () => {
+    const url = resolvePublicBaseUrl(
+      { protocol: 'http', host: 'localhost:3100' },
+      { publicBaseUrl: undefined, trustedHosts: [] },
+    );
+    expect(url).toBe('http://localhost:3100');
+  });
+
   it('rejects an injected non-loopback host when no allow-list is configured', () => {
     expect(() =>
       resolvePublicBaseUrl(
-        { protocol: 'http', hostname: 'attacker.com' },
+        { protocol: 'http', host: 'attacker.com' },
         { publicBaseUrl: undefined, trustedHosts: [] },
       ),
     ).toThrow(UntrustedHostError);
@@ -119,7 +131,7 @@ describe('resolvePublicBaseUrl', () => {
 
   it('allows a host that is on the TRUSTED_HOSTS allow-list', () => {
     const url = resolvePublicBaseUrl(
-      { protocol: 'https', hostname: 'live.example.com' },
+      { protocol: 'https', host: 'live.example.com' },
       { publicBaseUrl: undefined, trustedHosts: ['live.example.com'] },
     );
     expect(url).toBe('https://live.example.com');
@@ -128,10 +140,58 @@ describe('resolvePublicBaseUrl', () => {
   it('rejects a host that is NOT on the TRUSTED_HOSTS allow-list', () => {
     expect(() =>
       resolvePublicBaseUrl(
-        { protocol: 'http', hostname: 'attacker.com' },
+        { protocol: 'http', host: 'attacker.com' },
         { publicBaseUrl: undefined, trustedHosts: ['live.example.com'] },
       ),
     ).toThrow(UntrustedHostError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression test for #397: real Fastify request, Host header with a port.
+//
+// The unit tests above call resolvePublicBaseUrl() with hand-built `{ host }`
+// objects, which exercise the function's own logic but not Fastify 5's actual
+// `req.host` getter behaviour. The bug fixed by #397 was specifically that the
+// previous implementation read `req.hostname`, which Fastify 5 strips the port
+// from, so a hand-built object using the right property name would never have
+// caught it. This spins up a real `trustProxy`-enabled Fastify instance (same
+// as server.ts) and sends a real request with `Host: localhost:3100`, so the
+// port is carried through Fastify's own header parsing rather than injected
+// directly into a plain object.
+// ---------------------------------------------------------------------------
+
+describe('resolvePublicBaseUrl — real Fastify request with a port (#397)', () => {
+  it('keeps the port from a real Host header instead of dropping it', async () => {
+    const app = Fastify({ trustProxy: true });
+    app.get('/probe', async (req) => ({
+      base: resolvePublicBaseUrl(req, { publicBaseUrl: undefined, trustedHosts: [] }),
+    }));
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/probe',
+      headers: { host: 'localhost:3100' },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ base: 'http://localhost:3100' });
+  });
+
+  it('still returns the default-port host unchanged (no spurious port added)', async () => {
+    const app = Fastify({ trustProxy: true });
+    app.get('/probe', async (req) => ({
+      base: resolvePublicBaseUrl(req, { publicBaseUrl: undefined, trustedHosts: [] }),
+    }));
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/probe',
+      headers: { host: 'localhost' },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ base: 'http://localhost' });
   });
 });
 
@@ -184,7 +244,7 @@ describe('POST /api/v1/productions/:id/activate — X-Forwarded-Host injection',
   });
 
   it('still activates normally (200) for a legitimate loopback request', async () => {
-    // No spoofed headers: Fastify inject resolves req.hostname to a loopback
+    // No spoofed headers: Fastify inject resolves req.host to a loopback
     // host, which the resolver accepts. This proves the fix does not break the
     // legitimate local/dev activation path.
     const doc = makeProductionDoc();
