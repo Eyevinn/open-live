@@ -363,10 +363,12 @@ Reuses existing `STROM_URL`, `PUBLIC_BASE_URL` (for building `joinUrl`/WHIP call
 | `INTERCOM_MANAGER_URL` | to enable talkback | — | Base URL of the Open Intercom manager |
 | `INTERCOM_MANAGER_TOKEN` | to enable talkback | — | Auth token (redact in `src/lib/log-redact.ts`) |
 | `GUEST_INVITE_TTL_S` | no | `86400` | Default invite lifetime |
-| `GUEST_INVITE_SECRET` | yes (to enable guests) | — | HMAC secret for signing invite tokens |
+| `GUEST_INVITE_SECRET` | no (optional override) | — | HMAC key for signing invite tokens. Since issue #391 the backend generates and stores its own key (on by default); set this only to pin a specific key — if set, it wins over the stored key |
 
-When intercom vars are unset, guest calling still works with WHIP video + WHEP return but no
-talkback line (feature degrades cleanly — the fallback is first-class by design).
+Guest calling is on by default (issue #391): the backend generates its invite-signing key on
+first start and stores it in its own CouchDB (`src/lib/guest-signing-key.ts`), reusing it on
+restart. When intercom vars are unset, guest calling still works with WHIP video + WHEP return but
+no talkback line (feature degrades cleanly — the fallback is first-class by design).
 
 ## Open Questions
 
@@ -432,8 +434,8 @@ implementation or in a dependent `open-live-studio` ticket.
 - **Cross-product coupling:** open-live now depends operationally on a reachable intercom-manager;
   the degrade-to-no-talkback path must be tested, not just designed.
 - **Invite token leakage:** tokens grant WHIP publish into a live production; short TTL, hashed
-  storage, and per-invite revocation (DELETE) are mandatory. Redact `INTERCOM_MANAGER_TOKEN` and
-  `GUEST_INVITE_SECRET` in logs.
+  storage, and per-invite revocation (DELETE) are mandatory. Redact `INTERCOM_MANAGER_TOKEN`,
+  `GUEST_INVITE_SECRET`, and the stored signing key's `signingSecret` field (issue #391) in logs.
 - **Wrong channel → guest hears themselves:** the flow generator gives test sources an audio
   channel (`src/lib/flow-generator.ts:388-392,476`) but the controller and `GET /audio` skip them
   (`src/ws/controller.ts:588,637`, `src/routes/audio.ts:79`). With a test source on a lower
