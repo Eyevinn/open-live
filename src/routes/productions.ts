@@ -60,7 +60,7 @@ export class UntrustedHostError extends Error {
  *
  * Resolution order:
  *   1. If PUBLIC_BASE_URL is configured, always use it (never trust the request).
- *   2. Otherwise derive proto/host from `req.protocol` / `req.hostname`, which
+ *   2. Otherwise derive proto/host from `req.protocol` / `req.host`, which
  *      honour X-Forwarded-* only for trusted proxies (Fastify trustProxy).
  *      - If a TRUSTED_HOSTS allow-list is configured, the derived host must be
  *        on it, else the request is rejected (UntrustedHostError → 400).
@@ -68,18 +68,28 @@ export class UntrustedHostError extends Error {
  *        accepted; any other (proxy-forwarded) host is rejected so an attacker
  *        cannot persist an arbitrary host. This keeps local dev working while
  *        refusing to trust an unvalidated forwarded host in a proxied setup.
+ *
+ * Note: this reads `req.host` rather than `req.hostname`. Under Fastify 5,
+ * `req.hostname` strips the port (e.g. `localhost:3100` → `localhost`), which
+ * silently drops the port from every URL built here whenever the service runs
+ * on a non-default port without PUBLIC_BASE_URL set. `req.host` retains the
+ * port and is validated identically — it goes through the same trustProxy
+ * resolution as `req.hostname` (Fastify derives `hostname` from `host`
+ * internally), and the hostname-only part is still extracted below for the
+ * loopback / TRUSTED_HOSTS check.
  */
 export function resolvePublicBaseUrl(
-  req: { protocol?: string; hostname?: string },
+  req: { protocol?: string; host?: string },
   cfg: { publicBaseUrl?: string; trustedHosts: readonly string[] } = config,
 ): string {
   if (cfg.publicBaseUrl) return cfg.publicBaseUrl;
 
   const proto = req.protocol ?? 'https';
-  // req.hostname respects trustProxy: it reflects X-Forwarded-Host only when the
-  // connecting peer is a trusted proxy. It still cannot vouch for *which* host is
-  // legitimate, so we validate it below.
-  const host = (req.hostname ?? '').toLowerCase();
+  // req.host respects trustProxy the same way req.hostname does (it reflects
+  // X-Forwarded-Host only when the connecting peer is a trusted proxy), but
+  // unlike req.hostname it keeps the port. It still cannot vouch for *which*
+  // host is legitimate, so we validate the hostname part below.
+  const host = (req.host ?? '').toLowerCase();
   if (!host) {
     throw new UntrustedHostError(
       'Cannot determine request host to build the WHIP callback URL. ' +
