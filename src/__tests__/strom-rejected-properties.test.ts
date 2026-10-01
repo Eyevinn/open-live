@@ -11,7 +11,7 @@
  * handler. CouchDB is mocked.
  */
 
-import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach, type MockInstance } from 'vitest';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { WebSocket } from 'ws';
@@ -55,9 +55,17 @@ vi.mock('../services/meter-relay.js', () => ({
 const FLOW_ID = 'flow-rejected';
 const AUDIO_BLOCK = 'mixer1';
 
-/** What the block-properties PATCH answers: apply all, refuse some keys (200), or fail (500). */
-type PatchMode = { kind: 'ok' } | { kind: 'reject'; keys: string[] } | { kind: 'http500' };
+/**
+ * What the block-properties PATCH answers: apply all, refuse some keys (200), or
+ * fail (500). `when` limits a refusal to matching requests.
+ */
+type PatchMode =
+  | { kind: 'ok' }
+  | { kind: 'reject'; keys: string[]; when?: (written: Record<string, unknown>) => boolean }
+  | { kind: 'http500' };
 let patchMode: PatchMode = { kind: 'ok' };
+/** Reply delay per request; Strom's state changes on receipt. */
+let patchDelayMs: (written: Record<string, unknown>) => number = () => 0;
 /** Strom's view of the mixer's current values, returned by GET and PATCH. */
 let stromProps: Record<string, unknown> = {};
 const patches: Array<Record<string, unknown>> = [];
@@ -88,14 +96,16 @@ const stromServer: Server = createServer((req, res) => {
     if (req.method === 'PATCH' && url === blockProps) {
       const written = body.properties ?? {};
       patches.push(written);
-      if (patchMode.kind === 'http500') return send(500, { error: 'boom' });
-      const refused = patchMode.kind === 'reject' ? patchMode.keys : [];
+      const delay = patchDelayMs(written);
+      if (patchMode.kind === 'http500') return void setTimeout(() => send(500, { error: 'boom' }), delay);
+      const refused = patchMode.kind === 'reject' && (patchMode.when?.(written) ?? true) ? patchMode.keys : [];
       const rejected: Record<string, string> = {};
       for (const key of Object.keys(written)) {
         if (refused.includes(key)) rejected[key] = 'property is not live (requires flow restart)';
         else stromProps[key] = written[key];
       }
-      return send(200, { block_id: AUDIO_BLOCK, properties: stromProps, rejected });
+      const reply = { block_id: AUDIO_BLOCK, properties: { ...stromProps }, rejected };
+      return void setTimeout(() => send(200, reply), delay);
     }
     send(200, {});
   });
@@ -180,7 +190,7 @@ function audioStates(frames: Frame[], elementId: string, property: 'mute' | 'vol
     .map((f) => f.value);
 }
 
-let warn: ReturnType<typeof vi.spyOn>;
+let warn: MockInstance<typeof console.warn>;
 
 beforeAll(async () => {
   app = await buildServer();
@@ -194,6 +204,7 @@ afterAll(async () => {
 
 beforeEach(() => {
   patchMode = { kind: 'ok' };
+  patchDelayMs = () => 0;
   stromProps = { ch1_fader: 0.4, ch2_fader: 0.7, main_fader: 0.9 };
   patches.length = 0;
   warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -329,6 +340,63 @@ describe('AUDIO_SET volume when Strom refuses the fader', () => {
 // ---------------------------------------------------------------------------
 // First connect: the channel reset keeps what applied, forgets refused faders
 // ---------------------------------------------------------------------------
+
+describe('AUDIO_SET races with a slow Strom', () => {
+  it('a refused fader does not overwrite a newer fader value that applied', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    stromProps['ch1_fader'] = 0.4;
+    patchMode = { kind: 'reject', keys: ['ch1_fader'], when: (w) => w['ch1_fader'] === 0.5 };
+    patchDelayMs = (w) => (w['ch1_fader'] === 0.5 ? 400 : 0);
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'volume', value: 0.5 });
+    await waitFor(() => patches.some((p) => p['ch1_fader'] === 0.5));
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'volume', value: 0.6 });
+    await waitFor(() => patches.some((p) => p['ch1_fader'] === 0.6));
+    await settle(500);
+
+    expect(stromProps['ch1_fader']).toBe(0.6);
+    expect(audioStates(a.frames, 'ch1', 'volume').at(-1)).toBe(0.6);
+    const c = await connect(prod);
+    expect(audioStates(c.frames, 'ch1', 'volume')).toEqual([0.6]);
+    a.close(); c.close();
+  });
+
+  it('a RETURN_SET during an in-flight mute keeps the muted channel closed in the return', async () => {
+    const prod = newProduction({
+      sources: [{ sourceId: 'guest-1', mixerInput: 'video_in_1', returnFeed: { synced: 'program' } }],
+      returnBuses: [{ mixerInput: 'video_in_1', auxBus: 1, ownChannel: 1, mode: 'program' }],
+    });
+    const a = await connect(prod);
+    patchDelayMs = (w) => ('ch1_to_main' in w ? 300 : 0);
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => patches.some((p) => p['ch1_to_main'] === false));
+    a.send({ type: 'RETURN_SET', mixerInput: 'video_in_1', mode: 'program' });
+    await waitFor(() => audioStates(a.frames, 'ch1', 'mute').includes(true));
+    await settle(100);
+
+    expect(stromProps['ch1_to_main']).toBe(false);
+    expect(stromProps['ch1_aux1_level']).toBe(0);
+    a.close();
+  });
+
+  it('a refused main mute resyncs the sender to Strom\'s main_mute, not a guess', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    a.send({ type: 'AUDIO_SET', elementId: 'main', property: 'mute', value: true });
+    await waitFor(() => audioStates(a.frames, 'main', 'mute').includes(true));
+    stromProps['main_mute'] = true;
+    patchMode = { kind: 'reject', keys: ['main_mute'] };
+
+    a.send({ type: 'AUDIO_SET', elementId: 'main', property: 'mute', value: true });
+    await waitFor(() => a.frames.some((f) => f.type === 'ERROR'));
+    await settle(50);
+    const afterError = a.frames.slice(a.frames.findIndex((f) => f.type === 'ERROR'));
+    expect(audioStates(afterError, 'main', 'mute')).toEqual([true]);
+    a.close();
+  });
+});
 
 describe('first-connect channel reset when Strom refuses a key', () => {
   it('reports Strom\'s level for a refused fader and unity for the rest', async () => {
