@@ -10,7 +10,7 @@ import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-p
 import { encryptStreamKey } from '../lib/rtmp-credentials-crypto.js';
 import { resolveIngestUrl, validateStreamKey } from '../lib/rtmp.js';
 import { resolveSrtConnect } from '../lib/srt-connect.js';
-import { config, isRecordingEnabled } from '../config.js';
+import { config } from '../config.js';
 import { getPortReservation } from '../services/port-reservation.js';
 import { clashesAfterWrite, listenerPortRequest, resolveListenerAddress, usedListenerPorts } from '../services/listener-ports.js';
 
@@ -202,13 +202,6 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
 
   fastify.post('/api/v1/outputs', async (req, reply) => {
     const body = OutputInput.parse(req.body);
-    // A 'recording' output only makes sense when MinIO/S3 is configured — Strom's
-    // recorder writes local files that open-live uploads to object storage. Reject
-    // the type at creation time when recording is disabled so the feature degrades
-    // cleanly (spec: vod-recording-minio.md, issue #41).
-    if (body.outputType === 'recording' && !isRecordingEnabled()) {
-      return reply.status(400).send({ error: 'Recording is disabled — MinIO/S3 is not configured', statusCode: 400 });
-    }
     const id = `output-${randomUUID()}`;
     // RTMP is an outbound connect to the platform — it leases NO SRT listener
     // port (unlike the SRT-listener path below), so skip that branch entirely.
