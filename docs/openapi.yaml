@@ -2510,7 +2510,10 @@ paths:
       description: |
         Mints an HMAC-signed, expiring invite token. The raw token is returned
         exactly once; only its SHA-256 hash is persisted. Requires the shared
-        API key. Returns 503 when `GUEST_INVITE_SECRET` is unset (feature disabled).
+        API key. Guest calling is on by default (the backend generates and stores
+        its own signing key); 503 only occurs if no signing key could be loaded at
+        startup (e.g. the database was unreachable and no `GUEST_INVITE_SECRET`
+        override is set).
       operationId: createGuestInvite
       tags: [Guests]
       requestBody:
