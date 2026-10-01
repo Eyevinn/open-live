@@ -735,6 +735,26 @@ export class StromClientError extends Error {
   }
 }
 
+/**
+ * Strom answers a block-properties PATCH with 200 even when it could not apply
+ * some of the properties: it lists them under `rejected` with a reason each
+ * (unknown name, not live, transform mismatch, failed pipeline write) and
+ * applies the rest. `updateBlockProperties` turns a refused key into this error
+ * so callers' error paths run. Keys not listed in `rejected` were applied;
+ * `current` is Strom's view of the block's values after the writes.
+ */
+export class StromPropertiesRejectedError extends Error {
+  constructor(
+    public readonly blockId: string,
+    public readonly rejected: Record<string, string>,
+    public readonly current: Record<string, unknown>,
+  ) {
+    const detail = Object.entries(rejected).map(([k, reason]) => `${k} (${reason})`).join(', ')
+    super(`Strom refused block ${blockId} properties: ${detail}`)
+    this.name = 'StromPropertiesRejectedError'
+  }
+}
+
 export interface StromClientOptions {
   baseUrl: string
   /** Optional Bearer token — API key or SAT for OSC-hosted instances */
@@ -923,8 +943,15 @@ export class StromClient {
     },
     getBlockProperties: (flowId: string, blockId: string) =>
       this.get<BlockPropertiesResponse>(`/api/flows/${flowId}/blocks/${blockId}/properties`),
-    updateBlockProperties: (flowId: string, blockId: string, body: UpdateBlockPropertiesRequest) =>
-      this.patch<BlockPropertiesResponse>(`/api/flows/${flowId}/blocks/${blockId}/properties`, body),
+    /** Throws {@link StromPropertiesRejectedError} when Strom refuses any written key. */
+    updateBlockProperties: async (flowId: string, blockId: string, body: UpdateBlockPropertiesRequest) => {
+      const res = await this.patch<BlockPropertiesResponse>(`/api/flows/${flowId}/blocks/${blockId}/properties`, body)
+      const refused = Object.entries(res?.rejected ?? {}).filter(([key]) => Object.hasOwn(body.properties, key))
+      if (refused.length > 0) {
+        throw new StromPropertiesRejectedError(blockId, Object.fromEntries(refused), res.properties ?? {})
+      }
+      return res
+    },
   }
 
   // -------------------------------------------------------------------------

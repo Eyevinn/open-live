@@ -15,7 +15,7 @@ import { persistClipCue, clearPersistedClipCue } from '../services/clip-cue-stor
 import { startClipRelay, stopClipRelay } from '../services/clip-relay.js';
 import { CONTRACT_VERSION, computeTallyContributions } from '../services/automation-contract.js';
 import { startMeterRelay, stopMeterRelay } from '../services/meter-relay.js';
-import { StromClient, StromClientError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms, type VideoEffect, type EffectTarget, type SetVideoEffectRequest } from '../lib/strom.js';
+import { StromClient, StromClientError, StromPropertiesRejectedError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms, type VideoEffect, type EffectTarget, type SetVideoEffectRequest } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { graphicUrl } from '../lib/url-validation.js';
 import { decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
@@ -2017,20 +2017,26 @@ export async function handleMessage(
           const capturedLogicalId = msg.elementId;
           pendingVolume.set(debounceKey, setTimeout(async () => {
             pendingVolume.delete(debounceKey);
+            const propName = capturedLogicalId === 'main' ? 'main_fader' : `ch${ch}_fader`;
             try {
               const s = await makeStromClient();
-              const propName = capturedLogicalId === 'main' ? 'main_fader' : `ch${ch}_fader`;
               await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
                 properties: { [propName]: capturedValue },
               });
             } catch (err) {
               console.warn('[controller] Strom audio update error:', err);
-              broadcast(productionId, { type: 'AUDIO_STATE', elementId: capturedLogicalId, property: 'volume', value: capturedValue });
+              // A refusal carries Strom's actual level: put the cache and every UI back on it.
+              const actual = err instanceof StromPropertiesRejectedError ? err.current[propName] : undefined;
+              const value = typeof actual === 'number' ? actual : capturedValue;
+              if (typeof actual === 'number') channelLevelsByProduction.get(productionId)?.set(capturedLogicalId, actual);
+              broadcast(productionId, { type: 'AUDIO_STATE', elementId: capturedLogicalId, property: 'volume', value });
             }
           }, 150));
         } else {
           let props: Record<string, unknown>;
+          let primaryKey: string;
           if (msg.elementId === 'main') {
+            primaryKey = 'main_mute';
             props = { main_mute: msg.value };
           } else {
             const chMatch = /^ch(\d+)$/.exec(msg.elementId);
@@ -2040,7 +2046,8 @@ export async function handleMessage(
             }
             const ch = parseInt(chMatch[1], 10);
             // to_main = !mute (true=ON routing, false=OFF routing)
-            props = { [`ch${ch}_to_main`]: !msg.value };
+            primaryKey = `ch${ch}_to_main`;
+            props = { [primaryKey]: !msg.value };
             // Mirror the routing change into every guest return in the SAME update
             // (spec §"Mirror `to_main` into return sends") so a return never keeps
             // a channel the crew just muted. ch is 1-based here; returns are 0-based.
@@ -2049,10 +2056,17 @@ export async function handleMessage(
               new Map([[ch - 1, !msg.value]]),
             ));
           }
-          await strom.flows.updateBlockProperties(doc.stromFlowId, ctx.audioBlockId, {
-            properties: props,
-            ...(msg.ramp_ms !== undefined && { ramp_ms: msg.ramp_ms }),
-          });
+          try {
+            await strom.flows.updateBlockProperties(doc.stromFlowId, ctx.audioBlockId, {
+              properties: props,
+              ...(msg.ramp_ms !== undefined && { ramp_ms: msg.ramp_ms }),
+            });
+          } catch (err) {
+            // Program routing went through and only return-mirror sends were
+            // refused: the mute took effect, so report it as applied.
+            if (!(err instanceof StromPropertiesRejectedError) || primaryKey in err.rejected) throw err;
+            console.warn('[controller] AUDIO_SET return mirror refused:', err.message);
+          }
           // Update the mute registry for state restoration on reconnect *after* the
           // Strom write settles, re-fetching the current per-production Set rather
           // than mutating one captured earlier. If the production was deactivated
@@ -2073,6 +2087,15 @@ export async function handleMessage(
         }
       } catch (err) {
         console.warn('[controller] Strom audio update error:', err);
+        const errText = `Audio: ${stromErrorMessage(err)}`;
+        if (cmdId) sendNack(ws, productionId, cmdId, errText);
+        else ws.send(JSON.stringify({ type: 'ERROR', error: errText }));
+        // The sender's UI flips mute optimistically; put it back on the unchanged state.
+        if (msg.property === 'mute') {
+          const mutedSet = msg.elementId === 'main' ? undefined : mutedElementsByProduction.get(productionId);
+          const value = mutedSet ? mutedSet.has(msg.elementId) : !msg.value;
+          ws.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: msg.elementId, property: 'mute', value }));
+        }
       }
       break;
     }
@@ -2901,25 +2924,31 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               initProps['main_fader'] = 1.0;
               levelCache.set('main', 1.0);
               channelLevelsByProduction.set(id, levelCache);
-              const initResult = await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: initProps })
-                .catch((err) => { console.warn('[controller] init channel props error:', err); return null; });
               // Strom may refuse to route a channel to main on this reset (e.g. a guard
               // left over from an earlier session where the channel was deliberately taken
-              // off program). When that happens the write above did not actually unmute the
-              // channel, so seed the mute registry from Strom's reply rather than leaving it
-              // empty — otherwise the client is told a still-muted channel is live (#396).
-              if (initResult) {
+              // off program). Seed the mute registry from what Strom reports, so the client
+              // is not told a still-muted channel is live (#396).
+              const seedMutes = (rejected: Record<string, unknown>, current: Record<string, unknown>) => {
                 const initMuted = mutedElementsByProduction.get(id) ?? new Set<string>();
                 for (let i = 1; i <= numChannels; i++) {
                   const toMainKey = `ch${i}_to_main`;
-                  const toMainRejected = Object.prototype.hasOwnProperty.call(initResult.rejected ?? {}, toMainKey);
-                  const toMainReported = initResult.properties?.[toMainKey];
-                  if (toMainRejected || toMainReported === false) {
-                    initMuted.add(`ch${i}`);
-                  }
+                  if (Object.hasOwn(rejected, toMainKey) || current[toMainKey] === false) initMuted.add(`ch${i}`);
                 }
                 mutedElementsByProduction.set(id, initMuted);
-              }
+              };
+              await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: initProps })
+                .then((res) => seedMutes(res.rejected ?? {}, res.properties ?? {}))
+                .catch((err) => {
+                  console.warn('[controller] init channel props error:', err);
+                  // Keys are independent, so keep what applied; forget a refused fader's
+                  // unity level so the restore below reports Strom's value instead.
+                  if (!(err instanceof StromPropertiesRejectedError)) return;
+                  for (const key of Object.keys(err.rejected)) {
+                    const fader = /^(ch\d+|main)_fader$/.exec(key);
+                    if (fader) levelCache.delete(fader[1]);
+                  }
+                  seedMutes(err.rejected, err.current);
+                });
             }
             // Restore fader levels and mute state.
             // Server-side cache (channelLevelsByProduction) is authoritative — it is updated

@@ -1,0 +1,369 @@
+/**
+ * Strom answers PATCH /api/flows/{flow}/blocks/{block}/properties with 200 even
+ * when it refuses some properties, listing them under `rejected`. A refused key
+ * must count as a failed write: the StromClient throws, and each controller
+ * caller handles that the way it handles an HTTP error.
+ *
+ * A throwaway Strom serves one flow with a two-channel builtin.mixer and answers
+ * block-property PATCHes per `patchMode`. The real controller plugin runs on a
+ * listening Fastify server and is driven over a real `ws` client, because the
+ * first-connect channel reset and the reconnect restore live in the connect
+ * handler. CouchDB is mocked.
+ */
+
+import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { WebSocket } from 'ws';
+import type { FastifyInstance } from 'fastify';
+
+const docs = new Map<string, Record<string, unknown>>();
+const mockGet = vi.fn(async (id: string) => {
+  const doc = docs.get(id);
+  if (!doc) throw Object.assign(new Error('not found'), { statusCode: 404 });
+  return doc;
+});
+
+vi.mock('../db/index.js', () => ({
+  getDb: () => ({ get: mockGet, insert: vi.fn().mockResolvedValue({ ok: true }), find: vi.fn().mockResolvedValue({ docs: [] }) }),
+  getSourcesDb: () => ({ get: mockGet, insert: vi.fn(), find: vi.fn().mockResolvedValue({ docs: [] }) }),
+  getOutputsDb: () => ({ get: mockGet, find: vi.fn().mockResolvedValue({ docs: [] }) }),
+  getGraphicsDb: () => ({ get: vi.fn().mockRejectedValue(new Error('not found')) }),
+  connectDb: vi.fn().mockResolvedValue(undefined),
+  isDbReady: vi.fn().mockResolvedValue(true),
+  isDbConnected: vi.fn().mockReturnValue(true),
+}));
+
+vi.mock('../lib/flow-generator.js', () => ({
+  activateStromFlow: vi.fn(),
+  deactivateStromFlow: vi.fn(),
+}));
+
+vi.mock('../lib/strom-token.js', () => ({
+  getStromToken: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../services/meter-relay.js', () => ({
+  startMeterRelay: vi.fn(),
+  stopMeterRelay: vi.fn(),
+}));
+
+// ---------------------------------------------------------------------------
+// Throwaway Strom
+// ---------------------------------------------------------------------------
+
+const FLOW_ID = 'flow-rejected';
+const AUDIO_BLOCK = 'mixer1';
+
+/** What the block-properties PATCH answers: apply all, refuse some keys (200), or fail (500). */
+type PatchMode = { kind: 'ok' } | { kind: 'reject'; keys: string[] } | { kind: 'http500' };
+let patchMode: PatchMode = { kind: 'ok' };
+/** Strom's view of the mixer's current values, returned by GET and PATCH. */
+let stromProps: Record<string, unknown> = {};
+const patches: Array<Record<string, unknown>> = [];
+
+const stromServer: Server = createServer((req, res) => {
+  const chunks: Buffer[] = [];
+  req.on('data', (c: Buffer) => chunks.push(c));
+  req.on('end', () => {
+    const raw = Buffer.concat(chunks).toString('utf8');
+    const body = raw ? (JSON.parse(raw) as { properties?: Record<string, unknown> }) : {};
+    const url = req.url ?? '';
+    const send = (status: number, json: unknown) => {
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(json));
+    };
+    if (req.method === 'GET' && url === `/api/flows/${FLOW_ID}`) {
+      return send(200, {
+        flow: {
+          id: FLOW_ID,
+          blocks: [{ id: AUDIO_BLOCK, block_definition_id: 'builtin.mixer', properties: { num_channels: 2 } }],
+        },
+      });
+    }
+    const blockProps = `/api/flows/${FLOW_ID}/blocks/${AUDIO_BLOCK}/properties`;
+    if (req.method === 'GET' && url === blockProps) {
+      return send(200, { block_id: AUDIO_BLOCK, properties: stromProps, rejected: {} });
+    }
+    if (req.method === 'PATCH' && url === blockProps) {
+      const written = body.properties ?? {};
+      patches.push(written);
+      if (patchMode.kind === 'http500') return send(500, { error: 'boom' });
+      const refused = patchMode.kind === 'reject' ? patchMode.keys : [];
+      const rejected: Record<string, string> = {};
+      for (const key of Object.keys(written)) {
+        if (refused.includes(key)) rejected[key] = 'property is not live (requires flow restart)';
+        else stromProps[key] = written[key];
+      }
+      return send(200, { block_id: AUDIO_BLOCK, properties: stromProps, rejected });
+    }
+    send(200, {});
+  });
+});
+
+await new Promise<void>((resolve) => stromServer.listen(0, '127.0.0.1', () => resolve()));
+const STROM_URL = `http://127.0.0.1:${(stromServer.address() as AddressInfo).port}`;
+process.env['STROM_URL'] = STROM_URL;
+
+// Imported after STROM_URL is set so config picks up the throwaway server.
+const { StromClient, StromPropertiesRejectedError } = await import('../lib/strom.js');
+const { buildServer } = await import('../server.js');
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+let app: FastifyInstance;
+let prodSeq = 0;
+
+/** A fresh production id per test: the controller's registries are module state keyed by it. */
+function newProduction(overrides: Record<string, unknown> = {}): string {
+  const id = `prod-rejected-${++prodSeq}`;
+  docs.set(id, {
+    _id: id,
+    _rev: '1-abc',
+    type: 'production',
+    name: 'Rejected',
+    status: 'active',
+    stromFlowId: FLOW_ID,
+    audioMixerBlockId: AUDIO_BLOCK,
+    sources: [],
+    pipeline: { stromConfig: null, status: 'running' },
+    graphics: [],
+    macros: [],
+    tally: { pgm: null, pvw: null },
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    ...overrides,
+  });
+  return id;
+}
+
+type Frame = Record<string, unknown>;
+
+interface Client {
+  ws: WebSocket;
+  frames: Frame[];
+  send: (msg: Frame) => void;
+  close: () => void;
+}
+
+/** Connect and wait until the connect-time audio restore has reached ch2. */
+async function connect(productionId: string): Promise<Client> {
+  const { port } = app.server.address() as AddressInfo;
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/productions/${productionId}/controller`);
+  const frames: Frame[] = [];
+  ws.on('message', (data) => {
+    try { frames.push(JSON.parse(data.toString()) as Frame); } catch { /* ignore */ }
+  });
+  await new Promise<void>((resolve, reject) => {
+    ws.on('error', reject);
+    ws.on('open', () => resolve());
+  });
+  await waitFor(() => frames.some((f) => f.type === 'AUDIO_STATE' && f.elementId === 'ch2' && f.property === 'mute'));
+  return { ws, frames, send: (msg) => ws.send(JSON.stringify(msg)), close: () => ws.close() };
+}
+
+async function waitFor(cond: () => boolean, timeoutMs = 2000): Promise<void> {
+  const start = Date.now();
+  while (!cond()) {
+    if (Date.now() - start > timeoutMs) throw new Error('waitFor timed out');
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+const settle = (ms = 300) => new Promise((r) => setTimeout(r, ms));
+
+function audioStates(frames: Frame[], elementId: string, property: 'mute' | 'volume'): unknown[] {
+  return frames
+    .filter((f) => f.type === 'AUDIO_STATE' && f.elementId === elementId && f.property === property)
+    .map((f) => f.value);
+}
+
+let warn: ReturnType<typeof vi.spyOn>;
+
+beforeAll(async () => {
+  app = await buildServer();
+  await app.listen({ port: 0, host: '127.0.0.1' });
+});
+
+afterAll(async () => {
+  await app.close();
+  stromServer.close();
+});
+
+beforeEach(() => {
+  patchMode = { kind: 'ok' };
+  stromProps = { ch1_fader: 0.4, ch2_fader: 0.7, main_fader: 0.9 };
+  patches.length = 0;
+  warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+});
+
+afterEach(() => {
+  warn.mockRestore();
+});
+
+// ---------------------------------------------------------------------------
+// StromClient
+// ---------------------------------------------------------------------------
+
+describe('StromClient.flows.updateBlockProperties', () => {
+  const client = () => new StromClient({ baseUrl: STROM_URL });
+
+  it('throws StromPropertiesRejectedError naming each refused key and its reason', async () => {
+    patchMode = { kind: 'reject', keys: ['ch1_to_main'] };
+    const err = await client().flows
+      .updateBlockProperties(FLOW_ID, AUDIO_BLOCK, { properties: { ch1_to_main: false, ch2_fader: 0.5 } })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(StromPropertiesRejectedError);
+    const rejectedErr = err as InstanceType<typeof StromPropertiesRejectedError>;
+    expect(rejectedErr.rejected).toEqual({ ch1_to_main: 'property is not live (requires flow restart)' });
+    expect(rejectedErr.message).toContain('ch1_to_main');
+    expect(rejectedErr.current).toMatchObject({ ch2_fader: 0.5 });
+  });
+
+  it('resolves when nothing written was refused', async () => {
+    const res = await client().flows.updateBlockProperties(FLOW_ID, AUDIO_BLOCK, { properties: { ch2_fader: 0.5 } });
+    expect(res.rejected).toEqual({});
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AUDIO_SET mute: error reply, sender UI put back, mute registry unchanged
+// ---------------------------------------------------------------------------
+
+describe('AUDIO_SET mute when Strom does not apply the routing', () => {
+  it.each<[string, PatchMode]>([
+    ['200 with ch1_to_main in rejected', { kind: 'reject', keys: ['ch1_to_main'] }],
+    ['HTTP 500', { kind: 'http500' }],
+  ])('%s: sender gets ERROR + its mute put back, nobody sees the mute, registry unchanged', async (_label, mode) => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    const b = await connect(prod);
+    patchMode = mode;
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => a.frames.some((f) => f.type === 'ERROR'));
+    await settle(100);
+
+    const error = a.frames.find((f) => f.type === 'ERROR');
+    if (mode.kind === 'reject') expect(error?.error).toContain('ch1_to_main');
+    // The sender's optimistic toggle is put back; no client sees ch1 muted.
+    const afterError = a.frames.slice(a.frames.findIndex((f) => f.type === 'ERROR'));
+    expect(audioStates(afterError, 'ch1', 'mute')).toEqual([false]);
+    expect(audioStates(a.frames, 'ch1', 'mute')).not.toContain(true);
+    expect(audioStates(b.frames, 'ch1', 'mute')).not.toContain(true);
+
+    // A later client restores from the mute registry: still unmuted.
+    patchMode = { kind: 'ok' };
+    const c = await connect(prod);
+    expect(audioStates(c.frames, 'ch1', 'mute')).toEqual([false]);
+    a.close(); b.close(); c.close();
+  });
+
+  it('NACKs a command carrying cmdId', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    patchMode = { kind: 'reject', keys: ['ch1_to_main'] };
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true, cmdId: 'c1' });
+    await waitFor(() => a.frames.some((f) => f.type === 'NACK'));
+    expect(a.frames.find((f) => f.type === 'NACK')).toMatchObject({ cmdId: 'c1' });
+    expect(String(a.frames.find((f) => f.type === 'NACK')?.error)).toContain('ch1_to_main');
+    a.close();
+  });
+
+  it('control: an applied mute is broadcast and kept in the registry', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => audioStates(a.frames, 'ch1', 'mute').includes(true));
+    const c = await connect(prod);
+    expect(audioStates(c.frames, 'ch1', 'mute')).toEqual([true]);
+    expect(a.frames.some((f) => f.type === 'ERROR')).toBe(false);
+    a.close(); c.close();
+  });
+
+  it('a refused return-mirror send alone does not undo a mute program took', async () => {
+    const prod = newProduction({
+      returnBuses: [{ mixerInput: 'video_in_1', auxBus: 1, ownChannel: 1, mode: 'program' }],
+    });
+    const a = await connect(prod);
+    patchMode = { kind: 'reject', keys: ['ch1_aux1_level'] };
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await waitFor(() => audioStates(a.frames, 'ch1', 'mute').includes(true));
+    expect(patches.at(-1)).toMatchObject({ ch1_to_main: false, ch1_aux1_level: expect.any(Number) });
+    expect(a.frames.some((f) => f.type === 'ERROR')).toBe(false);
+    expect(warn.mock.calls.some((c) => String(c[1]).includes('ch1_aux1_level'))).toBe(true);
+
+    const c = await connect(prod);
+    expect(audioStates(c.frames, 'ch1', 'mute')).toEqual([true]);
+    a.close(); c.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AUDIO_SET volume: a refused fader puts the cache and UIs back on Strom's level
+// ---------------------------------------------------------------------------
+
+describe('AUDIO_SET volume when Strom refuses the fader', () => {
+  it('broadcasts and caches Strom\'s actual level, not the refused one', async () => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    patchMode = { kind: 'reject', keys: ['ch1_fader'] };
+    stromProps['ch1_fader'] = 0.4;
+
+    a.send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'volume', value: 0.9 });
+    await waitFor(() => patches.some((p) => p['ch1_fader'] === 0.9));
+    await waitFor(() => audioStates(a.frames, 'ch1', 'volume').at(-1) === 0.4);
+
+    patchMode = { kind: 'ok' };
+    const c = await connect(prod);
+    expect(audioStates(c.frames, 'ch1', 'volume')).toEqual([0.4]);
+    a.close(); c.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// First connect: the channel reset keeps what applied, forgets refused faders
+// ---------------------------------------------------------------------------
+
+describe('first-connect channel reset when Strom refuses a key', () => {
+  it('reports Strom\'s level for a refused fader and unity for the rest', async () => {
+    const prod = newProduction();
+    patchMode = { kind: 'reject', keys: ['ch1_fader'] };
+    stromProps['ch1_fader'] = 0.4;
+
+    const a = await connect(prod);
+    expect(patches[0]).toMatchObject({ ch1_fader: 1, ch2_fader: 1, main_fader: 1 });
+    expect(audioStates(a.frames, 'ch1', 'volume')).toEqual([0.4]);
+    expect(audioStates(a.frames, 'ch2', 'volume')).toEqual([1]);
+    expect(warn.mock.calls.some((c) => c[1] instanceof StromPropertiesRejectedError)).toBe(true);
+    a.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Log-only callers: a refusal takes the same path as an HTTP error
+// ---------------------------------------------------------------------------
+
+describe('log-only callers report a refusal like an HTTP error', () => {
+  it.each<[string, Frame, string]>([
+    ['PFL_SET', { type: 'PFL_SET', elementId: 'ch1', enabled: true }, 'ch1_pfl'],
+    ['MONITOR_SET (debounced)', { type: 'MONITOR_SET', volume: 0.5, muted: false }, 'monitor_fader'],
+  ])('%s logs the refused key', async (_label, msg, key) => {
+    const prod = newProduction();
+    const a = await connect(prod);
+    patchMode = { kind: 'reject', keys: [key] };
+    warn.mockClear();
+
+    a.send(msg);
+    await waitFor(() => patches.some((p) => key in p));
+    await waitFor(() => warn.mock.calls.some((c) => c[1] instanceof StromPropertiesRejectedError));
+    const logged = warn.mock.calls.find((c) => c[1] instanceof StromPropertiesRejectedError)!;
+    expect(String((logged[1] as Error).message)).toContain(key);
+    a.close();
+  });
+});
