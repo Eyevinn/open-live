@@ -293,9 +293,9 @@ Added to `src/config.ts` (same `process.env` + optional-fallback style used ther
 | `RECORDING_MAX_INPUTS` | no | `4` | Most inputs one production may record to their own files (OL-32, [`iso-input-recording.md`](iso-input-recording.md) §10.1); integer 0-16; `0` turns input recording off (every enable returns 409 `record-cap-reached`). Provisional until the load measurement (OL-32c) |
 | `RECORDING_INPUT_VIDEO_BITRATE_KBPS` | no | `4000` | `bitrate` of each input recorder's H.264 encode (`builtin.videoenc`); integer 500-50000 |
 
-When the MinIO vars are unset, the `recording` output type is rejected at assignment time with
-`400` (recording disabled) so the feature degrades cleanly, matching how the service already
-tolerates optional config (`STROM_URL`, `API_KEY`, etc.).
+When the MinIO vars are unset, the `recording` output type is still accepted: Strom's recorder
+writes local files (Open Question 1), so recording works without object storage. The segments
+stay on Strom's media path and deactivate skips the upload, so there is no `RecordingDoc` to list.
 
 ## Open Questions (need a human/maintainer decision)
 

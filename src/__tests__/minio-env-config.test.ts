@@ -44,14 +44,14 @@ describe('MinIO env resolution', () => {
 
   it('S3_ENDPOINT alone with the other three set enables recording', async () => {
     const m = await load({ S3_ENDPOINT: 'http://h:9000', ...FULL });
-    expect(m.isRecordingEnabled()).toBe(true);
+    expect(m.isObjectStorageConfigured()).toBe(true);
     expect(m.minioTargetFromConfig()?.endpoint).toBe('h:9000');
   });
 
   it('an empty MINIO_ENDPOINT does not hide a set S3_ENDPOINT', async () => {
     const m = await load({ MINIO_ENDPOINT: '', S3_ENDPOINT: 'http://h:9000', ...FULL });
     expect(m.config.minioEndpoint).toBe('http://h:9000');
-    expect(m.isRecordingEnabled()).toBe(true);
+    expect(m.isObjectStorageConfigured()).toBe(true);
   });
 
   it('compose-style empty vars everywhere leave recording off', async () => {
@@ -61,7 +61,7 @@ describe('MinIO env resolution', () => {
       MINIO_SECRET_KEY: '',
       MINIO_BUCKET: '',
     });
-    expect(m.isRecordingEnabled()).toBe(false);
+    expect(m.isObjectStorageConfigured()).toBe(false);
     expect(m.minioTargetFromConfig()).toBeNull();
   });
 
@@ -69,7 +69,7 @@ describe('MinIO env resolution', () => {
     'a whitespace-only %s does not count as configured',
     async (name) => {
       const m = await load({ MINIO_ENDPOINT: 'http://h:9000', ...FULL, [name]: '  \t' });
-      expect(m.isRecordingEnabled()).toBe(false);
+      expect(m.isObjectStorageConfigured()).toBe(false);
       expect(m.minioTargetFromConfig()).toBeNull();
     },
   );
@@ -104,7 +104,7 @@ describe('MinIO env resolution', () => {
         env[n] = mask & (1 << i) ? (n === 'MINIO_ENDPOINT' ? 'http://h:9000' : 'v') : ' ';
       });
       const m = await load(env);
-      expect(m.isRecordingEnabled()).toBe(mask === 15);
+      expect(m.isObjectStorageConfigured()).toBe(mask === 15);
       expect(m.minioTargetFromConfig() !== null).toBe(mask === 15);
     }
   });

@@ -1,4 +1,4 @@
-import { isRecordingEnabled } from '../config.js';
+import { isObjectStorageConfigured } from '../config.js';
 import type { RecordingUploadReason } from '../db/types.js';
 import type { MinioTarget } from './recording-uploader.js';
 import { DEFAULT_CONNECTION_ID, resolveStorageTarget, StorageConnectionNotFoundError } from './storage-connection.js';
@@ -15,7 +15,7 @@ export type RecordingUploadTarget =
 
 export async function resolveRecordingUploadTarget(connectionId: string | undefined): Promise<RecordingUploadTarget> {
   const namedConnection = !!connectionId && connectionId !== DEFAULT_CONNECTION_ID;
-  if (!namedConnection && !isRecordingEnabled()) {
+  if (!namedConnection && !isObjectStorageConfigured()) {
     return {
       reason: 'no-storage-target',
       message: 'No storage connection is set on the recording output and MINIO_* object storage is not configured.',

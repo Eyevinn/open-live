@@ -127,6 +127,14 @@ and fill in the values:
 | `RECORDING_BLOCK` | Which Strom block records program. `auto`: Strom's Live Recorder (`builtin.liverecorder`, a live fragmented-MP4 muxer that does not stall when a track goes quiet) when the Strom has it, else `builtin.recorder`. `recorder`: always `builtin.recorder` — an escape hatch if Live Recorder misbehaves. Any other value fails startup. See [`docs/specs/iso-input-recording.md`](docs/specs/iso-input-recording.md) | `auto` |
 | `RECORDING_MAX_INPUTS` | Most inputs one production may record to their own files (ISO recording, `record: "transcode"` on a source assignment). Integer 0-16; `0` turns input recording off. Each recorded input adds one H.264 encode on Strom. See [`docs/specs/iso-input-recording.md`](docs/specs/iso-input-recording.md) | `4` |
 | `RECORDING_INPUT_VIDEO_BITRATE_KBPS` | Video bitrate (kbit/s) of each recorded input's H.264 encode. Integer 500-50000 | `4000` |
+| `MINIO_ENDPOINT` | Object storage (MinIO/S3) endpoint for uploading recordings, as `host[:port]` or a full URL. `S3_ENDPOINT` is accepted as a fallback. Recording does **not** need object storage: a `recording` output writes segments to Strom's media path (`recordings/<productionId>/`). When `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY` and `MINIO_BUCKET` are all set, deactivate uploads those segments to the bucket; otherwise (and with no storage connection on the output) the segments stay on Strom and deactivate skips the upload. A partial set logs a startup warning and is treated as unset | _(empty — recordings stay on Strom)_ |
+| `MINIO_ACCESS_KEY` | Object storage access key (see `MINIO_ENDPOINT`) | _(empty)_ |
+| `MINIO_SECRET_KEY` | Object storage secret key (see `MINIO_ENDPOINT`) | _(empty)_ |
+| `MINIO_BUCKET` | Bucket that recordings are uploaded to (see `MINIO_ENDPOINT`) | _(empty)_ |
+| `MINIO_REGION` | S3 region used for request signing | `us-east-1` |
+| `MINIO_USE_SSL` | Use TLS to the endpoint when `MINIO_ENDPOINT` has no scheme | `true` |
+| `RECORDING_KEY_PREFIX` | Prefix prepended to every uploaded recording's object key | _(empty)_ |
+| `RECORDING_PRESIGN_TTL_S` | Lifetime in seconds of the presigned `playbackUrl` returned by the VOD endpoints | `3600` |
 
 > **Never commit `.env`** — it is gitignored. Use `.env.example` as the reference.
 
