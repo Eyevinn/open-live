@@ -74,6 +74,8 @@ let patchDelayMs: (written: Record<string, unknown>) => number = () => 0;
 let patchAppliesLate: When = () => false;
 /** Strom's view of the mixer's current values, returned by GET and PATCH. */
 let stromProps: Record<string, unknown> = {};
+/** Values Strom keeps whatever a PATCH writes, without refusing it. */
+let stromHolds: Record<string, unknown> = {};
 const patches: Array<Record<string, unknown>> = [];
 /** Makes GET of the mixer's properties fail with 500. */
 let blockGetFails = false;
@@ -128,7 +130,7 @@ const stromServer: Server = createServer((req, res) => {
           send(200, { block_id: AUDIO_BLOCK, properties: { ...stromProps }, rejected });
         }, delay);
       }
-      Object.assign(stromProps, toApply);
+      Object.assign(stromProps, toApply, stromHolds);
       if (patchMode.kind === 'reject' && patchMode.listUnwritten) {
         for (const key of refused) rejected[key] ??= 'property is not live (requires flow restart)';
       }
@@ -240,6 +242,7 @@ beforeEach(() => {
   patchDelayMs = () => 0;
   patchAppliesLate = () => false;
   stromProps = { ch1_fader: 0.4, ch2_fader: 0.7, main_fader: 0.9 };
+  stromHolds = {};
   patches.length = 0;
   blockGetFails = false;
   blockGetDelayMs = 0;
@@ -832,6 +835,16 @@ describe('first-connect channel reset when Strom refuses a key', () => {
     expect(audioStates(a.frames, 'ch1', 'volume')).toEqual([0.4]);
     expect(audioStates(a.frames, 'ch2', 'volume')).toEqual([1]);
     expect(warn.mock.calls.some((c) => c[1] instanceof StromPropertiesRejectedError)).toBe(true);
+    a.close();
+  });
+
+  it('records a channel as muted when Strom accepts the reset but reports it off program', async () => {
+    const prod = newProduction();
+    stromHolds = { ch2_to_main: false };
+
+    const a = await connect(prod);
+    expect(audioStates(a.frames, 'ch2', 'mute')).toEqual([true]);
+    expect(audioStates(a.frames, 'ch1', 'mute')).toEqual([false]);
     a.close();
   });
 });
