@@ -2768,8 +2768,25 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               initProps['main_fader'] = 1.0;
               levelCache.set('main', 1.0);
               channelLevelsByProduction.set(id, levelCache);
-              await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: initProps })
-                .catch((err) => console.warn('[controller] init channel props error:', err));
+              const initResult = await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: initProps })
+                .catch((err) => { console.warn('[controller] init channel props error:', err); return null; });
+              // Strom may refuse to route a channel to main on this reset (e.g. a guard
+              // left over from an earlier session where the channel was deliberately taken
+              // off program). When that happens the write above did not actually unmute the
+              // channel, so seed the mute registry from Strom's reply rather than leaving it
+              // empty — otherwise the client is told a still-muted channel is live (#396).
+              if (initResult) {
+                const initMuted = mutedElementsByProduction.get(id) ?? new Set<string>();
+                for (let i = 1; i <= numChannels; i++) {
+                  const toMainKey = `ch${i}_to_main`;
+                  const toMainRejected = Object.prototype.hasOwnProperty.call(initResult.rejected ?? {}, toMainKey);
+                  const toMainReported = initResult.properties?.[toMainKey];
+                  if (toMainRejected || toMainReported === false) {
+                    initMuted.add(`ch${i}`);
+                  }
+                }
+                mutedElementsByProduction.set(id, initMuted);
+              }
             }
             // Restore fader levels and mute state.
             // Server-side cache (channelLevelsByProduction) is authoritative — it is updated
