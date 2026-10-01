@@ -169,16 +169,21 @@ export interface DeactivateResult {
 const inFlightDeactivations = new Map<string, Promise<DeactivateResult>>();
 
 /**
- * `doc` with every live-session field cleared. Transition rule (spec §1): a
- * production that was `active` (reached a live broadcast) becomes `ended`; one
- * that never reached `active` (still `activating`) becomes `inactive`.
+ * `doc` with every live-session field cleared. Unless `stopped` carries the
+ * status another stop path already recorded, the transition rule (spec §1)
+ * applies: a production that was `active` (reached a live broadcast) becomes
+ * `ended`; one that never reached `active` (still `activating`) becomes
+ * `inactive`.
  */
-function deactivatedDoc(doc: ProductionDoc): ProductionDoc {
-  const status = stoppedStatus(doc.status);
+function deactivatedDoc(
+  doc: ProductionDoc,
+  stopped?: Pick<ProductionDoc, 'status' | 'endedReason'>,
+): ProductionDoc {
+  const status = stopped?.status ?? stoppedStatus(doc.status);
   return {
     ...doc,
     status,
-    endedReason: status === 'ended' ? 'deactivated' : undefined,
+    endedReason: stopped ? stopped.endedReason : status === 'ended' ? 'deactivated' : undefined,
     stromFlowId: undefined,
     mixerBlockId: undefined,
     audioMixerBlockId: undefined,
@@ -202,36 +207,41 @@ function deactivatedDoc(doc: ProductionDoc): ProductionDoc {
 
 /**
  * Persist the end of a deactivation whose teardown has already run against
- * `doc`. On a revision conflict the doc is re-read:
- *  - same status and Strom flow as `doc`: an unrelated field changed (a tally
- *    write, a rename), so the deactivation is re-applied on top of it;
- *  - stopped with no flow: another stop path (the idle watchdog, another
- *    backend instance) got there first, so its state is returned unwritten;
- *  - anything else (e.g. a new activation): the conflict is rethrown rather
- *    than overwriting state this run did not tear down.
+ * `doc`. On a revision conflict the doc is re-read, and the write is retried
+ * only if the stored doc still names no Strom flow or intercom grouping other
+ * than the ones this run tore down:
+ *  - same status: an unrelated field changed (a tally write, a rename), so the
+ *    deactivation is re-applied on top of it;
+ *  - `inactive`/`ended` with no flow: another stop path (the idle watchdog,
+ *    another backend instance) got there first. Its status is kept and the
+ *    refs it left behind are cleared.
+ * Anything else (a new activation, a guest's new intercom grouping) rethrows
+ * the conflict rather than dropping a resource this run did not tear down.
  */
 async function writeDeactivatedDoc(
   doc: ProductionDoc,
   log: FastifyBaseLogger,
-): Promise<{ doc: ProductionDoc; rev: string; written: boolean }> {
-  let base = doc;
+): Promise<{ doc: ProductionDoc; rev: string }> {
+  let updated = deactivatedDoc(doc);
   for (let attempt = 0; ; attempt++) {
-    const updated = deactivatedDoc(base);
     try {
       const response = await getDb().insert(updated);
-      return { doc: updated, rev: response.rev, written: true };
+      return { doc: updated, rev: response.rev };
     } catch (err) {
       if (!isConflict(err) || attempt >= MAX_DB_WRITE_RETRIES - 1) throw err;
       const current = await getDb().get(doc._id);
+      const tornDown =
+        (current.stromFlowId === undefined || current.stromFlowId === doc.stromFlowId) &&
+        (current.intercomProductionId === undefined || current.intercomProductionId === doc.intercomProductionId);
+      if (!tornDown) throw err;
       if (current.status === doc.status && current.stromFlowId === doc.stromFlowId) {
-        base = current;
-        continue;
+        updated = deactivatedDoc(current);
+      } else if ((current.status === 'inactive' || current.status === 'ended') && !current.stromFlowId) {
+        log.info({ productionId: doc._id, status: current.status }, 'Production already stopped by another writer — keeping its status');
+        updated = deactivatedDoc(current, current);
+      } else {
+        throw err;
       }
-      if ((current.status === 'inactive' || current.status === 'ended') && !current.stromFlowId) {
-        log.info({ productionId: doc._id, status: current.status }, 'Production already stopped by another writer — keeping its state');
-        return { doc: current, rev: current._rev!, written: false };
-      }
-      throw err;
     }
   }
 }
@@ -1049,9 +1059,9 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
     // deactivation, matching the Strom/intercom teardown contract.
     await sweepGuestsOnProductionEnd(doc._id, log);
 
-    const { doc: stored, rev, written } = await writeDeactivatedDoc(doc, log);
+    const { doc: stored, rev } = await writeDeactivatedDoc(doc, log);
     notifyProductionDeactivated(doc._id);
-    if (written) emitProductionStatus(stored);
+    emitProductionStatus(stored);
     return { id: stored._id, name: stored.name, status: stored.status, _rev: rev };
   }
 

@@ -72,6 +72,10 @@ function settle(): Promise<void> {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Drop any unconsumed *Once values so one failing test cannot feed the next.
+  mockGet.mockReset();
+  mockInsert.mockReset();
+  mockDeactivateStromFlow.mockReset();
 });
 
 describe('overlapping deactivates of one production', () => {
@@ -160,18 +164,42 @@ describe('revision conflict on the final write', () => {
     expect(retried.tally).toEqual({ pgm: null, pvw: null });
   });
 
-  it('keeps and returns the state another stop path already wrote', async () => {
-    mockGet.mockResolvedValueOnce(makeProductionDoc());
-    // The idle watchdog auto-deactivated the production meanwhile.
-    mockGet.mockResolvedValueOnce(makeProductionDoc({ _rev: '116-idle', status: 'ended', endedReason: 'idle', stromFlowId: undefined }));
+  it('keeps the status another stop path wrote and clears the refs it left behind', async () => {
+    mockGet.mockResolvedValueOnce(makeProductionDoc({ intercomProductionId: 'ic-1' }));
+    // The idle watchdog auto-deactivated the production meanwhile. It does not
+    // clear the intercom grouping, which this run has already torn down.
+    mockGet.mockResolvedValueOnce(makeProductionDoc({
+      _rev: '116-idle', status: 'ended', endedReason: 'idle', stromFlowId: undefined, intercomProductionId: 'ic-1',
+    }));
     mockInsert.mockRejectedValueOnce(conflict());
+    mockInsert.mockResolvedValueOnce({ ok: true, id: 'prod-test-1', rev: '117-def' });
     mockDeactivateStromFlow.mockResolvedValue(undefined);
 
     const app = await buildServer();
     const res = await app.inject({ method: 'POST', url });
 
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ id: 'prod-test-1', name: 'Test Production', status: 'ended', _rev: '116-idle' });
+    expect(JSON.parse(res.body)).toEqual({ id: 'prod-test-1', name: 'Test Production', status: 'ended', _rev: '117-def' });
+    const retried = mockInsert.mock.calls[1][0];
+    expect(retried._rev).toBe('116-idle');
+    expect(retried.status).toBe('ended');
+    expect(retried.endedReason).toBe('idle');
+    expect(retried.intercomProductionId).toBeUndefined();
+  });
+
+  it('does not drop an intercom grouping a guest created during the teardown', async () => {
+    mockGet.mockResolvedValueOnce(makeProductionDoc());
+    // A guest's join provisioned a talkback grouping after this run read the doc.
+    mockGet.mockResolvedValueOnce(makeProductionDoc({ _rev: '116-guest', intercomProductionId: 'ic-new' }));
+    mockInsert.mockRejectedValueOnce(conflict());
+    mockDeactivateStromFlow.mockResolvedValue(undefined);
+
+    const app = await buildServer();
+    const res = await app.inject({ method: 'POST', url });
+
+    // The request fails and the stored doc keeps the grouping, so the next
+    // deactivate tears it down.
+    expect(res.statusCode).toBe(500);
     expect(mockInsert).toHaveBeenCalledTimes(1);
   });
 
