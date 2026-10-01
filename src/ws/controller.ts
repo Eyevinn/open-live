@@ -2106,18 +2106,27 @@ export async function handleMessage(
       //
       // IMPORTANT: ch{N}_aux{M}_pre is a build-time topology property (element_id: "_block")
       // that controls which tee (pre_fader_tee vs post_fader_tee) the send is wired to.
-      // It CANNOT be applied to a running pipeline — only the level property maps to a live
-      // GStreamer element. We send pre and level as SEPARATE updateBlockProperties calls so
-      // that a pre rejection never silences the level update.
+      // Strom marks it `live: false` and refuses it on a running pipeline every time
+      // (issue #395) — a prior version of this handler sent it as a live
+      // updateBlockProperties call anyway and logged a misleading "stored for next
+      // start" warning on the resulting rejection, when nothing was actually stored.
+      // Instead, persist the choice on the production doc (`ch{N}_aux{M}_pre` in
+      // `values`, read by `flow-generator.ts` at build time) so it is wired correctly
+      // the next time the flow is built — see the per-channel override there.
       const chMatch = /^ch(\d+)$/.exec(msg.elementId);
+      if (chMatch && msg.pre !== undefined) {
+        const chNum = parseInt(chMatch[1], 10);
+        const preKey = `ch${chNum}_aux${msg.auxBus}_pre`;
+        updateProductionDoc(productionId, {
+          values: { ...(doc.values ?? {}), [preKey]: msg.pre },
+        }).catch((err) => console.warn(`[controller] AUX pre persist error (${preKey} will not apply on next flow build):`, err));
+      }
       if (chMatch && doc.stromFlowId && ctx.audioBlockId) {
-        const chIdx = parseInt(chMatch[1], 10) - 1;     // 0-based
-        const chNum = chIdx + 1;
+        const chNum = parseInt(chMatch[1], 10);
         const stromValue = msg.enabled ? msg.level : 0;
         const flowId = doc.stromFlowId;
         const capturedAudioBlockId = ctx.audioBlockId;
         const capturedAuxBus = msg.auxBus;
-        const capturedPre = msg.pre;
         const debounceKey = `${productionId}:aux:ch${chNum}_aux${capturedAuxBus}`;
         const prev = pendingVolume.get(debounceKey);
         if (prev) clearTimeout(prev);
@@ -2125,18 +2134,11 @@ export async function handleMessage(
           pendingVolume.delete(debounceKey);
           try {
             const s = await makeStromClient();
-            // Send level update first — this IS live-applicable (aux_send element volume).
+            // This IS live-applicable (aux_send element volume) — pre/post is handled
+            // above, as a persisted build-time property, not a live write.
             await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
               properties: { [`ch${chNum}_aux${capturedAuxBus}_level`]: stromValue },
             });
-            // Send pre separately — this is a build-time property stored in the flow JSON
-            // so it takes effect on next production start. Keeping it separate means a
-            // rejection of pre (non-live topology change) never blocks the level update.
-            if (capturedPre !== undefined) {
-              await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
-                properties: { [`ch${chNum}_aux${capturedAuxBus}_pre`]: capturedPre },
-              }).catch((err) => console.warn('[controller] AUX pre update error (non-live, stored for next start):', err));
-            }
           } catch (err) {
             console.warn('[controller] AUX_SEND_SET error:', err);
           }
@@ -2821,8 +2823,25 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               initProps['main_fader'] = 1.0;
               levelCache.set('main', 1.0);
               channelLevelsByProduction.set(id, levelCache);
-              await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: initProps })
-                .catch((err) => console.warn('[controller] init channel props error:', err));
+              const initResult = await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: initProps })
+                .catch((err) => { console.warn('[controller] init channel props error:', err); return null; });
+              // Strom may refuse to route a channel to main on this reset (e.g. a guard
+              // left over from an earlier session where the channel was deliberately taken
+              // off program). When that happens the write above did not actually unmute the
+              // channel, so seed the mute registry from Strom's reply rather than leaving it
+              // empty — otherwise the client is told a still-muted channel is live (#396).
+              if (initResult) {
+                const initMuted = mutedElementsByProduction.get(id) ?? new Set<string>();
+                for (let i = 1; i <= numChannels; i++) {
+                  const toMainKey = `ch${i}_to_main`;
+                  const toMainRejected = Object.prototype.hasOwnProperty.call(initResult.rejected ?? {}, toMainKey);
+                  const toMainReported = initResult.properties?.[toMainKey];
+                  if (toMainRejected || toMainReported === false) {
+                    initMuted.add(`ch${i}`);
+                  }
+                }
+                mutedElementsByProduction.set(id, initMuted);
+              }
             }
             // Restore fader levels and mute state.
             // Server-side cache (channelLevelsByProduction) is authoritative — it is updated

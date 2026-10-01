@@ -442,9 +442,14 @@ export async function activateStromFlow(
     const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
     props['num_channels'] = numChannels;
     // ch{N}_aux{M}_pre is a build-time topology property — must be set here at flow
-    // generation time; attempts to change it on a running pipeline are rejected by Strom.
-    // Per-bus setting: aux1_pre, aux2_pre, … (boolean, default true = pre-fader).
-    // Falls back to the legacy aux_pre_fader key for older productions.
+    // generation time; attempts to change it on a running pipeline are rejected by Strom
+    // (issue #395). Resolution order, most specific first:
+    //   1. per-channel override: ch{N}_aux{M}_pre — set by the crew via the WS
+    //      AUX_SEND_SET `pre` field, persisted here (not live) by controller.ts since
+    //      it can't be applied to a running pipeline.
+    //   2. per-bus setting: aux1_pre, aux2_pre, …
+    //   3. legacy aux_pre_fader key, for older productions.
+    //   4. default true (pre-fader).
     if (typeof numAuxBuses === 'number' && numAuxBuses > 0) {
       const legacyPre = production.values?.aux_pre_fader;
       for (let aux = 1; aux <= numAuxBuses; aux++) {
@@ -454,7 +459,9 @@ export async function activateStromFlow(
           : typeof legacyPre === 'boolean' ? legacyPre
           : true; // default pre-fader
         for (let ch = 1; ch <= numChannels; ch++) {
-          props[`ch${ch}_aux${aux}_pre`] = isPre;
+          const perChannelKey = `ch${ch}_aux${aux}_pre`;
+          const perChannelValue = production.values?.[perChannelKey];
+          props[`ch${ch}_aux${aux}_pre`] = typeof perChannelValue === 'boolean' ? perChannelValue : isPre;
         }
       }
     }
