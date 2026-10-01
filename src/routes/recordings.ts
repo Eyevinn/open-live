@@ -12,14 +12,14 @@
  *   GET /api/v1/recordings                    list recordings across productions
  *   GET /api/v1/recordings/:id                fetch a single recording
  *
- * When object storage is not configured the endpoints return 503 rather than
- * pretending recordings exist, mirroring how the `recording` output type is
- * rejected at assignment time (issue #41).
+ * When object storage is not configured the endpoints return 503: recordings
+ * then stay on Strom's media path, are never uploaded, and have no RecordingDoc
+ * or bucket key to presign, so there is nothing these routes can list.
  */
 import type { FastifyBaseLogger, FastifyPluginAsync } from 'fastify';
 import { getDb, getRecordingsDb } from '../db/index.js';
 import type { RecordingDoc } from '../db/types.js';
-import { config, isRecordingEnabled } from '../config.js';
+import { config, isObjectStorageConfigured } from '../config.js';
 import { minioTargetFromConfig, presignGetUrl } from '../lib/recording-uploader.js';
 
 /**
@@ -68,7 +68,7 @@ const recordingsRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get<{ Params: { id: string } }>(
     '/api/v1/productions/:id/recordings',
     async (req, reply) => {
-      if (!isRecordingEnabled()) {
+      if (!isObjectStorageConfigured()) {
         return reply.status(503).send({ error: 'Object storage unavailable', statusCode: 503 });
       }
       // 404 when the production itself does not exist, matching the other
@@ -100,7 +100,7 @@ const recordingsRoutes: FastifyPluginAsync = async (fastify) => {
 
   // List recordings across all productions.
   fastify.get('/api/v1/recordings', async (_req, reply) => {
-    if (!isRecordingEnabled()) {
+    if (!isObjectStorageConfigured()) {
       return reply.status(503).send({ error: 'Object storage unavailable', statusCode: 503 });
     }
     const presign = buildPresigner(fastify.log);
@@ -121,7 +121,7 @@ const recordingsRoutes: FastifyPluginAsync = async (fastify) => {
 
   // Fetch a single recording.
   fastify.get<{ Params: { id: string } }>('/api/v1/recordings/:id', async (req, reply) => {
-    if (!isRecordingEnabled()) {
+    if (!isObjectStorageConfigured()) {
       return reply.status(503).send({ error: 'Object storage unavailable', statusCode: 503 });
     }
     const presign = buildPresigner(fastify.log);
