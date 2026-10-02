@@ -720,6 +720,16 @@ export type FlowEvent =
   // that emits it is not yet merged, so field names follow the issue, not a
   // verified `events.rs` variant.
   | { type: 'PipelineError'; data: { flow_id?: string; source: string; error: string } }
+  // A recorder opened a new file: its first, or the next after a split.
+  // `filename` is relative to Strom's media root (events.rs, recorder.rs format-location).
+  // `start_utc_us` is the file's t=0 on the flow's pipeline clock, mapped to UTC µs; the
+  // same instant in two of a flow's recorders has the same value. Absent before Eyevinn/strom#944.
+  | {
+      type: 'RecorderFileChanged';
+      data: { flow_id: string; block_id: string; filename: string; start_running_time_ns?: number; start_utc_us?: number };
+    }
+  // Strom's own flow lifecycle events (events.rs StromEvent::FlowStopped / FlowDeleted).
+  | { type: 'FlowStopped' | 'FlowDeleted'; data: { flow_id: string } }
   | { type: 'ping' }
 
 // ---------------------------------------------------------------------------
@@ -1142,6 +1152,19 @@ export class StromClient {
       this.del<MediaOperationResponse>(`/api/media/file/${encodeURIComponent(path)}`),
     rename: (body: RenameMediaRequest) =>
       this.post<MediaOperationResponse>('/api/media/rename', body),
+    /** Writes (or overwrites) one file in an existing media directory. */
+    upload: async (dir: string, fileName: string, body: string, contentType = 'application/json') => {
+      const form = new FormData()
+      form.append('file', new Blob([body], { type: contentType }), fileName)
+      const headers: Record<string, string> = {}
+      if (this.token) headers['Authorization'] = `Bearer ${this.token}`
+      const url = `${this.baseUrl}/api/media/upload?path=${encodeURIComponent(dir)}`
+      const res = await fetch(url, { method: 'POST', headers, body: form })
+      if (!res.ok) {
+        const text = await res.text().catch(() => '')
+        throw new StromClientError(res.status, text.slice(0, 200) || res.statusText)
+      }
+    },
   }
 
   // -------------------------------------------------------------------------
@@ -1168,7 +1191,7 @@ export class StromClient {
    * Opens a WebSocket connection to /api/ws and calls `onEvent` for each
    * flow event. Returns a cleanup function that closes the socket.
    */
-  connectWebSocket(onEvent: (event: FlowEvent) => void, onClose?: () => void): () => void {
+  connectWebSocket(onEvent: (event: FlowEvent) => void, onClose?: () => void, onOpen?: () => void): () => void {
     const wsUrl = this.baseUrl.replace(/^http/, 'ws') + '/api/ws'
     const headers: Record<string, string> = {}
     if (this.token) headers['Authorization'] = `Bearer ${this.token}`
@@ -1181,6 +1204,8 @@ export class StromClient {
     ws.on('close', (_code, _reason) => {
       onClose?.()
     })
+
+    if (onOpen) ws.on('open', onOpen)
 
     ws.on('message', (data) => {
       try {
