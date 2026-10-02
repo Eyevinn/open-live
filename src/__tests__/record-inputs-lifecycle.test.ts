@@ -1,7 +1,9 @@
 /**
  * Per-input recorders (ProductionSourceAssignment.record) through the production lifecycle.
- * Activate saves their ids. Deactivate splits every recorder, and uploads
- * input files and registers them with their mixerInput.
+ * Activate saves their ids and binds the recording index. Deactivate splits
+ * every recorder, uploads input files and registers them with their
+ * mixerInput, and copies the activation's sidecar to object storage without
+ * registering it as a recording.
  *
  * CouchDB, Strom and object storage are mocked.
  */
@@ -57,6 +59,21 @@ vi.mock('../lib/flow-generator.js', () => ({
   deactivateStromFlow: (...args: unknown[]) => mockDeactivateStromFlow(...args),
 }));
 
+const mockOpenIndex = vi.fn();
+const mockBindIndex = vi.fn();
+const mockCloseIndex = vi.fn();
+vi.mock('../services/recording-index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../services/recording-index.js')>();
+  return {
+    ...actual,
+    openRecordingIndex: (...args: [string]) => { mockOpenIndex(...args); return actual.openRecordingIndex(...args); },
+    bindRecordingIndex: (...args: Parameters<typeof actual.bindRecordingIndex>) => mockBindIndex(...args),
+    closeRecordingIndex: (...args: Parameters<typeof actual.closeRecordingIndex>) => {
+      mockCloseIndex(...args);
+      return actual.closeRecordingIndex(...args);
+    },
+  };
+});
 
 const ACT_NAME = '20261001T100000Z-11111111-1111-4111-8111-111111111111';
 const ACT_DIR = `recordings/prod-iso-1/${ACT_NAME}`;
@@ -64,6 +81,7 @@ const PROGRAM = `${ACT_DIR}/prod-iso-1_20261001_100000_00000.mp4`;
 const INPUT_1 = `${ACT_DIR}/video_in_1/prod-iso-1_video_in_1_video_20261001_100000_00000.mp4`;
 const INPUT_1_AUDIO = `${ACT_DIR}/video_in_1/prod-iso-1_video_in_1_audio_20261001_100000_00000.mp4`;
 const INPUT_2 = `${ACT_DIR}/video_in_2/prod-iso-1_video_in_2_audio_20261001_100000_00000.mp4`;
+const SIDECAR = `${ACT_DIR}/recordings.json`;
 
 let mediaFiles: string[];
 const mockMediaList = vi.fn(async (dir: string) => {
@@ -95,7 +113,11 @@ vi.mock('../lib/strom.js', async (importOriginal) => {
   class MockStromClient {
     flows = { list: vi.fn(), get: mockFlowsGet, start: vi.fn(), stop: vi.fn(), delete: vi.fn() };
     recorder = { splitNow: mockSplitNow };
-    media = { list: mockMediaList, deleteFile: mockMediaDeleteFile, deleteDirectory: mockMediaDeleteDirectory };
+    media = { list: mockMediaList, deleteFile: mockMediaDeleteFile, deleteDirectory: mockMediaDeleteDirectory, upload: vi.fn() };
+    connectWebSocket(_onEvent: unknown, _onClose?: () => void, onOpen?: () => void) {
+      queueMicrotask(() => onOpen?.());
+      return () => {};
+    }
   }
   return { ...actual, StromClient: MockStromClient };
 });
@@ -106,6 +128,7 @@ vi.mock('../lib/strom-token.js', () => ({
 
 import { buildServer } from '../server.js';
 import { config } from '../config.js';
+import { deactivateProduction } from '../services/idle-watchdog.js';
 
 const savedConfig = {
   minioEndpoint: config.minioEndpoint,
@@ -149,7 +172,7 @@ beforeEach(() => {
   recordings.clear();
   puts.clear();
   deletedDirs.length = 0;
-  mediaFiles = [PROGRAM, INPUT_1, INPUT_1_AUDIO, INPUT_2];
+  mediaFiles = [PROGRAM, INPUT_1, INPUT_1_AUDIO, INPUT_2, SIDECAR];
   production = activeProduction();
   mockDeactivateStromFlow.mockResolvedValue(undefined);
   Object.assign(config, { minioEndpoint: 'minio.local:9000', minioAccessKey: 'a', minioSecretKey: 'b', minioBucket: 'vod' });
@@ -176,6 +199,18 @@ describe('deactivate — per-input recordings', () => {
     expect(mockDeactivateStromFlow).toHaveBeenCalledOnce();
   });
 
+  it('writes the sidecar a last time before splitting the recorders', async () => {
+    await deactivate();
+    expect(mockCloseIndex).toHaveBeenCalledWith('prod-iso-1');
+    expect(mockCloseIndex.mock.invocationCallOrder[0]).toBeLessThan(mockSplitNow.mock.invocationCallOrder[0]!);
+  });
+
+  it('writes the sidecar a last time when the idle timer ends the production', async () => {
+    const log = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    await deactivateProduction('prod-iso-1', log as never);
+    expect(mockCloseIndex).toHaveBeenCalledWith('prod-iso-1');
+  });
+
   it('registers input files with their mixerInput and the program file with its output', async () => {
     await deactivate();
     const docs = [...recordings.values()].map((d) => ({ key: d['key'], mixerInput: d['mixerInput'], track: d['track'], outputId: d['outputId'] }));
@@ -187,6 +222,12 @@ describe('deactivate — per-input recordings', () => {
     ]));
     expect(docs).toHaveLength(4);
     expect([...recordings.values()].every((d) => d['startedAt'] === '2026-10-01T10:00:00.000Z')).toBe(true);
+  });
+
+  it('copies the sidecar to object storage without registering it as a recording', async () => {
+    await deactivate();
+    expect(puts.get(`prod-iso-1/${ACT_NAME}/recordings.json`)).toBe('application/json');
+    expect([...recordings.values()].some((d) => String(d['key']).endsWith('.json'))).toBe(false);
   });
 
   it('removes the uploaded files and the input directories before the activation directory', async () => {
@@ -201,7 +242,7 @@ describe('deactivate — per-input recordings', () => {
   });
 
   it('sweeps input recordings when only inputs were recorded', async () => {
-    mediaFiles = [INPUT_1];
+    mediaFiles = [INPUT_1, SIDECAR];
     production = activeProduction({ recorderBlockId: undefined, recorderOutputDir: undefined, outputAssignments: [] });
     await deactivate();
     expect(mockSplitNow.mock.calls.map((c) => c[1]).sort()).toEqual(['b-inrec-a-1', 'b-inrec-a-2', 'b-inrec-v-1']);
@@ -213,7 +254,7 @@ describe('deactivate — per-input recordings', () => {
     await deactivate();
     expect(mockSplitNow).not.toHaveBeenCalled();
     expect(puts.size).toBe(0);
-    expect(mediaFiles).toHaveLength(4);
+    expect(mediaFiles).toHaveLength(5);
     expect(production['inputRecorderBlockIds']).toBeUndefined();
     expect(mockDeactivateStromFlow).toHaveBeenCalledOnce();
   });
@@ -244,18 +285,37 @@ describe('activate — per-input recorders', () => {
     expect(res.statusCode).toBe(200);
   }
 
-  it('saves the input recorder ids', async () => {
+  it('saves the input recorder ids and binds the recording index to the activation', async () => {
     mockFlowsGet.mockResolvedValue({ flow: { running: true, blocks: [] } });
     await activate();
     await vi.waitFor(() => expect(production['status']).toBe('active'));
     expect(production['inputRecorderBlockIds']).toEqual({ video_in_1: { video: 'b-inrec-v-1', audio: 'b-inrec-a-1' } });
+    expect(mockOpenIndex).toHaveBeenCalledWith('prod-iso-1');
+    expect(mockBindIndex).toHaveBeenCalledOnce();
+    expect(mockBindIndex.mock.calls[0]![1]).toMatchObject({
+      flowId: 'flow-new',
+      dir: ACT_DIR,
+      program: null,
+      inputs: [{ mixerInput: 'video_in_1', blockIds: { video: 'b-inrec-v-1', audio: 'b-inrec-a-1' }, sourceId: 'Whip', recordMode: 'transcode' }],
+    });
+    expect(mockCloseIndex).not.toHaveBeenCalledWith(expect.objectContaining({ productionId: 'prod-iso-1' }));
   });
 
-  it('clears the ids when activation fails', async () => {
+  it('closes the recording index and clears the ids when activation fails', async () => {
     mockFlowsGet.mockRejectedValue(new Error('strom unavailable'));
     await activate();
     await vi.waitFor(() => expect(production['status']).toBe('inactive'));
+    await vi.waitFor(() => expect(mockCloseIndex).toHaveBeenCalledWith(expect.objectContaining({ productionId: 'prod-iso-1' })));
     expect(production['inputRecorderBlockIds']).toBeUndefined();
   });
 
+  it('does not open a recording index when nothing is recorded', async () => {
+    production = { ...production, sources: [{ sourceId: 'Whip', mixerInput: 'video_in_1', record: 'off' }] };
+    mockActivateStromFlow.mockResolvedValue({ ...(await mockActivateStromFlow()), recordingsDir: undefined, inputRecorders: [] });
+    mockFlowsGet.mockResolvedValue({ flow: { running: true, blocks: [] } });
+    await activate();
+    await vi.waitFor(() => expect(production['status']).toBe('active'));
+    expect(mockOpenIndex).not.toHaveBeenCalled();
+    expect(mockBindIndex).not.toHaveBeenCalled();
+  });
 });

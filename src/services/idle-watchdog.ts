@@ -19,6 +19,7 @@ import { clearAudioState, clearPipState, clearFxState } from '../ws/controller.j
 import { broadcast } from './tally.service.js';
 import { activationAbortControllers, updateProductionDoc, emitProductionStatus } from '../routes/productions.js';
 import { stoppedStatus } from '../lib/production-health.js';
+import { closeRecordingIndex } from './recording-index.js';
 import type { ProductionDoc } from '../db/types.js';
 
 // Idle deadline is config-driven (issue #290, env IDLE_TIMEOUT_SEC, default 300s
@@ -234,6 +235,7 @@ export async function deactivateProduction(productionId: string, log: FastifyBas
     activationAbortControllers.delete(doc._id);
   }
 
+  await closeRecordingIndex(doc._id);
   clearProductionPflState(doc._id);
   clearAudioState(doc._id);
   clearPipState(doc._id);

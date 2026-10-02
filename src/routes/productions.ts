@@ -12,6 +12,7 @@ import { clearPipState, clearAudioState, clearFxState, clearClipStateForProducti
 import { config, isRecordingEnabled } from '../config.js';
 import { minioTargetFromConfig, uploadProductionRecordings } from '../lib/recording-uploader.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
+import { bindRecordingIndex, closeRecordingIndex, openRecordingIndex, type RecordingIndexHandle } from '../services/recording-index.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type OutputStatusEntry } from '../lib/production-health.js';
 
@@ -310,6 +311,8 @@ async function runActivationFlow(
   let loudnessMainBlockId: string | undefined;
   let whepOutputEntries: Array<{ outputId: string; endpointId: string }> | undefined;
   let pgmWhepEndpointId: string | undefined;
+  let recordingIndex: RecordingIndexHandle | undefined;
+  let activationSucceeded = false;
 
   try {
     // Load the current production doc
@@ -333,8 +336,13 @@ async function runActivationFlow(
     const stromToken = await getStromToken(config.stromToken);
     const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
 
-    // Step 1: Start the Strom flow
+    // Step 1: Start the Strom flow. The recording index listens first, so it
+    // sees a recorder open its first file even if that happens at once.
     if (signal.aborted) return;
+    if (doc.sources.some((s) => (s.record ?? 'off') !== 'off') || outputDocs.some((o) => o.outputType === 'recording')) {
+      recordingIndex = await openRecordingIndex(productionId);
+    }
+    const activatedAtMs = Date.now();
     const activation = await activateStromFlow(doc, strom, config.stromUrl, outputDocs.length > 0 ? outputDocs : undefined);
     stromFlowId = activation.flowId;
     mixerBlockId = activation.mixerBlockId ?? undefined;
@@ -369,6 +377,21 @@ async function runActivationFlow(
       ...(activation.warnings.length > 0 && { activationWarnings: activation.warnings }),
     });
     for (const w of activation.warnings) log.warn({ productionId, warning: w.type }, w.message);
+    if (recordingIndex && activation.recordingsDir) {
+      bindRecordingIndex(recordingIndex, {
+        productionId,
+        productionName: doc.name,
+        flowId: stromFlowId,
+        dir: activation.recordingsDir,
+        activatedAtMs,
+        program: activation.recorderBlockId && activation.recorderOutputDir
+          ? { recorderBlockId: activation.recorderBlockId, outputDir: activation.recorderOutputDir }
+          : null,
+        inputs: activation.inputRecorders,
+      });
+    } else if (recordingIndex) {
+      await closeRecordingIndex(recordingIndex);
+    }
 
     // Step 3: Poll until flow reaches 'playing' or we time out
     const deadline = Date.now() + FLOW_POLL_TIMEOUT_MS;
@@ -529,6 +552,7 @@ async function runActivationFlow(
           for (const w of activation.warnings) broadcast(productionId, { type: 'ERROR', error: w.message });
         }
         log.info({ productionId, stromFlowId, whepEndpoint, initialTally, audioMixerBlockId }, 'Production activated — flow playing');
+        activationSucceeded = true;
         return;
       }
 
@@ -571,6 +595,8 @@ async function runActivationFlow(
 
     notifyProductionDeactivated(productionId);
   } finally {
+    // Kept open only by an activation that went live; deactivate closes it.
+    if (recordingIndex && (signal.aborted || !activationSucceeded)) await closeRecordingIndex(recordingIndex);
     // Only remove the entry if it still points to *this* run's controller.
     // A slow aborted run can otherwise finish after a newer activation has
     // registered its own controller and delete that entry, leaving the newer
@@ -917,6 +943,9 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         activationAbortControllers.delete(doc._id);
       }
 
+      // Final sidecar write before the sweep below uploads it. A file the final
+      // split opens is not listed.
+      await closeRecordingIndex(doc._id);
       clearProductionPflState(doc._id);
       clearAudioState(doc._id);
       clearPipState(doc._id);

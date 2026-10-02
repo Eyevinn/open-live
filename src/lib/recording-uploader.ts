@@ -308,6 +308,9 @@ function activationStartFromDirName(name: string): string | undefined {
   return `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}.000Z`;
 }
 
+/** The per-activation sidecar services/recording-index.ts writes beside the recordings. */
+export const RECORDING_INDEX_FILE = 'recordings.json';
+
 function keyPrefix(): string {
   return config.recordingKeyPrefix
     ? `${config.recordingKeyPrefix.replace(/\/+$/, '')}/`
@@ -317,6 +320,11 @@ function keyPrefix(): string {
 /** Object key a recorded file is uploaded to. */
 export function recordingObjectKey(productionId: string, fileName: string): string {
   return `${keyPrefix()}${productionId}/${fileName}`;
+}
+
+/** Object key of an activation's sidecar. */
+export function recordingIndexObjectKey(productionId: string, activationDirName: string): string {
+  return `${keyPrefix()}${productionId}/${activationDirName}/${RECORDING_INDEX_FILE}`;
 }
 
 export interface UploadRecordingsArgs {
@@ -380,8 +388,9 @@ export interface UploadProductionRecordingsArgs extends Omit<UploadRecordingsArg
  * whose upload failed at its own deactivate is picked up by a later one.
  * A production that never recorded (no directory on Strom) uploads nothing.
  *
- * Inside an activation's directory, files are the program recording and
- * `video_in_N/` subdirectories hold per-input recordings.
+ * Inside an activation's directory, files are the program recording,
+ * `video_in_N/` subdirectories hold per-input recordings, and the sidecar is
+ * copied to recordingIndexObjectKey() without being returned as a recording.
  *
  * Then deletes from Strom every swept file that is in object storage,
  * including ones skipped as already uploaded, and removes each directory
@@ -422,9 +431,19 @@ export async function uploadProductionRecordings(args: UploadProductionRecording
       const done = await uploadFiles(args, files, startedAt, isUploaded, result, sub.name);
       swept.push({ path: sub.path, fileCount: files.length, done });
     }
-    const files = listed.filter((e) => !e.is_directory);
+    const files = listed.filter((e) => !e.is_directory && e.name !== RECORDING_INDEX_FILE);
     const done = await uploadFiles(args, files, startedAt, isUploaded, result);
-    swept.push({ path: dir.path, fileCount: files.length, done });
+    const index = listed.find((e) => !e.is_directory && e.name === RECORDING_INDEX_FILE);
+    if (index) {
+      try {
+        const bytes = await downloadFromStrom(args.stromUrl, args.stromToken, index.path);
+        await putObject(args.target, recordingIndexObjectKey(productionId, dir.name), bytes, 'application/json');
+        done.push(index.path);
+      } catch (err) {
+        result.failed.push({ file: index.path, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    swept.push({ path: dir.path, fileCount: files.length + (index ? 1 : 0), done });
   }
   if (includeSharedDir) {
     // Listed last so its directory, the production's, is only removed once
