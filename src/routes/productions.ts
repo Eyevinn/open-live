@@ -1,14 +1,17 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { createHash, randomUUID } from 'crypto';
 import { z } from 'zod';
-import { getDb, getOutputsDb, getRecordingsDb, getGuestInvitesDb, getGuestSessionsDb } from '../db/index.js';
-import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc, RecordingDoc, GuestSessionDoc } from '../db/types.js';
+import { getDb, getOutputsDb, getRecordingsDb } from '../db/index.js';
+import { sweepGuestsOnProductionEnd } from '../services/guest-sweep.js';
+import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc, RecordingDoc } from '../db/types.js';
 import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js';
 import { setTally, broadcast, getSubscriberCount } from '../services/tally.service.js';
 import { clearProductionPflState } from '../services/pfl-state.js';
-import { clearPipState, clearAudioState, clearFxState, clearClipStateForProduction } from '../ws/controller.js';
+import { clearPipState, clearAudioState, clearFxState, clearClipStateForProduction, reinitConnectedControllers } from '../ws/controller.js';
+import { forceStopMeterRelay } from '../services/meter-relay.js';
+import { forceStopClipRelay } from '../services/clip-relay.js';
 import { config, isRecordingEnabled } from '../config.js';
 import { minioTargetFromConfig, uploadProductionRecordings } from '../lib/recording-uploader.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
@@ -196,55 +199,6 @@ async function isRecordingRegistered(bucket: string, key: string): Promise<boole
   } catch (err) {
     if (typeof err === 'object' && err !== null && (err as { statusCode?: unknown }).statusCode === 404) return false;
     throw err;
-  }
-}
-
-/**
- * Revoke a production's outstanding guest invites and mark its live guest
- * sessions `left` on deactivate (issue #325).
- *
- * A guest invite token is the security boundary of guest calling: deactivating a
- * production must invalidate its invites so a still-TTL-valid token can no longer
- * redeem a session (and provision a fresh intercom line) against a finished
- * production. Invites are deleted (mirroring the per-invite DELETE revoke in
- * guests.ts); live sessions (state !== 'left') are transitioned to `left`
- * (mirroring the kick/leave transition). The join guard in guests.ts is the
- * belt-and-braces backstop for invites created between this sweep and any later
- * write. Failures are logged per-doc and swallowed — the caller treats the whole
- * sweep as best-effort, matching the Strom/intercom teardown contract.
- */
-async function revokeGuestInvitesForProduction(
-  productionId: string,
-  log: { warn: (obj: unknown, msg: string) => void },
-): Promise<void> {
-  // Delete outstanding invites for this production.
-  const invitesDb = getGuestInvitesDb();
-  const invites = await invitesDb.find({
-    selector: { type: 'guest-invite', productionId },
-  });
-  for (const invite of Array.isArray(invites?.docs) ? invites.docs : []) {
-    if (!invite._rev) continue;
-    try {
-      await invitesDb.destroy(invite._id, invite._rev);
-    } catch (err) {
-      log.warn({ err, inviteId: invite._id, productionId }, 'guest invite revoke on deactivate failed');
-    }
-  }
-
-  // Mark any live guest sessions `left`.
-  const sessionsDb = getGuestSessionsDb();
-  const sessions = await sessionsDb.find({
-    selector: { type: 'guest-session', productionId },
-  });
-  const now = new Date().toISOString();
-  for (const session of Array.isArray(sessions?.docs) ? sessions.docs : []) {
-    if (session.state === 'left') continue;
-    try {
-      const leftSession: GuestSessionDoc = { ...session, state: 'left', updatedAt: now };
-      await sessionsDb.insert(leftSession);
-    } catch (err) {
-      log.warn({ err, guestId: session._id, productionId }, 'guest session leave on deactivate failed');
-    }
   }
 }
 
@@ -526,6 +480,13 @@ async function runActivationFlow(
           for (const w of activation.warnings) broadcast(productionId, { type: 'ERROR', error: w.message });
         }
         log.info({ productionId, stromFlowId, whepEndpoint, initialTally, audioMixerBlockId }, 'Production activated — flow playing');
+
+        // Controllers that stayed connected across a deactivate→reactivate are
+        // never re-run through the WS connect handler, so re-run first-connect
+        // audio init once and restart the meter/clip relays against this new
+        // flow for them (issue #416). Best-effort — it internally swallows its
+        // own errors and is a no-op when nobody is connected.
+        await reinitConnectedControllers(productionId);
         return;
       }
 
@@ -909,6 +870,13 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       clearAudioState(doc._id);
       clearPipState(doc._id);
       clearFxState(doc._id);
+      // Force-stop the meter and clip relays regardless of refCount (issue #416).
+      // Controller sockets stay open across deactivate; if the relays were left
+      // alive they would stay bound to this (torn-down) flow and every connect
+      // after reactivation would ref-count into the stale relay, so no client
+      // would get METER_DATA/LOUDNESS_DATA/CLIP_STATE until all sockets closed.
+      forceStopMeterRelay(doc._id);
+      forceStopClipRelay(doc._id);
       // Stop any clip completion-poll timers and wipe the in-memory clip-state
       // registry — live-only clip state must not survive deactivation (#278).
       clearClipStateForProduction(doc._id);
@@ -1022,9 +990,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       // mirrors the per-invite DELETE revoke (guests.ts) and the kick/leave
       // session transition. Best-effort: a failed sweep must not block
       // deactivation, matching the Strom/intercom teardown contract.
-      await revokeGuestInvitesForProduction(doc._id, req.log).catch((err) => {
-        req.log.warn({ err, productionId: doc._id }, 'guest-invite revoke failed — continuing deactivation');
-      });
+      await sweepGuestsOnProductionEnd(doc._id, req.log);
 
       // Transition rule (spec §1): a production that was `active` (reached a live
       // broadcast) and is now explicitly deactivated becomes `ended`; one that
