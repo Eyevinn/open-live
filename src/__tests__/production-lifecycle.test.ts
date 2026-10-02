@@ -89,6 +89,19 @@ function makeProductionDoc(overrides: Record<string, unknown> = {}) {
   };
 }
 
+
+function seedGuests(productionId: string) {
+  mockInviteFind.mockResolvedValue({
+    docs: [{ _id: 'guest-invite-1', _rev: '1-a', type: 'guest-invite', productionId }],
+  });
+  mockSessionFind.mockResolvedValue({
+    docs: [
+      { _id: 'guest-session-1', _rev: '1-a', type: 'guest-session', productionId, inviteId: 'guest-invite-1', mixerInput: 'video_in_0', state: 'joined' },
+      { _id: 'guest-session-2', _rev: '1-b', type: 'guest-session', productionId, inviteId: 'guest-invite-2', mixerInput: 'video_in_1', state: 'left' },
+    ],
+  });
+}
+
 /** Minimal fake WebSocket that records everything sent to it. */
 class FakeWs {
   readonly OPEN = 1;
@@ -243,6 +256,35 @@ describe('idle-watchdog auto-deactivate — active → ended (spec §1)', () => 
     expect(inserted.autoDeactivated).toBe(true);
   });
 
+  it('revokes guest invites and ends live guest sessions when the production ends (issue #414)', async () => {
+    const doc = makeProductionDoc({ status: 'active', stromFlowId: 'flow-abc' });
+    mockGet.mockResolvedValue(doc);
+    mockDeactivateStromFlow.mockResolvedValue(undefined);
+    mockInsert.mockResolvedValue({ rev: '2-bcd', ok: true, id: doc._id });
+    seedGuests(doc._id);
+
+    await deactivateProduction('prod-test-1', silentLog);
+
+    expect(mockInviteDestroy).toHaveBeenCalledWith('guest-invite-1', '1-a');
+    const sessions = mockSessionInsert.mock.calls.map((c) => c[0]);
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]).toMatchObject({ _id: 'guest-session-1', state: 'left' });
+  });
+
+  it('still reaches ended when the guest sweep fails (issue #414)', async () => {
+    const doc = makeProductionDoc({ status: 'active', stromFlowId: 'flow-abc' });
+    mockGet.mockResolvedValue(doc);
+    mockDeactivateStromFlow.mockResolvedValue(undefined);
+    mockInsert.mockResolvedValue({ rev: '2-bcd', ok: true, id: doc._id });
+    mockInviteFind.mockRejectedValue(new Error('couch down'));
+
+    await deactivateProduction('prod-test-1', silentLog);
+
+    const inserted = mockInsert.mock.calls.find((c) => (c[0] as { type?: string }).type === 'production')![0];
+    expect(inserted.status).toBe('ended');
+    expect(inserted.endedReason).toBe('idle');
+  });
+
   it('an idle activating production resets to inactive (never broadcast)', async () => {
     const doc = makeProductionDoc({ status: 'activating', stromFlowId: 'flow-abc' });
     mockGet.mockResolvedValue(doc);
@@ -275,6 +317,37 @@ describe('startup reconcile — flow gone: active → ended, activating → inac
     expect(inserted.status).toBe('ended');
     expect(inserted.endedReason).toBe('flow-lost');
     expect(inserted.stromFlowId).toBeUndefined();
+  });
+
+  it('revokes guest invites and ends live guest sessions when the flow is lost (issue #414)', async () => {
+    mockStromFlowsList.mockResolvedValue({ flows: [] });
+    mockFind.mockResolvedValue({
+      docs: [makeProductionDoc({ status: 'active', stromFlowId: 'flow-gone' })],
+    });
+    mockInsert.mockResolvedValue({ rev: '2-bcd', ok: true });
+    seedGuests('prod-test-1');
+
+    await reconcileProductionStatuses(silentLog);
+
+    expect(mockInviteDestroy).toHaveBeenCalledWith('guest-invite-1', '1-a');
+    const sessions = mockSessionInsert.mock.calls.map((c) => c[0]);
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]).toMatchObject({ _id: 'guest-session-1', state: 'left' });
+  });
+
+  it('still reaches ended when the guest sweep fails (issue #414)', async () => {
+    mockStromFlowsList.mockResolvedValue({ flows: [] });
+    mockFind.mockResolvedValue({
+      docs: [makeProductionDoc({ status: 'active', stromFlowId: 'flow-gone' })],
+    });
+    mockInsert.mockResolvedValue({ rev: '2-bcd', ok: true });
+    mockInviteFind.mockRejectedValue(new Error('couch down'));
+
+    await reconcileProductionStatuses(silentLog);
+
+    const inserted = mockInsert.mock.calls[0][0];
+    expect(inserted.status).toBe('ended');
+    expect(inserted.endedReason).toBe('flow-lost');
   });
 
   it('an activating production whose flow never appeared resets to inactive', async () => {
