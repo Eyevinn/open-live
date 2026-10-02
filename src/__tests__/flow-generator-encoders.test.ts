@@ -28,6 +28,7 @@ function makeStromClient() {
       start: vi.fn().mockResolvedValue({}),
       delete: vi.fn().mockResolvedValue({}),
     },
+    blocks: { list: vi.fn().mockResolvedValue({ blocks: [{ id: 'builtin.audioenc' }] }) },
     capturedFlows,
   };
 }
@@ -60,8 +61,8 @@ type Link = Record<string, unknown>;
 const byName = (blocks: Block[], name: string) =>
   blocks.find((b) => b['block_definition_id'] === 'builtin.videoenc' && b['name'] === name);
 
-const feedFor = (links: Link[], blockId: string) =>
-  links.find((l) => l['to'] === `${blockId}:video_in`);
+const feedFor = (links: Link[], blockId: string, pad = 'video_in') =>
+  links.find((l) => l['to'] === `${blockId}:${pad}`);
 
 const whepOutput = 'whep' as const;
 const recordingOutput = 'recording' as const;
@@ -119,7 +120,7 @@ describe('flow-generator — viewer/program encoder split (#413)', () => {
 
     // Recorder stays on the full-rate program encode.
     const recorder = blocks.find((b) => b['block_definition_id'] === 'builtin.recorder')!;
-    expect(feedFor(links, recorder['id'] as string)!['from']).toBe(encPgmPad);
+    expect(feedFor(links, recorder['id'] as string, 'video_in_0')!['from']).toBe(encPgmPad);
 
     // The dynamic WHEP viewer output is fed from the low-bitrate viewer encode.
     const whep = blocks.find((b) => b['block_definition_id'] === 'builtin.whep_output' && b['name'] === 'Viewer WHEP')!;

@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { z } from 'zod';
 import { getDb, getOutputsDb, getRecordingsDb } from '../db/index.js';
 import { sweepGuestsOnProductionEnd } from '../services/guest-sweep.js';
@@ -13,8 +13,9 @@ import { clearPipState, clearAudioState, clearFxState, clearClipStateForProducti
 import { forceStopMeterRelay } from '../services/meter-relay.js';
 import { forceStopClipRelay } from '../services/clip-relay.js';
 import { config, isRecordingEnabled } from '../config.js';
-import { minioTargetFromConfig, uploadRecordings } from '../lib/recording-uploader.js';
+import { minioTargetFromConfig, uploadProductionRecordings } from '../lib/recording-uploader.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
+import { bindRecordingIndex, closeRecordingIndex, openRecordingIndex, type RecordingIndexHandle } from '../services/recording-index.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type OutputStatusEntry } from '../lib/production-health.js';
 
@@ -179,6 +180,30 @@ async function firstRecordingOutputId(
 }
 
 /**
+ * RecordingDoc id for an uploaded object. Deterministic, so deactivate can
+ * check whether an object is registered before uploading it, and two
+ * deactivates registering the same object conflict instead of duplicating it.
+ */
+function recordingDocId(bucket: string, key: string): string {
+  return `recording-${createHash('sha256').update(`${bucket}/${key}`).digest('hex').slice(0, 32)}`;
+}
+
+function isConflict(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && (err as { statusCode?: unknown }).statusCode === 409;
+}
+
+/** Whether an object has already been uploaded and registered as a RecordingDoc. */
+async function isRecordingRegistered(bucket: string, key: string): Promise<boolean> {
+  try {
+    await getRecordingsDb().get(recordingDocId(bucket, key));
+    return true;
+  } catch (err) {
+    if (typeof err === 'object' && err !== null && (err as { statusCode?: unknown }).statusCode === 404) return false;
+    throw err;
+  }
+}
+
+/**
  * Derive the per-output health snapshot for a production from its own state
  * (issue #255). The signal is flow-level, so every assigned output shares the
  * same derived status. A production reads as running when it is `active` with a
@@ -227,7 +252,11 @@ export function emitProductionStatus(
 async function runActivationFlow(
   productionId: string,
   signal: AbortSignal,
-  log: { error: (obj: unknown, msg: string) => void; info: (obj: unknown, msg: string) => void },
+  log: {
+    error: (obj: unknown, msg: string) => void;
+    warn: (obj: unknown, msg: string) => void;
+    info: (obj: unknown, msg: string) => void;
+  },
   publicBaseUrl: string,
 ): Promise<void> {
   let stromFlowId: string | undefined;
@@ -236,6 +265,8 @@ async function runActivationFlow(
   let loudnessMainBlockId: string | undefined;
   let whepOutputEntries: Array<{ outputId: string; endpointId: string }> | undefined;
   let pgmWhepEndpointId: string | undefined;
+  let recordingIndex: RecordingIndexHandle | undefined;
+  let activationSucceeded = false;
 
   try {
     // Load the current production doc
@@ -259,8 +290,13 @@ async function runActivationFlow(
     const stromToken = await getStromToken(config.stromToken);
     const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
 
-    // Step 1: Start the Strom flow
+    // Step 1: Start the Strom flow. The recording index listens first, so it
+    // sees a recorder open its first file even if that happens at once.
     if (signal.aborted) return;
+    if (doc.sources.some((s) => (s.record ?? 'off') !== 'off') || outputDocs.some((o) => o.outputType === 'recording')) {
+      recordingIndex = await openRecordingIndex(productionId);
+    }
+    const activatedAtMs = Date.now();
     const activation = await activateStromFlow(doc, strom, config.stromUrl, outputDocs.length > 0 ? outputDocs : undefined);
     stromFlowId = activation.flowId;
     mixerBlockId = activation.mixerBlockId ?? undefined;
@@ -281,12 +317,35 @@ async function runActivationFlow(
       ...(mixerBlockId !== undefined && { mixerBlockId }),
       ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
       ...(loudnessMainBlockId !== undefined && { loudnessMainBlockId }),
-      ...(activation.recorderBlockId !== undefined && { recorderBlockId: activation.recorderBlockId }),
+      // Always written, so an activation without a recorder replaces any
+      // recorder fields a previous activation left behind.
+      recorderBlockId: activation.recorderBlockId,
+      recorderOutputDir: activation.recorderOutputDir,
+      inputRecorderBlockIds: activation.inputRecorders.length > 0
+        ? Object.fromEntries(activation.inputRecorders.map((r) => [r.mixerInput, r.blockIds]))
+        : undefined,
       ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
       ...(Object.keys(activation.sourceAudioOffsetBlockIds).length > 0 && { sourceAudioOffsetBlockIds: activation.sourceAudioOffsetBlockIds }),
       ...(Object.keys(activation.clipPlayerBlockIds).length > 0 && { clipPlayerBlockIds: activation.clipPlayerBlockIds }),
       ...(activation.returnBuses.length > 0 && { returnBuses: activation.returnBuses }),
+      ...(activation.warnings.length > 0 && { activationWarnings: activation.warnings }),
     });
+    for (const w of activation.warnings) log.warn({ productionId, warning: w.type }, w.message);
+    if (recordingIndex && activation.recordingsDir) {
+      bindRecordingIndex(recordingIndex, {
+        productionId,
+        productionName: doc.name,
+        flowId: stromFlowId,
+        dir: activation.recordingsDir,
+        activatedAtMs,
+        program: activation.recorderBlockId && activation.recorderOutputDir
+          ? { recorderBlockId: activation.recorderBlockId, outputDir: activation.recorderOutputDir }
+          : null,
+        inputs: activation.inputRecorders,
+      });
+    } else if (recordingIndex) {
+      await closeRecordingIndex(recordingIndex);
+    }
 
     // Step 3: Poll until flow reaches 'playing' or we time out
     const deadline = Date.now() + FLOW_POLL_TIMEOUT_MS;
@@ -441,7 +500,13 @@ async function runActivationFlow(
           stromFlowId,
           outputAssignments: doc.outputAssignments,
         });
+        // Studio shows ERROR frames as a toast. Controllers that connect later get
+        // the same frame from the connect-time snapshot in ws/controller.ts.
+        if (!signal.aborted) {
+          for (const w of activation.warnings) broadcast(productionId, { type: 'ERROR', error: w.message });
+        }
         log.info({ productionId, stromFlowId, whepEndpoint, initialTally, audioMixerBlockId }, 'Production activated — flow playing');
+        activationSucceeded = true;
 
         // Controllers that stayed connected across a deactivate→reactivate are
         // never re-run through the WS connect handler, so re-run first-connect
@@ -478,15 +543,21 @@ async function runActivationFlow(
       status: 'inactive',
       stromFlowId: undefined,
       mixerBlockId: undefined,
+      recorderBlockId: undefined,
+      recorderOutputDir: undefined,
+      inputRecorderBlockIds: undefined,
       whepEndpoint: undefined,
       pgmWhepEndpoint: undefined,
       whipEndpoints: undefined,
+      activationWarnings: undefined,
     }).catch((resetErr) => {
       log.error({ resetErr, productionId }, 'Failed to reset production to inactive after activation failure');
     });
 
     notifyProductionDeactivated(productionId);
   } finally {
+    // Kept open only by an activation that went live; deactivate closes it.
+    if (recordingIndex && (signal.aborted || !activationSucceeded)) await closeRecordingIndex(recordingIndex);
     // Only remove the entry if it still points to *this* run's controller.
     // A slow aborted run can otherwise finish after a newer activation has
     // registered its own controller and delete that entry, leaving the newer
@@ -586,10 +657,18 @@ const ReturnFeedInput = z
   })
   .optional();
 
+// Passthrough recording (encoded streams into the recorder, no transcode) is
+// not built yet; it is refused here rather than saved and skipped at activation.
+const RecordModeInput = z
+  .enum(['off', 'transcode', 'passthrough'])
+  .refine((mode) => mode !== 'passthrough', { message: "record: 'passthrough' is not supported yet; use 'transcode'" })
+  .optional();
+
 const SourceAssignmentInput = z.object({
   sourceId: z.string().min(1).max(128),
   mixerInput: mixerInputSchema,
   returnFeed: ReturnFeedInput,
+  record: RecordModeInput,
 });
 
 const GraphicAssignmentInput = z.object({
@@ -775,6 +854,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         ...doc,
         status: 'activating',
         deletionWarnings: undefined,
+        activationWarnings: undefined,
         autoDeactivated: undefined,
         endedReason: undefined,
         updatedAt: new Date().toISOString(),
@@ -824,6 +904,9 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         activationAbortControllers.delete(doc._id);
       }
 
+      // Final sidecar write before the sweep below uploads it. A file the final
+      // split opens is not listed.
+      await closeRecordingIndex(doc._id);
       clearProductionPflState(doc._id);
       clearAudioState(doc._id);
       clearPipState(doc._id);
@@ -850,29 +933,41 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         // the current segment (recorder.splitNow) then upload Strom's local
         // recordings to MinIO — Strom's recorder has no native S3 sink, so
         // open-live pulls the segments and pushes them to object storage.
+        // Every activation's directory is swept, skipping objects already
+        // registered, so a session whose upload failed (or that ended without
+        // this route, e.g. the idle watchdog) is uploaded here instead of lost.
         // Best-effort: a failed upload must not block deactivation/teardown.
-        if (doc.recorderBlockId && isRecordingEnabled()) {
+        const inputRecorderBlockIds = Object.values(doc.inputRecorderBlockIds ?? {}).flatMap((ids) => Object.values(ids));
+        if (isRecordingEnabled()) {
           const target = minioTargetFromConfig();
           if (target) {
             try {
-              await strom.recorder.splitNow(doc.stromFlowId, doc.recorderBlockId).catch(() => undefined);
-              const uploadRes = await uploadRecordings({
+              const flowId = doc.stromFlowId;
+              await Promise.all(
+                [doc.recorderBlockId, ...inputRecorderBlockIds]
+                  .filter((id): id is string => !!id)
+                  .map((id) => strom.recorder.splitNow(flowId, id).catch(() => undefined)),
+              );
+              const uploadRes = await uploadProductionRecordings({
                 strom,
                 stromUrl: config.stromUrl,
                 stromToken,
-                outputDir: `recordings/${doc._id}`,
                 productionId: doc._id,
                 target,
+                // A recorder activated before per-activation directories wrote
+                // straight into the production's directory.
+                includeSharedDir: Boolean(doc.recorderBlockId && !doc.recorderOutputDir),
+                isUploaded: (key) => isRecordingRegistered(target.bucket, key),
                 // Guard (issue #366): re-check the production doc immediately
-                // before uploadRecordings' delete-after-upload pass. Nothing
-                // else in this handler writes to the production doc before its
-                // own final status update below, which runs after this block —
-                // so `doc._rev` cannot legitimately change between the read at
-                // the top of this handler and here. A different _rev means
-                // something else (most plausibly a reactivation) touched the
-                // doc while the upload was in flight; treat the activation as
-                // still live and skip deletion rather than risk deleting
-                // recordings it still needs.
+                // before uploadProductionRecordings' delete-after-upload pass.
+                // Nothing else in this handler writes to the production doc
+                // before its own final status update below, which runs after
+                // this block — so `doc._rev` cannot legitimately change between
+                // the read at the top of this handler and here. A different
+                // _rev means something else (most plausibly a reactivation)
+                // touched the doc while the upload was in flight; treat the
+                // activation as still live and skip deletion rather than risk
+                // deleting recordings it still needs.
                 isStillRecording: async () => {
                   try {
                     const current = await getDb().get(doc._id);
@@ -891,22 +986,25 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
               const finalizedAt = new Date().toISOString();
               for (const seg of uploadRes.uploaded) {
                 try {
-                  const recId = `recording-${randomUUID()}`;
                   const recDoc: RecordingDoc = {
-                    _id: recId,
+                    _id: recordingDocId(target.bucket, seg.key),
                     type: 'recording',
                     productionId: doc._id,
-                    ...(recordingOutputId ? { outputId: recordingOutputId } : {}),
+                    ...(seg.mixerInput
+                      ? { mixerInput: seg.mixerInput, ...(seg.track && { track: seg.track }) }
+                      : recordingOutputId ? { outputId: recordingOutputId } : {}),
                     bucket: target.bucket,
                     key: seg.key,
                     sizeBytes: seg.sizeBytes,
-                    startedAt: doc.updatedAt,
-                    endedAt: finalizedAt,
+                    startedAt: seg.activationStartedAt ?? doc.updatedAt,
+                    endedAt: seg.modifiedAt ?? finalizedAt,
                     createdAt: finalizedAt,
                     updatedAt: finalizedAt,
                   };
                   await getRecordingsDb().insert(recDoc);
                 } catch (persistErr) {
+                  // A concurrent deactivate registered it first.
+                  if (isConflict(persistErr)) continue;
                   req.log.error({ persistErr, productionId: doc._id, key: seg.key }, 'RecordingDoc persist failed — object uploaded but unlisted');
                 }
               }
@@ -955,6 +1053,8 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         audioMixerBlockId: undefined,
         loudnessMainBlockId: undefined,
         recorderBlockId: undefined,
+        recorderOutputDir: undefined,
+        inputRecorderBlockIds: undefined,
         sourceOffsetBlockIds: undefined,
         sourceAudioOffsetBlockIds: undefined,
         clipPlayerBlockIds: undefined,
@@ -990,6 +1090,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       ...(body.returnFeed
         ? { returnFeed: { synced: body.returnFeed.synced, lowLatency: false as const } }
         : {}),
+      ...(body.record && body.record !== 'off' && { record: body.record }),
     };
     for (let attempt = 0; attempt < MAX_DB_WRITE_RETRIES; attempt++) {
       try {

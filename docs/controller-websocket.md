@@ -153,7 +153,8 @@ per-effect parameters.
 
 Outbound frames are JSON objects, each with a `type` discriminator. Most are sent via
 `broadcast(productionId, ...)` to every client subscribed to the production; a few
-(`ERROR`, `MACRO_ERROR`) are sent only to the originating socket. The following types
+(`ERROR`, `MACRO_ERROR`) are sent only to the originating socket, except for activation
+warnings (see `ERROR` below). The following types
 are emitted from `src/ws/controller.ts` and `src/services/meter-relay.ts`:
 
 | `type` | Fields | Emitted when |
@@ -189,7 +190,7 @@ are emitted from `src/ws/controller.ts` and `src/services/meter-relay.ts`:
 | `IDLE_WARNING_CLEARED` | `productionId: string` | A pending idle warning was cancelled because activity reset the idle timer (a subscriber joined or a `KEEP_ALIVE` was received). |
 | `RETURN_STATE` | `mixerInput: string`, `mode: 'program' \| 'program-minus'` | A per-guest return feed's mix-minus mode changed on `mixerInput` (crew via `PUT .../returns/{mixerInput}/mode`, the `RETURN_SET` WS command, or the guest via `PUT /api/v1/guests/{inviteId}/session/return`). `program-minus` closes that guest's own send; `program` opens it (epic #208, issue #300). Also emitted once per configured return during the connect-time snapshot. |
 | `GUEST_STATE` | `guestId: string`, `mixerInput: string`, `state: 'invited' \| 'joined' \| 'previewing' \| 'on-air' \| 'left' \| 'error'`, `label?`, `intercomLine?` | A guest's lifecycle state changed (epic #208, issue #301). Broadcast on the persisted join/leave/kick transitions and emitted once per live guest in the connect-time snapshot. `previewing`/`on-air` are **derived** from the live vision-mixer contribution set (#209); a guest composited only as a PiP *inset* reads `joined` until the PiP-inset tally gap #209 raises is closed. |
-| `ERROR` | `error: string` | An inbound frame was invalid or an operation failed (sent to originating socket) |
+| `ERROR` | `error: string` | An inbound frame was invalid or an operation failed (sent to originating socket). Also carries each activation warning (`ProductionDoc.activationWarnings`, e.g. a recording with no sound): broadcast when the production goes active, and sent to each client that connects while it is active. Not a response to any command. |
 
 `pgmBg` is the mixer input a PiP on program is composited over. It is `null` unless
 `PIP_STATE.pgmPip` is set, so the two fields together distinguish an empty program
