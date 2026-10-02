@@ -42,19 +42,39 @@ export function setTally(productionId: string, tally: Tally): void {
   tallyState.set(productionId, tally);
 }
 
-export function subscribe(productionId: string, ws: WebSocket): void {
+// Watch-only sockets receive broadcasts but are not operators: they are left out
+// of getSubscriberCount, so they neither show in the controller count nor keep
+// a production alive against the idle watchdog.
+const watchOnlySockets = new WeakSet<WebSocket>();
+
+export function subscribe(productionId: string, ws: WebSocket, opts: { watchOnly?: boolean } = {}): void {
   if (!subscribers.has(productionId)) {
     subscribers.set(productionId, new Set());
   }
   subscribers.get(productionId)!.add(ws);
+  if (opts.watchOnly) watchOnlySockets.add(ws);
 }
 
 export function unsubscribe(productionId: string, ws: WebSocket): void {
   subscribers.get(productionId)?.delete(ws);
 }
 
+/** Operator (non-watch-only) sockets for a production. */
+export function getOperatorSockets(productionId: string): WebSocket[] {
+  return [...subscribers.get(productionId) ?? []].filter((ws) => !watchOnlySockets.has(ws));
+}
+
+/** Operator (non-watch-only) connections for a production. */
 export function getSubscriberCount(productionId: string): number {
-  return subscribers.get(productionId)?.size ?? 0;
+  return getOperatorSockets(productionId).length;
+}
+
+export function getWatcherCount(productionId: string): number {
+  let count = 0;
+  for (const ws of subscribers.get(productionId) ?? []) {
+    if (watchOnlySockets.has(ws)) count++;
+  }
+  return count;
 }
 
 export function broadcast(productionId: string, message: unknown): void {
