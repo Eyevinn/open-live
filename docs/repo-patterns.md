@@ -57,6 +57,25 @@ Guest calling is on by default (issue #391). The signing key is resolved via
   redacted by `log-redact.ts`; `server.ts` also lists `signingSecret` / `*.signingSecret` in the
   Fastify logger redact paths. Never add a route that returns the doc.
 
+## A new `/api/v1/guests/:inviteId/...` route needs the `isGuestTokenAuthedPath` allowlist
+
+Guest-facing routes authenticate with the per-invite HMAC token *inside the handler*
+(`resolveGuestSession` / `verifyGuestInviteToken`), not the shared `API_KEY`. The shared-key
+`onRequest` gate in `src/server.ts` blocks every `/api/v1` request that is neither a valid
+`API_KEY` nor an eligible guest token, so a new guest route 401s before its handler ever runs
+unless its path is added to the `isGuestTokenAuthedPath()` regex (the explicit exemption list).
+When you add a guest route, extend that regex and keep it anchored (`$`) and narrow — it is a
+security boundary, not a convenience. This is distinct from `isGuestEligibleWhipReturnPath()`,
+which is the *crew* `/api/v1/productions/...` WHIP/return paths where a guest token is *also*
+accepted (setting `req.guestScope`); guest-scoped `/api/v1/guests/...` aliases use the
+`isGuestTokenAuthedPath` exemption instead and verify the token themselves.
+
+Why two mechanisms at all: on OSC the ingress gate only passes `^/guest` and `^/api/v1/guests`
+(osaas-app#6143), so WHIP/WHEP that a guest browser must reach has to live under
+`/api/v1/guests/:inviteId/...` (issue #423). The mixerInput for those aliases comes from the
+guest's LIVE session, never the URL or the invite — a left guest's token must not be able to act
+on the slot a later guest now holds.
+
 ## RTMP outputs never populate `OutputDoc.url` and are never in `SRT_OUTPUT_TYPES`
 
 An `outputType: 'rtmp'` destination keeps its ingest URL + key in the structured `rtmp` object,
