@@ -299,6 +299,7 @@ describe('activate — recorder fields describe only the current activation', ()
       clipPlayerBlockIds: {},
       returnBuses: [],
       warnings: [],
+      inputRecorders: [],
       ...overrides,
     };
   }

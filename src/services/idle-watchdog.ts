@@ -264,6 +264,7 @@ export async function deactivateProduction(productionId: string, log: FastifyBas
     loudnessMainBlockId: undefined,
     recorderBlockId: undefined,
     recorderOutputDir: undefined,
+    inputRecorderBlockIds: undefined,
     sourceOffsetBlockIds: undefined,
     sourceAudioOffsetBlockIds: undefined,
     whepEndpoint: undefined,
