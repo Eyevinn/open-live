@@ -339,14 +339,17 @@ describe('guest page on a return-only slot', () => {
     expect(page.peers.some((pc) => pc.sentTracks > 0)).toBe(true);
   });
 
-  it('stops at page load on an expired invite', async () => {
+  it('treats an expired invite as main does: camera at load, join reports it', async () => {
     seedProduction();
     const inv = await invite('video_in_0');
     const doc = invitesStore.get(inv.id)!;
     invitesStore.set(inv.id, { ...doc, expiresAt: new Date(Date.now() - 1000).toISOString() });
     const page = await loadPage(inv);
-    expect(page.getUserMedia).not.toHaveBeenCalled();
-    expect(page.els['golive'].disabled).toBe(true);
+    expect(page.getUserMedia).toHaveBeenCalled();
+
+    page.els['golive'].click();
+    await settle();
     expect(page.els['banner'].textContent).toMatch(/expired/);
+    expect(page.peers.some((pc) => pc.sentTracks > 0)).toBe(false);
   });
 });

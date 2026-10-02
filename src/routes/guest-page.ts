@@ -581,25 +581,19 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       goLiveBtn.disabled = true;
       setBanner("This browser does not support live calling. Try a recent Chrome, Safari or Firefox.", "error");
     } else {
-      // Ask the server what the slot takes before touching any device.
+      // Ask the server what the slot takes before touching any device. Only a
+      // clear "return-only" answer changes anything: any other result (a dead
+      // link, no network, server trouble) goes the usual camera way, and join
+      // reports what is wrong.
       goLiveBtn.disabled = true;
-      // A dead link (invalid, expired, production gone or ended) stops here.
-      // Any other failure (no network, rate limit, server trouble, a slot the
-      // producer may restore) falls back to the camera, and join decides.
       fetch(apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/slot", {
         headers: { "Authorization": "Bearer " + token }
       }).then(function (res) {
-        return res.json().catch(function () { return {}; }).then(function (payload) {
-          if (res.ok) return payload;
-          var deadLink = res.status === 401 || res.status === 404 ||
-            (res.status === 409 && /expired|not active|ended/i.test((payload && payload.error) || ""));
-          if (deadLink) throw { handled: true, message: joinErrorMessage(res.status, payload) };
-          return {};
-        });
-      }, function () {
+        return res.ok ? res.json() : {};
+      }).catch(function () {
         return {};
       }).then(function (slot) {
-        if (slot.returnOnly) {
+        if (slot && slot.returnOnly) {
           hide(preview);
           hide(previewHint);
           hide(pickers);
@@ -618,8 +612,6 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         }, function () {
           setBanner("Could not access your camera or microphone. Check the browser permissions and reload.", "error");
         });
-      }).catch(function (err) {
-        setBanner(err && err.handled ? err.message : "Could not reach the studio. Check your connection and reload.", "error");
       });
     }
   })();
