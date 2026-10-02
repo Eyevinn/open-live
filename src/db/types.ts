@@ -354,7 +354,7 @@ export interface RecordingDoc {
   key: string;            // object key, e.g. "<productionId>/<segment>.mp4"
   sizeBytes?: number;
   durationMs?: number;
-  startedAt: string;      // ISO 8601 — when the recording session began
+  startedAt: string;      // ISO 8601 — when the recording session began, from the segment's file name
   endedAt?: string;       // ISO 8601 — when the segment was finalized/uploaded
   createdAt: string;
   updatedAt: string;

@@ -166,7 +166,7 @@ SRT passphrases are embedded in the source `address` and encrypted at rest befor
 
 1. A production is given source assignments (`POST /api/v1/productions/:id/sources`), plus any outputs and graphics.
 2. `POST /api/v1/productions/:id/activate` builds a Strom flow from the built-in topology in [`src/lib/default-flow.ts`](src/lib/default-flow.ts) — vision mixer, audio mixer, encoders and WHEP endpoints sized to the production's config — patches each assigned source's address into the matching block, then creates and starts the flow in Strom. The `stromFlowId` is stored on the production.
-3. `POST /api/v1/productions/:id/deactivate` stops and deletes the Strom flow and clears `stromFlowId`.
+3. `POST /api/v1/productions/:id/deactivate` stops and deletes the Strom flow and clears `stromFlowId`. If the production records and object storage is configured, it first uploads the recordings on Strom, including any that earlier sessions left there (see [Segments left on Strom](docs/specs/vod-recording-minio.md#segments-left-on-strom)).
 
 The flow topology is generated, not user-supplied: productions are configured through their sources, outputs, graphics and config values rather than by editing flow JSON.
 
