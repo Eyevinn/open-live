@@ -133,6 +133,14 @@ and fill in the values:
 | `GUEST_INVITE_TTL_S` | Default guest invite lifetime in seconds (invites stay short-lived on purpose) | `86400` |
 | `INTERCOM_MANAGER_URL` | Base URL of the Open Intercom manager ([`Eyevinn/intercom-manager`](https://github.com/Eyevinn/intercom-manager)) for operator↔guest talkback. Optional: when unset, guest calling still works with WHIP video + WHEP return but no talkback line | _(empty — talkback disabled)_ |
 | `INTERCOM_MANAGER_TOKEN` | Auth token for the Open Intercom manager. Optional; held server-side only and redacted from logs | _(empty)_ |
+| `MINIO_ENDPOINT` | Object storage (MinIO/S3) endpoint for uploading recordings, as `host[:port]` or a full URL. `S3_ENDPOINT` is accepted as a fallback. Recording does **not** need object storage: a `recording` output writes segments to Strom's media path (`recordings/<productionId>/`). When `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY` and `MINIO_BUCKET` are all set, deactivate uploads those segments to the bucket and the `/recordings` VOD endpoints serve them; otherwise the segments stay on Strom, deactivate skips the upload, and the VOD endpoints return 503. A partial set logs a startup warning and is treated as unset | _(empty — recordings stay on Strom)_ |
+| `MINIO_ACCESS_KEY` | Object storage access key (see `MINIO_ENDPOINT`) | _(empty)_ |
+| `MINIO_SECRET_KEY` | Object storage secret key (see `MINIO_ENDPOINT`) | _(empty)_ |
+| `MINIO_BUCKET` | Bucket that recordings are uploaded to (see `MINIO_ENDPOINT`) | _(empty)_ |
+| `MINIO_REGION` | S3 region used for request signing | `us-east-1` |
+| `MINIO_USE_SSL` | Use TLS to the endpoint when `MINIO_ENDPOINT` has no scheme | `true` |
+| `RECORDING_KEY_PREFIX` | Prefix prepended to every uploaded recording's object key | _(empty)_ |
+| `RECORDING_PRESIGN_TTL_S` | Lifetime in seconds of the presigned `playbackUrl` returned by the VOD endpoints | `3600` |
 
 > **Never commit `.env`** — it is gitignored. Use `.env.example` as the reference.
 

@@ -12,7 +12,7 @@ import { clearProductionPflState } from '../services/pfl-state.js';
 import { clearPipState, clearAudioState, clearFxState, clearClipStateForProduction, reinitConnectedControllers } from '../ws/controller.js';
 import { forceStopMeterRelay } from '../services/meter-relay.js';
 import { forceStopClipRelay } from '../services/clip-relay.js';
-import { config, isRecordingEnabled } from '../config.js';
+import { config } from '../config.js';
 import { minioTargetFromConfig, uploadRecordings } from '../lib/recording-uploader.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
@@ -846,14 +846,21 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         const stromToken = await getStromToken(config.stromToken).catch((err) => { req.log.error({ errMsg: err instanceof Error ? err.message : String(err) }, "SAT exchange failed — proceeding without auth"); return undefined; });
         const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
 
-        // VOD recording (issue #41): when a recorder block is active, finalise
-        // the current segment (recorder.splitNow) then upload Strom's local
-        // recordings to MinIO — Strom's recorder has no native S3 sink, so
-        // open-live pulls the segments and pushes them to object storage.
+        // VOD recording (issue #41): when a recorder block is active and object
+        // storage is configured, finalise the current segment (recorder.splitNow)
+        // then upload Strom's local recordings to MinIO — Strom's recorder has no
+        // native S3 sink, so open-live pulls the segments and pushes them to
+        // object storage. Without object storage the recordings stay on Strom's
+        // media path and teardown proceeds immediately.
         // Best-effort: a failed upload must not block deactivation/teardown.
-        if (doc.recorderBlockId && isRecordingEnabled()) {
+        if (doc.recorderBlockId) {
           const target = minioTargetFromConfig();
-          if (target) {
+          if (!target) {
+            req.log.info(
+              { productionId: doc._id, outputDir: `recordings/${doc._id}` },
+              'VOD recordings kept on Strom — object storage not configured, skipping upload',
+            );
+          } else {
             try {
               await strom.recorder.splitNow(doc.stromFlowId, doc.recorderBlockId).catch(() => undefined);
               const uploadRes = await uploadRecordings({

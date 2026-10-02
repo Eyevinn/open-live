@@ -124,10 +124,10 @@ components:
       type: string
       enum: [mpegtssrt, efpsrt, whep, recording]
       description: >
-        Output kind. 'recording' archives the programme to MinIO/S3 as a VOD via
-        Strom's builtin recorder (uploaded from local segments post-deactivate);
-        it is only accepted when MinIO/S3 is configured, otherwise creating a
-        recording output returns 400.
+        Output kind. 'recording' records the programme with Strom's builtin
+        recorder to Strom's media path. When MinIO/S3 is configured the segments
+        are uploaded to object storage on deactivate and listed by the
+        /recordings endpoints; otherwise they stay on Strom.
 
     OutputStatus:
       type: string
