@@ -104,6 +104,7 @@ async function activate(): Promise<Record<string, unknown>> {
     returnWhepEntries: [{ mixerInput: 'video_in_1', endpointId: 'ret-ep' }],
     mixerInputMap: {},
     warnings: [],
+    inputRecorders: [],
   });
 
   const app = await buildServer();

@@ -90,6 +90,7 @@ export async function reconcileProductionStatuses(
           stromFlowId: undefined,
           recorderBlockId: undefined,
           recorderOutputDir: undefined,
+          inputRecorderBlockIds: undefined,
           updatedAt: new Date().toISOString(),
         } as ProductionDoc);
         log.info({ productionId: doc._id, status: nextStatus }, '[reconcile] Reset stale production');
