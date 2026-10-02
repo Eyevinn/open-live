@@ -7,7 +7,9 @@
  *    the timeout, puts the previous mode back;
  *  - "Full program" warns that the guest will hear themselves, except while muted;
  *  - the poll follows a change the crew made, but never undoes a newer local pick;
- *  - leaving stops the poll, and so does a 401 (the guest was kicked).
+ *  - leaving stops the poll, and so do three 401s in a row (the guest was
+ *    kicked); a single 401 does not;
+ *  - once stopped, nothing brings the warning back.
  */
 import { describe, it, expect } from 'vitest';
 import vm from 'node:vm';
@@ -290,26 +292,82 @@ describe('guest page return-mode switch', () => {
     expect(els['mode-program']!.checked).toBe(true);
   });
 
-  it('stops polling and hides the switch once the guest is kicked', async () => {
+  it('stops polling and hides the switch after three 401s in a row (guest kicked)', async () => {
     let status = 200;
     const { els, tick, releaseGets, polling, gets } = await goLive({ getStatus: () => status });
     status = 401;
-    tick();
-    releaseGets();
-    await flush();
+    for (let i = 0; i < 3; i++) {
+      expect(polling()).toBe(true);
+      tick();
+      releaseGets();
+      await flush();
+    }
     expect(polling()).toBe(false);
     expect(els['return-mode']!.hidden).toBe(true);
     tick();
-    expect(gets()).toBe(1);
+    expect(gets()).toBe(3);
   });
 
-  it('stops polling when a mode change gets 401', async () => {
+  it('keeps the switch through a single 401 (a momentary server error)', async () => {
+    let status = 200;
+    const { els, server, tick, releaseGets, polling } = await goLive({ getStatus: () => status });
+    for (const next of [401, 401, 200, 401, 401, 200]) {
+      status = next;
+      tick();
+      releaseGets();
+      await flush();
+    }
+    expect(polling()).toBe(true);
+    expect(els['return-mode']!.hidden).toBe(false);
+    server.mode = 'program';
+    tick();
+    releaseGets();
+    await flush();
+    expect(els['mode-program']!.checked).toBe(true);
+  });
+
+  it('a refused mode change counts towards the 401s that stop the switch', async () => {
     const { els, pick, polling } = await goLive({ putStatus: 401 });
+    pick('program');
+    await flush();
+    expect(polling()).toBe(true);
+    expect(els['mode-program-minus']!.checked).toBe(true);
+    pick('program');
+    await flush();
     pick('program');
     await flush();
     expect(polling()).toBe(false);
     expect(els['return-mode']!.hidden).toBe(true);
     expect(els['self-warning']!.hidden).toBe(true);
+  });
+
+  it('keeps the warning hidden after the switch stops, even when the guest toggles mute', async () => {
+    let status = 200;
+    const { els, pick, tick, releaseGets } = await goLive({ getStatus: () => status });
+    pick('program');
+    await flush();
+    expect(els['self-warning']!.hidden).toBe(false);
+    status = 401;
+    for (let i = 0; i < 3; i++) {
+      tick();
+      releaseGets();
+      await flush();
+    }
+    els['mute']!.fire('click');
+    els['mute']!.fire('click');
+    expect(els['self-warning']!.hidden).toBe(true);
+  });
+
+  it('a mode change still pending at leave does not bring the warning back when it times out', async () => {
+    const { els, pick, fireLongTimers } = await goLive({ hangPut: true, returnMode: 'program' });
+    pick('program-minus');
+    await flush();
+    els['leave']!.fire('click');
+    await flush();
+    fireLongTimers();
+    await flush();
+    expect(els['self-warning']!.hidden).toBe(true);
+    expect(els['return-mode']!.hidden).toBe(true);
   });
 
   it('stops polling on leave', async () => {

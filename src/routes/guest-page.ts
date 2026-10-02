@@ -202,6 +202,11 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     // A mode change that has not answered by then is given up, so a stalled
     // request on a bad connection cannot hold off the poll for good.
     var MODE_PUT_TIMEOUT_MS = 10000;
+    // 401s in a row from the return-mode routes. The server also answers 401
+    // when its database errors for a moment, so the page only treats the guest
+    // as gone (kicked, invite revoked) after MODE_MAX_REFUSALS of them.
+    var modeRefusals = 0;
+    var MODE_MAX_REFUSALS = 3;
 
     function setBanner(text, cls) {
       banner.textContent = text;
@@ -368,13 +373,14 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         body: JSON.stringify({ mode: mode }),
         signal: abort.signal
       }).then(function (res) {
-        if (res.status === 401) { stopReturnMode(); return; }
+        if (res.status === 401) refused();
         if (!res.ok) throw new Error("mode change failed: " + res.status);
+        modeRefusals = 0;
       }).catch(function () {
         // Put back what the server still has, unless a newer change superseded
-        // this one. After a timeout the server may have applied it after all;
-        // the next poll shows whichever it has.
-        if (seq === modeSeq && previous) applyReturnAudio(previous);
+        // this one or the switch has been taken down. After a timeout the server
+        // may have applied it after all; the next poll shows whichever it has.
+        if (seq === modeSeq && previous && modePoll) applyReturnAudio(previous);
       }).then(function () {
         clearTimeout(timer);
         modePending--;
@@ -387,11 +393,12 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       fetch(returnUrl(), {
         headers: { "Authorization": "Bearer " + token }
       }).then(function (res) {
-        // 401: the guest is no longer live (kicked, or the invite was revoked).
-        if (res.status === 401) { stopReturnMode(); return null; }
-        return res.ok ? res.json() : null;
+        if (res.status === 401) { refused(); return null; }
+        if (!res.ok) return null;
+        modeRefusals = 0;
+        return res.json();
       }).then(function (data) {
-        if (!live || seq !== modeSeq || modePending > 0) return;
+        if (!live || !modePoll || seq !== modeSeq || modePending > 0) return;
         if (data && modeInputs[data.mode] && data.mode !== returnMode) applyReturnAudio(data.mode);
       }).catch(function () { /* try again next tick */ });
     }
@@ -412,8 +419,14 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       modePoll = setInterval(pollReturnMode, MODE_POLL_MS);
     }
 
+    function refused() {
+      if (++modeRefusals >= MODE_MAX_REFUSALS) stopReturnMode();
+    }
+
     function stopReturnMode() {
       if (modePoll) { clearInterval(modePoll); modePoll = null; }
+      // Clearing the mode keeps the warning hidden if the guest toggles mute later.
+      returnMode = null;
       hide(returnModeBox);
       hide(selfWarning);
     }

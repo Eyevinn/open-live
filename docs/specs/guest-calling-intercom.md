@@ -218,7 +218,8 @@ returnMode: 'program' | 'program-minus';   // current mode of the picture feed's
   invite's live session and act on its `mixerInput`, so a guest who has left cannot change the
   return of whoever holds the slot now. Guest and crew changes are last-write-wins; the guest
   page polls `GET …/session/return` (every 5 s) to follow a crew change, since guests have no
-  WebSocket. A 401 stops the poll and hides the switch; a PUT with no answer after 10 s is
+  WebSocket. Three 401s in a row (a single one can be a
+  momentary database error) stop the poll and hide the switch; a PUT with no answer after 10 s is
   abandoned and the previous mode shown until the next poll.
 - **Guest page switch** — once live, the page offers the two picture-switch modes ("Program
   without you" and "Full program"). With `program` on and the mic open it warns that the
