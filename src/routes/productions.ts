@@ -13,7 +13,7 @@ import { config, isRecordingEnabled } from '../config.js';
 import { minioTargetFromConfig, uploadProductionRecordings } from '../lib/recording-uploader.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
-import { buildProductionStatusEvent, deriveOutputSnapshot, type OutputStatusEntry } from '../lib/production-health.js';
+import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type OutputStatusEntry } from '../lib/production-health.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1026,21 +1026,15 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         req.log.warn({ err, productionId: doc._id }, 'guest-invite revoke failed — continuing deactivation');
       });
 
-      // An explicit `POST /deactivate` is a clean, operator-initiated teardown:
-      // the Strom flow is torn down here and now, so the production returns to the
-      // clean idle state `inactive` (issue #385 — matches the beta-regression
-      // baseline / check 7). `ended` is reserved for the paths where a live
-      // broadcast stopped *without* a clean explicit deactivate — idle-watchdog
-      // auto-deactivate (`endedReason: 'idle'`) and startup reconcile finding the
-      // Strom flow gone (`endedReason: 'flow-lost'`), which continue to derive
-      // their terminal state from `stoppedStatus()`. Explicit deactivate therefore
-      // always resolves to `inactive`, regardless of whether the production had
-      // reached `active`.
-      const nextStatus = 'inactive' as const;
+      // Transition rule (spec §1): a production that was `active` (reached a live
+      // broadcast) and is now explicitly deactivated becomes `ended`; one that
+      // never reached `active` (still `activating`) becomes `inactive` — it never
+      // broadcast, so there is nothing to "end".
+      const nextStatus = stoppedStatus(doc.status);
       const updated: ProductionDoc = {
         ...doc,
         status: nextStatus,
-        endedReason: undefined,
+        endedReason: nextStatus === 'ended' ? 'deactivated' : undefined,
         stromFlowId: undefined,
         mixerBlockId: undefined,
         audioMixerBlockId: undefined,
