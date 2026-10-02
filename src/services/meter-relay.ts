@@ -109,3 +109,22 @@ export function stopMeterRelay(productionId: string): void {
     relays.delete(productionId);
   }
 }
+
+/**
+ * Force-stop and forget the relay regardless of refCount (deactivate/teardown).
+ *
+ * Mirrors `forceStopClipRelay`. The relay filters Strom `MeterData`/`LoudnessData`
+ * by the `flowId` + mixer-block it was started with, and `startMeterRelay` only
+ * ref-counts into an existing relay — so if the relay is left alive across a
+ * deactivate→reactivate (which builds a NEW flow) every subsequent connect
+ * reuses the stale relay bound to the old flow and no client gets METER_DATA/
+ * LOUDNESS_DATA until every socket closes and the refCount reaches 0 (issue
+ * #416). Deactivate must force-stop here so reactivation can rebind to the new
+ * flow.
+ */
+export function forceStopMeterRelay(productionId: string): void {
+  const entry = relays.get(productionId);
+  if (!entry) return;
+  entry.stop();
+  relays.delete(productionId);
+}

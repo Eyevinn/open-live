@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { getDb, getSourcesDb, getGuestSessionsDb, getGuestInvitesDb } from '../db/index.js';
 import { updateProductionDoc } from '../routes/productions.js';
 import type { ProductionDoc, ClipState, SourceDoc, GuestSessionState } from '../db/types.js';
-import { getTally, setTally, subscribe, unsubscribe, broadcast, nextSeq, currentSeq } from '../services/tally.service.js';
+import { getTally, setTally, subscribe, unsubscribe, broadcast, nextSeq, currentSeq, getSubscriberCount } from '../services/tally.service.js';
 import {
   cueClip, playClip, stopClip, pauseClip, seekClip,
   resolveClipSource, resolveClipTarget,
@@ -796,6 +796,129 @@ export function clearAudioState(productionId: string): void {
   pgmBgByProduction.delete(productionId)
   pgmPipByProduction.delete(productionId)
   pvwPipByProduction.delete(productionId)
+}
+
+/**
+ * Re-run first-connect audio init and restart the meter/clip relays for a
+ * production that has just (re)activated with a NEW Strom flow, targeting the
+ * controller operators that stayed connected across a deactivate→reactivate
+ * cycle (issue #416).
+ *
+ * On deactivate both relays are force-stopped and `clearAudioState` wipes the
+ * per-production registries, but a controller socket that stays open is never
+ * re-run through the WS connect handler. Without this, such a socket sits on the
+ * OLD flow's (now torn-down) relays — so no client gets METER_DATA/LOUDNESS_DATA
+ * or CLIP_STATE — and on an un-initialised mixer whose NEXT fresh connect would
+ * run first-connect init and reset every channel to fader 1.0 / unmuted / to
+ * main, clobbering any change made since reactivation.
+ *
+ * Fixing it here: when at least one controller is connected, initialise the new
+ * flow's audio ONCE (so a later fresh connect inherits rather than re-inits) and
+ * restart both relays bound to the new flow, ref-counted once per connected
+ * controller so each is torn down only when the last of those sockets closes.
+ * A no-op when nobody is connected — the next connect runs the normal path.
+ *
+ * TODO(#415): once watch-only controller connections land (draft PR #417), a
+ * watch-only viewer must not count here — exclude it from the connected-operator
+ * count below (and therefore from the relay ref-count and the init trigger).
+ */
+export async function reinitConnectedControllers(productionId: string): Promise<void> {
+  // Watch-only connections (#415) are not yet on main, so every subscriber is a
+  // full controller operator today (see TODO above).
+  const connectedCount = getSubscriberCount(productionId);
+  if (connectedCount === 0) return;
+
+  let doc: ProductionDoc;
+  try {
+    doc = await getDb().get(productionId) as ProductionDoc;
+  } catch {
+    return;
+  }
+  if (!doc.stromFlowId) return;
+  const flowId = doc.stromFlowId;
+
+  // Mark the new flow as current so a subsequent fresh connect does not treat it
+  // as a pipeline change and wipe the state we are about to initialise.
+  activeFlowIdByProduction.set(productionId, flowId);
+
+  try {
+    const strom = await makeStromClient();
+    const { flow } = await strom.flows.get(flowId);
+    const blocks = flow.blocks ?? [];
+    const audioBlockId = doc.audioMixerBlockId ?? blocks.find((b) => b.block_definition_id === 'builtin.mixer')?.id;
+    if (audioBlockId) {
+      const mixerBlock = blocks.find((b) => b.id === audioBlockId);
+      const rawNumCh = mixerBlock?.properties?.num_channels;
+      const numChannels = typeof rawNumCh === 'number' ? rawNumCh
+        : typeof rawNumCh === 'string' ? parseInt(rawNumCh, 10)
+        : 0;
+      numAudioChannelsByProduction.set(productionId, numChannels);
+
+      // Initialise ONCE. If clearAudioState already ran (deactivate) the registry
+      // is cold; if some fresh connect raced ahead and initialised the new flow,
+      // leave its state untouched.
+      const isFirstInit = !afvChannelsByProduction.has(productionId);
+      if (isFirstInit) {
+        afvChannelsByProduction.set(productionId, new Set());
+        const muted = new Set<string>();
+        mutedElementsByProduction.set(productionId, muted);
+        const initProps: Record<string, unknown> = {};
+        const levelCache = channelLevelsByProduction.get(productionId) ?? new Map<string, number>();
+        for (let i = 1; i <= numChannels; i++) {
+          initProps[`ch${i}_fader`] = 1.0;
+          initProps[`ch${i}_mute`] = false;
+          initProps[`ch${i}_to_main`] = true;
+          levelCache.set(`ch${i}`, 1.0);
+        }
+        initProps['main_fader'] = 1.0;
+        levelCache.set('main', 1.0);
+        channelLevelsByProduction.set(productionId, levelCache);
+        const initResult = await strom.flows.updateBlockProperties(flowId, audioBlockId, { properties: initProps })
+          .catch((err) => { console.warn('[controller] reinit channel props error:', err); return null; });
+        // Mirror the first-connect guard (#396): a channel Strom refused to route
+        // to main is reported muted rather than falsely told live.
+        if (initResult) {
+          for (let i = 1; i <= numChannels; i++) {
+            const toMainKey = `ch${i}_to_main`;
+            const toMainRejected = Object.prototype.hasOwnProperty.call(initResult.rejected ?? {}, toMainKey);
+            const toMainReported = initResult.properties?.[toMainKey];
+            if (toMainRejected || toMainReported === false) {
+              muted.add(`ch${i}`);
+            }
+          }
+        }
+        // Push the freshly-initialised defaults to every connected operator so a
+        // socket that stayed open across reactivation drops its stale mixer view.
+        for (let i = 1; i <= numChannels; i++) {
+          broadcast(productionId, { type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'volume', value: 1.0 });
+          broadcast(productionId, { type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'mute', value: muted.has(`ch${i}`) });
+        }
+        broadcast(productionId, { type: 'AUDIO_STATE', elementId: 'main', property: 'volume', value: 1.0 });
+        broadcast(productionId, { type: 'GRP_STATE_RESET' });
+      }
+
+      // Restart the meter relay against the NEW flow, once per connected operator
+      // so the refCount matches the sockets that will later call stopMeterRelay.
+      for (let i = 0; i < connectedCount; i++) {
+        startMeterRelay(productionId, flowId, audioBlockId, doc.loudnessMainBlockId);
+      }
+    }
+  } catch (err) {
+    console.warn('[controller] reinit audio/meter error:', err);
+  }
+
+  // Restart the clip relay against the NEW flow (same ref-count reasoning).
+  if (doc.clipPlayerBlockIds) {
+    const blockToInput = new Map<string, string>();
+    for (const [mixerInput, blockId] of Object.entries(doc.clipPlayerBlockIds)) {
+      blockToInput.set(blockId, mixerInput);
+    }
+    if (blockToInput.size > 0) {
+      for (let i = 0; i < connectedCount; i++) {
+        startClipRelay(productionId, flowId, blockToInput);
+      }
+    }
+  }
 }
 
 /**
@@ -1959,14 +2082,6 @@ export async function handleMessage(
             }
           }, 150));
         } else {
-          // Update mute registry for state restoration on reconnect
-          if (msg.elementId !== 'main') {
-            const mutedSet = mutedElementsByProduction.get(productionId);
-            if (mutedSet) {
-              if (msg.value === true) mutedSet.add(msg.elementId);
-              else mutedSet.delete(msg.elementId);
-            }
-          }
           let props: Record<string, unknown>;
           if (msg.elementId === 'main') {
             props = { main_mute: msg.value };
@@ -1991,6 +2106,22 @@ export async function handleMessage(
             properties: props,
             ...(msg.ramp_ms !== undefined && { ramp_ms: msg.ramp_ms }),
           });
+          // Update the mute registry for state restoration on reconnect *after* the
+          // Strom write settles, re-fetching the current per-production Set rather
+          // than mutating one captured earlier. If the production was deactivated
+          // (and possibly reactivated) while this write was stalled on Strom, the
+          // Set that existed when the message arrived has since been replaced by
+          // clearAudioState + the next first-connect reset. Writing to that stale
+          // Set would leave the live registry wrong and tell the next connect a
+          // channel Strom is holding off program is live (#402). A get() miss means
+          // the production is no longer active, so there is nothing to record.
+          if (msg.elementId !== 'main') {
+            const mutedSet = mutedElementsByProduction.get(productionId);
+            if (mutedSet) {
+              if (msg.value === true) mutedSet.add(msg.elementId);
+              else mutedSet.delete(msg.elementId);
+            }
+          }
           broadcast(productionId, { type: 'AUDIO_STATE', elementId: msg.elementId, property: msg.property, value: msg.value });
         }
       } catch (err) {
