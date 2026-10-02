@@ -2,11 +2,9 @@
  * Integration tests for the production lifecycle + output health feature
  * (issue #255, spec docs/specs/production-lifecycle-health.md).
  *
- * Covers the stop paths: an explicit deactivate is a clean teardown that always
- * returns to `inactive` (issue #385), while the automatic/abnormal stops
- * (idle-watchdog auto-deactivate, startup reconcile finding the flow gone) take
- * an `active` production to `ended`; that a never-activated production stays
- * `inactive`, the REST `Output.status` derivation
+ * Covers the three `active → ended` stop paths (explicit deactivate,
+ * idle-watchdog auto-deactivate, startup reconcile), that a never-activated
+ * production stays `inactive`, the REST `Output.status` derivation
  * (healthy / down / unknown), and the WS `PRODUCTION_STATUS` lifecycle event
  * (broadcast on transition + connect snapshot). CouchDB and Strom are mocked.
  */
@@ -129,8 +127,8 @@ beforeEach(() => {
 // Stop path 1: explicit deactivate
 // ---------------------------------------------------------------------------
 
-describe('explicit deactivate — clean teardown always → inactive (issue #385)', () => {
-  it('an active production that is explicitly deactivated returns to inactive (no endedReason)', async () => {
+describe('explicit deactivate — active → ended, activating → inactive (spec §1)', () => {
+  it('an active production that is deactivated becomes ended (endedReason: deactivated)', async () => {
     const doc = makeProductionDoc({ status: 'active', stromFlowId: 'flow-abc', mixerBlockId: 'mixer-1' });
     mockGet.mockResolvedValue(doc);
     mockDeactivateStromFlow.mockResolvedValue(undefined);
@@ -139,14 +137,11 @@ describe('explicit deactivate — clean teardown always → inactive (issue #385
     const app = await buildServer();
     const res = await app.inject({ method: 'POST', url: '/api/v1/productions/prod-test-1/deactivate' });
 
-    // An explicit deactivate is a clean, operator-initiated teardown: the flow is
-    // torn down here and now, so the terminal state is `inactive`, not `ended`.
-    // `ended` is reserved for the idle-watchdog and reconcile stop paths below.
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body).status).toBe('inactive');
+    expect(JSON.parse(res.body).status).toBe('ended');
     const inserted = mockInsert.mock.calls[0][0];
-    expect(inserted.status).toBe('inactive');
-    expect(inserted.endedReason).toBeUndefined();
+    expect(inserted.status).toBe('ended');
+    expect(inserted.endedReason).toBe('deactivated');
     expect(inserted.stromFlowId).toBeUndefined();
   });
 
@@ -210,7 +205,7 @@ describe('explicit deactivate — clean teardown always → inactive (issue #385
     expect(mockInsert.mock.calls[0][0].status).toBe('inactive');
   });
 
-  it('broadcasts PRODUCTION_STATUS { status: inactive } to subscribers on deactivate', async () => {
+  it('broadcasts PRODUCTION_STATUS { status: ended } to subscribers on deactivate', async () => {
     const doc = makeProductionDoc({
       status: 'active',
       stromFlowId: 'flow-abc',
@@ -230,7 +225,7 @@ describe('explicit deactivate — clean teardown always → inactive (issue #385
     const statusEvt = ws.messages().find((m) => m.type === 'PRODUCTION_STATUS');
     expect(statusEvt).toBeDefined();
     expect(statusEvt!.productionId).toBe('prod-test-1');
-    expect(statusEvt!.status).toBe('inactive');
+    expect(statusEvt!.status).toBe('ended');
     expect(typeof statusEvt!.ts).toBe('string'); // stamped by broadcast()
     // Flow torn down → all assigned outputs derive as down.
     expect(statusEvt!.outputs).toEqual([
