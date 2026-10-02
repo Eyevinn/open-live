@@ -350,6 +350,8 @@ export interface RecordingDoc {
   type: 'recording';
   productionId: string;   // references ProductionDoc._id
   outputId?: string;      // the 'recording' OutputDoc that produced it, when known
+  mixerInput?: string;    // the input it records (ProductionSourceAssignment.record); absent for the program recording
+  track?: 'video' | 'audio'; // which of that input's tracks; each is recorded to its own file
   bucket: string;
   key: string;            // object key, e.g. "<productionId>/<segment>.mp4"
   sizeBytes?: number;
@@ -530,6 +532,19 @@ export interface ProductionConfigDoc {
 // --------------- Production types ---------------
 
 /**
+ * How a source assignment's input is recorded on its own (docs/recording-inputs.md).
+ * - `off`: not recorded (the default).
+ * - `transcode`: decoded picture and sound → builtin.videoenc / builtin.audioenc → recorder.
+ *   The mode for browser WHIP feeds: their H.264 has irregular keyframes, and a
+ *   keyframe request cannot reach the browser from the recorder's side of
+ *   Strom's WHIP session bridge.
+ * - `passthrough`: the encoded streams straight into the recorder, for SRT/EFP
+ *   feeds from encoders with a fixed GOP. Not built yet: the API rejects it,
+ *   and activation skips an assignment that still carries it, with a warning.
+ */
+export type InputRecordMode = 'off' | 'transcode' | 'passthrough';
+
+/**
  * Maps a source from the sources catalogue to a mixer input in the template.
  */
 export interface ProductionSourceAssignment {
@@ -545,6 +560,12 @@ export interface ProductionSourceAssignment {
    * v1 accepts `lowLatency: false` only.
    */
   returnFeed?: { synced: 'program' | 'program-minus'; lowLatency?: boolean };
+  /**
+   * Whether this input is recorded on its own, beside the program recording.
+   * Off unless set: the feed may already be recorded upstream, and in a
+   * delayed production the mixer inputs are bridged out of the store.
+   */
+  record?: InputRecordMode;
 }
 
 /**
@@ -621,6 +642,8 @@ export interface ProductionDoc {
   recorderBlockId?: string;
   /** Strom media directory this activation's recorder writes into — set on activate alongside recorderBlockId, cleared on deactivate */
   recorderOutputDir?: string;
+  /** Maps mixerInput → builtin.recorder block ID per track of that input's own recording (ProductionSourceAssignment.record) — set on activate, cleared on deactivate */
+  inputRecorderBlockIds?: Record<string, { video?: string; audio?: string }>;
   /** WHEP multiview endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */
   whepEndpoint?: string;
   /** WHEP PGM output endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */
@@ -692,7 +715,7 @@ export interface ProductionDoc {
    * Problems found while going on air that did not stop activation, such as a
    * recording that will have no sound. Cleared on next activation.
    */
-  activationWarnings?: Array<{ type: 'recording-no-audio'; message: string }>;
+  activationWarnings?: Array<{ type: 'recording-no-audio' | 'input-recording-incomplete'; message: string }>;
   /** Set when the idle watchdog auto-deactivated this production; cleared on next activation */
   autoDeactivated?: boolean;
   /**

@@ -33,6 +33,7 @@
 import { createHash, createHmac, randomUUID } from 'crypto';
 import { config } from '../config.js';
 import { StromClientError, type MediaEntry, type StromClient } from './strom.js';
+import { INPUT_RECORDING_DIR_RE, inputRecordingFilePrefix, type InputTrack } from './input-recording.js';
 
 export interface MinioTarget {
   endpoint: string; // host[:port], no scheme
@@ -57,6 +58,10 @@ export interface UploadedSegment {
   activationStartedAt?: string;
   /** When Strom last wrote the file (ISO 8601), if Strom reported it. */
   modifiedAt?: string;
+  /** The input it records, for a per-input recording; absent for the program. */
+  mixerInput?: string;
+  /** Which of that input's tracks the file holds. */
+  track?: InputTrack;
 }
 
 export interface UploadResult {
@@ -432,6 +437,9 @@ export interface UploadProductionRecordingsArgs extends Omit<UploadRecordingsArg
  * whose upload failed at its own deactivate is picked up by a later one.
  * A production that never recorded (no directory on Strom) uploads nothing.
  *
+ * Inside an activation's directory, files are the program recording and
+ * `video_in_N/` subdirectories hold per-input recordings.
+ *
  * Stops at the first object-store auth rejection (abortedOnAuthError).
  *
  * Then deletes from Strom every swept file that is in object storage,
@@ -452,14 +460,29 @@ export async function uploadProductionRecordings(args: UploadProductionRecording
 
   const swept: SweptDir[] = [];
   for (const dir of entries.filter((e) => e.is_directory)) {
-    let files: MediaEntry[];
+    let listed: MediaEntry[];
     try {
-      files = ((await strom.media.list(dir.path)).entries ?? []).filter((e) => !e.is_directory);
+      listed = (await strom.media.list(dir.path)).entries ?? [];
     } catch (err) {
       result.failed.push({ file: dir.path, error: err instanceof Error ? err.message : String(err) });
       continue;
     }
-    const done = await uploadFiles(args, files, activationStartFromDirName(dir.name), isUploaded, result);
+    const startedAt = activationStartFromDirName(dir.name);
+    // Subdirectories first, so the activation's own directory is only removed
+    // once they have been.
+    for (const sub of listed.filter((e) => e.is_directory && INPUT_RECORDING_DIR_RE.test(e.name))) {
+      let files: MediaEntry[];
+      try {
+        files = ((await strom.media.list(sub.path)).entries ?? []).filter((e) => !e.is_directory);
+      } catch (err) {
+        result.failed.push({ file: sub.path, error: err instanceof Error ? err.message : String(err) });
+        continue;
+      }
+      const done = await uploadFiles(args, files, startedAt, isUploaded, result, sub.name);
+      swept.push({ path: sub.path, fileCount: files.length, done });
+    }
+    const files = listed.filter((e) => !e.is_directory);
+    const done = await uploadFiles(args, files, startedAt, isUploaded, result);
     swept.push({ path: dir.path, fileCount: files.length, done });
     // The store rejected our credentials; every other directory would fail the same way.
     if (result.abortedOnAuthError) break;
@@ -485,6 +508,7 @@ async function uploadFiles(
   activationStartedAt: string | undefined,
   isUploaded: (key: string) => Promise<boolean>,
   result: UploadResult,
+  mixerInput?: string,
 ): Promise<string[]> {
   const { stromUrl, stromToken, productionId, target } = args;
   const done: string[] = [];
@@ -503,6 +527,8 @@ async function uploadFiles(
         stromPath: entry.path,
         ...(activationStartedAt ? { activationStartedAt } : {}),
         ...(entry.modified ? { modifiedAt: new Date(entry.modified * 1000).toISOString() } : {}),
+        ...(mixerInput ? { mixerInput } : {}),
+        ...(mixerInput ? trackOf(productionId, mixerInput, entry.name) : {}),
       });
       done.push(entry.path);
     } catch (err) {
@@ -522,6 +548,11 @@ async function uploadFiles(
     }
   }
   return done;
+}
+
+function trackOf(productionId: string, mixerInput: string, fileName: string): { track?: InputTrack } {
+  const track = (['video', 'audio'] as const).find((t) => fileName.startsWith(`${inputRecordingFilePrefix(productionId, mixerInput, t)}_`));
+  return track ? { track } : {};
 }
 
 interface SweptDir {

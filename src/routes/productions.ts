@@ -191,6 +191,7 @@ function deactivatedDoc(
     loudnessMainBlockId: undefined,
     recorderBlockId: undefined,
     recorderOutputDir: undefined,
+    inputRecorderBlockIds: undefined,
     sourceOffsetBlockIds: undefined,
     sourceAudioOffsetBlockIds: undefined,
     clipPlayerBlockIds: undefined,
@@ -419,6 +420,9 @@ async function runActivationFlow(
       // recorder fields a previous activation left behind.
       recorderBlockId: activation.recorderBlockId,
       recorderOutputDir: activation.recorderOutputDir,
+      inputRecorderBlockIds: activation.inputRecorders.length > 0
+        ? Object.fromEntries(activation.inputRecorders.map((r) => [r.mixerInput, r.blockIds]))
+        : undefined,
       ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
       ...(Object.keys(activation.sourceAudioOffsetBlockIds).length > 0 && { sourceAudioOffsetBlockIds: activation.sourceAudioOffsetBlockIds }),
       ...(Object.keys(activation.clipPlayerBlockIds).length > 0 && { clipPlayerBlockIds: activation.clipPlayerBlockIds }),
@@ -635,6 +639,7 @@ async function runActivationFlow(
       mixerBlockId: undefined,
       recorderBlockId: undefined,
       recorderOutputDir: undefined,
+      inputRecorderBlockIds: undefined,
       whepEndpoint: undefined,
       pgmWhepEndpoint: undefined,
       whipEndpoints: undefined,
@@ -744,10 +749,18 @@ const ReturnFeedInput = z
   })
   .optional();
 
+// Passthrough recording (encoded streams into the recorder, no transcode) is
+// not built yet; it is refused here rather than saved and skipped at activation.
+const RecordModeInput = z
+  .enum(['off', 'transcode', 'passthrough'])
+  .refine((mode) => mode !== 'passthrough', { message: "record: 'passthrough' is not supported yet; use 'transcode'" })
+  .optional();
+
 const SourceAssignmentInput = z.object({
   sourceId: z.string().min(1).max(128),
   mixerInput: mixerInputSchema,
   returnFeed: ReturnFeedInput,
+  record: RecordModeInput,
 });
 
 const GraphicAssignmentInput = z.object({
@@ -1045,13 +1058,17 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       // registered, so a session whose upload failed (or that ended without
       // this route, e.g. the idle watchdog) is uploaded here instead of lost.
       // Best-effort: a failed upload must not block deactivation/teardown.
+      const inputRecorderBlockIds = Object.values(doc.inputRecorderBlockIds ?? {}).flatMap((ids) => Object.values(ids));
       if (isRecordingEnabled()) {
         const target = minioTargetFromConfig();
         if (target) {
           try {
-            if (doc.recorderBlockId) {
-              await strom.recorder.splitNow(doc.stromFlowId, doc.recorderBlockId).catch(() => undefined);
-            }
+            const flowId = doc.stromFlowId;
+            await Promise.all(
+              [doc.recorderBlockId, ...inputRecorderBlockIds]
+                .filter((id): id is string => !!id)
+                .map((id) => strom.recorder.splitNow(flowId, id).catch(() => undefined)),
+            );
             const uploadRes = await uploadProductionRecordings({
               strom,
               stromUrl: config.stromUrl,
@@ -1094,7 +1111,9 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
                   _id: recordingDocId(target.bucket, seg.key),
                   type: 'recording',
                   productionId: doc._id,
-                  ...(recordingOutputId ? { outputId: recordingOutputId } : {}),
+                  ...(seg.mixerInput
+                    ? { mixerInput: seg.mixerInput, ...(seg.track && { track: seg.track }) }
+                    : recordingOutputId ? { outputId: recordingOutputId } : {}),
                   bucket: target.bucket,
                   key: seg.key,
                   sizeBytes: seg.sizeBytes,
@@ -1172,6 +1191,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       ...(body.returnFeed
         ? { returnFeed: { synced: body.returnFeed.synced, lowLatency: false as const } }
         : {}),
+      ...(body.record && body.record !== 'off' && { record: body.record }),
     };
     for (let attempt = 0; attempt < MAX_DB_WRITE_RETRIES; attempt++) {
       try {
