@@ -108,6 +108,13 @@ vi.mock('../lib/strom.js', async (importOriginal) => {
 
 vi.mock('../services/guest-sweep.js', () => ({ sweepGuestsOnProductionEnd: vi.fn().mockResolvedValue(undefined) }));
 
+// The real index waits for Strom's WebSocket, which the mocked client never opens.
+vi.mock('../services/recording-index.js', () => ({
+  openRecordingIndex: vi.fn(async (productionId: string) => ({ productionId })),
+  bindRecordingIndex: vi.fn(),
+  closeRecordingIndex: vi.fn().mockResolvedValue(undefined),
+}));
+
 const mockUploadRecordings = vi.fn();
 vi.mock('../lib/recording-uploader.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/recording-uploader.js')>();
