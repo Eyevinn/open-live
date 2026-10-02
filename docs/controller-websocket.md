@@ -23,10 +23,41 @@ security fix for exactly that gap. Subscriber counts are also observable by oper
 through `GET /api/v1/productions/{id}/controllers`. In short, the code already treats
 this as a first-class surface that carries live production commands.
 
-**Read-only observers are technically supported.** A client may connect, never send an
-inbound message, and simply consume the outbound broadcasts (for example to observe
-mixer cuts). Nothing in the handler requires a client to send anything; the connection
-receives a state snapshot on connect and all subsequent broadcasts.
+**Read-only observers should connect watch-only** (see [Watch-only connections](#watch-only-connections)).
+A plain connection that never sends anything is still an operator connection: if it is
+the first one after (re)activation it runs the audio-mixer reset, and it keeps the
+production alive against the idle watchdog.
+
+## Watch-only connections
+
+```
+WS /ws/productions/:id/controller?mode=watch
+```
+
+For passive consumers such as tally loggers. Authentication is unchanged. A watch-only
+connection:
+
+- receives the same connect-time snapshot (ending in `SNAPSHOT_END`) and every broadcast;
+- may not send commands. Every inbound frame is answered with a `NACK` (when it carries a
+  `cmdId`) or an `ERROR`, and has no effect. This includes `KEEP_ALIVE`;
+- never runs the first-connect audio-mixer reset. That still happens on the first
+  operator connection, however many watchers connected before it;
+- makes no other Strom writes and seeds no server-side state that would change what a later
+  operator connection does. A persisted PiP layout or clip cue is reported but left for the
+  next operator connect to restore;
+- does not count in `GET /api/v1/productions/{id}/controllers` `count` (it is reported
+  in `watchers`) or in the list endpoint's `subscriberCount`, and does not reset the idle
+  timer, so watchers alone do not keep a production alive;
+- does not start the meter or clip relays. `METER_DATA`, `LOUDNESS_DATA` and relayed
+  `CLIP_STATE` updates arrive only while an operator connection is open.
+
+Before any operator has connected, the snapshot's `AUDIO_STATE` mute values come from
+Strom's `chN_to_main` routing rather than the server's mute registry. When the first
+operator connection then resets the mixer, the new channel and main values are broadcast as
+`AUDIO_STATE`, so watchers that connected earlier follow the reset.
+
+Any other `mode` value is rejected: the server sends an `ERROR` and closes with code 1008,
+rather than treating the connection as an operator.
 
 > **Stability note (TBD by maintainers).** What is documented below reflects the message
 > contract as implemented in `src/ws/controller.ts` at the time of writing. Whether that

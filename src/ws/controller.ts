@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { getDb, getSourcesDb, getGuestSessionsDb, getGuestInvitesDb } from '../db/index.js';
 import { updateProductionDoc } from '../routes/productions.js';
 import type { ProductionDoc, ClipState, SourceDoc, GuestSessionState } from '../db/types.js';
-import { getTally, setTally, subscribe, unsubscribe, broadcast, nextSeq, currentSeq, getSubscriberCount } from '../services/tally.service.js';
+import { getTally, setTally, subscribe, unsubscribe, broadcast, nextSeq, currentSeq, getOperatorSockets } from '../services/tally.service.js';
 import {
   cueClip, playClip, stopClip, pauseClip, seekClip,
   resolveClipSource, resolveClipTarget,
@@ -799,6 +799,36 @@ export function clearAudioState(productionId: string): void {
 }
 
 /**
+ * Tells every connected socket the mixer state after first-connect init. Levels
+ * come from the cache rather than the init defaults, so a fader moved while the
+ * init write was in flight is not reported back at unity.
+ */
+function broadcastAudioReset(productionId: string, numChannels: number, muted: Set<string>): void {
+  const levels = channelLevelsByProduction.get(productionId);
+  for (let i = 1; i <= numChannels; i++) {
+    broadcast(productionId, { type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'volume', value: levels?.get(`ch${i}`) ?? 1.0 });
+    broadcast(productionId, { type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'mute', value: muted.has(`ch${i}`) });
+  }
+  broadcast(productionId, { type: 'AUDIO_STATE', elementId: 'main', property: 'volume', value: levels?.get('main') ?? 1.0 });
+}
+
+/**
+ * The flow whose meter/clip relay each operator socket holds one ref on. A
+ * socket releases on close only what it holds, and reinit takes refs on behalf
+ * of sockets that stayed open across a reactivation.
+ */
+const relayHolds = new WeakMap<WebSocket, { meter?: string; clip?: string }>();
+
+function relayHold(ws: WebSocket): { meter?: string; clip?: string } {
+  let hold = relayHolds.get(ws);
+  if (!hold) {
+    hold = {};
+    relayHolds.set(ws, hold);
+  }
+  return hold;
+}
+
+/**
  * Re-run first-connect audio init and restart the meter/clip relays for a
  * production that has just (re)activated with a NEW Strom flow, targeting the
  * controller operators that stayed connected across a deactivate→reactivate
@@ -814,19 +844,14 @@ export function clearAudioState(productionId: string): void {
  *
  * Fixing it here: when at least one controller is connected, initialise the new
  * flow's audio ONCE (so a later fresh connect inherits rather than re-inits) and
- * restart both relays bound to the new flow, ref-counted once per connected
- * controller so each is torn down only when the last of those sockets closes.
- * A no-op when nobody is connected — the next connect runs the normal path.
- *
- * TODO(#415): once watch-only controller connections land (draft PR #417), a
- * watch-only viewer must not count here — exclude it from the connected-operator
- * count below (and therefore from the relay ref-count and the init trigger).
+ * restart both relays bound to the new flow, taking one ref per connected
+ * operator socket that does not already hold one on this flow, so each relay is
+ * torn down only when the last of those sockets closes. Watch-only sockets
+ * neither trigger init nor hold relay refs. A no-op when no operator is
+ * connected — the next connect runs the normal path.
  */
 export async function reinitConnectedControllers(productionId: string): Promise<void> {
-  // Watch-only connections (#415) are not yet on main, so every subscriber is a
-  // full controller operator today (see TODO above).
-  const connectedCount = getSubscriberCount(productionId);
-  if (connectedCount === 0) return;
+  if (getOperatorSockets(productionId).length === 0) return;
 
   let doc: ProductionDoc;
   try {
@@ -887,20 +912,20 @@ export async function reinitConnectedControllers(productionId: string): Promise<
             }
           }
         }
-        // Push the freshly-initialised defaults to every connected operator so a
-        // socket that stayed open across reactivation drops its stale mixer view.
-        for (let i = 1; i <= numChannels; i++) {
-          broadcast(productionId, { type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'volume', value: 1.0 });
-          broadcast(productionId, { type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'mute', value: muted.has(`ch${i}`) });
-        }
-        broadcast(productionId, { type: 'AUDIO_STATE', elementId: 'main', property: 'volume', value: 1.0 });
+        // Push the freshly-initialised defaults to every connected socket so one
+        // that stayed open across reactivation drops its stale mixer view.
+        broadcastAudioReset(productionId, numChannels, muted);
         broadcast(productionId, { type: 'GRP_STATE_RESET' });
       }
 
-      // Restart the meter relay against the NEW flow, once per connected operator
+      // Restart the meter relay against the NEW flow, once per operator socket
       // so the refCount matches the sockets that will later call stopMeterRelay.
-      for (let i = 0; i < connectedCount; i++) {
+      // A socket that connected after activation already holds a ref.
+      for (const ws of getOperatorSockets(productionId)) {
+        const hold = relayHold(ws);
+        if (hold.meter === flowId) continue;
         startMeterRelay(productionId, flowId, audioBlockId, doc.loudnessMainBlockId);
+        hold.meter = flowId;
       }
     }
   } catch (err) {
@@ -914,8 +939,11 @@ export async function reinitConnectedControllers(productionId: string): Promise<
       blockToInput.set(blockId, mixerInput);
     }
     if (blockToInput.size > 0) {
-      for (let i = 0; i < connectedCount; i++) {
+      for (const ws of getOperatorSockets(productionId)) {
+        const hold = relayHold(ws);
+        if (hold.clip === flowId) continue;
         startClipRelay(productionId, flowId, blockToInput);
+        hold.clip = flowId;
       }
     }
   }
@@ -974,6 +1002,13 @@ export function setPipConfigSlot(productionId: string, pip: number, cfg: PipConf
  */
 export function hydratePipConfigsFromDoc(doc: ProductionDoc): PipConfig[] | null {
   if (pipConfigsByProduction.has(doc._id)) return null
+  const { configs, persisted } = pipConfigsFromDoc(doc)
+  if (configs) pipConfigsByProduction.set(doc._id, configs)
+  return persisted ? configs : null
+}
+
+/** The PiP layout the doc implies, without touching the cache. */
+function pipConfigsFromDoc(doc: ProductionDoc): { configs: PipConfig[] | null; persisted: boolean } {
   const rawNumPips = doc.values?.num_pips
   const numPips = typeof rawNumPips === 'number' ? Math.max(0, Math.round(rawNumPips))
     : typeof rawNumPips === 'string' ? Math.max(0, parseInt(rawNumPips, 10) || 0)
@@ -984,13 +1019,12 @@ export function hydratePipConfigsFromDoc(doc: ProductionDoc): PipConfig[] | null
     // num_pips even if it changed since the layout was saved.
     const restored = Array.from({ length: Math.max(numPips, persisted.length) }, (_, i) =>
       persisted[i] ?? { bg: null, zones: [], transforms: {} })
-    pipConfigsByProduction.set(doc._id, restored)
-    return restored
+    return { configs: restored, persisted: true }
   }
   if (numPips > 0) {
-    pipConfigsByProduction.set(doc._id, Array.from({ length: numPips }, () => ({ bg: null, zones: [], transforms: {} })))
+    return { configs: Array.from({ length: numPips }, () => ({ bg: null, zones: [], transforms: {} })), persisted: false }
   }
-  return null
+  return { configs: null, persisted: false }
 }
 
 /** Wipe all per-production FX state. Called when the pipeline changes or production deactivates. */
@@ -2701,14 +2735,45 @@ export function deriveGuestDisplayState(
   return 'joined';
 }
 
+/**
+ * Watch-only connections may not send commands. Every inbound frame is
+ * answered with a NACK when it carries a cmdId, otherwise an ERROR, so a client
+ * that sends commands by mistake finds out instead of being silently ignored.
+ */
+function rejectWatchOnlyMessage(productionId: string, ws: WebSocket, raw: string): void {
+  const error = 'Watch-only connection: commands are not accepted';
+  let cmdId: unknown;
+  try {
+    cmdId = (JSON.parse(raw) as { cmdId?: unknown } | null)?.cmdId;
+  } catch { /* not JSON: plain ERROR below */ }
+  if (typeof cmdId === 'string' && cmdId) {
+    sendNack(ws, productionId, cmdId, error);
+  } else {
+    ws.send(JSON.stringify({ type: 'ERROR', error }));
+  }
+}
+
 const controllerWs: FastifyPluginAsync = async (fastify) => {
-  fastify.get<{ Params: { id: string } }>(
+  fastify.get<{ Params: { id: string }; Querystring: { mode?: string } }>(
     '/ws/productions/:id/controller',
     { websocket: true },
     async (socket, req) => {
       const { id } = req.params;
-      subscribe(id, socket);
-      notifySubscriberJoin(id);
+      const { mode } = req.query;
+      // Fail closed on an unknown mode: a mistyped `watch` must not fall back to
+      // an operator connection that can run first-connect audio init.
+      if (mode !== undefined && mode !== 'watch') {
+        socket.send(JSON.stringify({ type: 'ERROR', error: `Unknown controller mode: ${mode}` }));
+        socket.close(1008, 'unknown mode');
+        return;
+      }
+      // Watch-only connections receive the snapshot and broadcasts but never
+      // write: no commands, no Strom writes, no registry/cache seeding that would
+      // change what a later operator connect does, no idle-timer reset, and they
+      // are not counted as operators.
+      const watchOnly = mode === 'watch';
+      subscribe(id, socket, { watchOnly });
+      if (!watchOnly) notifySubscriberJoin(id);
 
       // Per-connection context — mutable so the audio block ID can be populated
       // at connect time and reused on every subsequent AUDIO_SET without a flow fetch.
@@ -2717,15 +2782,23 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
       // Register message/close handlers immediately so no messages are dropped
       // while we perform the async connect-time sync below.
       socket.on('message', (raw: Buffer | string) => {
+        if (watchOnly) {
+          rejectWatchOnlyMessage(id, socket, raw.toString());
+          return;
+        }
         handleMessage(id, socket, raw.toString(), ctx).catch((err) => {
           console.error('[controller] unhandled message error:', err);
         });
       });
 
+      let socketClosed = false;
       socket.on('close', () => {
+        socketClosed = true;
         unsubscribe(id, socket);
-        stopMeterRelay(id);
-        stopClipRelay(id);
+        // Relays are ref-counted, so only release what this socket holds.
+        const hold = relayHolds.get(socket);
+        if (hold?.meter) stopMeterRelay(id);
+        if (hold?.clip) stopClipRelay(id);
         // Audio state registries are kept in memory so other connected clients
         // and future reconnects inherit the current AFV/mute configuration.
         // State is only wiped when the pipeline changes (new stromFlowId).
@@ -2741,7 +2814,7 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
       // If the pipeline changed while a client stayed connected across the restart,
       // stale channel-index registries would apply mutes/AFV to the wrong channels.
       // Wipe immediately so this connect is treated as a fresh start.
-      if (connectDoc?.stromFlowId) {
+      if (connectDoc?.stromFlowId && !watchOnly) {
         const lastFlowId = activeFlowIdByProduction.get(id)
         if (lastFlowId && lastFlowId !== connectDoc.stromFlowId) {
           clearAudioState(id)
@@ -2827,12 +2900,17 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
       // so the operator's PiP layout is restored. If nothing was persisted, seed
       // empty slots from num_pips so the PipPanel shows the correct number of slots
       // without requiring a SET_PIP first.
-      const restoredPipConfigs = connectDoc ? hydratePipConfigsFromDoc(connectDoc) : null;
+      // A watcher reads the doc's layout without caching it: a warm cache would
+      // make the next operator connect skip the Strom re-push below.
+      const restoredPipConfigs = connectDoc && !watchOnly ? hydratePipConfigsFromDoc(connectDoc) : null;
+      const watcherPips = watchOnly && connectDoc && !pipConfigsByProduction.has(id)
+        ? pipConfigsFromDoc(connectDoc).configs
+        : null;
       socket.send(JSON.stringify({
         type: 'PIP_STATE',
         pgmPip: pgmPipByProduction.get(id) ?? null,
         pvwPip: pvwPipByProduction.get(id) ?? null,
-        pips:   pipConfigsByProduction.get(id) ?? [],
+        pips:   pipConfigsByProduction.get(id) ?? watcherPips ?? [],
       }));
 
       // On the first connect after (re)activation, Strom's PiP slots start empty
@@ -2880,10 +2958,11 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             const numChannels = typeof rawNumCh === 'number' ? rawNumCh
               : typeof rawNumCh === 'string' ? parseInt(rawNumCh, 10)
               : 0;
-            numAudioChannelsByProduction.set(id, numChannels);
+            if (!watchOnly) numAudioChannelsByProduction.set(id, numChannels);
             // Only initialise registries on first connect for this production.
             // Subsequent connects (refresh, second operator) inherit existing state.
-            const isFirstConnect = !afvChannelsByProduction.has(id);
+            // A watcher never initialises; the first operator connect does.
+            const isFirstConnect = !watchOnly && !afvChannelsByProduction.has(id);
             if (isFirstConnect) {
               afvChannelsByProduction.set(id, new Set());
               mutedElementsByProduction.set(id, new Set());
@@ -2919,6 +2998,9 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
                   }
                 }
                 mutedElementsByProduction.set(id, initMuted);
+                // Watchers that connected first were shown Strom's pre-reset values.
+                // Skipped when the write failed: Strom still holds those values.
+                broadcastAudioReset(id, numChannels, initMuted);
               }
             }
             // Restore fader levels and mute state.
@@ -2926,7 +3008,7 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             // on every AUDIO_SET volume and survives page refreshes / new tabs within the
             // same server session. Strom block properties are used as a fallback for
             // values set before the server started (e.g. pipeline defaults).
-            const mutedSet = mutedElementsByProduction.get(id) ?? new Set<string>();
+            const mutedSet = mutedElementsByProduction.get(id);
             const levelCache = channelLevelsByProduction.get(id);
             const blockProps = await strom.flows.getBlockProperties(connectDoc.stromFlowId, audioBlockId).catch(() => null);
             for (let i = 1; i <= numChannels; i++) {
@@ -2936,7 +3018,10 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               if (volume !== undefined) {
                 socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'volume', value: volume }));
               }
-              const isMuted = mutedSet.has(`ch${i}`);
+              // No registry yet (only a watcher has connected): report Strom's routing.
+              const isMuted = mutedSet
+                ? mutedSet.has(`ch${i}`)
+                : blockProps?.properties[`ch${i}_to_main`] === false;
               socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'mute', value: isMuted }));
             }
             // Restore main fader level
@@ -3075,7 +3160,12 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               inputEffects: inputEffectsByProduction.get(id) ?? [],
               masterEffect: masterEffectByProduction.get(id) ?? { type: 'none' },
             }));
-            startMeterRelay(id, connectDoc.stromFlowId, audioBlockId, connectDoc.loudnessMainBlockId);
+            // Watchers get meters only while an operator's relay is running. A socket
+            // that closed during the connect sync must not take a ref it never releases.
+            if (!watchOnly && !socketClosed) {
+              startMeterRelay(id, connectDoc.stromFlowId, audioBlockId, connectDoc.loudnessMainBlockId);
+              relayHold(socket).meter = connectDoc.stromFlowId;
+            }
           }
         } catch (err) {
           console.warn('[controller] audio sync error:', err);
@@ -3124,9 +3214,10 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
           }
           // Cold registry: prefer restoring a persisted cue (OQ3) before falling
           // back to Strom's live state. A restored cue is put back into `cued` at
-          // the cue point and MUST NOT auto-play.
+          // the cue point and MUST NOT auto-play. A watcher leaves the re-cue
+          // (a Strom write) to the next operator connect.
           const persistedCue = connectDoc.clipCues?.[mixerInput];
-          if (persistedCue) {
+          if (persistedCue && !watchOnly) {
             try {
               if (!clipStrom) clipStrom = await makeStromClient();
               const source = await resolveClipSource(connectDoc, mixerInput, (sid) => getSourcesDb().get(sid) as Promise<SourceDoc>);
@@ -3163,7 +3254,8 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               ...(player.position_ns !== undefined ? { positionMs: Math.round(player.position_ns / 1e6) } : {}),
               ...(player.duration_ns !== undefined ? { durationMs: Math.round(player.duration_ns / 1e6) } : {}),
             };
-            setClipStateEntry(id, state);
+            // Not cached for a watcher: a warm registry would skip the operator's cue restore.
+            if (!watchOnly) setClipStateEntry(id, state);
             socket.send(JSON.stringify({ type: 'CLIP_STATE', ...state }));
           } catch (err) {
             console.warn(`[controller] clip state connect sync error (${mixerInput}):`, String(err));
@@ -3173,12 +3265,14 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
         // Start the reactive clip-relay for this production's clip player blocks
         // (OQ2). blockToInput is the inverse of clipPlayerBlockIds. Ref-counted:
         // one WS per production, stopped on the last controller disconnect.
-        if (connectDoc.stromFlowId) {
+        // The relay writes the registry, so a watcher does not start it.
+        if (connectDoc.stromFlowId && !watchOnly && !socketClosed) {
           const blockToInput = new Map<string, string>();
           for (const [mixerInput, blockId] of Object.entries(connectDoc.clipPlayerBlockIds)) {
             blockToInput.set(blockId, mixerInput);
           }
           startClipRelay(id, connectDoc.stromFlowId, blockToInput);
+          relayHold(socket).clip = connectDoc.stromFlowId;
         }
       }
 

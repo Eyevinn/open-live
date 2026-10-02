@@ -60,10 +60,12 @@ vi.mock('../lib/strom-token.js', () => ({
 // Throwaway Strom (drives the cold-registry player.getState restore path)
 // ---------------------------------------------------------------------------
 let playerState: Record<string, unknown> = { state: 'stopped' };
+const stromWrites: string[] = [];
 const stromServer: Server = createServer((req, res) => {
   const chunks: Buffer[] = [];
   req.on('data', (c: Buffer) => chunks.push(c));
   req.on('end', () => {
+    if (req.method !== 'GET') stromWrites.push(`${req.method} ${req.url}`);
     res.writeHead(200, { 'content-type': 'application/json' });
     if ((req.url ?? '').endsWith('/player/state')) res.end(JSON.stringify(playerState));
     else res.end(JSON.stringify({ success: true }));
@@ -115,9 +117,9 @@ function makeProductionDoc(overrides: Record<string, unknown> = {}) {
 
 let app: FastifyInstance;
 
-async function connectAndCollect(productionId: string, timeoutMs = 400): Promise<Array<Record<string, unknown>>> {
+async function connectAndCollect(productionId: string, timeoutMs = 400, query = ''): Promise<Array<Record<string, unknown>>> {
   const { port } = app.server.address() as AddressInfo;
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/productions/${productionId}/controller`);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/productions/${productionId}/controller${query}`);
   const messages: Array<Record<string, unknown>> = [];
   await new Promise<void>((resolve, reject) => {
     ws.on('message', (data) => {
@@ -138,6 +140,7 @@ beforeEach(async () => {
   vi.clearAllMocks();
   clearClipStateForProduction(PROD);
   playerState = { state: 'stopped' };
+  stromWrites.length = 0;
   productionDocs.clear();
   sourceDocs.clear();
   productionDocs.set(PROD, makeProductionDoc());
@@ -222,6 +225,21 @@ describe('WS connect snapshot — CLIP_STATE (spec §3)', () => {
     expect(clip).toBeDefined();
     expect(clip).toMatchObject({ mixerInput: 'video_in_0', state: 'cued', clipId: 'src-clip', positionMs: 4000 });
     expect(clip!.state).not.toBe('playing');
+  });
+
+  it('a watch-only connection reports live state and leaves the persisted cue for the operator', async () => {
+    productionDocs.set(PROD, makeProductionDoc({
+      clipCues: { video_in_0: { clipId: 'src-clip', positionMs: 4000, durationMs: 12000 } },
+    }));
+    playerState = { state: 'paused', position_ns: 4_000_000_000, duration_ns: 12_000_000_000 };
+
+    const watcher = await connectAndCollect(PROD, 400, '?mode=watch');
+    expect(watcher.find((m) => m.type === 'CLIP_STATE')).toMatchObject({ mixerInput: 'video_in_0', state: 'paused' });
+    expect(stromWrites).toEqual([]);
+
+    const operator = await connectAndCollect(PROD);
+    expect(operator.find((m) => m.type === 'CLIP_STATE')).toMatchObject({ mixerInput: 'video_in_0', state: 'cued', clipId: 'src-clip' });
+    expect(stromWrites.length).toBeGreaterThan(0);
   });
 
   it('emits no CLIP_STATE for a production with no clip sources', async () => {
