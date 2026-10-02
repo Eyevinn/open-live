@@ -605,6 +605,11 @@ export interface ProductionDoc {
   intercomProductionId?: string;
   /** Warnings accumulated when a referenced source/graphic/output was deleted while production was inactive */
   deletionWarnings?: Array<{ type: 'source' | 'graphic' | 'output'; name: string }>;
+  /**
+   * Problems found while going on air that did not stop activation, such as a
+   * recording that will have no sound. Cleared on next activation.
+   */
+  activationWarnings?: Array<{ type: 'recording-no-audio'; message: string }>;
   /** Set when the idle watchdog auto-deactivated this production; cleared on next activation */
   autoDeactivated?: boolean;
   /**
