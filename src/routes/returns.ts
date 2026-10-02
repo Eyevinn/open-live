@@ -1,12 +1,11 @@
-import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
+import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { getDb, getGuestInvitesDb, getGuestSessionsDb } from '../db/index.js';
-import type { GuestInviteDoc, ProductionDoc } from '../db/types.js';
+import { getDb, getGuestSessionsDb } from '../db/index.js';
+import type { ProductionDoc, ProductionSourceAssignment } from '../db/types.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { assertSameStromOrigin } from '../lib/url-validation.js';
 import { config, isGuestCallingEnabled } from '../config.js';
-import { getGuestSigningKey } from '../lib/guest-signing-key.js';
-import { verifyGuestInviteToken, hashGuestInviteToken } from '../lib/guest-invite-token.js';
+import { resolveGuestSession } from '../lib/guest-scope.js';
 import { applyReturnMode } from '../ws/controller.js';
 import { returnModesFor } from './guests.js';
 
@@ -212,51 +211,66 @@ const returnsRoutes: FastifyPluginAsync = async (fastify) => {
   );
 
   // -------------------------------------------------------------------------
-  // Guest — PUT session/return (token-authed; same shared mode handler)
+  // Guest — GET / PUT session/return (token-authed; PUT uses the shared mode handler)
   // -------------------------------------------------------------------------
+  // Both need the invite's LIVE session and take the mixerInput from it: once a
+  // guest has left, another invite may hold the slot, and a left guest's token
+  // must not change what that guest hears. The guest page polls the GET to
+  // follow mode changes the crew makes.
+  async function guestReturnSlot(
+    req: FastifyRequest<{ Params: { inviteId: string } }>,
+    reply: FastifyReply,
+  ): Promise<{ productionId: string; mixerInput: string; assignment: ProductionSourceAssignment } | null> {
+    if (!isGuestCallingEnabled()) {
+      await reply.status(503).send({ error: 'Guest calling is disabled', statusCode: 503 });
+      return null;
+    }
+    const token = bearerToken(req);
+    const who = token ? await resolveGuestSession(token) : undefined;
+    if (!who?.ok || who.invite._id !== req.params.inviteId) {
+      await reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
+      return null;
+    }
+    const { invite, session } = who;
+    let production: ProductionDoc;
+    try {
+      production = await getDb().get(invite.productionId);
+    } catch {
+      await reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+      return null;
+    }
+    const assignment = production.sources.find((s) => s.mixerInput === session.mixerInput);
+    if (!session.mixerInput || !assignment?.returnFeed) {
+      await reply.status(404).send({ error: 'No return on that input', statusCode: 404 });
+      return null;
+    }
+    return { productionId: invite.productionId, mixerInput: session.mixerInput, assignment };
+  }
+
+  fastify.get<{ Params: { inviteId: string } }>(
+    '/api/v1/guests/:inviteId/session/return',
+    async (req, reply) => {
+      const slot = await guestReturnSlot(req, reply);
+      if (!slot) return reply;
+      return reply.send({
+        mixerInput: slot.mixerInput,
+        mode: slot.assignment.returnFeed!.synced,
+        modes: returnModesFor(slot.mixerInput),
+        defaultMode: 'program-minus' as const,
+      });
+    },
+  );
+
   fastify.put<{ Params: { inviteId: string } }>(
     '/api/v1/guests/:inviteId/session/return',
     async (req, reply) => {
-      if (!isGuestCallingEnabled()) {
-        return reply.status(503).send({ error: 'Guest calling is disabled', statusCode: 503 });
-      }
       const body = ModeBody.parse(req.body);
+      const slot = await guestReturnSlot(req, reply);
+      if (!slot) return reply;
       if (body.mode === 'low-latency-minus') {
         return reply.status(400).send({ error: 'low-latency-minus is not available in v1', statusCode: 400 });
       }
-      const secret = getGuestSigningKey()!;
-      const token = bearerToken(req);
-      if (!token) {
-        return reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
-      }
-      const verified = verifyGuestInviteToken(token, secret);
-      if (!verified.ok || verified.claims.inviteId !== req.params.inviteId) {
-        return reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
-      }
-      let invite: GuestInviteDoc;
-      try {
-        invite = await getGuestInvitesDb().get(req.params.inviteId);
-      } catch {
-        return reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
-      }
-      if (invite.tokenHash !== hashGuestInviteToken(token)) {
-        return reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
-      }
-
-      // The guest's live session pins its mixerInput — the token is scoped to it.
-      let production: ProductionDoc;
-      try {
-        production = await getDb().get(invite.productionId);
-      } catch {
-        return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
-      }
-      const assignment = production.sources.find(
-        (s) => s.mixerInput === invite.mixerInput,
-      );
-      if (!invite.mixerInput || !assignment?.returnFeed) {
-        return reply.status(404).send({ error: 'No return on that input', statusCode: 404 });
-      }
-      const result = await applyReturnMode(invite.productionId, invite.mixerInput, body.mode);
+      const result = await applyReturnMode(slot.productionId, slot.mixerInput, body.mode);
       if (!result.ok) {
         return reply.status(404).send({ error: 'No return on that input', statusCode: 404 });
       }

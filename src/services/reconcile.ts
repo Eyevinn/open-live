@@ -3,6 +3,7 @@ import { config } from '../config.js';
 import { getDb, isDbConnected } from '../db/index.js';
 import { StromClient } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
+import { sweepGuestsOnProductionEnd } from './guest-sweep.js';
 import { stoppedStatus } from '../lib/production-health.js';
 import type { ProductionDoc } from '../db/types.js';
 
@@ -79,6 +80,8 @@ export async function reconcileProductionStatuses(
       // (endedReason: 'flow-lost'). A doc still `activating` never reached a live
       // broadcast, so it resets to `inactive`.
       const nextStatus = stoppedStatus(doc.status);
+      // Revoke guest invites and end live guest sessions (issue #414); best-effort.
+      await sweepGuestsOnProductionEnd(doc._id, log);
       try {
         await db.insert({
           ...doc,

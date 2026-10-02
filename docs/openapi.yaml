@@ -841,6 +841,23 @@ components:
           type: string
           enum: [program, program-minus]
 
+    GuestReturnState:
+      type: object
+      required: [mixerInput, mode, modes, defaultMode]
+      properties:
+        mixerInput:
+          type: string
+        mode:
+          type: string
+          enum: [program, program-minus]
+          description: Current mode of the guest's picture-feed audio.
+        modes:
+          type: array
+          items:
+            $ref: '#/components/schemas/GuestReturnMode'
+        defaultMode:
+          type: string
+
     GuestJoinResult:
       type: object
       required: [guestId, whipUrl, feeds, modes, defaultMode, returnMode]
@@ -2721,12 +2738,48 @@ paths:
         required: true
         schema:
           type: string
+    get:
+      summary: Guest reads their own return mode (token-authed)
+      description: >-
+        The current return mode of the guest's slot. The guest page polls this to
+        follow changes the crew makes. Needs the invite's live session; the
+        mixerInput is the session's.
+      operationId: guestGetReturnMode
+      tags: [Guests]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Current return mode
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GuestReturnState'
+        '401':
+          description: Missing, invalid, revoked or expired invite token, or the guest has left or been removed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No return on that input, or production not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Guest calling disabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
     put:
       summary: Guest switches their own return mode (token-authed)
       description: >-
         Switches the guest's return feed between `program` and `program-minus`
-        (mix-minus). The mixerInput is pinned server-side to the invite's scoped
-        input. `low-latency-minus` is not built in v1 and returns 400.
+        (mix-minus). Needs the invite's live session, and changes the session's
+        mixerInput, so a guest who has left cannot change the return of whoever
+        holds the slot now. `low-latency-minus` is not built in v1 and returns 400.
       operationId: guestSetReturnMode
       tags: [Guests]
       security:
@@ -2751,7 +2804,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '401':
-          description: Missing, invalid, or revoked invite token
+          description: Missing, invalid, revoked or expired invite token, or the guest has left or been removed
           content:
             application/json:
               schema:

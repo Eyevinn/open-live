@@ -50,6 +50,7 @@ vi.mock('../ws/controller.js', () => ({
   clearPipState: vi.fn(),
   clearFxState: vi.fn(),
   clearClipStateForProduction: vi.fn(),
+  reinitConnectedControllers: vi.fn(),
 }));
 
 const mockActivateStromFlow = vi.fn();

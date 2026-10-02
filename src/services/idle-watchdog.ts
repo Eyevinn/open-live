@@ -16,8 +16,11 @@ import { deactivateStromFlow } from '../lib/flow-generator.js';
 import { getSubscriberCount } from './tally.service.js';
 import { clearProductionPflState } from './pfl-state.js';
 import { clearAudioState, clearPipState, clearFxState } from '../ws/controller.js';
+import { forceStopMeterRelay } from './meter-relay.js';
+import { forceStopClipRelay } from './clip-relay.js';
 import { broadcast } from './tally.service.js';
 import { activationAbortControllers, updateProductionDoc, emitProductionStatus } from '../routes/productions.js';
+import { sweepGuestsOnProductionEnd } from './guest-sweep.js';
 import { stoppedStatus } from '../lib/production-health.js';
 import { closeRecordingIndex } from './recording-index.js';
 import type { ProductionDoc } from '../db/types.js';
@@ -240,6 +243,12 @@ export async function deactivateProduction(productionId: string, log: FastifyBas
   clearAudioState(doc._id);
   clearPipState(doc._id);
   clearFxState(doc._id);
+  // Force-stop both relays regardless of refCount — same stale-relay hazard as
+  // the explicit deactivate path (issue #416): controller sockets survive the
+  // idle auto-deactivate, so the relays must be torn down here too or a connect
+  // after reactivation ref-counts into a relay bound to the old flow.
+  forceStopMeterRelay(doc._id);
+  forceStopClipRelay(doc._id);
   broadcast(doc._id, { type: 'GRP_STATE_RESET' });
 
   if (doc.stromFlowId) {
@@ -251,6 +260,9 @@ export async function deactivateProduction(productionId: string, log: FastifyBas
       log.warn({ err, productionId: doc._id }, '[idle-watchdog] Strom flow teardown failed — continuing');
     }
   }
+
+  // Revoke guest invites and end live guest sessions (issue #414); best-effort.
+  await sweepGuestsOnProductionEnd(doc._id, log);
 
   // Transition rule (spec §1): an `active` production auto-deactivated for idle
   // becomes `ended` (it broadcast and then stopped); one still `activating`
