@@ -82,6 +82,39 @@ function findPgmFeedPad(flow: FlowTopology): string | null {
   return null;
 }
 
+/**
+ * Feed pad for WHEP viewers and guest returns: the shared low-bitrate program
+ * encode (`Enc View`, issue #413). Kept separate from `findPgmFeedPad` so the
+ * recorder, RTMP and SRT outputs stay on the full-rate `Enc PGM` encode while
+ * WHEP consumers avoid whepserversink's GCC pacing of the 10 Mbit/s stream.
+ *
+ * Prefers the feed link of the template's static `PGM Output` WHEP block (which
+ * default-flow.ts wires from `Enc View`), falling back to the `Enc View` block's
+ * `encoded_out` pad so this tracks the template wiring.
+ */
+function findViewerFeedPad(flow: FlowTopology): string | null {
+  const pgmOutput = flow.blocks.find(
+    (b) =>
+      (b as Record<string, unknown>)['block_definition_id'] === 'builtin.whep_output' &&
+      (b as Record<string, unknown>)['name'] === 'PGM Output',
+  ) as Record<string, unknown> | undefined;
+  if (pgmOutput) {
+    const outputId = pgmOutput['id'] as string;
+    const feedLink = flow.links.find((link) => {
+      const l = link as Record<string, unknown>;
+      return ((l['to'] as string | undefined) ?? '') === `${outputId}:video_in`;
+    }) as Record<string, unknown> | undefined;
+    if (feedLink) return feedLink['from'] as string;
+  }
+  const encView = flow.blocks.find(
+    (b) =>
+      (b as Record<string, unknown>)['block_definition_id'] === 'builtin.videoenc' &&
+      (b as Record<string, unknown>)['name'] === 'Enc View',
+  ) as Record<string, unknown> | undefined;
+  if (encView) return `${encView['id'] as string}:encoded_out`;
+  return null;
+}
+
 /** `console` in the shape the port services log through. */
 const portLog = {
   debug: (obj: object, msg?: string) => console.debug('[flow-generator]', msg ?? '', obj),
@@ -161,6 +194,7 @@ export async function activateStromFlow(
 
   const pgmBitrate = typeof production.values?.bitrate === 'number' ? production.values.bitrate : undefined;
   const multiviewBitrate = typeof production.values?.multiview_bitrate === 'number' ? production.values.multiview_bitrate : undefined;
+  const viewerBitrate = typeof production.values?.viewer_bitrate === 'number' ? production.values.viewer_bitrate : undefined;
   const pgmFramerate = typeof production.values?.pgm_framerate === 'string' ? production.values.pgm_framerate : undefined;
   const multiviewResolution = typeof production.values?.multiview_resolution === 'string' ? production.values.multiview_resolution : undefined;
   const multiviewFramerate = typeof production.values?.multiview_framerate === 'string' ? production.values.multiview_framerate : undefined;
@@ -229,6 +263,10 @@ export async function activateStromFlow(
         props['bitrate'] = multiviewBitrate;
         b['properties'] = props;
       }
+      if (name === 'Enc View' && viewerBitrate !== undefined) {
+        props['bitrate'] = viewerBitrate;
+        b['properties'] = props;
+      }
     }
 
     if (b['block_definition_id'] === 'builtin.mixer') {
@@ -268,6 +306,10 @@ export async function activateStromFlow(
   // builtin.whep_output is intentionally kept — it carries the multiview stream
   // that the controller's WHEP viewer connects to via /blocks/{id}/multiview-endpoint.
   const pgmFeedPad = findPgmFeedPad(flow);
+  // WHEP viewers + guest returns feed from the low-bitrate Enc View encode (issue
+  // #413); recorder/RTMP/SRT stay on pgmFeedPad (Enc PGM). Falls back to pgmFeedPad
+  // if the template ever lacks an Enc View block, so viewers never lose video.
+  const viewerFeedPad = findViewerFeedPad(flow) ?? pgmFeedPad;
 
   // Strip only SRT/EFP program output blocks from the template.
   // User-assigned outputs are injected below; the template's WHEP block stays.
@@ -913,7 +955,8 @@ export async function activateStromFlow(
           },
           position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
         });
-        if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
+        // WHEP viewers get the low-bitrate Enc View encode (issue #413).
+        if (viewerFeedPad) flow.links.push({ from: viewerFeedPad, to: `${blockId}:video_in` });
         if (mainAudioSource) {
           flow.links.push({ from: mainAudioSource, to: `${blockId}:audio_in` });
           let audioTrack = 1;
@@ -995,7 +1038,8 @@ export async function activateStromFlow(
         properties: { endpoint_id: endpointId, low_latency: true, mode: 'audio_video', num_audio_tracks: 1 },
         position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
       });
-      if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
+      // Guest returns get the low-bitrate Enc View encode (issue #413).
+      if (viewerFeedPad) flow.links.push({ from: viewerFeedPad, to: `${blockId}:video_in` });
       flow.links.push({ from: `${audioMixerBlockId}:aux_out_${rb.auxBus}`, to: `${blockId}:audio_in` });
       returnWhepEntries.push({ mixerInput: rb.assignment.mixerInput, endpointId });
       outputBlockIndex++;

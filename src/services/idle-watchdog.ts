@@ -16,6 +16,8 @@ import { deactivateStromFlow } from '../lib/flow-generator.js';
 import { getSubscriberCount } from './tally.service.js';
 import { clearProductionPflState } from './pfl-state.js';
 import { clearAudioState, clearPipState, clearFxState } from '../ws/controller.js';
+import { forceStopMeterRelay } from './meter-relay.js';
+import { forceStopClipRelay } from './clip-relay.js';
 import { broadcast } from './tally.service.js';
 import { activationAbortControllers, updateProductionDoc, emitProductionStatus } from '../routes/productions.js';
 import { sweepGuestsOnProductionEnd } from './guest-sweep.js';
@@ -239,6 +241,12 @@ export async function deactivateProduction(productionId: string, log: FastifyBas
   clearAudioState(doc._id);
   clearPipState(doc._id);
   clearFxState(doc._id);
+  // Force-stop both relays regardless of refCount — same stale-relay hazard as
+  // the explicit deactivate path (issue #416): controller sockets survive the
+  // idle auto-deactivate, so the relays must be torn down here too or a connect
+  // after reactivation ref-counts into a relay bound to the old flow.
+  forceStopMeterRelay(doc._id);
+  forceStopClipRelay(doc._id);
   broadcast(doc._id, { type: 'GRP_STATE_RESET' });
 
   if (doc.stromFlowId) {
