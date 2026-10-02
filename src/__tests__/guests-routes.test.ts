@@ -4,7 +4,8 @@
  * the WS controller are mocked; no live services required.
  *
  * Covers: invite create (raw token returned once, only hash stored), join happy
- * path (whipUrl reuses the existing WHIP contract), token auth failures (401),
+ * path (whipUrl is the guest-scoped alias under /api/v1/guests/:inviteId/whip,
+ * issue #423), token auth failures (401),
  * expired invite (409), production/invite 404, cross-production 403, and the
  * feature-disabled 503 gate.
  */
@@ -255,9 +256,11 @@ describe('POST /api/v1/guests/:inviteId/join', () => {
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body.guestId).toMatch(/^guest-session-/);
-    // whipUrl MUST reuse /api/v1/productions/:id/whip/:mixerInput — not a new path.
-    expect(body.whipUrl).toMatch(
-      /^https:\/\/live\.example\.com\/api\/v1\/productions\/prod-1\/whip\/video_in_\d+$/,
+    // whipUrl is the guest-scoped WHIP alias under /api/v1/guests/:inviteId/whip
+    // (issue #423) — the OSC ingress gate only passes `^/api/v1/guests`, so the
+    // guest page cannot reach the crew /api/v1/productions/... path.
+    expect(body.whipUrl).toBe(
+      `https://live.example.com/api/v1/guests/${invite.id}/whip`,
     );
     expect(body.defaultMode).toBe('program-minus');
     expect(body.returnMode).toBe('program-minus');
@@ -278,7 +281,11 @@ describe('POST /api/v1/guests/:inviteId/join', () => {
       url: `/api/v1/guests/${invite.id}/join`,
       headers: { authorization: `Bearer ${invite.token}` },
     });
-    expect(res.json().whipUrl).toContain('/whip/video_in_3');
+    // The guest-scoped whipUrl (issue #423) is keyed by :inviteId, so the pinned
+    // mixerInput is honoured on the persisted session rather than in the URL.
+    const body = res.json();
+    expect(body.whipUrl).toBe(`https://live.example.com/api/v1/guests/${invite.id}/whip`);
+    expect(sessionsStore.get(body.guestId)?.mixerInput).toBe('video_in_3');
   });
 
   it('does NOT require the shared API key (token-authed route is exempt)', async () => {
