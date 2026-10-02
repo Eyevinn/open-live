@@ -102,6 +102,14 @@ function seedProduction() {
   } as unknown as ProductionDoc);
 }
 
+function setSlotSource(mixerInput: string, sourceId: string) {
+  const p = productionsStore.get('prod-1')!;
+  productionsStore.set('prod-1', {
+    ...p,
+    sources: p.sources.map((s) => (s.mixerInput === mixerInput ? { ...s, sourceId } : s)),
+  });
+}
+
 async function invite(mixerInput: string): Promise<{ id: string; token: string }> {
   const res = await app.inject({
     method: 'POST',
@@ -149,7 +157,7 @@ async function settle() {
   for (let i = 0; i < 30; i++) await new Promise((r) => setTimeout(r, 2));
 }
 
-async function loadPage(inv: { id: string; token: string }) {
+async function loadPage(inv: { id: string; token: string }, options: { slotCheckFails?: boolean } = {}) {
   const html = (await app.inject({ method: 'GET', url: `/guest/${inv.id}` })).body;
   const script = /<script>([\s\S]*?)<\/script>/.exec(html)![1];
   const hiddenAtStart = new Set(['onair-badge', 'return', 'return-hint', 'mute', 'leave', 'return-mode', 'self-warning']);
@@ -159,12 +167,16 @@ async function loadPage(inv: { id: string; token: string }) {
     'mode-program', 'self-warning']) {
     els[id] = new FakeElement(hiddenAtStart.has(id));
   }
+  const tracks: Array<{ kind: string; enabled: boolean; stopped: boolean; stop(): void }> = [];
   const getUserMedia = vi.fn(async () => {
-    const tracks = [
-      { kind: 'video', enabled: true, stop() {} },
-      { kind: 'audio', enabled: true, stop() {} },
-    ];
-    return { getTracks: () => tracks, getAudioTracks: () => tracks.filter((t) => t.kind === 'audio') };
+    const opened = ['video', 'audio'].map((kind) => ({
+      kind,
+      enabled: true,
+      stopped: false,
+      stop() { this.stopped = true; },
+    }));
+    tracks.push(...opened);
+    return { getTracks: () => opened, getAudioTracks: () => opened.filter((t) => t.kind === 'audio') };
   });
   const peers: Array<{ sentTracks: number; transceivers: number }> = [];
   class FakePeerConnection {
@@ -182,6 +194,7 @@ async function loadPage(inv: { id: string; token: string }) {
   }
   const pageFetch = async (url: string, opts: { method?: string; headers?: Record<string, string>; body?: string } = {}) => {
     const u = new URL(url, 'https://live.example.com');
+    if (options.slotCheckFails && u.pathname.endsWith('/slot')) throw new TypeError('Failed to fetch');
     const res = await app.inject({
       method: (opts.method ?? 'GET') as 'GET',
       url: u.pathname + u.search,
@@ -211,7 +224,7 @@ async function loadPage(inv: { id: string; token: string }) {
   win['window'] = win;
   vm.runInNewContext(script, win);
   await settle();
-  return { els, getUserMedia, peers };
+  return { els, getUserMedia, peers, tracks };
 }
 
 beforeAll(async () => {
@@ -267,5 +280,73 @@ describe('guest page on a return-only slot', () => {
     expect(page.els['banner'].className).toBe('live');
     expect(page.peers.some((pc) => pc.sentTracks > 0)).toBe(true);
     expect(page.els['mute'].hidden).toBe(false);
+  });
+
+  it('falls back to the camera when the slot check cannot reach the server', async () => {
+    seedProduction();
+    const page = await loadPage(await invite('video_in_0'), { slotCheckFails: true });
+    expect(page.getUserMedia).toHaveBeenCalled();
+    expect(page.els['golive'].disabled).toBe(false);
+
+    page.els['golive'].click();
+    await settle();
+    expect(page.els['banner'].className).toBe('live');
+    expect(page.peers.some((pc) => pc.sentTracks > 0)).toBe(true);
+  });
+
+  it('opens the camera at Join when the slot was switched to WHIP after the page loaded', async () => {
+    seedProduction();
+    const page = await loadPage(await invite('video_in_1'));
+    expect(page.getUserMedia).not.toHaveBeenCalled();
+    setSlotSource('video_in_1', 'Whip');
+
+    page.els['golive'].click();
+    await settle();
+    expect(page.getUserMedia).toHaveBeenCalled();
+    expect(page.els['banner'].className).toBe('live');
+    expect(page.peers.some((pc) => pc.sentTracks > 0)).toBe(true);
+    expect(page.els['mute'].hidden).toBe(false);
+  });
+
+  it('releases the camera at Join when the slot was switched away from WHIP after the page loaded', async () => {
+    seedProduction();
+    const page = await loadPage(await invite('video_in_0'));
+    expect(page.getUserMedia).toHaveBeenCalled();
+    setSlotSource('video_in_0', 'src-srt');
+
+    page.els['golive'].click();
+    await settle();
+    expect(page.els['banner'].className).toBe('live');
+    expect(page.tracks.every((t) => t.stopped)).toBe(true);
+    expect(page.els['preview'].hidden).toBe(true);
+    expect(page.peers.every((pc) => pc.sentTracks === 0)).toBe(true);
+  });
+
+  it('lets the guest go live once a slot that was unavailable at page load is restored', async () => {
+    seedProduction();
+    const inv = await invite('video_in_0');
+    const prod = productionsStore.get('prod-1')!;
+    productionsStore.set('prod-1', {
+      ...prod,
+      sources: prod.sources.map((s) => (s.mixerInput === 'video_in_0' ? { ...s, returnFeed: undefined } : s)),
+    });
+    const page = await loadPage(inv);
+    productionsStore.set('prod-1', prod);
+
+    page.els['golive'].click();
+    await settle();
+    expect(page.els['banner'].className).toBe('live');
+    expect(page.peers.some((pc) => pc.sentTracks > 0)).toBe(true);
+  });
+
+  it('stops at page load on an expired invite', async () => {
+    seedProduction();
+    const inv = await invite('video_in_0');
+    const doc = invitesStore.get(inv.id)!;
+    invitesStore.set(inv.id, { ...doc, expiresAt: new Date(Date.now() - 1000).toISOString() });
+    const page = await loadPage(inv);
+    expect(page.getUserMedia).not.toHaveBeenCalled();
+    expect(page.els['golive'].disabled).toBe(true);
+    expect(page.els['banner'].textContent).toMatch(/expired/);
   });
 });

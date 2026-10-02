@@ -194,7 +194,15 @@ from the encoder; the invite gives the guest the return and nothing else.
   return-only slot is `403`. The flow builds no WHIP endpoint for the input, so
   this is defence in depth.
 - **No device prompt.** The guest page reads `GET …/slot` before asking for a
-  camera or microphone, and skips both on a return-only slot.
+  camera or microphone, and skips both on a return-only slot. If that check
+  fails for any reason other than a dead invite (no network, rate limit, server
+  trouble), the page opens the camera as for a WHIP slot. Join has the final
+  say: the page publishes only when join returns a `whipUrl`, opening the
+  camera then if it has not, and releases the camera when join returns none.
+- **Changing a slot's source mid-show.** The WHIP grant follows the slot's
+  current source, while the running flow keeps the inputs it was activated
+  with. A WHIP guest whose slot is switched to another source during the show
+  cannot republish (a reconnect is `403`) until the production is reactivated.
 - **Encoder setup stays with the operator.** The page does not show the SRT
   address. An SRT address carries the source's long-lived passphrase; the
   invite token is short-lived and revocable per invite. Showing one to every

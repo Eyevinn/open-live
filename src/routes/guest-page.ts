@@ -274,6 +274,27 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       });
     }
 
+    // Join can disagree with the slot check made at page load (the slot's
+    // source may have changed since), so these two let goLive() follow join.
+    function openCamera() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        return Promise.reject({ handled: true, message: "This browser does not support live calling. Try a recent Chrome, Safari or Firefox." });
+      }
+      show(preview);
+      show(previewHint);
+      return startPreview().catch(function () {
+        throw { handled: true, message: "Could not access your camera or microphone. Check the browser permissions and try again." };
+      });
+    }
+
+    function closeCamera() {
+      if (localStream) localStream.getTracks().forEach(function (t) { t.stop(); });
+      localStream = null;
+      preview.srcObject = null;
+      hide(preview);
+      hide(previewHint);
+    }
+
     function applyMuteToTrack() {
       if (!localStream) return;
       localStream.getAudioTracks().forEach(function (t) { t.enabled = !muted; });
@@ -451,7 +472,13 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       }).then(function (data) {
         joinData = data;
         // No whipUrl: the slot is return-only (its source is not WHIP).
-        return data.whipUrl ? whipPublish(data.whipUrl, localStream) : null;
+        if (!data.whipUrl) {
+          closeCamera();
+          return null;
+        }
+        return (localStream ? Promise.resolve() : openCamera()).then(function () {
+          return whipPublish(data.whipUrl, localStream);
+        });
       }).then(function () {
         live = true;
         hide(pickers);
@@ -556,13 +583,21 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     } else {
       // Ask the server what the slot takes before touching any device.
       goLiveBtn.disabled = true;
+      // A dead link (invalid, expired, production gone or ended) stops here.
+      // Any other failure (no network, rate limit, server trouble, a slot the
+      // producer may restore) falls back to the camera, and join decides.
       fetch(apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/slot", {
         headers: { "Authorization": "Bearer " + token }
       }).then(function (res) {
         return res.json().catch(function () { return {}; }).then(function (payload) {
-          if (!res.ok) throw { handled: true, message: joinErrorMessage(res.status, payload) };
-          return payload;
+          if (res.ok) return payload;
+          var deadLink = res.status === 401 || res.status === 404 ||
+            (res.status === 409 && /expired|not active|ended/i.test((payload && payload.error) || ""));
+          if (deadLink) throw { handled: true, message: joinErrorMessage(res.status, payload) };
+          return {};
         });
+      }, function () {
+        return {};
       }).then(function (slot) {
         if (slot.returnOnly) {
           hide(preview);
