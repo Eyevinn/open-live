@@ -900,27 +900,36 @@ export async function reinitConnectedControllers(productionId: string): Promise<
         initProps['main_fader'] = 1.0;
         levelCache.set('main', 1.0);
         channelLevelsByProduction.set(productionId, levelCache);
-        const initResult = await strom.flows.updateBlockProperties(flowId, audioBlockId, { properties: initProps })
-          .catch((err) => { console.warn('[controller] reinit channel props error:', err); return null; });
         // Mirror the first-connect guard (#396): a channel Strom refused to route
         // to main is reported muted rather than falsely told live.
-        if (initResult) {
+        const seedMutes = (rejected: Record<string, unknown>, current: Record<string, unknown>) => {
           for (let i = 1; i <= numChannels; i++) {
             const toMainKey = `ch${i}_to_main`;
-            const toMainRejected = Object.prototype.hasOwnProperty.call(initResult.rejected ?? {}, toMainKey);
-            const toMainReported = initResult.properties?.[toMainKey];
-            if (toMainRejected || toMainReported === false) {
-              muted.add(`ch${i}`);
-            }
+            if (Object.hasOwn(rejected, toMainKey) || current[toMainKey] === false) muted.add(`ch${i}`);
           }
-        }
+        };
+        await strom.flows.updateBlockProperties(flowId, audioBlockId, { properties: initProps })
+          .then((res) => seedMutes(res.rejected ?? {}, res.properties ?? {}))
+          .catch((err) => {
+            console.warn('[controller] reinit channel props error:', err);
+            // Keys are independent, so keep what applied; forget a refused fader's
+            // unity level so it is not broadcast below.
+            if (!(err instanceof StromPropertiesRejectedError)) return;
+            for (const key of Object.keys(err.rejected)) {
+              const fader = /^(ch\d+|main)_fader$/.exec(key);
+              if (fader) levelCache.delete(fader[1]);
+            }
+            seedMutes(err.rejected, err.current);
+          });
         // Push the freshly-initialised defaults to every connected operator so a
         // socket that stayed open across reactivation drops its stale mixer view.
         for (let i = 1; i <= numChannels; i++) {
-          broadcast(productionId, { type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'volume', value: 1.0 });
+          const level = levelCache.get(`ch${i}`);
+          if (level !== undefined) broadcast(productionId, { type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'volume', value: level });
           broadcast(productionId, { type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'mute', value: muted.has(`ch${i}`) });
         }
-        broadcast(productionId, { type: 'AUDIO_STATE', elementId: 'main', property: 'volume', value: 1.0 });
+        const mainLevel = levelCache.get('main');
+        if (mainLevel !== undefined) broadcast(productionId, { type: 'AUDIO_STATE', elementId: 'main', property: 'volume', value: mainLevel });
         broadcast(productionId, { type: 'GRP_STATE_RESET' });
       }
 
