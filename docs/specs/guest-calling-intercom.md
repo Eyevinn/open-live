@@ -156,8 +156,9 @@ DELETE /api/v1/productions/:id/guests/invites/:inviteId
 
 ```
 POST   /api/v1/guests/:inviteId/join       (Authorization: Bearer <invite token>)
-  200 → { guestId, whipUrl, feeds, modes, defaultMode, returnMode, intercomLine? }
-      # whipUrl → existing /api/v1/productions/:id/whip/:mixerInput contract
+  200 → { guestId, whipUrl?, returnOnly, feeds, modes, defaultMode, returnMode, intercomLine? }
+      # whipUrl → existing /api/v1/productions/:id/whip/:mixerInput contract;
+      #   absent (returnOnly: true) when the slot's source is not WHIP
       # feeds[].url → per-guest /api/v1/productions/:id/returns/:mixerInput/... routes, not
       #   /api/v1/whep-proxy?target=..., which forwards to any URL on the Strom host and so
       #   cannot be scoped to one guest's token
@@ -166,7 +167,40 @@ POST   /api/v1/guests/:inviteId/join       (Authorization: Bearer <invite token>
 
 DELETE /api/v1/guests/:inviteId/session    (guest leaves)
   204
+
+GET    /api/v1/guests/:inviteId/slot       (Authorization: Bearer <invite token>)
+  200 → { mixerInput, returnOnly }          # read-only; creates no session
 ```
+
+#### Return-only slots
+
+A guest slot whose source is not WHIP (an SRT encoder: a phone on cellular, an
+aid-station camera) is return-only. The guest's picture and voice reach the slot
+from the encoder; the invite gives the guest the return and nothing else.
+
+- **Derived from the slot, not set on the invite.** The minus modes exclude the
+  slot's channel, so they are right only if the guest's voice is on that channel.
+  The slot's source decides where that voice comes from, so it also decides
+  whether the guest publishes. An invite flag could disagree with the slot (a
+  return-only invite on a WHIP slot leaves the slot empty; a publishing invite
+  on an SRT slot has nowhere to publish).
+- **The minus assumes the encoder carries the guest's voice.** The invite names
+  the slot's mixer input, and program-minus closes that input's channel. If the
+  guest speaks on air some other way (a separate mic on another input), the
+  minus removes the encoder's audio instead and the guest hears themselves.
+  Nothing checks this; the operator inviting the right slot is what makes it
+  hold, as for WHIP slots.
+- **No WHIP grant.** Join omits `whipUrl`, and a guest-token WHIP publish on a
+  return-only slot is `403`. The flow builds no WHIP endpoint for the input, so
+  this is defence in depth.
+- **No device prompt.** The guest page reads `GET …/slot` before asking for a
+  camera or microphone, and skips both on a return-only slot.
+- **Encoder setup stays with the operator.** The page does not show the SRT
+  address. An SRT address carries the source's long-lived passphrase; the
+  invite token is short-lived and revocable per invite. Showing one to every
+  invite holder would let a leaked or expired invite outlive its revocation.
+- **Leave and kick end the guest session, not the encoder.** The SRT stream is
+  the operator's; it keeps feeding the slot until the operator stops it.
 
 ### Guest management (operator / automation)
 

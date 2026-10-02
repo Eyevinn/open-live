@@ -13,7 +13,10 @@ import type { FastifyPluginAsync } from 'fastify';
  * (WHIP), and plays the return feed from `feeds[].url` (WHEP). Once live, the
  * guest picks what they hear (program minus themselves, or full program) with
  * `PUT …/session/return`, and the page polls `GET …/session/return` so a change
- * the crew makes shows up here too.
+ * the crew makes shows up here too. On a return-only slot (its source is not
+ * WHIP, e.g. an SRT encoder) the page never asks for a camera or microphone and
+ * only plays the return; it learns which from `GET /api/v1/guests/:inviteId/slot`
+ * before touching any device.
  *
  * This route is a plain static HTML document (no build step): the whole page is
  * embedded as a string constant so the `tsc`-only build carries it into `dist/`
@@ -120,7 +123,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
 
     <div class="videos">
       <video id="preview" autoplay playsinline muted></video>
-      <div class="hint">This is your camera preview. It is muted here so you don't hear yourself.</div>
+      <div id="preview-hint" class="hint">This is your camera preview. It is muted here so you don't hear yourself.</div>
       <video id="return" autoplay playsinline class="hidden"></video>
       <div id="return-hint" class="hint hidden">Return feed from the studio.</div>
     </div>
@@ -169,6 +172,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     var mutedIndicator = document.getElementById("muted-indicator");
     var onairBadge = document.getElementById("onair-badge");
     var preview = document.getElementById("preview");
+    var previewHint = document.getElementById("preview-hint");
     var returnVideo = document.getElementById("return");
     var returnHint = document.getElementById("return-hint");
     var camSel = document.getElementById("cam");
@@ -446,14 +450,17 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         });
       }).then(function (data) {
         joinData = data;
-        return whipPublish(data.whipUrl, localStream);
+        // No whipUrl: the slot is return-only (its source is not WHIP).
+        return data.whipUrl ? whipPublish(data.whipUrl, localStream) : null;
       }).then(function () {
         live = true;
         hide(pickers);
         hide(goLiveBtn);
-        show(muteBtn);
+        if (joinData.whipUrl) show(muteBtn);
         show(leaveBtn);
-        setBanner("You are live. The studio can see and hear you.", "live");
+        setBanner(joinData.whipUrl
+          ? "You are live. The studio can see and hear you."
+          : "You are connected. You hear the studio here; your camera reaches it separately.", "live");
         startReturnMode(joinData);
         // Play the return feed(s), if any are live yet. Failure here is
         // non-fatal: the guest is still contributing even without return video.
@@ -463,6 +470,9 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
             returnHint.textContent = "Return feed not available yet.";
             show(returnHint);
           });
+        } else if (!joinData.whipUrl) {
+          returnHint.textContent = "Return feed not available yet. Leave and open the link again once the show is running.";
+          show(returnHint);
         }
       }).catch(function (err) {
         goLiveBtn.disabled = false;
@@ -540,15 +550,41 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     if (!token) {
       goLiveBtn.disabled = true;
       setBanner("This link is missing its access token. Ask the producer for the full invite link.", "error");
-    } else if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.RTCPeerConnection) {
+    } else if (!window.RTCPeerConnection) {
       goLiveBtn.disabled = true;
       setBanner("This browser does not support live calling. Try a recent Chrome, Safari or Firefox.", "error");
     } else {
-      startPreview().then(function () {
-        setBanner("Camera and microphone ready. Press \\u201cGo live\\u201d when you're set.", "");
-      }).catch(function () {
-        goLiveBtn.disabled = true;
-        setBanner("Could not access your camera or microphone. Check the browser permissions and reload.", "error");
+      // Ask the server what the slot takes before touching any device.
+      goLiveBtn.disabled = true;
+      fetch(apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/slot", {
+        headers: { "Authorization": "Bearer " + token }
+      }).then(function (res) {
+        return res.json().catch(function () { return {}; }).then(function (payload) {
+          if (!res.ok) throw { handled: true, message: joinErrorMessage(res.status, payload) };
+          return payload;
+        });
+      }).then(function (slot) {
+        if (slot.returnOnly) {
+          hide(preview);
+          hide(previewHint);
+          hide(pickers);
+          goLiveBtn.textContent = "Join";
+          goLiveBtn.disabled = false;
+          setBanner("Press \\u201cJoin\\u201d to hear the studio. Your camera is connected separately by the producer.", "");
+          return;
+        }
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          setBanner("This browser does not support live calling. Try a recent Chrome, Safari or Firefox.", "error");
+          return;
+        }
+        return startPreview().then(function () {
+          goLiveBtn.disabled = false;
+          setBanner("Camera and microphone ready. Press \\u201cGo live\\u201d when you're set.", "");
+        }, function () {
+          setBanner("Could not access your camera or microphone. Check the browser permissions and reload.", "error");
+        });
+      }).catch(function (err) {
+        setBanner(err && err.handled ? err.message : "Could not reach the studio. Check your connection and reload.", "error");
       });
     }
   })();
