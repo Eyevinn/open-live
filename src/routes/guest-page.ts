@@ -199,6 +199,9 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     var modePending = 0;
     var modePoll = null;
     var MODE_POLL_MS = 5000;
+    // A mode change that has not answered by then is given up, so a stalled
+    // request on a bad connection cannot hold off the poll for good.
+    var MODE_PUT_TIMEOUT_MS = 10000;
 
     function setBanner(text, cls) {
       banner.textContent = text;
@@ -357,16 +360,25 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       var seq = ++modeSeq;
       modePending++;
       applyReturnAudio(mode);
+      var abort = new AbortController();
+      var timer = setTimeout(function () { abort.abort(); }, MODE_PUT_TIMEOUT_MS);
       fetch(returnUrl(), {
         method: "PUT",
         headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
-        body: JSON.stringify({ mode: mode })
+        body: JSON.stringify({ mode: mode }),
+        signal: abort.signal
       }).then(function (res) {
+        if (res.status === 401) { stopReturnMode(); return; }
         if (!res.ok) throw new Error("mode change failed: " + res.status);
       }).catch(function () {
-        // Put back what the server still has, unless a newer change superseded this one.
+        // Put back what the server still has, unless a newer change superseded
+        // this one. After a timeout the server may have applied it after all;
+        // the next poll shows whichever it has.
         if (seq === modeSeq && previous) applyReturnAudio(previous);
-      }).then(function () { modePending--; });
+      }).then(function () {
+        clearTimeout(timer);
+        modePending--;
+      });
     }
 
     function pollReturnMode() {
@@ -375,6 +387,8 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       fetch(returnUrl(), {
         headers: { "Authorization": "Bearer " + token }
       }).then(function (res) {
+        // 401: the guest is no longer live (kicked, or the invite was revoked).
+        if (res.status === 401) { stopReturnMode(); return null; }
         return res.ok ? res.json() : null;
       }).then(function (data) {
         if (!live || seq !== modeSeq || modePending > 0) return;
