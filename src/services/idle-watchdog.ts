@@ -18,6 +18,7 @@ import { clearProductionPflState } from './pfl-state.js';
 import { clearAudioState, clearPipState, clearFxState } from '../ws/controller.js';
 import { broadcast } from './tally.service.js';
 import { activationAbortControllers, updateProductionDoc, emitProductionStatus } from '../routes/productions.js';
+import { sweepGuestsOnProductionEnd } from './guest-sweep.js';
 import { stoppedStatus } from '../lib/production-health.js';
 import type { ProductionDoc } from '../db/types.js';
 
@@ -249,6 +250,9 @@ export async function deactivateProduction(productionId: string, log: FastifyBas
       log.warn({ err, productionId: doc._id }, '[idle-watchdog] Strom flow teardown failed — continuing');
     }
   }
+
+  // Revoke guest invites and end live guest sessions (issue #414); best-effort.
+  await sweepGuestsOnProductionEnd(doc._id, log);
 
   // Transition rule (spec §1): an `active` production auto-deactivated for idle
   // becomes `ended` (it broadcast and then stopped); one still `activating`
