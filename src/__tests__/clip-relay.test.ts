@@ -266,3 +266,39 @@ describe('raw Strom frame through connectWebSocket -> clip-relay', () => {
     expect(clipStates().at(-1)).toMatchObject({ state: 'playing', positionMs: 3000, durationMs: 8000 });
   });
 });
+
+// Issue #416: on deactivate the clip relay must be force-stopped, because
+// `startClipRelay` on an existing relay only refreshes `blockToInput` and keeps
+// the OLD `entry.flowId` — so a connect after reactivation (which built a new
+// flow) would filter every event against the stale flow and drop it. A
+// force-stop + restart rebinds to the new flow.
+describe('deactivate→reactivate flow rebind (issue #416)', () => {
+  const OLD_FLOW = 'flow-old';
+  const NEW_FLOW = 'flow-new';
+  const BLOCK = 'mediaplayer-1';
+
+  beforeEach(() => {
+    wsHandlers.clear();
+    forceStopClipRelay(PROD);
+  });
+
+  it('a plain re-start keeps the stale flow (the bug); forceStop + restart rebinds', async () => {
+    startClipRelay(PROD, OLD_FLOW, new Map([[BLOCK, INPUT]]));
+    await Promise.resolve(); await Promise.resolve();
+
+    // Reactivation connect calls startClipRelay with the NEW flow, but it only
+    // refreshes blockToInput and ref-counts in — the filter stays OLD_FLOW.
+    startClipRelay(PROD, NEW_FLOW, new Map([[BLOCK, INPUT]]));
+    setClipStateEntry(PROD, { mixerInput: INPUT, state: 'playing', clipId: 'c1' });
+    pushRawFrame(JSON.stringify({ type: 'MediaPlayerStateChanged', data: { flow_id: NEW_FLOW, block_id: BLOCK, state: 'paused' } }));
+    expect(clipStates()).toHaveLength(0); // stale relay drops the new flow's events
+
+    // Fix: force-stop on deactivate, restart bound to the new flow on reactivate.
+    forceStopClipRelay(PROD);
+    startClipRelay(PROD, NEW_FLOW, new Map([[BLOCK, INPUT]]));
+    await Promise.resolve(); await Promise.resolve();
+    setClipStateEntry(PROD, { mixerInput: INPUT, state: 'playing', clipId: 'c1' });
+    pushRawFrame(JSON.stringify({ type: 'MediaPlayerStateChanged', data: { flow_id: NEW_FLOW, block_id: BLOCK, state: 'paused' } }));
+    expect(clipStates().at(-1)).toMatchObject({ mixerInput: INPUT, state: 'paused' });
+  });
+});
