@@ -814,6 +814,12 @@ export function clearAudioState(productionId: string): void {
   sourceAudioOffsetsByProduction.delete(productionId)
   numAudioChannelsByProduction.delete(productionId)
   channelLevelsByProduction.delete(productionId)
+  // A write still in flight keeps its own record and settles on its own; it
+  // must not count as overlapping with writes made after reactivation.
+  const keyPrefix = `${productionId}:`
+  for (const map of [muteWritesInFlight, latestMuteWrite, latestVolumeWrite]) {
+    for (const key of map.keys()) if (key.startsWith(keyPrefix)) map.delete(key)
+  }
   auxSendByProduction.delete(productionId)
   auxMasterByProduction.delete(productionId)
   grpSendByProduction.delete(productionId)
@@ -2065,7 +2071,8 @@ export async function handleMessage(
               console.warn('[controller] Strom audio update error:', err);
               if (err instanceof StromPropertiesRejectedError) {
                 // Put the cache and every UI back on Strom's actual level, unless a
-                // newer fader move has already replaced the refused value.
+                // newer fader move, or a deactivate, has already replaced the refused value.
+                if (latestVolumeWrite.get(debounceKey) !== writeId) return;
                 let actual = err.current[propName];
                 if (actual === undefined) {
                   actual = await makeStromClient()
@@ -2176,7 +2183,7 @@ export async function handleMessage(
             }
             break;
           }
-          muteWritesInFlight.delete(muteKey);
+          if (muteWritesInFlight.get(muteKey) === writes) muteWritesInFlight.delete(muteKey);
           let state = writes.settled;
           if (writes.overlapped || writes.unclear) {
             const read = await strom.flows.getBlockProperties(flowId, blockId)
