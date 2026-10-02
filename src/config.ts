@@ -10,6 +10,16 @@ function requireEnv(name: string): string {
   return value;
 }
 
+/**
+ * Reads an optional env var, trimmed. Empty or whitespace-only values (e.g. a
+ * compose-style `MINIO_BUCKET=`) read as unset, so `??` fallbacks and
+ * truthiness checks downstream treat them the same as a missing var.
+ */
+function optionalEnv(name: string): string | undefined {
+  const value = process.env[name]?.trim();
+  return value ? value : undefined;
+}
+
 function parseBoolEnv(name: string, defaultValue: boolean): boolean {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return defaultValue;
@@ -214,13 +224,14 @@ export const config = {
    *
    * When these vars are unset the `recording` output type is rejected at assignment time
    * (400 — recording disabled), mirroring how STROM_URL / API_KEY degrade cleanly.
-   * `MINIO_ENDPOINT` falls back to `S3_ENDPOINT` for S3-compatible naming.
+   * `MINIO_ENDPOINT` falls back to `S3_ENDPOINT` for S3-compatible naming. Empty or
+   * whitespace-only values count as unset (see `optionalEnv`).
    */
-  minioEndpoint: process.env['MINIO_ENDPOINT'] ?? process.env['S3_ENDPOINT'] ?? undefined,
-  minioAccessKey: process.env['MINIO_ACCESS_KEY'] ?? undefined,
-  minioSecretKey: process.env['MINIO_SECRET_KEY'] ?? undefined,
-  minioBucket: process.env['MINIO_BUCKET'] ?? undefined,
-  minioRegion: process.env['MINIO_REGION'] ?? 'us-east-1',
+  minioEndpoint: optionalEnv('MINIO_ENDPOINT') ?? optionalEnv('S3_ENDPOINT'),
+  minioAccessKey: optionalEnv('MINIO_ACCESS_KEY'),
+  minioSecretKey: optionalEnv('MINIO_SECRET_KEY'),
+  minioBucket: optionalEnv('MINIO_BUCKET'),
+  minioRegion: optionalEnv('MINIO_REGION') ?? 'us-east-1',
   minioUseSsl: parseBoolEnv('MINIO_USE_SSL', true),
   /** Optional prefix prepended to every recording object key. */
   recordingKeyPrefix: process.env['RECORDING_KEY_PREFIX'] ?? '',
