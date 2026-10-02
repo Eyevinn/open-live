@@ -1906,14 +1906,6 @@ export async function handleMessage(
             }
           }, 150));
         } else {
-          // Update mute registry for state restoration on reconnect
-          if (msg.elementId !== 'main') {
-            const mutedSet = mutedElementsByProduction.get(productionId);
-            if (mutedSet) {
-              if (msg.value === true) mutedSet.add(msg.elementId);
-              else mutedSet.delete(msg.elementId);
-            }
-          }
           let props: Record<string, unknown>;
           if (msg.elementId === 'main') {
             props = { main_mute: msg.value };
@@ -1938,6 +1930,22 @@ export async function handleMessage(
             properties: props,
             ...(msg.ramp_ms !== undefined && { ramp_ms: msg.ramp_ms }),
           });
+          // Update the mute registry for state restoration on reconnect *after* the
+          // Strom write settles, re-fetching the current per-production Set rather
+          // than mutating one captured earlier. If the production was deactivated
+          // (and possibly reactivated) while this write was stalled on Strom, the
+          // Set that existed when the message arrived has since been replaced by
+          // clearAudioState + the next first-connect reset. Writing to that stale
+          // Set would leave the live registry wrong and tell the next connect a
+          // channel Strom is holding off program is live (#402). A get() miss means
+          // the production is no longer active, so there is nothing to record.
+          if (msg.elementId !== 'main') {
+            const mutedSet = mutedElementsByProduction.get(productionId);
+            if (mutedSet) {
+              if (msg.value === true) mutedSet.add(msg.elementId);
+              else mutedSet.delete(msg.elementId);
+            }
+          }
           broadcast(productionId, { type: 'AUDIO_STATE', elementId: msg.elementId, property: msg.property, value: msg.value });
         }
       } catch (err) {
