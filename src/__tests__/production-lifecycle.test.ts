@@ -256,6 +256,21 @@ describe('idle-watchdog auto-deactivate — active → ended (spec §1)', () => 
     expect(inserted.autoDeactivated).toBe(true);
   });
 
+  it('clears the recorder fields, so a later activation cannot act on the old recorder', async () => {
+    const doc = makeProductionDoc({
+      status: 'active', stromFlowId: 'flow-abc', recorderBlockId: 'b-rec', recorderOutputDir: 'recordings/prod-test-1/x',
+    });
+    mockGet.mockResolvedValue(doc);
+    mockDeactivateStromFlow.mockResolvedValue(undefined);
+    mockInsert.mockResolvedValue({ rev: '2-bcd', ok: true, id: doc._id });
+
+    await deactivateProduction('prod-test-1', silentLog);
+
+    const inserted = mockInsert.mock.calls[0][0];
+    expect(inserted.recorderBlockId).toBeUndefined();
+    expect(inserted.recorderOutputDir).toBeUndefined();
+  });
+
   it('revokes guest invites and ends live guest sessions when the production ends (issue #414)', async () => {
     const doc = makeProductionDoc({ status: 'active', stromFlowId: 'flow-abc' });
     mockGet.mockResolvedValue(doc);
@@ -307,7 +322,9 @@ describe('startup reconcile — flow gone: active → ended, activating → inac
   it('an active production whose flow disappeared becomes ended (endedReason: flow-lost)', async () => {
     mockStromFlowsList.mockResolvedValue({ flows: [] }); // no live flows
     mockFind.mockResolvedValue({
-      docs: [makeProductionDoc({ status: 'active', stromFlowId: 'flow-gone' })],
+      docs: [makeProductionDoc({
+        status: 'active', stromFlowId: 'flow-gone', recorderBlockId: 'b-rec', recorderOutputDir: 'recordings/prod-test-1/x',
+      })],
     });
     mockInsert.mockResolvedValue({ rev: '2-bcd', ok: true });
 
@@ -317,6 +334,8 @@ describe('startup reconcile — flow gone: active → ended, activating → inac
     expect(inserted.status).toBe('ended');
     expect(inserted.endedReason).toBe('flow-lost');
     expect(inserted.stromFlowId).toBeUndefined();
+    expect(inserted.recorderBlockId).toBeUndefined();
+    expect(inserted.recorderOutputDir).toBeUndefined();
   });
 
   it('revokes guest invites and ends live guest sessions when the flow is lost (issue #414)', async () => {

@@ -345,7 +345,7 @@ export interface ProductionOutputAssignment {
  * between upload and persist does not permanently hide an object (spec §Risks).
  */
 export interface RecordingDoc {
-  _id: string;            // "recording-<uuid>"
+  _id: string;            // "recording-<hash of bucket/key>"
   _rev?: string;
   type: 'recording';
   productionId: string;   // references ProductionDoc._id
@@ -549,6 +549,8 @@ export interface ProductionDoc {
   stromFlowId?: string;
   /** ID of the builtin.recorder block — set on activate when a 'recording' output is assigned, cleared on deactivate */
   recorderBlockId?: string;
+  /** Strom media directory this activation's recorder writes into — set on activate alongside recorderBlockId, cleared on deactivate */
+  recorderOutputDir?: string;
   /** WHEP multiview endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */
   whepEndpoint?: string;
   /** WHEP PGM output endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */
@@ -605,6 +607,11 @@ export interface ProductionDoc {
   intercomProductionId?: string;
   /** Warnings accumulated when a referenced source/graphic/output was deleted while production was inactive */
   deletionWarnings?: Array<{ type: 'source' | 'graphic' | 'output'; name: string }>;
+  /**
+   * Problems found while going on air that did not stop activation, such as a
+   * recording that will have no sound. Cleared on next activation.
+   */
+  activationWarnings?: Array<{ type: 'recording-no-audio'; message: string }>;
   /** Set when the idle watchdog auto-deactivated this production; cleared on next activation */
   autoDeactivated?: boolean;
   /**

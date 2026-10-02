@@ -10,6 +10,7 @@ import { composeRtmpUrl } from './rtmp.js';
 import { safeFlowProjection } from './log-redact.js';
 import { VIRTUAL_SOURCES, assignAudioChannels } from './audio-channels.js';
 import { assignReturnBuses, returnSendMatrix } from './return-feeds.js';
+import { activationRecordingsDirName, productionRecordingsDir } from './recording-uploader.js';
 import { assignPortsToFlow, unassignPortsFromFlow } from '../services/port-reservation.js';
 import { listenerPortRequest } from '../services/listener-ports.js';
 
@@ -39,6 +40,11 @@ export interface ActivationResult {
    * post-deactivate to locate the recorded segments via Strom's media API.
    */
   recorderOutputDir?: string;
+  /**
+   * Problems that did not stop the production from going on air but that the
+   * operator needs to know about (e.g. a recording with no sound).
+   */
+  warnings: ActivationWarning[];
   /** WHEP endpoint ID for the mixer's monitor_out (headphone/monitor bus) — undefined if no audio mixer */
   monitorWhepEndpointId?: string;
   /** Maps mixerInput (e.g. 'video_in_1') → time_offset block ID — so the WS layer can apply live offset changes */
@@ -56,6 +62,22 @@ export interface ActivationResult {
   returnBuses: Array<{ mixerInput: string; auxBus: number; ownChannel: number; mode: 'program' | 'program-minus' }>;
   /** WHEP endpoint IDs for per-guest return outputs, keyed by the guest's mixerInput. */
   returnWhepEntries: Array<{ mixerInput: string; endpointId: string }>;
+}
+
+export type ActivationWarning = { type: 'recording-no-audio'; message: string };
+
+/**
+ * Whether Strom has the builtin.audioenc block (added in Strom 0.6.9). If the
+ * block list can't be read, assume it does: the flow create/start that follows
+ * reports an unreachable Strom better than a guess here would.
+ */
+async function stromHasAudioEncoder(strom: StromClient): Promise<boolean> {
+  try {
+    const { blocks } = await strom.blocks.list();
+    return blocks.some((b) => b.id === 'builtin.audioenc');
+  } catch {
+    return true;
+  }
 }
 
 /** `builtin.mixer`'s own `min_upstream_latency` default (strom `types/src/mixer.rs`). */
@@ -908,6 +930,7 @@ export async function activateStromFlow(
   const whepOutputEntries: Array<{ outputId: string; endpointId: string }> = [];
   let recorderBlockId: string | undefined;
   let recorderOutputDir: string | undefined;
+  const warnings: ActivationWarning[] = [];
   let outputBlockIndex = 0;
   if (outputDocs && outputDocs.length > 0) {
     for (const outputDoc of outputDocs) {
@@ -923,21 +946,45 @@ export async function activateStromFlow(
         // extra 'recording' assignments are ignored so we never fan-out writes.
         if (recorderBlockId) continue;
         // Per-production output directory: recorder writes
-        // {media_path}/{output_dir}/{prefix}_%05d.{ext} (Strom recorder.rs). We key
+        // {media_path}/{output_dir}/{filename_prefix}_{timestamp}_%05d.{ext} (Strom recorder.rs). We key
         // it by production id so segments are trivially locatable + uploadable.
-        const outputDir = `recordings/${production._id}`;
+        // Each activation gets its own subdirectory, named by its start time, so
+        // deactivate can tell which activation recorded each file.
+        const outputDir = `${productionRecordingsDir(production._id)}/${activationRecordingsDirName()}`;
         flow.blocks.push({
           id: blockId,
           block_definition_id: 'builtin.recorder',
           name: outputDoc.name,
           properties: {
             output_dir: outputDir,
-            prefix: production._id,
+            filename_prefix: production._id,
           },
           position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
         });
-        if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
-        if (mainAudioSource) flow.links.push({ from: mainAudioSource, to: `${blockId}:audio_in_0` });
+        if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in_0` });
+        // The recorder refuses raw audio (Strom refusal.rs), and main_out is raw,
+        // so audio needs builtin.audioenc. Strom older than 0.6.9 lacks it and
+        // refuses to start the whole flow if it is referenced; record picture
+        // only rather than keep the production off air.
+        if (mainAudioSource && !(await stromHasAudioEncoder(strom))) {
+          warnings.push({
+            type: 'recording-no-audio',
+            message:
+              `Recording "${outputDoc.name}" has no sound: this Strom has no builtin.audioenc block. ` +
+              'Upgrade Strom to 0.6.9 or later to record audio.',
+          });
+        } else if (mainAudioSource) {
+          const audioEncId = `b-rec-aenc-${idSlug}-${endpointSuffix}`;
+          flow.blocks.push({
+            id: audioEncId,
+            block_definition_id: 'builtin.audioenc',
+            name: `${outputDoc.name} Audio`,
+            properties: { codec: 'aac' },
+            position: { x: COL_OUTPUT - 200, y: ROW_START + outputBlockIndex * ROW_H },
+          });
+          flow.links.push({ from: mainAudioSource, to: `${audioEncId}:audio_in` });
+          flow.links.push({ from: `${audioEncId}:encoded_out`, to: `${blockId}:audio_in_0` });
+        }
         recorderBlockId = blockId;
         recorderOutputDir = outputDir;
         outputBlockIndex++;
@@ -1161,6 +1208,7 @@ export async function activateStromFlow(
     pgmWhepEndpointId,
     recorderBlockId,
     recorderOutputDir,
+    warnings,
     sourceOffsetBlockIds,
     sourceAudioOffsetBlockIds,
     clipPlayerBlockIds,
