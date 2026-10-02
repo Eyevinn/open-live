@@ -453,6 +453,30 @@ describe('watch-only controller connection', () => {
     await waitFor(() => relayRefs(id).meter === 0 && relayRefs(id).clip === 0);
   });
 
+  it('an operator mid-connect when reactivation re-init runs takes one relay ref, not two', async () => {
+    const id = 'prod-watch-reinit-mid-connect';
+    productionDocs.set(id, makeProductionDoc(id, { clipPlayerBlockIds: { clip1: 'b-clip-0' } }));
+    await startApp();
+
+    holdNextFlowGet = true;
+    const operator = open(id);
+    const snapshotEnd = new Promise<void>((resolve) => operator.on('message', (data) => {
+      if ((JSON.parse(data.toString()) as { type?: string }).type === 'SNAPSHOT_END') resolve();
+    }));
+    await waitFor(() => releaseFlowGet !== null);
+    clearAudioState(id); // deactivate
+    await reinitConnectedControllers(id);
+    expect(relayRefs(id)).toEqual({ meter: 1, clip: 1 });
+    releaseFlowGet!();
+    releaseFlowGet = null;
+    await snapshotEnd;
+    expect(relayRefs(id)).toEqual({ meter: 1, clip: 1 });
+
+    operator.close();
+    await waitFor(() => getSubscriberCount(id) === 0);
+    expect(relayRefs(id)).toEqual({ meter: 0, clip: 0 });
+  });
+
   it('tells a watcher that connected first about the operator connect\'s audio reset', async () => {
     const id = 'prod-watch-reset-broadcast';
     productionDocs.set(id, makeProductionDoc(id));
