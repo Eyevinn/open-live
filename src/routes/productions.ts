@@ -219,6 +219,7 @@ function deactivatedDoc(
     // Replaced only by a deactivate that had a recording to upload (issue #534).
     ...(lastRecordingUpload ? { lastRecordingUpload } : {}),
     recorderOutputDir: undefined,
+    inputRecorderBlockIds: undefined,
     sourceOffsetBlockIds: undefined,
     sourceAudioOffsetBlockIds: undefined,
     clipPlayerBlockIds: undefined,
@@ -301,6 +302,11 @@ async function firstRecordingOutput(
   return undefined;
 }
 
+/** Block ids of the per-input recorders (one per track) of the live activation. */
+function inputRecorderBlockIds(doc: ProductionDoc): string[] {
+  return Object.values(doc.inputRecorderBlockIds ?? {}).flatMap((ids) => Object.values(ids));
+}
+
 /**
  * Uploads the recordings of the activation being torn down and summarises the
  * outcome for `ProductionDoc.lastRecordingUpload` (issue #534). Never throws.
@@ -318,6 +324,7 @@ async function uploadProductionRecording(
   stromToken: string | undefined,
   log: FastifyBaseLogger,
 ): Promise<RecordingUploadSummary> {
+  const inputBlockIds = inputRecorderBlockIds(doc);
   let outputId: string | undefined;
   let connectionId: string | undefined;
   if (doc.recording) {
@@ -338,7 +345,7 @@ async function uploadProductionRecording(
 
   const nothingUploaded = (reason: RecordingUploadSummary['reason'], message: string): RecordingUploadSummary => {
     // A production that never recorded has nothing to warn about.
-    if (recorderBlockId) log.warn({ productionId: doc._id, reason }, `VOD recording not uploaded — ${message}`);
+    if (recorderBlockId || inputBlockIds.length > 0) log.warn({ productionId: doc._id, reason }, `VOD recording not uploaded — ${message}`);
     return summarise({ reason, message: `${message} The recording stays on Strom.` });
   };
 
@@ -368,9 +375,11 @@ async function uploadProductionRecording(
 
   let uploadRes: Awaited<ReturnType<typeof uploadProductionRecordings>>;
   try {
-    if (recorderBlockId) {
-      await strom.recorder.splitNow(stromFlowId, recorderBlockId).catch(() => undefined);
-    }
+    await Promise.all(
+      [recorderBlockId, ...inputBlockIds]
+        .filter((id): id is string => !!id)
+        .map((id) => strom.recorder.splitNow(stromFlowId, id).catch(() => undefined)),
+    );
     uploadRes = await uploadProductionRecordings({
       strom,
       stromUrl: config.stromUrl,
@@ -421,7 +430,9 @@ async function uploadProductionRecording(
         _id: recordingDocId(target.bucket, seg.key),
         type: 'recording',
         productionId: doc._id,
-        ...(outputId ? { outputId } : {}),
+        ...(seg.mixerInput
+          ? { mixerInput: seg.mixerInput, ...(seg.track && { track: seg.track }) }
+          : outputId ? { outputId } : {}),
         // Record which connection wrote the asset (issue #520); absent = the
         // default (env) connection — no backfill on old docs.
         ...(connectionId ? { connectionId } : {}),
@@ -664,6 +675,9 @@ async function runActivationFlow(
       // recorder fields a previous activation left behind.
       recorderBlockId: activation.recorderBlockId,
       recorderOutputDir: activation.recorderOutputDir,
+      inputRecorderBlockIds: activation.inputRecorders.length > 0
+        ? Object.fromEntries(activation.inputRecorders.map((r) => [r.mixerInput, r.blockIds]))
+        : undefined,
       ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
       ...(Object.keys(activation.sourceAudioOffsetBlockIds).length > 0 && { sourceAudioOffsetBlockIds: activation.sourceAudioOffsetBlockIds }),
       ...(Object.keys(activation.clipPlayerBlockIds).length > 0 && { clipPlayerBlockIds: activation.clipPlayerBlockIds }),
@@ -894,6 +908,7 @@ async function runActivationFlow(
       mixerBlockId: undefined,
       recorderBlockId: undefined,
       recorderOutputDir: undefined,
+      inputRecorderBlockIds: undefined,
       whepEndpoint: undefined,
       pgmWhepEndpoint: undefined,
       whipEndpoints: undefined,
@@ -1003,10 +1018,18 @@ const ReturnFeedInput = z
   })
   .optional();
 
+// Passthrough recording (encoded streams into the recorder, no transcode) is
+// not built yet; it is refused here rather than saved and skipped at activation.
+const RecordModeInput = z
+  .enum(['off', 'transcode', 'passthrough'])
+  .refine((mode) => mode !== 'passthrough', { message: "record: 'passthrough' is not supported yet; use 'transcode'" })
+  .optional();
+
 const SourceAssignmentInput = z.object({
   sourceId: z.string().min(1).max(128),
   mixerInput: mixerInputSchema,
   returnFeed: ReturnFeedInput,
+  record: RecordModeInput,
 });
 
 const GraphicAssignmentInput = z.object({
@@ -1324,7 +1347,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       // recorder or found files to upload.
       {
         const summary = await uploadProductionRecording(doc, doc.stromFlowId, doc.recorderBlockId, strom, stromToken, log);
-        if (doc.recorderBlockId || summary.uploaded > 0 || summary.failed.length > 0) lastRecordingUpload = summary;
+        if (doc.recorderBlockId || inputRecorderBlockIds(doc).length > 0 || summary.uploaded > 0 || summary.failed.length > 0) lastRecordingUpload = summary;
       }
 
       await deactivateStromFlow(doc.stromFlowId, strom);
@@ -1365,6 +1388,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       ...(body.returnFeed
         ? { returnFeed: { synced: body.returnFeed.synced, lowLatency: false as const } }
         : {}),
+      ...(body.record && body.record !== 'off' && { record: body.record }),
     };
     for (let attempt = 0; attempt < MAX_DB_WRITE_RETRIES; attempt++) {
       try {

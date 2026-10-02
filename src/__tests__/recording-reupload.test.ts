@@ -353,6 +353,7 @@ describe('activate — recorder fields describe only the current activation', ()
       returnBuses: [],
       mixerInputMap: {},
       warnings: [],
+      inputRecorders: [],
       ...overrides,
     };
   }

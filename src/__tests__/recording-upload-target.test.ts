@@ -146,6 +146,7 @@ function activationResult() {
     whepOutputEntries: undefined,
     pgmWhepEndpointId: undefined,
     warnings: [],
+    inputRecorders: [],
     sourceOffsetBlockIds: {},
     sourceAudioOffsetBlockIds: {},
     clipPlayerBlockIds: {},
