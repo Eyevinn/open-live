@@ -10,7 +10,10 @@ import type { FastifyPluginAsync } from 'fastify';
  * sits in the URL fragment so it never reaches server or proxy access logs. The
  * page reads it from `location.hash`, calls `POST /api/v1/guests/:inviteId/join`
  * with it as a bearer token, publishes camera+mic to the returned `whipUrl`
- * (WHIP), and plays the return feed from `feeds[].url` (WHEP).
+ * (WHIP), and plays the return feed from `feeds[].url` (WHEP). Once live, the
+ * guest picks what they hear (program minus themselves, or full program) with
+ * `PUT …/session/return`, and the page polls `GET …/session/return` so a change
+ * the crew makes shows up here too.
  *
  * This route is a plain static HTML document (no build step): the whole page is
  * embedded as a string constant so the `tsc`-only build carries it into `dist/`
@@ -99,6 +102,13 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       font-weight: 700; margin-left: 8px; vertical-align: middle;
     }
     .badge.onair { background: #c92a2a; }
+    #return-mode { margin-top: 16px; border: 1px solid #33333d; border-radius: 10px; padding: 10px 14px; }
+    #return-mode legend { font-size: 12px; color: #a0a0ad; padding: 0 4px; }
+    #return-mode label { display: flex; align-items: center; gap: 8px; font-size: 14px; color: #f4f4f6; margin: 6px 0; }
+    #self-warning {
+      margin-top: 8px; padding: 10px 12px; border-radius: 8px; font-size: 13px;
+      background: #3a2e13; border: 1px solid #f08c00;
+    }
     .hidden { display: none !important; }
   </style>
 </head>
@@ -112,8 +122,15 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       <video id="preview" autoplay playsinline muted></video>
       <div class="hint">This is your camera preview. It is muted here so you don't hear yourself.</div>
       <video id="return" autoplay playsinline class="hidden"></video>
-      <div id="return-hint" class="hint hidden">Return feed from the studio (program).</div>
+      <div id="return-hint" class="hint hidden">Return feed from the studio.</div>
     </div>
+
+    <fieldset id="return-mode" class="hidden">
+      <legend>What you hear</legend>
+      <label><input type="radio" name="return-mode" id="mode-program-minus" value="program-minus" /> Program without you</label>
+      <label><input type="radio" name="return-mode" id="mode-program" value="program" /> Full program (you hear yourself, delayed)</label>
+      <div id="self-warning" class="hidden">You will hear your own voice about half a second late, which makes talking hard. Switch to &ldquo;Program without you&rdquo; before you speak on air.</div>
+    </fieldset>
 
     <div id="pickers" class="row">
       <div class="field">
@@ -160,6 +177,12 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     var goLiveBtn = document.getElementById("golive");
     var muteBtn = document.getElementById("mute");
     var leaveBtn = document.getElementById("leave");
+    var returnModeBox = document.getElementById("return-mode");
+    var modeInputs = {
+      "program-minus": document.getElementById("mode-program-minus"),
+      "program": document.getElementById("mode-program")
+    };
+    var selfWarning = document.getElementById("self-warning");
 
     // ---- State -------------------------------------------------------------
     var localStream = null;
@@ -168,6 +191,14 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     var returnPc = null;
     var muted = false;
     var live = false;
+    // The return mode the page shows, and the poll that keeps it in step with
+    // the server. modeSeq counts local changes so a poll answer that started
+    // before one is dropped instead of undoing it.
+    var returnMode = null;
+    var modeSeq = 0;
+    var modePending = 0;
+    var modePoll = null;
+    var MODE_POLL_MS = 5000;
 
     function setBanner(text, cls) {
       banner.textContent = text;
@@ -303,6 +334,76 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       });
     }
 
+    // ---- Return mode -------------------------------------------------------
+    // Makes what the guest hears match the mode. Both modes play the picture
+    // feed's audio; the server switches what that audio carries.
+    function applyReturnAudio(mode) {
+      returnMode = mode;
+      Object.keys(modeInputs).forEach(function (k) { modeInputs[k].checked = k === mode; });
+      updateSelfWarning();
+    }
+
+    function updateSelfWarning() {
+      if (returnMode === "program" && !muted) show(selfWarning);
+      else hide(selfWarning);
+    }
+
+    function returnUrl() {
+      return apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/session/return";
+    }
+
+    function setReturnMode(mode) {
+      var previous = returnMode;
+      var seq = ++modeSeq;
+      modePending++;
+      applyReturnAudio(mode);
+      fetch(returnUrl(), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+        body: JSON.stringify({ mode: mode })
+      }).then(function (res) {
+        if (!res.ok) throw new Error("mode change failed: " + res.status);
+      }).catch(function () {
+        // Put back what the server still has, unless a newer change superseded this one.
+        if (seq === modeSeq && previous) applyReturnAudio(previous);
+      }).then(function () { modePending--; });
+    }
+
+    function pollReturnMode() {
+      if (modePending > 0) return;
+      var seq = modeSeq;
+      fetch(returnUrl(), {
+        headers: { "Authorization": "Bearer " + token }
+      }).then(function (res) {
+        return res.ok ? res.json() : null;
+      }).then(function (data) {
+        if (!live || seq !== modeSeq || modePending > 0) return;
+        if (data && modeInputs[data.mode] && data.mode !== returnMode) applyReturnAudio(data.mode);
+      }).catch(function () { /* try again next tick */ });
+    }
+
+    // Offers the switch when there is a return feed and join lists both
+    // picture-feed modes. A low-latency-minus mode (delivered as its own feed)
+    // is not a choice here.
+    function startReturnMode(joinData) {
+      if (!joinData || !(joinData.feeds || []).length) return;
+      var modes = joinData.modes || [];
+      var offered = {};
+      modes.forEach(function (m) {
+        if (m && m.delivery && m.delivery.kind === "picture-switch") offered[m.key] = true;
+      });
+      if (!offered["program"] || !offered["program-minus"]) return;
+      applyReturnAudio(joinData.returnMode || joinData.defaultMode || "program-minus");
+      show(returnModeBox);
+      modePoll = setInterval(pollReturnMode, MODE_POLL_MS);
+    }
+
+    function stopReturnMode() {
+      if (modePoll) { clearInterval(modePoll); modePoll = null; }
+      hide(returnModeBox);
+      hide(selfWarning);
+    }
+
     // ---- Go live -----------------------------------------------------------
     function goLive() {
       goLiveBtn.disabled = true;
@@ -326,6 +427,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         show(muteBtn);
         show(leaveBtn);
         setBanner("You are live. The studio can see and hear you.", "live");
+        startReturnMode(joinData);
         // Play the return feed(s), if any are live yet. Failure here is
         // non-fatal: the guest is still contributing even without return video.
         var feeds = (joinData && joinData.feeds) || [];
@@ -349,6 +451,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       muteBtn.className = muted ? "muted" : "";
       if (muted) mutedIndicator.classList.add("show");
       else mutedIndicator.classList.remove("show");
+      updateSelfWarning();
       // Report to the backend so the operator sees it (best-effort).
       fetch(apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/session/mute", {
         method: "PUT",
@@ -359,6 +462,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
 
     // ---- Leave -------------------------------------------------------------
     function teardown() {
+      stopReturnMode();
       if (publishPc) { try { publishPc.close(); } catch (e) {} publishPc = null; }
       if (returnPc) { try { returnPc.close(); } catch (e) {} returnPc = null; }
       if (localStream) { localStream.getTracks().forEach(function (t) { t.stop(); }); }
@@ -397,6 +501,11 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     goLiveBtn.addEventListener("click", goLive);
     muteBtn.addEventListener("click", function () { setMuted(!muted); });
     leaveBtn.addEventListener("click", leave);
+    Object.keys(modeInputs).forEach(function (k) {
+      modeInputs[k].addEventListener("change", function () {
+        if (modeInputs[k].checked && k !== returnMode) setReturnMode(k);
+      });
+    });
     camSel.addEventListener("change", function () { startPreview().catch(function () {}); });
     micSel.addEventListener("change", function () { startPreview().catch(function () {}); });
 

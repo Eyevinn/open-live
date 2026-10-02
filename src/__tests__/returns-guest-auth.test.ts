@@ -109,6 +109,8 @@ vi.mock('../lib/strom-token.js', () => ({
 const AUTH = { authorization: `Bearer ${TEST_API_KEY}` };
 const STROM_URL = 'http://localhost:7000'; // matches vitest.config.ts env STROM_URL
 
+const { applyReturnMode } = await import('../ws/controller.js');
+
 let app: FastifyInstance;
 let buildServer: typeof import('../server.js')['buildServer'];
 
@@ -340,5 +342,142 @@ describe('Return-picture WHEP guest-token auth (issue #380)', () => {
       headers: AUTH,
     });
     expect(res.statusCode).toBe(204);
+  });
+});
+
+describe('Guest return mode: GET / PUT /api/v1/guests/:inviteId/session/return', () => {
+  const returnUrl = (inviteId: string) => `/api/v1/guests/${inviteId}/session/return`;
+  const bearer = (token: string) => ({ authorization: `Bearer ${token}` });
+
+  beforeEach(() => {
+    vi.mocked(applyReturnMode).mockReset();
+    vi.mocked(applyReturnMode).mockImplementation(async (_productionId, mixerInput, mode) => ({
+      ok: true,
+      mixerInput,
+      mode,
+    }));
+  });
+
+  async function leaveGuest(inviteId: string, token: string) {
+    const res = await app.inject({ method: 'DELETE', url: `/api/v1/guests/${inviteId}/session`, headers: bearer(token) });
+    expect(res.statusCode).toBe(204);
+  }
+
+  it('GET reports the slot mode and the modes on offer to a live guest', async () => {
+    const doc = seedActiveProduction();
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    await joinGuest(invite.id, invite.token);
+    doc.sources[0]!.returnFeed = { synced: 'program' };
+    const res = await app.inject({ method: 'GET', url: returnUrl(invite.id), headers: bearer(invite.token) });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { mixerInput: string; mode: string; modes: Array<{ key: string }>; defaultMode: string };
+    expect(body.mixerInput).toBe('video_in_0');
+    expect(body.mode).toBe('program');
+    expect(body.defaultMode).toBe('program-minus');
+    expect(body.modes.map((m) => m.key)).toEqual(['program', 'program-minus']);
+  });
+
+  it('PUT applies the mode on the guest\'s own input', async () => {
+    seedActiveProduction();
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    await joinGuest(invite.id, invite.token);
+    const res = await app.inject({
+      method: 'PUT',
+      url: returnUrl(invite.id),
+      headers: bearer(invite.token),
+      payload: { mode: 'program' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ mixerInput: 'video_in_0', mode: 'program' });
+    expect(applyReturnMode).toHaveBeenCalledWith('prod-1', 'video_in_0', 'program');
+  });
+
+  it('401s without a token, and the shared API key is not a guest token', async () => {
+    seedActiveProduction();
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    await joinGuest(invite.id, invite.token);
+    for (const headers of [{}, AUTH]) {
+      const get = await app.inject({ method: 'GET', url: returnUrl(invite.id), headers });
+      expect(get.statusCode).toBe(401);
+      const put = await app.inject({ method: 'PUT', url: returnUrl(invite.id), headers, payload: { mode: 'program' } });
+      expect(put.statusCode).toBe(401);
+    }
+    expect(applyReturnMode).not.toHaveBeenCalled();
+  });
+
+  it('401s a token used under another invite\'s id', async () => {
+    seedActiveProduction();
+    const inviteA = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    const inviteB = await createInvite('prod-1', { mixerInput: 'video_in_1' });
+    await joinGuest(inviteA.id, inviteA.token);
+    await joinGuest(inviteB.id, inviteB.token);
+    const res = await app.inject({
+      method: 'PUT',
+      url: returnUrl(inviteB.id),
+      headers: bearer(inviteA.token),
+      payload: { mode: 'program' },
+    });
+    expect(res.statusCode).toBe(401);
+    expect(applyReturnMode).not.toHaveBeenCalled();
+  });
+
+  it('a guest who left cannot change the mode of the guest who now holds the slot', async () => {
+    seedActiveProduction();
+    const first = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    await joinGuest(first.id, first.token);
+    await leaveGuest(first.id, first.token);
+    const second = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    await joinGuest(second.id, second.token);
+    vi.mocked(applyReturnMode).mockClear();
+
+    const put = await app.inject({
+      method: 'PUT',
+      url: returnUrl(first.id),
+      headers: bearer(first.token),
+      payload: { mode: 'program' },
+    });
+    expect(put.statusCode).toBe(401);
+    const get = await app.inject({ method: 'GET', url: returnUrl(first.id), headers: bearer(first.token) });
+    expect(get.statusCode).toBe(401);
+    expect(applyReturnMode).not.toHaveBeenCalled();
+  });
+
+  it('401s once the guest has been kicked', async () => {
+    seedActiveProduction();
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    const { guestId } = await joinGuest(invite.id, invite.token);
+    const kick = await app.inject({ method: 'DELETE', url: `/api/v1/productions/prod-1/guests/${guestId}`, headers: AUTH });
+    expect(kick.statusCode).toBe(204);
+    const res = await app.inject({
+      method: 'PUT',
+      url: returnUrl(invite.id),
+      headers: bearer(invite.token),
+      payload: { mode: 'program' },
+    });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('401s an expired invite (persisted expiry)', async () => {
+    seedActiveProduction();
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    await joinGuest(invite.id, invite.token);
+    const stored = invitesStore.get(invite.id)!;
+    invitesStore.set(invite.id, { ...stored, expiresAt: new Date(Date.now() - 1000).toISOString() });
+    const res = await app.inject({ method: 'GET', url: returnUrl(invite.id), headers: bearer(invite.token) });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('400s low-latency-minus, which is a feed choice rather than a mix', async () => {
+    seedActiveProduction();
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    await joinGuest(invite.id, invite.token);
+    const res = await app.inject({
+      method: 'PUT',
+      url: returnUrl(invite.id),
+      headers: bearer(invite.token),
+      payload: { mode: 'low-latency-minus' },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(applyReturnMode).not.toHaveBeenCalled();
   });
 });
