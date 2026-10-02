@@ -195,8 +195,9 @@ describe('guest join — intercom configured', () => {
     expect(sessionsStore.get(body.guestId)?.intercomLineId).toBe('ic-line-1');
     // …and the grouping id on the production so teardown can find it.
     expect(productionsStore.get('prod-1')?.intercomProductionId).toBe('ic-prod-9');
-    // WHIP video + WHEP return unaffected — talkback is additive.
-    expect(body.whipUrl).toContain('/whip/video_in_');
+    // WHIP video + WHEP return unaffected — talkback is additive. The whipUrl is
+    // the guest-scoped alias (issue #423), keyed by :inviteId not mixerInput.
+    expect(body.whipUrl).toMatch(/\/api\/v1\/guests\/[^/]+\/whip$/);
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
