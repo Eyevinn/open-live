@@ -9,7 +9,9 @@ import { getStromToken } from '../lib/strom-token.js';
 import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js';
 import { setTally, broadcast, getSubscriberCount } from '../services/tally.service.js';
 import { clearProductionPflState } from '../services/pfl-state.js';
-import { clearPipState, clearAudioState, clearFxState, clearClipStateForProduction } from '../ws/controller.js';
+import { clearPipState, clearAudioState, clearFxState, clearClipStateForProduction, reinitConnectedControllers } from '../ws/controller.js';
+import { forceStopMeterRelay } from '../services/meter-relay.js';
+import { forceStopClipRelay } from '../services/clip-relay.js';
 import { config, isRecordingEnabled } from '../config.js';
 import { minioTargetFromConfig, uploadRecordings } from '../lib/recording-uploader.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
@@ -451,6 +453,13 @@ async function runActivationFlow(
           for (const w of activation.warnings) broadcast(productionId, { type: 'ERROR', error: w.message });
         }
         log.info({ productionId, stromFlowId, whepEndpoint, initialTally, audioMixerBlockId }, 'Production activated — flow playing');
+
+        // Controllers that stayed connected across a deactivate→reactivate are
+        // never re-run through the WS connect handler, so re-run first-connect
+        // audio init once and restart the meter/clip relays against this new
+        // flow for them (issue #416). Best-effort — it internally swallows its
+        // own errors and is a no-op when nobody is connected.
+        await reinitConnectedControllers(productionId);
         return;
       }
 
@@ -832,6 +841,13 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       clearAudioState(doc._id);
       clearPipState(doc._id);
       clearFxState(doc._id);
+      // Force-stop the meter and clip relays regardless of refCount (issue #416).
+      // Controller sockets stay open across deactivate; if the relays were left
+      // alive they would stay bound to this (torn-down) flow and every connect
+      // after reactivation would ref-count into the stale relay, so no client
+      // would get METER_DATA/LOUDNESS_DATA/CLIP_STATE until all sockets closed.
+      forceStopMeterRelay(doc._id);
+      forceStopClipRelay(doc._id);
       // Stop any clip completion-poll timers and wipe the in-memory clip-state
       // registry — live-only clip state must not survive deactivation (#278).
       clearClipStateForProduction(doc._id);

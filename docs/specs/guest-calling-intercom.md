@@ -192,7 +192,7 @@ POST/DELETE /api/v1/productions/:id/returns/:mixerInput/picture/whep
 POST/DELETE /api/v1/productions/:id/returns/:mixerInput/fast/whep   # lowLatency only (after v1)
 PUT         /api/v1/productions/:id/returns/:mixerInput/mode        # crew; body { mode }
 GET         /api/v1/productions/:id/returns/:mixerInput             # crew; join shape, no guest fields
-PUT         /api/v1/guests/:inviteId/session/return                 # guest token; body { mode }
+GET/PUT     /api/v1/guests/:inviteId/session/return                 # guest token; PUT body { mode }
 ```
 
 Return fields in the join response:
@@ -214,7 +214,16 @@ returnMode: 'program' | 'program-minus';   // current mode of the picture feed's
   return is an error rather than a guest hearing themselves.
 - **Mode changes** — `PUT …/mode`, the guest route and `RETURN_SET` share one handler: persist,
   apply live if active, broadcast `RETURN_STATE`. Only `program` and `program-minus`;
-  `low-latency-minus` is a client-side feed choice and returns `400`.
+  `low-latency-minus` is a client-side feed choice and returns `400`. The guest routes need the
+  invite's live session and act on its `mixerInput`, so a guest who has left cannot change the
+  return of whoever holds the slot now. Guest and crew changes are last-write-wins; the guest
+  page polls `GET …/session/return` (every 5 s) to follow a crew change, since guests have no
+  WebSocket. Three 401s in a row (a single one can be a
+  momentary database error) stop the poll and hide the switch; a PUT with no answer after 10 s is
+  abandoned and the previous mode shown until the next poll.
+- **Guest page switch** — once live, the page offers the two picture-switch modes ("Program
+  without you" and "Full program"). With `program` on and the mic open it warns that the
+  guest hears their own voice about half a second late.
 - **Scoping** — the Strom target is derived server-side, as the WHIP proxy does
   (`src/routes/whip.ts:30-35`), and session URLs are checked against that output's endpoint path,
   not just the Strom origin. Credentials in `Authorization` only. A guest token is scoped to its
