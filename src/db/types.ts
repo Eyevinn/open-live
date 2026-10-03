@@ -610,6 +610,8 @@ export interface GuestSessionDoc {
   talkbackWhipSessionId?: string;
   /** intercom-manager WHEP session id of this guest's talkback listen (as above). Internal. */
   talkbackWhepSessionId?: string;
+  /** Strom WHEP session id of this guest's most recent fast return feed; same role as `returnWhepSessionId`. */
+  fastWhepSessionId?: string;
   createdAt: string;
   updatedAt: string;
 }
