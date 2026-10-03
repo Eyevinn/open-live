@@ -199,6 +199,8 @@ function deactivatedDoc(
     whepOutputUrls: undefined,
     returnBuses: undefined,
     returnWhepUrls: undefined,
+    fastWhepUrls: undefined,
+    fastFeedRouter: undefined,
     intercomProductionId: undefined,
     tally: { pgm: null, pvw: null },
     updatedAt: new Date().toISOString(),
@@ -505,6 +507,13 @@ async function runActivationFlow(
                 endpointId,
               }))
             : undefined;
+        // Audio-only fast return endpoints (returnFeed.lowLatency), in the
+        // production's conversation flow.
+        const fastWhepUrls = activation.fastWhepEntries.map(({ mixerInput, endpointId }) => ({
+          mixerInput,
+          url: `${config.stromUrl}/whep/${endpointId}`,
+          endpointId,
+        }));
 
         await updateProductionDoc(productionId, {
           status: 'active',
@@ -514,6 +523,9 @@ async function runActivationFlow(
           srtOutputUri: undefined,
           whepOutputUrls: whepOutputUrls && whepOutputUrls.length > 0 ? whepOutputUrls : undefined,
           ...(returnWhepUrls && returnWhepUrls.length > 0 && { returnWhepUrls }),
+          // Always written: an earlier run's fast feed must not outlive a run without one.
+          fastWhepUrls: fastWhepUrls.length > 0 ? fastWhepUrls : undefined,
+          fastFeedRouter: activation.fastFeedRouter,
           ...(activation.returnBuses.length > 0 && { returnBuses: activation.returnBuses }),
           tally: initialTally,
           ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),

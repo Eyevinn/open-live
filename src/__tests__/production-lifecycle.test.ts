@@ -54,10 +54,11 @@ vi.mock('../lib/flow-generator.js', () => ({
 }));
 
 const mockStromFlowsList = vi.fn();
+const mockStromFlowsDelete = vi.fn().mockResolvedValue({});
 vi.mock('../lib/strom.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/strom.js')>();
   class MockStromClient {
-    flows = { list: mockStromFlowsList, get: vi.fn(), start: vi.fn(), stop: vi.fn(), delete: vi.fn() };
+    flows = { list: mockStromFlowsList, get: vi.fn(), start: vi.fn(), stop: vi.fn().mockResolvedValue({}), delete: mockStromFlowsDelete };
   }
   return { ...actual, StromClient: MockStromClient };
 });
@@ -373,6 +374,21 @@ describe('startup reconcile — flow gone: active → ended, activating → inac
     await reconcileProductionStatuses(silentLog);
 
     expect(mockInsert).not.toHaveBeenCalled();
+  });
+
+  it('removes a conversation flow whose program flow is gone, and keeps one whose program is live', async () => {
+    mockStromFlowsList.mockResolvedValue({
+      flows: [
+        { id: 'flow-live', properties: { description: 'prod:prod-test-1' } },
+        { id: 'flow-conv-live', properties: { description: 'conv:flow-live' } },
+        { id: 'flow-conv-orphan', properties: { description: 'conv:flow-gone' } },
+      ],
+    });
+    mockFind.mockResolvedValue({ docs: [] });
+
+    await reconcileProductionStatuses(silentLog);
+
+    expect(mockStromFlowsDelete.mock.calls.map((c) => c[0])).toEqual(['flow-conv-orphan']);
   });
 });
 
