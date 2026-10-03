@@ -7,7 +7,8 @@
  *    and does not offer Rejoin yet; it restores the live banner on its own if
  *    it comes back "connected" within the grace window;
  *  - Rejoin joins and publishes again (reusing the invite's session) and puts
- *    the page back to live;
+ *    the page back to live; it closes both return feeds and ends their WHEP
+ *    sessions first;
  *  - the return connection failing only warns in the hint, leaving the live
  *    banner and the publish connection untouched; it clears when it recovers;
  *  - after leaving, a late connection-state change does nothing.
@@ -92,7 +93,7 @@ const DEVICES = [
   { kind: 'audioinput', deviceId: 'audio-a', label: 'Mic A' },
 ];
 
-function runPage(script: string) {
+function runPage(script: string, opts: { fastFeed?: boolean } = {}) {
   const els: Record<string, FakeElement> = {};
   const el = (id: string) => (els[id] ??= new FakeElement());
   for (const id of ['return', 'return-hint', 'return-mode', 'self-warning', 'mute', 'leave', 'rejoin', 'device-alert']) {
@@ -106,12 +107,14 @@ function runPage(script: string) {
     connectionState: string;
     setState(state: string): void;
     role?: 'publish' | 'return';
+    closed: boolean;
   }
   const pcs: PeerState[] = [];
 
   class RTCPeerConnection implements PeerState {
     connectionState = 'new';
     role: 'publish' | 'return' | undefined;
+    closed = false;
     iceGatheringState = 'complete';
     localDescription = { sdp: 'offer' };
     private listeners: Record<string, Array<() => void>> = {};
@@ -135,7 +138,9 @@ function runPage(script: string) {
     createOffer() { return Promise.resolve({ type: 'offer', sdp: 'offer' }); }
     setLocalDescription() { return Promise.resolve(); }
     setRemoteDescription() { return Promise.resolve(); }
-    close() {}
+    close() {
+      this.closed = true;
+    }
   }
 
   const respond = (status: number, json: unknown, location: string | null = null) =>
@@ -152,7 +157,13 @@ function runPage(script: string) {
     requests.push({ method, url });
     if (url.endsWith('/slot')) return respond(200, { returnOnly: false });
     if (url.endsWith('/join')) {
-      return respond(200, { whipUrl: 'https://live.example.com/whip', feeds: [{ url: 'https://live.example.com/whep' }] });
+      const feeds = [{ id: 'picture', url: 'https://live.example.com/returns/picture/whep' }];
+      if (opts.fastFeed) feeds.push({ id: 'fast', url: 'https://live.example.com/returns/fast/whep' });
+      return respond(200, { whipUrl: 'https://live.example.com/whip', feeds });
+    }
+    if (method === 'POST' && url.endsWith('/whep')) {
+      const n = requests.filter((r) => r.method === 'POST' && r.url === url).length;
+      return respond(201, {}, `${new URL(url).pathname}/s${n}`);
     }
     return respond(201, {}, '/whip/s1');
   };
@@ -185,6 +196,7 @@ function runPage(script: string) {
     els,
     requests,
     publishPc: () => pcs.find((p) => p.role === 'publish'),
+    pcs,
     returnPc: () => pcs.find((p) => p.role === 'return'),
     fireWindow: (type: string) => (windowListeners[type] ?? []).forEach((fn) => fn()),
     joinPosts: () => requests.filter((r) => r.method === 'POST' && r.url.endsWith('/join')).length,
@@ -194,8 +206,8 @@ function runPage(script: string) {
 
 const flush = () => new Promise((r) => setTimeout(r, 10));
 
-async function goLive() {
-  const page = runPage(await pageScript());
+async function goLive(opts: { fastFeed?: boolean } = {}) {
+  const page = runPage(await pageScript(), opts);
   await flush();
   page.els['golive']!.fire('click');
   await flush();
@@ -241,6 +253,25 @@ describe('guest page connection loss', () => {
     expect(page.els['banner']!.textContent).toBe('You are live. The studio can see and hear you.');
     expect(page.els['rejoin']!.hidden).toBe(true);
     expect(page.els['mute']!.hidden).toBe(false);
+  });
+
+  it('closes both return feeds and ends their WHEP sessions on Rejoin', async () => {
+    const page = await goLive({ fastFeed: true });
+    const oldReturns = page.pcs.filter((p) => p.role === 'return');
+    expect(oldReturns).toHaveLength(2);
+    page.publishPc()!.setState('failed');
+
+    page.els['rejoin']!.fire('click');
+    await flush();
+
+    expect(oldReturns.every((p) => p.closed)).toBe(true);
+    const deletes = page.requests.filter((r) => r.method === 'DELETE').map((r) => r.url);
+    expect(deletes).toEqual([
+      'https://live.example.com/returns/picture/whep/s1',
+      'https://live.example.com/returns/fast/whep/s1',
+    ]);
+    // Both feeds are played again on the new connection.
+    expect(page.pcs.filter((p) => p.role === 'return' && !p.closed)).toHaveLength(2);
   });
 
   it('only warns in the hint when the return connection fails, leaving publish live', async () => {
