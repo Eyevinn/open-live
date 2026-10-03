@@ -72,9 +72,13 @@ const sessionsDb = {
     if (!doc) throw Object.assign(new Error('not_found'), { statusCode: 404 });
     return doc;
   }),
+  // Revision-checked like CouchDB: a write from a stale snapshot gets a 409.
   insert: vi.fn(async (doc: GuestSessionDoc) => {
-    sessionsStore.set(doc._id, { ...doc, _rev: '1-x' });
-    return { ok: true };
+    const stored = sessionsStore.get(doc._id);
+    if (stored && stored._rev !== doc._rev) throw Object.assign(new Error('conflict'), { statusCode: 409 });
+    const rev = `${parseInt(stored?._rev ?? '0', 10) + 1}-x`;
+    sessionsStore.set(doc._id, { ...doc, _rev: rev });
+    return { ok: true, rev };
   }),
   destroy: vi.fn(),
   find: vi.fn(async (q: { selector: Record<string, unknown> }) => ({
@@ -479,5 +483,172 @@ describe('Guest return mode: GET / PUT /api/v1/guests/:inviteId/session/return',
     });
     expect(res.statusCode).toBe(400);
     expect(applyReturnMode).not.toHaveBeenCalled();
+  });
+});
+
+describe('Fast return feed (returnFeed.lowLatency)', () => {
+  function seedWithFast() {
+    const doc = seedActiveProduction();
+    const withFast = {
+      ...doc,
+      fastWhepUrls: [{ mixerInput: 'video_in_0', url: `${STROM_URL}/whep/fast-video_in_0`, endpointId: 'fast-video_in_0' }],
+    } as ProductionDoc;
+    productionsStore.set(doc._id, withFast);
+    return withFast;
+  }
+
+  async function postFast(mixerInput: string, headers: Record<string, string>) {
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/v1/productions/prod-1/returns/${mixerInput}/fast/whep`,
+      headers: { ...headers, 'content-type': 'application/sdp' },
+      payload: 'v=0',
+    });
+    const location = res.headers['location'] as string | undefined;
+    return { res, location, sessionId: location ? location.split('/').pop()! : undefined };
+  }
+
+  it('lists the fast feed and the low-latency-minus mode only where one exists', async () => {
+    seedWithFast();
+    const withFast = (await app.inject({ method: 'GET', url: '/api/v1/productions/prod-1/returns/video_in_0', headers: AUTH })).json();
+    expect(withFast.feeds).toEqual([
+      { id: 'picture', url: '/api/v1/productions/prod-1/returns/video_in_0/picture/whep', video: true },
+      { id: 'fast', url: '/api/v1/productions/prod-1/returns/video_in_0/fast/whep', video: false },
+    ]);
+    expect(withFast.modes.find((m: { key: string }) => m.key === 'low-latency-minus')).toMatchObject({
+      synced: false,
+      excludesMixerInput: 'video_in_0',
+      delivery: { kind: 'feed', feed: 'fast' },
+    });
+
+    const without = (await app.inject({ method: 'GET', url: '/api/v1/productions/prod-1/returns/video_in_1', headers: AUTH })).json();
+    expect(without.feeds.map((f: { id: string }) => f.id)).toEqual(['picture']);
+    expect(without.modes.map((m: { key: string }) => m.key)).not.toContain('low-latency-minus');
+  });
+
+  it('proxies a guest\'s fast feed to its own Strom endpoint and scopes teardown to /fast/whep', async () => {
+    seedWithFast();
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    await joinGuest(invite.id, invite.token);
+    const { res, location } = await postFast('video_in_0', { authorization: `Bearer ${invite.token}` });
+    expect(res.statusCode).toBe(201);
+    const calls = (fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+    expect(calls.at(-1)![0]).toBe(`${STROM_URL}/whep/fast-video_in_0`);
+    expect(location).toMatch(/^\/api\/v1\/productions\/prod-1\/returns\/video_in_0\/fast\/whep\/session-\d+$/);
+  });
+
+  it('hands a guest the fast feed under /api/v1/guests and serves it there', async () => {
+    seedWithFast();
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    const guest = { authorization: `Bearer ${invite.token}` };
+    const join = (await app.inject({ method: 'POST', url: `/api/v1/guests/${invite.id}/join`, headers: guest })).json();
+    const path = `/api/v1/guests/${invite.id}/returns`;
+    expect(join.feeds.map((f: { id: string; url: string; video: boolean }) => [f.id, new URL(f.url).pathname, f.video])).toEqual([
+      ['picture', `${path}/picture/whep`, true],
+      ['fast', `${path}/fast/whep`, false],
+    ]);
+    expect(join.modes.map((m: { key: string }) => m.key)).toContain('low-latency-minus');
+
+    const post = (feed: string) => app.inject({
+      method: 'POST',
+      url: `/api/v1/guests/${invite.id}/returns/${feed}/whep`,
+      headers: { ...guest, 'content-type': 'application/sdp' },
+      payload: 'v=0',
+    });
+    const fast = await post('fast');
+    expect(fast.statusCode).toBe(201);
+    const calls = (fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+    expect(calls.at(-1)![0]).toBe(`${STROM_URL}/whep/fast-video_in_0`);
+    const fastLocation = fast.headers['location'] as string;
+    expect(fastLocation).toMatch(new RegExp(`^/api/v1/guests/${invite.id}/returns/fast/whep/session-\\d+$`));
+    const picture = await post('picture');
+    const pictureSession = (picture.headers['location'] as string).split('/').pop();
+
+    // Each feed's session is bound on its own: the picture id does not tear down the fast feed.
+    const del = (feed: string, id: string | undefined) =>
+      app.inject({ method: 'DELETE', url: `/api/v1/guests/${invite.id}/returns/${feed}/whep/${id}`, headers: guest });
+    expect((await del('fast', pictureSession)).statusCode).toBe(403);
+    expect((await del('fast', fastLocation.split('/').pop())).statusCode).toBe(204);
+    expect((await del('picture', pictureSession)).statusCode).toBe(204);
+
+    const mode = (await app.inject({ method: 'GET', url: `/api/v1/guests/${invite.id}/session/return`, headers: guest })).json();
+    expect(mode.modes.map((m: { key: string }) => m.key)).toContain('low-latency-minus');
+  });
+
+  it('404s the fast feed on an input without one', async () => {
+    seedWithFast();
+    const { res } = await postFast('video_in_1', AUTH);
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('binds fast and picture sessions separately for guest teardown', async () => {
+    seedWithFast();
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    await joinGuest(invite.id, invite.token);
+    const guest = { authorization: `Bearer ${invite.token}` };
+    const { sessionId: pictureSession } = await postPicture('video_in_0', guest);
+    const { sessionId: fastSession } = await postFast('video_in_0', guest);
+    expect(pictureSession).not.toBe(fastSession);
+
+    // The picture session id does not authorize tearing down through /fast/whep.
+    const wrong = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/productions/prod-1/returns/video_in_0/fast/whep/${pictureSession}`,
+      headers: guest,
+    });
+    expect(wrong.statusCode).toBe(403);
+    const own = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/productions/prod-1/returns/video_in_0/fast/whep/${fastSession}`,
+      headers: guest,
+    });
+    expect(own.statusCode).toBe(204);
+    const picture = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/productions/prod-1/returns/video_in_0/picture/whep/${pictureSession}`,
+      headers: guest,
+    });
+    expect(picture.statusCode).toBe(204);
+  });
+
+  it('keeps both bindings when a guest opens the picture and fast feeds at once', async () => {
+    seedWithFast();
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    await joinGuest(invite.id, invite.token);
+    const guest = { authorization: `Bearer ${invite.token}` };
+    const [picture, fast] = await Promise.all([postPicture('video_in_0', guest), postFast('video_in_0', guest)]);
+
+    const del = (feed: string, id: string | undefined) =>
+      app.inject({ method: 'DELETE', url: `/api/v1/productions/prod-1/returns/video_in_0/${feed}/whep/${id}`, headers: guest });
+    expect((await del('picture', picture.sessionId)).statusCode).toBe(204);
+    expect((await del('fast', fast.sessionId)).statusCode).toBe(204);
+  });
+
+  it('retries the session binding after a write conflict', async () => {
+    seedWithFast();
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    await joinGuest(invite.id, invite.token);
+    const guest = { authorization: `Bearer ${invite.token}` };
+    sessionsDb.insert.mockRejectedValueOnce(Object.assign(new Error('conflict'), { statusCode: 409 }));
+    const { sessionId } = await postFast('video_in_0', guest);
+
+    const own = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/productions/prod-1/returns/video_in_0/fast/whep/${sessionId}`,
+      headers: guest,
+    });
+    expect(own.statusCode).toBe(204);
+  });
+
+  it('leaves the fast feed out of the join reply on an input without one', async () => {
+    seedWithFast();
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_1' });
+    const join = (await app.inject({
+      method: 'POST',
+      url: `/api/v1/guests/${invite.id}/join`,
+      headers: { authorization: `Bearer ${invite.token}` },
+    })).json();
+    expect(join.feeds.map((f: { id: string }) => f.id)).toEqual(['picture']);
+    expect(join.modes.map((m: { key: string }) => m.key)).not.toContain('low-latency-minus');
   });
 });

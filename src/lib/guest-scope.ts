@@ -40,15 +40,15 @@ export function looksLikeGuestToken(value: string): boolean {
 }
 
 // The two route families a guest invite token may authenticate (issue #380).
-// Deliberately narrow: matches ONLY the WHIP upload routes and the
-// return-picture WHEP routes (including the DELETE .../picture/whep/:sessionId
+// Deliberately narrow: matches ONLY the WHIP upload routes and the return
+// WHEP feed routes, picture and fast (including the DELETE .../whep/:sessionId
 // child) — never widen this to other `/api/v1/productions/:id/...` routes.
 const WHIP_PATH_RE = /^\/api\/v1\/productions\/[^/]+\/whip\/[^/]+$/;
-const RETURN_PICTURE_PATH_RE = /^\/api\/v1\/productions\/[^/]+\/returns\/[^/]+\/picture\/whep(?:\/[^/]+)?$/;
+const RETURN_FEED_PATH_RE = /^\/api\/v1\/productions\/[^/]+\/returns\/[^/]+\/(?:picture|fast)\/whep(?:\/[^/]+)?$/;
 
-/** True if `path` is one of the two guest-eligible WHIP/return-picture route families. */
+/** True if `path` is one of the two guest-eligible WHIP/return-feed route families. */
 export function isGuestEligibleWhipReturnPath(path: string): boolean {
-  return WHIP_PATH_RE.test(path) || RETURN_PICTURE_PATH_RE.test(path);
+  return WHIP_PATH_RE.test(path) || RETURN_FEED_PATH_RE.test(path);
 }
 
 /** The pieces a route handler needs once a guest caller has been scoped. */

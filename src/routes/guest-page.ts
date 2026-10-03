@@ -10,10 +10,17 @@ import type { FastifyPluginAsync } from 'fastify';
  * sits in the URL fragment so it never reaches server or proxy access logs. The
  * page reads it from `location.hash`, calls `POST /api/v1/guests/:inviteId/join`
  * with it as a bearer token, publishes camera+mic to the returned `whipUrl`
- * (WHIP), and plays the return feed from `feeds[].url` (WHEP). Once live, the
+ * (WHIP), and plays the return feeds from `feeds[].url` (WHEP). Once live, the
  * guest picks what they hear (program minus themselves, or full program) with
  * `PUT …/session/return`, and the page polls `GET …/session/return` so a change
  * the crew makes shows up here too.
+ *
+ * When the join lists a `fast` feed and the mode is `program-minus`, the guest
+ * hears the fast feed's audio and sees the picture feed's video with the
+ * picture's own audio muted. The fast feed is always mix-minus, so in `program`
+ * the guest hears the picture's audio instead. The two feeds stay on separate
+ * PeerConnections so the browser cannot lip-sync the fast audio back to the
+ * picture.
  *
  * This route is a plain static HTML document (no build step): the whole page is
  * embedded as a string constant so the `tsc`-only build carries it into `dist/`
@@ -27,8 +34,8 @@ import type { FastifyPluginAsync } from 'fastify';
 // (`default-src 'none'`) is meant for the JSON API and would block this page's
 // own inline script/style and its media playback, so we override it here to the
 // minimum this page needs: same-origin everything, inline script/style for the
-// self-contained document, blob:/mediastream: media for the WebRTC <video>
-// elements, and same-origin connect for the join/WHIP/WHEP fetches (WebRTC ICE
+// self-contained document, blob:/mediastream: media for the WebRTC <video> and
+// <audio> elements, and same-origin connect for the join/WHIP/WHEP fetches (WebRTC ICE
 // itself is not governed by connect-src).
 const GUEST_PAGE_CSP = [
   "default-src 'self'",
@@ -122,6 +129,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       <video id="preview" autoplay playsinline muted></video>
       <div class="hint">This is your camera preview. It is muted here so you don't hear yourself.</div>
       <video id="return" autoplay playsinline class="hidden"></video>
+      <audio id="return-audio" autoplay></audio>
       <div id="return-hint" class="hint hidden">Return feed from the studio.</div>
     </div>
 
@@ -170,6 +178,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     var onairBadge = document.getElementById("onair-badge");
     var preview = document.getElementById("preview");
     var returnVideo = document.getElementById("return");
+    var returnAudio = document.getElementById("return-audio");
     var returnHint = document.getElementById("return-hint");
     var camSel = document.getElementById("cam");
     var micSel = document.getElementById("mic");
@@ -189,6 +198,13 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     var publishPc = null;
     var publishResource = null;
     var returnPc = null;
+    var returnResource = null;
+    var fastPc = null;
+    var fastResource = null;
+    // Whether a fast feed is listed and has not failed, and the mode whose audio
+    // is playing. routeReturnAudio picks what the guest hears from these.
+    var fastAvailable = false;
+    var audioMode = "program-minus";
     var muted = false;
     var live = false;
     // The return mode the page shows, and the poll that keeps it in step with
@@ -313,12 +329,15 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       });
     }
 
-    function whepPlay(url) {
+    // Open a recvonly WHEP session and hand its stream to onStream. Resolves
+    // with { pc, resource } once the answer is applied.
+    function whepPlay(url, withVideo, onStream) {
       var pc = new RTCPeerConnection(ICE);
-      pc.addTransceiver("video", { direction: "recvonly" });
+      var resource = null;
+      if (withVideo) pc.addTransceiver("video", { direction: "recvonly" });
       pc.addTransceiver("audio", { direction: "recvonly" });
       pc.addEventListener("track", function (e) {
-        if (e.streams && e.streams[0]) returnVideo.srcObject = e.streams[0];
+        if (e.streams && e.streams[0]) onStream(e.streams[0]);
       });
       return pc.createOffer().then(function (offer) {
         return pc.setLocalDescription(offer);
@@ -332,21 +351,97 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         });
       }).then(function (res) {
         if (!res.ok) throw new Error("WHEP play failed: " + res.status);
+        resource = res.headers.get("Location");
         return res.text();
       }).then(function (answer) {
         return pc.setRemoteDescription({ type: "answer", sdp: answer });
       }).then(function () {
-        returnPc = pc;
-        show(returnVideo);
-        show(returnHint);
+        return { pc: pc, resource: resource };
+      }, function (err) {
+        try { pc.close(); } catch (e) {}
+        throw err;
       });
     }
 
+    function findFeed(feeds, id) {
+      for (var i = 0; i < feeds.length; i++) {
+        if (feeds[i].id === id && feeds[i].url) return feeds[i];
+      }
+      return null;
+    }
+
+    // Play the picture feed, and the fast feed when there is one.
+    function playReturns(feeds, mode) {
+      var picture = findFeed(feeds, "picture");
+      var fast = findFeed(feeds, "fast");
+      fastAvailable = !!fast;
+      routeReturnAudio(mode);
+      if (picture) {
+        whepPlay(picture.url, true, function (stream) { returnVideo.srcObject = stream; }).then(function (s) {
+          if (!live) { closeWhep(s.pc, s.resource); return; }
+          returnPc = s.pc;
+          returnResource = s.resource;
+          show(returnVideo);
+          show(returnHint);
+        }).catch(function () {
+          returnHint.textContent = "Return feed not available yet.";
+          show(returnHint);
+        });
+      }
+      if (fast) {
+        whepPlay(fast.url, false, function (stream) { returnAudio.srcObject = stream; }).then(function (s) {
+          if (!live) { closeWhep(s.pc, s.resource); return; }
+          fastPc = s.pc;
+          fastResource = s.resource;
+        }).catch(function () {
+          fastAvailable = false;
+          routeReturnAudio(audioMode);
+        });
+      }
+    }
+
+    // Close a WHEP PeerConnection and ask the server to end its session. The
+    // DELETE must go out before the guest session's own DELETE, since the
+    // invite token stops authorizing return routes once the session is gone.
+    function closeWhep(pc, resource) {
+      if (pc) { try { pc.close(); } catch (e) {} }
+      if (!resource) return Promise.resolve();
+      return fetch(new URL(resource, apiBase).toString(), {
+        method: "DELETE",
+        headers: { "Authorization": "Bearer " + token },
+        keepalive: true
+      }).catch(function () {});
+    }
+
+    // Closes the return feeds and resolves once their DELETEs are answered.
+    function closeReturns() {
+      var done = Promise.all([
+        closeWhep(returnPc, returnResource),
+        closeWhep(fastPc, fastResource)
+      ]);
+      returnPc = returnResource = fastPc = fastResource = null;
+      returnVideo.srcObject = null;
+      returnAudio.srcObject = null;
+      return done;
+    }
+
     // ---- Return mode -------------------------------------------------------
-    // Makes what the guest hears match the mode. Both modes play the picture
-    // feed's audio; the server switches what that audio carries.
+    // Makes what the guest hears match the mode. The server switches what the
+    // picture feed's audio carries; in program-minus with a fast feed the guest
+    // hears the fast feed instead, which arrives about half a second sooner.
+    // The fast feed is always mix-minus, so program, or a fast feed that failed,
+    // plays the picture's audio. A muted fast feed stays connected so switching
+    // back is instant.
+    function routeReturnAudio(mode) {
+      audioMode = mode;
+      var useFast = mode === "program-minus" && fastAvailable;
+      returnVideo.muted = useFast;
+      returnAudio.muted = !useFast;
+    }
+
     function applyReturnAudio(mode) {
       returnMode = mode;
+      routeReturnAudio(mode);
       Object.keys(modeInputs).forEach(function (k) { modeInputs[k].checked = k === mode; });
       updateSelfWarning();
     }
@@ -454,16 +549,13 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         show(muteBtn);
         show(leaveBtn);
         setBanner("You are live. The studio can see and hear you.", "live");
+        // Play the return feeds, if any are live yet. Failure here is
+        // non-fatal: the guest is still contributing even without a return.
+        playReturns(
+          (joinData && joinData.feeds) || [],
+          (joinData && (joinData.returnMode || joinData.defaultMode)) || "program-minus"
+        );
         startReturnMode(joinData);
-        // Play the return feed(s), if any are live yet. Failure here is
-        // non-fatal: the guest is still contributing even without return video.
-        var feeds = (joinData && joinData.feeds) || [];
-        if (feeds.length && feeds[0].url) {
-          whepPlay(feeds[0].url).catch(function () {
-            returnHint.textContent = "Return feed not available yet.";
-            show(returnHint);
-          });
-        }
       }).catch(function (err) {
         goLiveBtn.disabled = false;
         setBanner(err && err.handled ? err.message : "Could not go live. Please check your connection and try again.", "error");
@@ -491,17 +583,19 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     function teardown() {
       stopReturnMode();
       if (publishPc) { try { publishPc.close(); } catch (e) {} publishPc = null; }
-      if (returnPc) { try { returnPc.close(); } catch (e) {} returnPc = null; }
+      closeReturns();
       if (localStream) { localStream.getTracks().forEach(function (t) { t.stop(); }); }
     }
 
     function leave() {
       leaveBtn.disabled = true;
       live = false;
-      fetch(apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/session", {
-        method: "DELETE",
-        headers: { "Authorization": "Bearer " + token },
-        keepalive: true
+      closeReturns().then(function () {
+        return fetch(apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/session", {
+          method: "DELETE",
+          headers: { "Authorization": "Bearer " + token },
+          keepalive: true
+        });
       }).catch(function () {}).then(function () {
         teardown();
         hide(muteBtn);
@@ -513,7 +607,9 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
 
     window.addEventListener("pagehide", function () {
       if (!live) { teardown(); return; }
-      // Best-effort teardown on close; keepalive lets the request outlive the page.
+      // Best-effort teardown on close; keepalive lets the requests outlive the
+      // page. The return feeds' DELETEs are queued first (see closeWhep).
+      closeReturns();
       try {
         fetch(apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/session", {
           method: "DELETE",

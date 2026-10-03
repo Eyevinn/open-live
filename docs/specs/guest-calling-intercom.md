@@ -106,8 +106,9 @@ explicitly a later enhancement.
 ### Low-latency mode (after v1)
 
 `low-latency-minus` is for on-air conversation between guests: the minus mix on its own
-audio-only WHEP output, played by the client in place of the picture feed's audio. v1 accepts
-only `returnFeed.lowLatency: false`. Before it ships:
+audio-only WHEP output, played by the client in place of the picture feed's audio.
+`returnFeed.lowLatency: true` builds it (`src/lib/fast-returns.ts`), on Strom's audio bridge
+(Eyevinn/strom#844) and the mixer's direct outputs (Eyevinn/strom#930). Requirements it is built to:
 
 - **Absorb stalls after the jitterbuffer, not in it.** Each seat keeps one WHIP jitterbuffer
   at its quality setting (Strom's default is 400 ms), shared by program and the fast feed.
@@ -120,7 +121,7 @@ only `returnFeed.lowLatency: false`. Before it ships:
   absorbed downstream of the jitterbuffer, on the conversation path only: run at a low target
   latency, time-stretch audio to cover a stall rather than go silent, then play slightly fast
   until back at target. A prototype recovered a 400 ms stall with no skip and no added
-  dropout; nothing that does this is built yet.
+  dropout; Strom's audio bridge (Eyevinn/strom#844) does this.
 - **Conversation audio never airs.** What airs is each voice via the program path, buffered and
   unstretched; the conversation path governs only what guests hear of each other. It must
   never feed program output or a recording, because time-scaled audio cannot be recovered
@@ -409,17 +410,27 @@ from Proposed → Accepted.
 These do not gate accepting the spec or cutting sub-issues; they are resolved during
 implementation or in a dependent `open-live-studio` ticket.
 
-- **Mix for the low-latency return (after v1):** `builtin.liveaudiorouter` fed before the mixer.
-  Not an aux bus on `builtin.mixer`: it puts the conversation through the program
-  mixer, which passes one guest's bad link on to every other guest. With one contributor on a
+- **Mix for the low-latency return (after v1):** `builtin.liveaudiorouter` fed from the
+  program mixer's per-channel direct outputs (`direct_outs`, Eyevinn/strom#930). Not an aux bus
+  on `builtin.mixer`: an aux bus sums in an aggregator, which passes one guest's bad link on to
+  every other guest. With one contributor on a
   badly impaired link, the other contributors' audio on the `liveaudiorouter` path kept 0.13–0.18%
   dropout, the same as the control, while the program mixer took every contributor's audio to 7%
   dropout and shifted its own delay by 220 ms (Strom loopback rig, 0–200 ms jitter, 0.4–1.2 s
   stalls and about 13% burst loss on one WHIP publisher's packets, dropout of a test tone from a
-  clean contributor). Open: the router feeds raw microphones, with no limiter unless
-  Eyevinn/strom#795 lands. Measure path headroom first; see
-  [Low-latency mode](#low-latency-mode-after-v1). Only relevant once `low-latency-minus` ships;
-  v1 is `lowLatency: false`.
+  clean contributor; measured with the router fed from each source, before the mixer). Fed from
+  the direct outs, under the same impairment, the other contributors kept 0.14–0.17% dropout in
+  the fast feed against 0.13–0.21% for the control. A direct
+  out taps its channel after the fader, mute and `to_main`, and before the Main sum, so no
+  aggregator sits on the fast path and the crew's changes reach the fast feed inside Strom. The
+  router is a fixed mix-minus. The fast feed therefore follows the whole channel strip,
+  including pan and a fader above unity. A channel routed to a group but not to Main reaches
+  program through the group and is silent in the fast feed. Open: the router sums the channels
+  with no limiter unless Eyevinn/strom#795 lands. The router takes at most 8 inputs and 8 outputs;
+  a production with more audio channels or fast feeds than that gets no fast feed, and its
+  guests use the picture feed's audio. Measure path headroom first; see
+  [Low-latency mode](#low-latency-mode-after-v1). Applies to assignments with
+  `returnFeed.lowLatency: true`.
 - **Guest auth model for invite links:** production-scoped, expiring, single-use vs reusable? This
   spec proposes signed (HMAC) expiring tokens stored as hashes — adopted as the implementation
   default.
