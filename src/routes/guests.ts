@@ -81,13 +81,19 @@ const MuteBody = z.object({ muted: z.boolean() });
 // ---------------------------------------------------------------------------
 
 /**
- * The guest return modes advertised on join. v1 ships `program` and
- * `program-minus` (synced, picture-switch delivery); `low-latency-minus` is
- * declared but gated off (spec §"Return feed design", §"Low-latency mode").
+ * The guest return modes advertised on join: `program` and `program-minus`
+ * (synced, picture-switch delivery), plus `low-latency-minus` (the fast feed)
+ * when the guest has one (spec §"Return feed design", §"Low-latency mode").
  * `defaultMode` is `program-minus` per OQ2 (@svensson00, #208).
  */
-export function returnModesFor(mixerInput: string) {
-  return [
+export function returnModesFor(mixerInput: string, fast = false) {
+  const modes: Array<{
+    key: 'program' | 'program-minus' | 'low-latency-minus';
+    label: string;
+    synced: boolean;
+    excludesMixerInput?: string;
+    delivery: { kind: 'picture-switch' } | { kind: 'feed'; feed: 'fast' };
+  }> = [
     {
       key: 'program' as const,
       label: 'Program',
@@ -102,6 +108,18 @@ export function returnModesFor(mixerInput: string) {
       delivery: { kind: 'picture-switch' as const },
     },
   ];
+  // The fast feed carries the same mix-minus ahead of the picture; the client
+  // plays it in place of the picture feed's audio.
+  if (fast) {
+    modes.push({
+      key: 'low-latency-minus',
+      label: 'Conversation (low latency)',
+      synced: false,
+      excludesMixerInput: mixerInput,
+      delivery: { kind: 'feed', feed: 'fast' },
+    });
+  }
+  return modes;
 }
 
 // ---------------------------------------------------------------------------
@@ -666,7 +684,7 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         fastify.log,
       );
 
-      // 6. Build the response. whipUrl and the return-picture feed URL point at
+      // 6. Build the response. whipUrl and the return feed URLs point at
       //    the guest-scoped aliases under `/api/v1/guests/:inviteId/...` (issue
       //    #423) rather than the crew `/api/v1/productions/...` paths: on OSC the
       //    ingress gate only passes `^/api/v1/guests` (osaas-app#6143), so the
@@ -680,19 +698,19 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         production.status === 'active' &&
         !!production.stromFlowId &&
         (production.returnWhepUrls ?? []).some((r) => r.mixerInput === mixerInput);
-      const feeds = returnLive
-        ? [{
-            id: 'picture',
-            url: `${base}/api/v1/guests/${req.params.inviteId}/returns/picture/whep`,
-            video: true,
-          }]
-        : [];
+      const fastLive =
+        returnLive && (production.fastWhepUrls ?? []).some((r) => r.mixerInput === mixerInput);
+      const returnsBase = `${base}/api/v1/guests/${req.params.inviteId}/returns`;
+      const feeds = [
+        ...(returnLive ? [{ id: 'picture', url: `${returnsBase}/picture/whep`, video: true }] : []),
+        ...(fastLive ? [{ id: 'fast', url: `${returnsBase}/fast/whep`, video: false }] : []),
+      ];
       return reply.status(200).send({
         guestId: session._id,
         ...(whipUrl ? { whipUrl } : {}),
         returnOnly: !takesWhip,
         feeds,
-        modes: returnModesFor(mixerInput),
+        modes: returnModesFor(mixerInput, fastLive),
         defaultMode: 'program-minus',
         returnMode,
         // intercomLine absent when intercom is unconfigured — join still works with
