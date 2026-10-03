@@ -5,8 +5,8 @@
  * default), declared before air via `POST /api/v1/productions/:id/sources` and
  * built into the flow as a per-guest return bus at activation. This test covers
  * that the assign-source route persists `returnFeed` when present (⇒ guest slot)
- * and omits it for an ordinary assignment, and that `lowLatency` is normalised to
- * false (v1 builds only the synced/picture-switch return).
+ * and omits it for an ordinary assignment, and that `lowLatency` defaults to
+ * false and is kept when true (the slot also gets a fast feed).
  *
  * CouchDB and the WS controller are mocked — no real services required.
  */
@@ -105,11 +105,22 @@ describe('POST /api/v1/productions/:id/sources — guest slot declaration (#381)
     expect(assignment?.returnFeed).toBeUndefined();
   });
 
-  it('rejects a v1-unsupported low-latency return (lowLatency: true)', async () => {
+  it('declares a slot with a fast feed (lowLatency: true)', async () => {
     const res = await postSource({
       sourceId: 'Whip',
       mixerInput: 'video_in_3',
       returnFeed: { synced: 'program-minus', lowLatency: true },
+    });
+    expect(res.statusCode).toBe(201);
+    const slot = lastInsertedDoc().sources.find((s) => s.mixerInput === 'video_in_3');
+    expect(slot?.returnFeed).toEqual({ synced: 'program-minus', lowLatency: true });
+  });
+
+  it('rejects a non-boolean lowLatency', async () => {
+    const res = await postSource({
+      sourceId: 'Whip',
+      mixerInput: 'video_in_3',
+      returnFeed: { synced: 'program-minus', lowLatency: 'yes' },
     });
     expect(res.statusCode).toBe(400);
     expect(mockInsert).not.toHaveBeenCalled();

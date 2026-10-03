@@ -95,11 +95,11 @@ function isGatewayHeartbeatPath(path: string): boolean {
 function isGuestTokenAuthedPath(path: string): boolean {
   // join, session (leave), session/return (guest return-mode switch, #300),
   // session/mute (guest mic mute toggle, #382), and the guest-scoped WHIP
-  // publish + its session PATCH/DELETE and the return-picture WHEP + its
-  // teardown (issue #423) — needed because the OSC ingress gate only passes
+  // publish + its session PATCH/DELETE and the return WHEP feeds (picture and
+  // fast) + their teardown (issue #423) — needed because the OSC ingress gate only passes
   // `^/api/v1/guests` (osaas-app#6143). Each handler verifies the per-invite
   // token itself (whip.ts / returns.ts), exactly like join/session.
-  return /^\/api\/v1\/guests\/[^/]+\/(join|session|session\/return|session\/mute|whip|returns\/picture\/whep(?:\/[^/]+)?)$/.test(path);
+  return /^\/api\/v1\/guests\/[^/]+\/(join|session|session\/return|session\/mute|whip|returns\/(?:picture|fast)\/whep(?:\/[^/]+)?)$/.test(path);
 }
 
 // Sentinel subprotocols used to carry the API key through the
