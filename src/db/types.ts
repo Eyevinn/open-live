@@ -421,6 +421,8 @@ export interface GuestSessionDoc {
    * caller-supplied :sessionId for another guest's feed.
    */
   returnWhepSessionId?: string;
+  /** Strom WHEP session id of this guest's most recent fast return feed; same role as `returnWhepSessionId`. */
+  fastWhepSessionId?: string;
   createdAt: string;
   updatedAt: string;
 }

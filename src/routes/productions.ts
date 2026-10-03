@@ -679,13 +679,13 @@ const dskInputSchema = z.string().regex(/^dsk_in_\d+$/, 'dskInput must match dsk
  * feed (program-minus by default) reserved for a guest and built into the flow
  * as a per-guest return bus at activation (`assignReturnBuses`,
  * `src/lib/flow-generator.ts`). Present ⇒ the input is a guest slot invites can
- * target; absent ⇒ an ordinary source assignment. v1 accepts `lowLatency: false`
- * only (the fast/low-latency return is a post-v1 feature).
+ * target; absent ⇒ an ordinary source assignment. `lowLatency: true` also
+ * builds the slot an audio-only fast feed (`src/lib/fast-returns.ts`).
  */
 const ReturnFeedInput = z
   .object({
     synced: z.enum(['program', 'program-minus']).default('program-minus'),
-    lowLatency: z.literal(false).optional(),
+    lowLatency: z.boolean().default(false),
   })
   .optional();
 
@@ -1083,10 +1083,9 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
     const assignment: ProductionSourceAssignment = {
       sourceId: body.sourceId,
       mixerInput: body.mixerInput,
-      // A returnFeed makes this a guest slot (#381 item 1). Normalise lowLatency
-      // to false — v1 builds only the synced (picture-switch) return.
+      // A returnFeed makes this a guest slot (#381 item 1).
       ...(body.returnFeed
-        ? { returnFeed: { synced: body.returnFeed.synced, lowLatency: false as const } }
+        ? { returnFeed: { synced: body.returnFeed.synced, lowLatency: body.returnFeed.lowLatency } }
         : {}),
     };
     for (let attempt = 0; attempt < MAX_DB_WRITE_RETRIES; attempt++) {
