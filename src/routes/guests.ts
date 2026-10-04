@@ -528,12 +528,16 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
       //     the final persisted session (state `joined`, intercom ref if any).
       broadcastGuestState(session, invite.label);
 
-      // 6. Build the response. whipUrl reuses the EXISTING WHIP proxy contract
-      //    (`/api/v1/productions/:id/whip/:mixerInput`) — never a new WHIP path.
-      //    The return picture feed URL is server-issued and scoped to this input;
-      //    it is only live once the production is active (spec §"Return feeds").
+      // 6. Build the response. whipUrl and the return-picture feed URL point at
+      //    the guest-scoped aliases under `/api/v1/guests/:inviteId/...` (issue
+      //    #423) rather than the crew `/api/v1/productions/...` paths: on OSC the
+      //    ingress gate only passes `^/api/v1/guests` (osaas-app#6143), so the
+      //    guest page must reach WHIP/WHEP through its own invite-scoped routes.
+      //    The crew paths are unchanged and still serve operator/automation
+      //    callers. The return feed is only live once the production is active
+      //    (spec §"Return feeds").
       const base = resolvePublicBaseUrl(req);
-      const whipUrl = `${base}/api/v1/productions/${invite.productionId}/whip/${encodeURIComponent(mixerInput)}`;
+      const whipUrl = `${base}/api/v1/guests/${req.params.inviteId}/whip`;
       const returnLive =
         production.status === 'active' &&
         !!production.stromFlowId &&
@@ -541,7 +545,7 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
       const feeds = returnLive
         ? [{
             id: 'picture',
-            url: `${base}/api/v1/productions/${invite.productionId}/returns/${encodeURIComponent(mixerInput)}/picture/whep`,
+            url: `${base}/api/v1/guests/${req.params.inviteId}/returns/picture/whep`,
             video: true,
           }]
         : [];
