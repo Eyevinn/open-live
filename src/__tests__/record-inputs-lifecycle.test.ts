@@ -1,9 +1,9 @@
 /**
  * Per-input recorders (ProductionSourceAssignment.record) through the production lifecycle.
  * Activate saves their ids and binds the recording index. Deactivate splits
- * every recorder, uploads input files and registers them with their
- * mixerInput, and copies the activation's sidecar to object storage without
- * registering it as a recording.
+ * every recorder, waits for the split files, stops the flow, uploads input
+ * files and registers them with their mixerInput, and copies the activation's
+ * sidecar to object storage without registering it as a recording.
  *
  * CouchDB, Strom and object storage are mocked.
  */
@@ -68,7 +68,10 @@ vi.mock('../services/recording-index.js', async (importOriginal) => {
   return {
     ...actual,
     openRecordingIndex: (...args: [string]) => { mockOpenIndex(...args); return actual.openRecordingIndex(...args); },
-    bindRecordingIndex: (...args: Parameters<typeof actual.bindRecordingIndex>) => mockBindIndex(...args),
+    bindRecordingIndex: (...args: Parameters<typeof actual.bindRecordingIndex>) => {
+      mockBindIndex(...args);
+      return actual.bindRecordingIndex(...args);
+    },
     closeRecordingIndex: (...args: Parameters<typeof actual.closeRecordingIndex>) => {
       mockCloseIndex(...args);
       return actual.closeRecordingIndex(...args);
@@ -108,14 +111,18 @@ const mockMediaDeleteDirectory = vi.fn(async (dir: string) => {
 });
 const mockSplitNow = vi.fn().mockResolvedValue({});
 const mockFlowsGet = vi.fn();
+const mockFlowsStop = vi.fn();
+const mockMediaUpload = vi.fn().mockResolvedValue({});
+let emit: (event: unknown) => void = () => {};
 
 vi.mock('../lib/strom.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/strom.js')>();
   class MockStromClient {
-    flows = { list: vi.fn(), get: mockFlowsGet, start: vi.fn(), stop: vi.fn(), delete: vi.fn() };
+    flows = { list: vi.fn(), get: mockFlowsGet, start: vi.fn(), stop: mockFlowsStop, delete: vi.fn() };
     recorder = { splitNow: mockSplitNow };
-    media = { list: mockMediaList, deleteFile: mockMediaDeleteFile, deleteDirectory: mockMediaDeleteDirectory, upload: vi.fn() };
-    connectWebSocket(_onEvent: unknown, _onClose?: () => void, onOpen?: () => void) {
+    media = { list: mockMediaList, deleteFile: mockMediaDeleteFile, deleteDirectory: mockMediaDeleteDirectory, upload: mockMediaUpload };
+    connectWebSocket(onEvent: (event: unknown) => void, _onClose?: () => void, onOpen?: () => void) {
+      emit = onEvent;
       queueMicrotask(() => onOpen?.());
       return () => {};
     }
@@ -130,6 +137,7 @@ vi.mock('../lib/strom-token.js', () => ({
 import { buildServer } from '../server.js';
 import { config } from '../config.js';
 import { deactivateProduction } from '../services/idle-watchdog.js';
+import { bindRecordingIndex, closeRecordingIndex, currentRecordingIndex, openRecordingIndex } from '../services/recording-index.js';
 
 const savedConfig = {
   minioEndpoint: config.minioEndpoint,
@@ -187,7 +195,8 @@ beforeEach(() => {
   }));
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await closeRecordingIndex('prod-iso-1');
   Object.assign(config, savedConfig);
   vi.unstubAllGlobals();
 });
@@ -200,10 +209,81 @@ describe('deactivate — per-input recordings', () => {
     expect(mockDeactivateStromFlow).toHaveBeenCalledOnce();
   });
 
-  it('writes the sidecar a last time before splitting the recorders', async () => {
-    await deactivate();
-    expect(mockCloseIndex).toHaveBeenCalledWith('prod-iso-1');
-    expect(mockCloseIndex.mock.invocationCallOrder[0]).toBeLessThan(mockSplitNow.mock.invocationCallOrder[0]!);
+  describe('with the activation\'s recording index open', () => {
+    const fileEvent = (blockId: string, n: number) => ({
+      type: 'RecorderFileChanged',
+      data: { flow_id: 'flow-1', block_id: blockId, filename: `${ACT_DIR}/${blockId}_0000${n}.mp4`, start_utc_us: (1_000 + n) * 1000 },
+    });
+    const sidecarFiles = () => {
+      const body = JSON.parse(mockMediaUpload.mock.calls.at(-1)![2] as string) as {
+        program: { files: Array<{ path: string; startMs?: number }> };
+        inputs: Record<string, { tracks: Record<string, { files: Array<{ path: string; startMs?: number }> }> }>;
+      };
+      return [body.program, ...Object.values(body.inputs).flatMap((i) => Object.values(i.tracks))].flatMap((r) => r.files);
+    };
+    const recorders = ['b-out-rec', 'b-inrec-v-1', 'b-inrec-a-1', 'b-inrec-a-2'];
+    const splitOpened: string[] = [];
+
+    beforeEach(async () => {
+      const handle = await openRecordingIndex('prod-iso-1');
+      bindRecordingIndex(handle, {
+        productionId: 'prod-iso-1', productionName: 'ISO Production', flowId: 'flow-1', dir: ACT_DIR, activatedAtMs: 0,
+        program: { recorderBlockId: 'b-out-rec', outputDir: ACT_DIR },
+        inputs: [
+          { mixerInput: 'video_in_1', blockIds: { video: 'b-inrec-v-1', audio: 'b-inrec-a-1' }, outputDir: `${ACT_DIR}/video_in_1`, sourceId: 'Whip', sourceName: 'WHIP', streamType: 'whip', recordMode: 'transcode' },
+          { mixerInput: 'video_in_2', blockIds: { audio: 'b-inrec-a-2' }, outputDir: `${ACT_DIR}/video_in_2`, sourceId: 'Srt', sourceName: 'SRT', streamType: 'srt', recordMode: 'passthrough' },
+        ],
+      });
+      for (const id of recorders) emit(fileEvent(id, 0));
+      // A split opens the recorder's next file a moment after the request returns.
+      splitOpened.length = 0;
+      mockSplitNow.mockImplementation(async (_flowId: string, blockId: string) => {
+        setTimeout(() => {
+          splitOpened.push(blockId);
+          emit(fileEvent(blockId, 1));
+        }, 5);
+      });
+    });
+
+    afterEach(() => {
+      mockSplitNow.mockReset().mockResolvedValue({});
+    });
+
+    it('stops the flow once every split has opened its next file, before uploading', async () => {
+      let openedAtStop: string[] = [];
+      let uploadedAtStop = -1;
+      mockFlowsStop.mockImplementationOnce(async () => {
+        openedAtStop = [...splitOpened];
+        uploadedAtStop = puts.size;
+        return {};
+      });
+      await deactivate();
+      expect(mockFlowsStop).toHaveBeenCalledWith('flow-1');
+      expect(openedAtStop.sort()).toEqual([...recorders].sort());
+      expect(uploadedAtStop).toBe(0);
+      expect(puts.size).toBeGreaterThan(0);
+      expect(mockFlowsStop.mock.invocationCallOrder[0]).toBeLessThan(mockDeactivateStromFlow.mock.invocationCallOrder[0]!);
+    });
+
+    it('lists the files the final split opened, with their startMs, in the sidecar it uploads', async () => {
+      await deactivate();
+      const files = sidecarFiles();
+      for (const id of recorders) expect(files).toContainEqual({ path: `${ACT_DIR}/${id}_00001.mp4`, openedAtMs: expect.any(Number), startMs: 1_001 });
+      expect(mockCloseIndex.mock.invocationCallOrder[0]).toBeGreaterThan(mockFlowsStop.mock.invocationCallOrder[0]!);
+      expect(puts.get(`prod-iso-1/${ACT_NAME}/recordings.json`)).toBe('application/json');
+    });
+
+    it('closes only its own activation\'s index', async () => {
+      // A reactivation during the upload opens the production's next index.
+      let next: Awaited<ReturnType<typeof openRecordingIndex>> | undefined;
+      mockMediaList.mockImplementationOnce(async (dir: string) => {
+        next = await openRecordingIndex('prod-iso-1');
+        return mockMediaList(dir);
+      });
+      await deactivate();
+      expect(next).toBeDefined();
+      expect(currentRecordingIndex('prod-iso-1')).toBe(next);
+    });
   });
 
   it('writes the sidecar a last time when the idle timer ends the production', async () => {
