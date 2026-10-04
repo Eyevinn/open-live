@@ -13,8 +13,9 @@
  * between an input's video and audio files by tens of ms.
  *
  * The sidecar is rewritten after each event and once more on close, which
- * deactivate does before its final split. Best-effort throughout: nothing here
- * may block activation or deactivation.
+ * deactivate does after its final split has opened each recorder's last file
+ * and the flow has stopped. Best-effort throughout: nothing here may block
+ * activation or deactivation.
  */
 import { config } from '../config.js';
 import { getGuestInvitesDb, getGuestSessionsDb } from '../db/index.js';
@@ -96,6 +97,8 @@ interface OpenIndex {
   recorders: Map<string, RecorderIndexEntry>;
   dirty: boolean;
   writing: Promise<void> | null;
+  /** Checked after each file event and on close; see waitForNextFiles */
+  waiters: Set<() => void>;
 }
 
 /** One activation's index, as returned by openRecordingIndex. */
@@ -119,6 +122,7 @@ export async function openRecordingIndex(productionId: string): Promise<Recordin
     recorders: new Map(),
     dirty: false,
     writing: null,
+    waiters: new Set(),
   };
   open.set(productionId, entry);
   await new Promise<void>((resolve) => {
@@ -182,6 +186,41 @@ function applyFileEvent(entry: OpenIndex, event: FileEvent): void {
   recorder.files.push({ path: event.path, openedAtMs: event.atMs, ...(event.startMs !== undefined && { startMs: event.startMs }) });
   recorder.startedAtMs ??= event.startMs ?? event.atMs;
   scheduleWrite(entry);
+  for (const check of entry.waiters) check();
+}
+
+/** The production's open index, if any. */
+export function currentRecordingIndex(productionId: string): RecordingIndexHandle | undefined {
+  return open.get(productionId);
+}
+
+/**
+ * Returns a promise that resolves once each of these recorders has opened a
+ * file after this call, or after timeoutMs. Recorders that have not opened a
+ * file yet are not waited for: a split does not make them open one. Resolves
+ * at once for a closed or unbound index.
+ */
+export function waitForNextFiles(handle: RecordingIndexHandle, blockIds: string[], timeoutMs: number): Promise<void> {
+  const entry = handle as OpenIndex;
+  if (entry.closed || !entry.index) return Promise.resolve();
+  const counts = new Map<RecorderIndexEntry, number>();
+  for (const id of blockIds) {
+    const recorder = entry.recorders.get(id);
+    if (recorder?.files.length) counts.set(recorder, recorder.files.length);
+  }
+  if (counts.size === 0) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      entry.waiters.delete(check);
+      resolve();
+    };
+    const check = () => {
+      if (entry.closed || [...counts].every(([recorder, n]) => recorder.files.length > n)) done();
+    };
+    const timer = setTimeout(done, timeoutMs);
+    entry.waiters.add(check);
+  });
 }
 
 /** Sets what this activation records and writes the first sidecar. */
@@ -218,6 +257,7 @@ export async function closeRecordingIndex(target: string | RecordingIndexHandle)
   open.delete(entry.productionId);
   entry.closed = true;
   entry.stopWs();
+  for (const check of entry.waiters) check();
   if (entry.index) scheduleWrite(entry);
   await entry.writing;
 }
