@@ -1,4 +1,4 @@
-import type { FastifyPluginAsync } from 'fastify';
+import type { FastifyBaseLogger, FastifyPluginAsync } from 'fastify';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { getDb, getOutputsDb, getRecordingsDb } from '../db/index.js';
@@ -9,7 +9,9 @@ import { getStromToken } from '../lib/strom-token.js';
 import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js';
 import { setTally, broadcast, getSubscriberCount } from '../services/tally.service.js';
 import { clearProductionPflState } from '../services/pfl-state.js';
-import { clearPipState, clearAudioState, clearFxState, clearClipStateForProduction } from '../ws/controller.js';
+import { clearPipState, clearAudioState, clearFxState, clearClipStateForProduction, reinitConnectedControllers } from '../ws/controller.js';
+import { forceStopMeterRelay } from '../services/meter-relay.js';
+import { forceStopClipRelay } from '../services/clip-relay.js';
 import { config, isRecordingEnabled } from '../config.js';
 import { minioTargetFromConfig, uploadRecordings } from '../lib/recording-uploader.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
@@ -125,6 +127,11 @@ export function resolvePublicBaseUrl(
   return `${proto}://${host}`;
 }
 
+/** CouchDB answers a stale `_rev` with 409. */
+function isConflict(err: unknown): boolean {
+  return err instanceof Error && 'statusCode' in err && (err as { statusCode?: number }).statusCode === 409;
+}
+
 /**
  * Write a partial update to ProductionDoc with retry-on-409.
  * Re-reads the document before each retry to get the latest _rev.
@@ -145,10 +152,96 @@ export async function updateProductionDoc(
       return;
     } catch (err) {
       // CouchDB 409 = revision conflict — retry after re-read
-      if (err instanceof Error && 'statusCode' in err && (err as { statusCode?: number }).statusCode === 409) {
-        if (attempt < MAX_DB_WRITE_RETRIES - 1) continue;
-      }
+      if (isConflict(err) && attempt < MAX_DB_WRITE_RETRIES - 1) continue;
       throw err;
+    }
+  }
+}
+
+export interface DeactivateResult {
+  id: string;
+  name: string;
+  status: ProductionDoc['status'];
+  _rev: string;
+}
+
+/** Deactivations currently running, keyed by production ID. */
+const inFlightDeactivations = new Map<string, Promise<DeactivateResult>>();
+
+/**
+ * `doc` with every live-session field cleared. Unless `stopped` carries the
+ * status another stop path already recorded, the transition rule (spec §1)
+ * applies: a production that was `active` (reached a live broadcast) becomes
+ * `ended`; one that never reached `active` (still `activating`) becomes
+ * `inactive`.
+ */
+function deactivatedDoc(
+  doc: ProductionDoc,
+  stopped?: Pick<ProductionDoc, 'status' | 'endedReason'>,
+): ProductionDoc {
+  const status = stopped?.status ?? stoppedStatus(doc.status);
+  return {
+    ...doc,
+    status,
+    endedReason: stopped ? stopped.endedReason : status === 'ended' ? 'deactivated' : undefined,
+    stromFlowId: undefined,
+    mixerBlockId: undefined,
+    audioMixerBlockId: undefined,
+    loudnessMainBlockId: undefined,
+    recorderBlockId: undefined,
+    sourceOffsetBlockIds: undefined,
+    sourceAudioOffsetBlockIds: undefined,
+    clipPlayerBlockIds: undefined,
+    whepEndpoint: undefined,
+    pgmWhepEndpoint: undefined,
+    whipEndpoints: undefined,
+    srtOutputUri: undefined,
+    whepOutputUrls: undefined,
+    returnBuses: undefined,
+    returnWhepUrls: undefined,
+    intercomProductionId: undefined,
+    tally: { pgm: null, pvw: null },
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Persist the end of a deactivation whose teardown has already run against
+ * `doc`. On a revision conflict the doc is re-read, and the write is retried
+ * only if the stored doc still names no Strom flow or intercom grouping other
+ * than the ones this run tore down:
+ *  - same status: an unrelated field changed (a tally write, a rename), so the
+ *    deactivation is re-applied on top of it;
+ *  - `inactive`/`ended` with no flow: another stop path (the idle watchdog,
+ *    another backend instance) got there first. Its status is kept and the
+ *    refs it left behind are cleared.
+ * Anything else (a new activation, a guest's new intercom grouping) rethrows
+ * the conflict rather than dropping a resource this run did not tear down.
+ */
+async function writeDeactivatedDoc(
+  doc: ProductionDoc,
+  log: FastifyBaseLogger,
+): Promise<{ doc: ProductionDoc; rev: string }> {
+  let updated = deactivatedDoc(doc);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const response = await getDb().insert(updated);
+      return { doc: updated, rev: response.rev };
+    } catch (err) {
+      if (!isConflict(err) || attempt >= MAX_DB_WRITE_RETRIES - 1) throw err;
+      const current = await getDb().get(doc._id);
+      const tornDown =
+        (current.stromFlowId === undefined || current.stromFlowId === doc.stromFlowId) &&
+        (current.intercomProductionId === undefined || current.intercomProductionId === doc.intercomProductionId);
+      if (!tornDown) throw err;
+      if (current.status === doc.status && current.stromFlowId === doc.stromFlowId) {
+        updated = deactivatedDoc(current);
+      } else if ((current.status === 'inactive' || current.status === 'ended') && !current.stromFlowId) {
+        log.info({ productionId: doc._id, status: current.status }, 'Production already stopped by another writer — keeping its status');
+        updated = deactivatedDoc(current, current);
+      } else {
+        throw err;
+      }
     }
   }
 }
@@ -440,6 +533,13 @@ async function runActivationFlow(
           outputAssignments: doc.outputAssignments,
         });
         log.info({ productionId, stromFlowId, whepEndpoint, initialTally, audioMixerBlockId }, 'Production activated — flow playing');
+
+        // Controllers that stayed connected across a deactivate→reactivate are
+        // never re-run through the WS connect handler, so re-run first-connect
+        // audio init once and restart the meter/clip relays against this new
+        // flow for them (issue #416). Best-effort — it internally swallows its
+        // own errors and is a no-op when nobody is connected.
+        await reinitConnectedControllers(productionId);
         return;
       }
 
@@ -804,167 +904,169 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
 
   // Deactivate a production — stops and deletes the Strom flow, cancels any
   // in-progress activation polling loop.
+  //
+  // Deactivate is idempotent: a request that arrives while another deactivate of
+  // the same production is still running (the VOD upload alone can take tens of
+  // seconds) joins that run and gets its result, instead of repeating the
+  // teardown against the same stale revision and failing the final write.
   fastify.post<{ Params: { id: string } }>('/api/v1/productions/:id/deactivate', async (req, reply) => {
-    try {
-      const doc = await getDb().get(req.params.id);
-
-      // Cancel any in-progress activation loop
-      const abortController = activationAbortControllers.get(doc._id);
-      if (abortController) {
-        abortController.abort();
-        activationAbortControllers.delete(doc._id);
-      }
-
-      clearProductionPflState(doc._id);
-      clearAudioState(doc._id);
-      clearPipState(doc._id);
-      clearFxState(doc._id);
-      // Stop any clip completion-poll timers and wipe the in-memory clip-state
-      // registry — live-only clip state must not survive deactivation (#278).
-      clearClipStateForProduction(doc._id);
-      // Broadcast group-state reset so all connected clients clear their ephemeral
-      // group assignments — these are live-only and must not survive deactivation.
-      broadcast(doc._id, { type: 'GRP_STATE_RESET' });
-      broadcast(doc._id, { type: 'PRODUCTION_DEACTIVATED' });
-      if (doc.stromFlowId) {
-        const stromToken = await getStromToken(config.stromToken).catch((err) => { req.log.error({ errMsg: err instanceof Error ? err.message : String(err) }, "SAT exchange failed — proceeding without auth"); return undefined; });
-        const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
-
-        // VOD recording (issue #41): when a recorder block is active, finalise
-        // the current segment (recorder.splitNow) then upload Strom's local
-        // recordings to MinIO — Strom's recorder has no native S3 sink, so
-        // open-live pulls the segments and pushes them to object storage.
-        // Best-effort: a failed upload must not block deactivation/teardown.
-        if (doc.recorderBlockId && isRecordingEnabled()) {
-          const target = minioTargetFromConfig();
-          if (target) {
-            try {
-              await strom.recorder.splitNow(doc.stromFlowId, doc.recorderBlockId).catch(() => undefined);
-              const uploadRes = await uploadRecordings({
-                strom,
-                stromUrl: config.stromUrl,
-                stromToken,
-                outputDir: `recordings/${doc._id}`,
-                productionId: doc._id,
-                target,
-                // Guard (issue #366): re-check the production doc immediately
-                // before uploadRecordings' delete-after-upload pass. Nothing
-                // else in this handler writes to the production doc before its
-                // own final status update below, which runs after this block —
-                // so `doc._rev` cannot legitimately change between the read at
-                // the top of this handler and here. A different _rev means
-                // something else (most plausibly a reactivation) touched the
-                // doc while the upload was in flight; treat the activation as
-                // still live and skip deletion rather than risk deleting
-                // recordings it still needs.
-                isStillRecording: async () => {
-                  try {
-                    const current = await getDb().get(doc._id);
-                    return current._rev !== doc._rev;
-                  } catch {
-                    // Doc gone entirely — nothing left to protect.
-                    return false;
-                  }
-                },
-              });
-              // Persist one RecordingDoc per uploaded object so #42's listing/
-              // playback endpoint can enumerate and presign recordings without
-              // round-tripping the bucket. Best-effort: a failed persist must not
-              // block teardown, mirroring the upload's non-fatal contract.
-              const recordingOutputId = await firstRecordingOutputId(doc, req.log);
-              const finalizedAt = new Date().toISOString();
-              for (const seg of uploadRes.uploaded) {
-                try {
-                  const recId = `recording-${randomUUID()}`;
-                  const recDoc: RecordingDoc = {
-                    _id: recId,
-                    type: 'recording',
-                    productionId: doc._id,
-                    ...(recordingOutputId ? { outputId: recordingOutputId } : {}),
-                    bucket: target.bucket,
-                    key: seg.key,
-                    sizeBytes: seg.sizeBytes,
-                    // The sweep also uploads segments earlier sessions left on
-                    // Strom, so take the start from each segment's own name;
-                    // doc.updatedAt is this activation's start.
-                    startedAt: seg.startedAt ?? doc.updatedAt,
-                    endedAt: finalizedAt,
-                    createdAt: finalizedAt,
-                    updatedAt: finalizedAt,
-                  };
-                  await getRecordingsDb().insert(recDoc);
-                } catch (persistErr) {
-                  req.log.error({ persistErr, productionId: doc._id, key: seg.key }, 'RecordingDoc persist failed — object uploaded but unlisted');
-                }
-              }
-              req.log.info(
-                { productionId: doc._id, uploaded: uploadRes.uploaded.length, failed: uploadRes.failed.length },
-                'VOD recordings uploaded to object storage',
-              );
-            } catch (err) {
-              req.log.error({ err, productionId: doc._id }, 'VOD recording upload failed — continuing deactivation');
-            }
-          }
+    const productionId = req.params.id;
+    let run = inFlightDeactivations.get(productionId);
+    if (run) {
+      req.log.info({ productionId }, 'Deactivation already in progress — waiting for it');
+    } else {
+      run = (async () => {
+        try {
+          return await deactivate(productionId, req.log);
+        } finally {
+          inFlightDeactivations.delete(productionId);
         }
-
-        await deactivateStromFlow(doc.stromFlowId, strom);
-      }
-
-      // Tear down the Open Intercom talkback grouping (all its lines) with the
-      // production lifecycle (issue #302). Best-effort: a failed teardown must not
-      // block deactivation, mirroring the Strom/recording teardown contract.
-      if (doc.intercomProductionId && isIntercomEnabled()) {
-        await teardownIntercomProduction(doc.intercomProductionId).catch((err) => {
-          req.log.warn({ err, productionId: doc._id }, 'intercom teardown failed — continuing deactivation');
-        });
-      }
-
-      // Revoke the production's outstanding guest invites and mark any live guest
-      // sessions `left` (issue #325). A guest invite token is the security
-      // boundary of guest calling; a still-TTL-valid token must not be able to
-      // join a deactivated production and provision a fresh intercom line. This
-      // mirrors the per-invite DELETE revoke (guests.ts) and the kick/leave
-      // session transition. Best-effort: a failed sweep must not block
-      // deactivation, matching the Strom/intercom teardown contract.
-      await sweepGuestsOnProductionEnd(doc._id, req.log);
-
-      // Transition rule (spec §1): a production that was `active` (reached a live
-      // broadcast) and is now explicitly deactivated becomes `ended`; one that
-      // never reached `active` (still `activating`) becomes `inactive` — it never
-      // broadcast, so there is nothing to "end".
-      const nextStatus = stoppedStatus(doc.status);
-      const updated: ProductionDoc = {
-        ...doc,
-        status: nextStatus,
-        endedReason: nextStatus === 'ended' ? 'deactivated' : undefined,
-        stromFlowId: undefined,
-        mixerBlockId: undefined,
-        audioMixerBlockId: undefined,
-        loudnessMainBlockId: undefined,
-        recorderBlockId: undefined,
-        sourceOffsetBlockIds: undefined,
-        sourceAudioOffsetBlockIds: undefined,
-        clipPlayerBlockIds: undefined,
-        whepEndpoint: undefined,
-        pgmWhepEndpoint: undefined,
-        whipEndpoints: undefined,
-        srtOutputUri: undefined,
-        whepOutputUrls: undefined,
-        returnBuses: undefined,
-        returnWhepUrls: undefined,
-        intercomProductionId: undefined,
-        tally: { pgm: null, pvw: null },
-        updatedAt: new Date().toISOString(),
-      };
-      const response = await getDb().insert(updated);
-      notifyProductionDeactivated(doc._id);
-      emitProductionStatus(updated);
-      return reply.send({ id: updated._id, name: updated.name, status: updated.status, _rev: response.rev });
+      })();
+      inFlightDeactivations.set(productionId, run);
+    }
+    try {
+      return reply.send(await run);
     } catch (err) {
       req.log.error({ err }, 'Deactivation failed');
       return reply.status(500).send({ error: 'Deactivation failed — check server logs', statusCode: 500 });
     }
   });
+
+  async function deactivate(productionId: string, log: FastifyBaseLogger): Promise<DeactivateResult> {
+    const doc = await getDb().get(productionId);
+
+    // Cancel any in-progress activation loop
+    const abortController = activationAbortControllers.get(doc._id);
+    if (abortController) {
+      abortController.abort();
+      activationAbortControllers.delete(doc._id);
+    }
+
+    clearProductionPflState(doc._id);
+    clearAudioState(doc._id);
+    clearPipState(doc._id);
+    clearFxState(doc._id);
+    // Force-stop the meter and clip relays regardless of refCount (issue #416).
+    // Controller sockets stay open across deactivate; if the relays were left
+    // alive they would stay bound to this (torn-down) flow and every connect
+    // after reactivation would ref-count into the stale relay, so no client
+    // would get METER_DATA/LOUDNESS_DATA/CLIP_STATE until all sockets closed.
+    forceStopMeterRelay(doc._id);
+    forceStopClipRelay(doc._id);
+    // Stop any clip completion-poll timers and wipe the in-memory clip-state
+    // registry — live-only clip state must not survive deactivation (#278).
+    clearClipStateForProduction(doc._id);
+    // Broadcast group-state reset so all connected clients clear their ephemeral
+    // group assignments — these are live-only and must not survive deactivation.
+    broadcast(doc._id, { type: 'GRP_STATE_RESET' });
+    broadcast(doc._id, { type: 'PRODUCTION_DEACTIVATED' });
+    if (doc.stromFlowId) {
+      const stromToken = await getStromToken(config.stromToken).catch((err) => { log.error({ errMsg: err instanceof Error ? err.message : String(err) }, "SAT exchange failed — proceeding without auth"); return undefined; });
+      const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
+
+      // VOD recording (issue #41): when a recorder block is active, finalise
+      // the current segment (recorder.splitNow) then upload Strom's local
+      // recordings to MinIO — Strom's recorder has no native S3 sink, so
+      // open-live pulls the segments and pushes them to object storage.
+      // Best-effort: a failed upload must not block deactivation/teardown.
+      if (doc.recorderBlockId && isRecordingEnabled()) {
+        const target = minioTargetFromConfig();
+        if (target) {
+          try {
+            await strom.recorder.splitNow(doc.stromFlowId, doc.recorderBlockId).catch(() => undefined);
+            const uploadRes = await uploadRecordings({
+              strom,
+              stromUrl: config.stromUrl,
+              stromToken,
+              outputDir: `recordings/${doc._id}`,
+              productionId: doc._id,
+              target,
+              // Guard (issue #366): re-check the production doc immediately
+              // before uploadRecordings' delete-after-upload pass. Nothing
+              // else in this handler writes to the production doc before its
+              // own final status update below, which runs after this block —
+              // so `doc._rev` cannot legitimately change between the read at
+              // the top of this handler and here. A different _rev means
+              // something else (most plausibly a reactivation) touched the
+              // doc while the upload was in flight; treat the activation as
+              // still live and skip deletion rather than risk deleting
+              // recordings it still needs.
+              isStillRecording: async () => {
+                try {
+                  const current = await getDb().get(doc._id);
+                  return current._rev !== doc._rev;
+                } catch {
+                  // Doc gone entirely — nothing left to protect.
+                  return false;
+                }
+              },
+            });
+            // Persist one RecordingDoc per uploaded object so #42's listing/
+            // playback endpoint can enumerate and presign recordings without
+            // round-tripping the bucket. Best-effort: a failed persist must not
+            // block teardown, mirroring the upload's non-fatal contract.
+            const recordingOutputId = await firstRecordingOutputId(doc, log);
+            const finalizedAt = new Date().toISOString();
+            for (const seg of uploadRes.uploaded) {
+              try {
+                const recId = `recording-${randomUUID()}`;
+                const recDoc: RecordingDoc = {
+                  _id: recId,
+                  type: 'recording',
+                  productionId: doc._id,
+                  ...(recordingOutputId ? { outputId: recordingOutputId } : {}),
+                  bucket: target.bucket,
+                  key: seg.key,
+                  sizeBytes: seg.sizeBytes,
+                  // The sweep also uploads segments earlier sessions left on
+                  // Strom, so take the start from each segment's own name;
+                  // doc.updatedAt is this activation's start.
+                  startedAt: seg.startedAt ?? doc.updatedAt,
+                  endedAt: finalizedAt,
+                  createdAt: finalizedAt,
+                  updatedAt: finalizedAt,
+                };
+                await getRecordingsDb().insert(recDoc);
+              } catch (persistErr) {
+                log.error({ persistErr, productionId: doc._id, key: seg.key }, 'RecordingDoc persist failed — object uploaded but unlisted');
+              }
+            }
+            log.info(
+              { productionId: doc._id, uploaded: uploadRes.uploaded.length, failed: uploadRes.failed.length },
+              'VOD recordings uploaded to object storage',
+            );
+          } catch (err) {
+            log.error({ err, productionId: doc._id }, 'VOD recording upload failed — continuing deactivation');
+          }
+        }
+      }
+
+      await deactivateStromFlow(doc.stromFlowId, strom);
+    }
+
+    // Tear down the Open Intercom talkback grouping (all its lines) with the
+    // production lifecycle (issue #302). Best-effort: a failed teardown must not
+    // block deactivation, mirroring the Strom/recording teardown contract.
+    if (doc.intercomProductionId && isIntercomEnabled()) {
+      await teardownIntercomProduction(doc.intercomProductionId).catch((err) => {
+        log.warn({ err, productionId: doc._id }, 'intercom teardown failed — continuing deactivation');
+      });
+    }
+
+    // Revoke the production's outstanding guest invites and mark any live guest
+    // sessions `left` (issue #325). A guest invite token is the security
+    // boundary of guest calling; a still-TTL-valid token must not be able to
+    // join a deactivated production and provision a fresh intercom line. This
+    // mirrors the per-invite DELETE revoke (guests.ts) and the kick/leave
+    // session transition. Best-effort: a failed sweep must not block
+    // deactivation, matching the Strom/intercom teardown contract.
+    await sweepGuestsOnProductionEnd(doc._id, log);
+
+    const { doc: stored, rev } = await writeDeactivatedDoc(doc, log);
+    notifyProductionDeactivated(doc._id);
+    emitProductionStatus(stored);
+    return { id: stored._id, name: stored.name, status: stored.status, _rev: rev };
+  }
 
   // Assign a source to a mixer input
   fastify.post<{ Params: { id: string } }>('/api/v1/productions/:id/sources', async (req, reply) => {

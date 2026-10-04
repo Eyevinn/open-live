@@ -76,6 +76,17 @@ export const DEFAULT_FLOW: FlowTopology = {
       position: { x: 550.0, y: 50.0 },
     },
     {
+      // Shared low-bitrate program encode for WHEP viewers (issue #413). The
+      // 10 Mbit/s Enc PGM encode crosses whepserversink's GCC pacing threshold,
+      // delaying every program frame to viewers by ~26 ms; a ~4 Mbit/s encode
+      // ships each frame in one burst. Recorder / RTMP / SRT stay on Enc PGM.
+      id: 'b1ce7a9d4e5f604bc8aa7d36eb0c4f413',
+      block_definition_id: 'builtin.videoenc',
+      name: 'Enc View',
+      properties: { bitrate: 4000 },
+      position: { x: 550.0, y: 300.0 },
+    },
+    {
       id: 'b08c7a35f181a4f6a90f5e2c517df284a',
       block_definition_id: 'builtin.mixer',
       name: 'Audio Mixer',
@@ -107,8 +118,10 @@ export const DEFAULT_FLOW: FlowTopology = {
   links: [
     // PGM/MV video routing
     { from: 'bba5be208b1904f9aae46c38c6c4d23a2:pgm_out',       to: 'b370f5d3ce9774e869f262aa5714f7a74:video_in' },
+    { from: 'bba5be208b1904f9aae46c38c6c4d23a2:pgm_out',       to: 'b1ce7a9d4e5f604bc8aa7d36eb0c4f413:video_in' },
     { from: 'b370f5d3ce9774e869f262aa5714f7a74:encoded_out',    to: 'b0454efed640a402cafb4727e6a259514:video_in' },
-    { from: 'b370f5d3ce9774e869f262aa5714f7a74:encoded_out',    to: 'b9f3c2e1a4d5b6c7e8f9a0b1c2d3e4f5:video_in' },
+    // PGM WHEP viewers get the low-bitrate Enc View encode (issue #413), not Enc PGM.
+    { from: 'b1ce7a9d4e5f604bc8aa7d36eb0c4f413:encoded_out',    to: 'b9f3c2e1a4d5b6c7e8f9a0b1c2d3e4f5:video_in' },
     { from: 'bba5be208b1904f9aae46c38c6c4d23a2:multiview_out',  to: 'b035ceff6c25d4bc2bb7a1d36eb0c4308:video_in' },
     { from: 'b035ceff6c25d4bc2bb7a1d36eb0c4308:encoded_out',    to: 'bdaf7aa1547ee4a11b8b2b147264b2694:video_in' },
     // Static video inputs: test sources (V2, V3)

@@ -64,23 +64,17 @@ export type GuestScopeResult =
 
 const INVALID_OR_EXPIRED = 'Invalid or expired invite';
 
+export type GuestSessionResult =
+  | { ok: true; invite: GuestInviteDoc; session: GuestSessionDoc }
+  | { ok: false; status: 401; error: string };
+
 /**
- * Resolves a guest invite bearer token into a scope, verifying it grants
- * access to `productionId` + `mixerInput`. Mirrors the identity checks in
- * `guests.ts`'s join/leave handlers (~lines 273-300) exactly — signature/exp,
- * doc lookup (revocation), tokenHash, persisted expiry — then adds the
- * resource-ownership checks join doesn't need: the invite's production, and
- * the guest's LIVE session's `mixerInput` (NOT `invite.mixerInput`, which is
- * optional and may predate an auto-allocation decided at join time — see the
- * module doc and the warning on `returns.ts`'s `PUT /guests/:inviteId/session/return`,
- * which scopes off `invite.mixerInput` and 404s for auto-allocated guests;
- * that narrower pattern must not be copied here).
+ * The who-you-are half of `resolveGuestScope`: verifies the token and finds the
+ * invite's LIVE session. Every failure is 401. Routes keyed by `:inviteId`
+ * rather than `(productionId, mixerInput)` use this directly and take the
+ * guest's mixerInput from the returned session.
  */
-export async function resolveGuestScope(
-  token: string,
-  productionId: string,
-  mixerInput: string,
-): Promise<GuestScopeResult> {
+export async function resolveGuestSession(token: string): Promise<GuestSessionResult> {
   const secret = getGuestSigningKey();
   if (!secret) {
     // Guest calling is disabled — never attempt guest verification.
@@ -128,6 +122,26 @@ export async function resolveGuestScope(
   if (!session) {
     return { ok: false, status: 401, error: INVALID_OR_EXPIRED };
   }
+  return { ok: true, invite, session };
+}
+
+/**
+ * Resolves a guest invite bearer token into a scope, verifying it grants
+ * access to `productionId` + `mixerInput`. Mirrors the identity checks in
+ * `guests.ts`'s join/leave handlers (~lines 273-300) exactly — signature/exp,
+ * doc lookup (revocation), tokenHash, persisted expiry — then adds the
+ * resource-ownership checks join doesn't need: the invite's production, and
+ * the guest's LIVE session's `mixerInput` (NOT `invite.mixerInput`, which is
+ * optional and may predate an auto-allocation decided at join time).
+ */
+export async function resolveGuestScope(
+  token: string,
+  productionId: string,
+  mixerInput: string,
+): Promise<GuestScopeResult> {
+  const who = await resolveGuestSession(token);
+  if (!who.ok) return who;
+  const { invite, session } = who;
 
   // 4. Authorization — the token/session is valid, but is it scoped to THIS
   //    resource? Wrong production or wrong mixerInput is 403 (not-your-resource).
