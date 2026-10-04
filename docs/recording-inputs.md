@@ -70,8 +70,9 @@ recordings/<productionId>/<activation>/video_in_N/   <productionId>_video_in_N_{
 ```
 
 `<activation>` is the activation's start time plus a uuid. On deactivate, with
-object storage configured, every recorder is split and the files are uploaded
-like the program's: object key `<RECORDING_KEY_PREFIX><productionId>/<file>`,
+object storage configured, every recorder is split, the flow is stopped once
+each split has opened its next file, and the files are uploaded like the
+program's: object key `<RECORDING_KEY_PREFIX><productionId>/<file>`,
 one `RecordingDoc` each, with `mixerInput` and `track` set for an input's file. Without
 object storage the files stay on Strom.
 
@@ -136,7 +137,11 @@ their session documents: `joinedAt` is the session's creation and `leftAt` its
 last update once it has left.
 
 Not listed: a file opened while Open Live was not connected to Strom's event
-stream, and the short file the final split opens at deactivate.
+stream.
+
+The final split at deactivate leaves each recorder a last file of a few
+milliseconds, listed like any other. Strom's stop does not finalise it, so it
+may hold one frame or no media at all; skip a file you cannot read.
 
 ## For tools that read these recordings
 

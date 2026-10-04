@@ -18,7 +18,7 @@ import { config, isRecordingEnabled } from '../config.js';
 import { uploadProductionRecordings, type MinioTarget } from '../lib/recording-uploader.js';
 import { DEFAULT_CONNECTION_ID, resolveStorageTarget, StorageConnectionNotFoundError } from '../lib/storage-connection.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
-import { bindRecordingIndex, closeRecordingIndex, openRecordingIndex, type RecordingIndexHandle } from '../services/recording-index.js';
+import { bindRecordingIndex, closeRecordingIndex, currentRecordingIndex, openRecordingIndex, waitForNextFiles, type RecordingIndexHandle } from '../services/recording-index.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type OutputStatusEntry } from '../lib/production-health.js';
 import { settleOnStop, preserveGpuUsageOnDelete } from '../services/gpu-usage.js';
@@ -31,6 +31,9 @@ import { checkProductionStartAllowed } from '../services/production-gate.js';
 const FLOW_POLL_INTERVAL_MS = 500;
 const FLOW_POLL_TIMEOUT_MS = 30_000;
 const MAX_DB_WRITE_RETRIES = 3;
+// How long deactivate waits for a split to open each recorder's next file.
+// A split lands on the next keyframe; a passthrough input keeps its sender's GOP.
+const SPLIT_TIMEOUT_MS = 10_000;
 
 // ---------------------------------------------------------------------------
 // AbortController map — keyed by production ID, allows deactivate to cancel
@@ -321,6 +324,7 @@ async function uploadProductionRecording(
   doc: ProductionDoc,
   stromFlowId: string,
   recorderBlockId: string | undefined,
+  recordingIndex: RecordingIndexHandle | undefined,
   strom: StromClient,
   stromToken: string | undefined,
   log: FastifyBaseLogger,
@@ -376,11 +380,24 @@ async function uploadProductionRecording(
 
   let uploadRes: Awaited<ReturnType<typeof uploadProductionRecordings>>;
   try {
-    await Promise.all(
-      [recorderBlockId, ...inputBlockIds]
-        .filter((id): id is string => !!id)
-        .map((id) => strom.recorder.splitNow(stromFlowId, id).catch(() => undefined)),
-    );
+    const recorderIds = [recorderBlockId, ...inputBlockIds].filter((id): id is string => !!id);
+    // A split lands on the recorder's next keyframe, after splitNow returns.
+    // Stopping before then would leave the file it closes unfinalised: Strom's
+    // stop does not end the recording, so the file keeps its last periodic moov
+    // and loses up to ~2 s.
+    const split = recordingIndex && waitForNextFiles(recordingIndex, recorderIds, SPLIT_TIMEOUT_MS);
+    await Promise.all(recorderIds.map((id) => strom.recorder.splitNow(stromFlowId, id).catch(() => undefined)));
+    await split;
+    // Stop at once, so the files the split opened hold milliseconds, not
+    // however long the upload takes.
+    try {
+      await strom.flows.stop(stromFlowId);
+    } catch {
+      // deactivateStromFlow stops it again
+    }
+    // Final sidecar write, listing the files the split opened, before the
+    // sweep uploads it.
+    if (recordingIndex) await closeRecordingIndex(recordingIndex);
     uploadRes = await uploadProductionRecordings({
       strom,
       stromUrl: config.stromUrl,
@@ -1341,9 +1358,9 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       activationAbortControllers.delete(doc._id);
     }
 
-    // Final sidecar write before the sweep below uploads it. A file the final
-    // split opens is not listed.
-    await closeRecordingIndex(doc._id);
+    // This activation's index. Closed by handle, since a reactivation during
+    // the upload below opens the production's next one.
+    const recordingIndex = currentRecordingIndex(doc._id);
     clearProductionPflState(doc._id);
     clearAudioState(doc._id);
     clearPipState(doc._id);
@@ -1367,20 +1384,22 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
 
       // VOD recording (issue #41): when a recorder block is active, finalise
-      // the current segment and upload Strom's local recordings to object
-      // storage. Every activation's directory is swept, so a session whose
+      // the current segment, stop the flow, then upload Strom's local
+      // recordings to object storage. Every activation's directory is swept, so a session whose
       // upload failed, or that ended without this route (e.g. the idle
       // watchdog), is uploaded here instead of lost. Best-effort: a failed
       // upload must not block teardown. The outcome is stored on the
       // production as `lastRecordingUpload` (#534) when this deactivate had a
       // recorder or found files to upload.
       {
-        const summary = await uploadProductionRecording(doc, doc.stromFlowId, doc.recorderBlockId, strom, stromToken, log);
+        const summary = await uploadProductionRecording(doc, doc.stromFlowId, doc.recorderBlockId, recordingIndex, strom, stromToken, log);
         if (doc.recorderBlockId || inputRecorderBlockIds(doc).length > 0 || summary.uploaded > 0 || summary.failed.length > 0) lastRecordingUpload = summary;
       }
 
       await deactivateStromFlow(doc.stromFlowId, strom);
     }
+    // Without object storage, the sidecar's final write; otherwise a no-op.
+    if (recordingIndex) await closeRecordingIndex(recordingIndex);
 
     // Tear down the Open Intercom talkback grouping (all its lines) with the
     // production lifecycle (issue #302). Best-effort: a failed teardown must not

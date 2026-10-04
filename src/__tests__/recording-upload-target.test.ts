@@ -112,6 +112,8 @@ vi.mock('../services/guest-sweep.js', () => ({ sweepGuestsOnProductionEnd: vi.fn
 vi.mock('../services/recording-index.js', () => ({
   openRecordingIndex: vi.fn(async (productionId: string) => ({ productionId })),
   bindRecordingIndex: vi.fn(),
+  currentRecordingIndex: vi.fn(() => undefined),
+  waitForNextFiles: vi.fn().mockResolvedValue(undefined),
   closeRecordingIndex: vi.fn().mockResolvedValue(undefined),
 }));
 
