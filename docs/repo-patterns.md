@@ -57,6 +57,35 @@ Guest calling is on by default (issue #391). The signing key is resolved via
   redacted by `log-redact.ts`; `server.ts` also lists `signingSecret` / `*.signingSecret` in the
   Fastify logger redact paths. Never add a route that returns the doc.
 
+## The credential encryption key is backend-generated and stored, not just an env var
+
+On OSC no `SRT_PASSPHRASE_KEY` / `HTML_AUTH_KEY` is provisioned, so storing an SRT passphrase or
+an authenticated-HTML-source credential used to fail closed with a 503 ("Credential storage is
+not configured"). Mirroring the guest signing key (#391), the backend now generates and stores a
+credential key itself (issue #438), via `src/lib/credential-encryption-key.ts`:
+
+- `ensureCredentialEncryptionKey()` runs once at startup (`src/main.ts`, after `connectDb()`). It
+  reads the single fixed-id doc (`CREDENTIAL_ENCRYPTION_KEY_DOC_ID = 'credential-encryption-key'`)
+  or creates it (32-byte AES-256, base64) if absent, decodes it to a Buffer and caches it. A
+  concurrent-create `409` is handled by re-reading the winner's key. It is a **no-op that returns
+  `null`** when `SRT_PASSPHRASE_KEY` is set — that env var is the shared base key both the SRT and
+  HTML crypto already resolve to, so a stored key is unnecessary and the DB is never touched (keeps
+  self-hosted deployments unchanged).
+- The crypto modules consume it as a *fallback*, not a replacement for the env override. In
+  `srt-passphrase-crypto.ts`, `loadKey()` falls back to `getStoredCredentialKey()` only for a
+  `KeySource` with `allowStoredKeyFallback: true` (set on `SRT_PASSPHRASE_KEY_SOURCE`). RTMP's
+  `RTMP_CREDENTIALS_KEY_SOURCE` leaves it unset, so **RTMP never falls back to the stored key**
+  (ADR-004 Resolved Decision 2 — rotation stays isolated). `html-auth-crypto.ts` `loadHtmlAuthKey()`
+  falls back to the stored key when neither `HTML_AUTH_KEY` nor `SRT_PASSPHRASE_KEY` is set.
+- Resolution order per kind: env override wins, then the stored key, then fail-closed-in-prod /
+  loud-plaintext-in-dev as before. Env overrides always win, so self-hosted setups are unchanged.
+- The stored key lives in `CredentialEncryptionKeyDoc.encryptionSecret`. The `secret` substring
+  makes it redacted by `log-redact.ts`; `server.ts` also lists `encryptionSecret` /
+  `*.encryptionSecret` in the Fastify logger redact paths. Never add a route that returns the doc.
+- `credential-encryption-key.ts` imports `db/index.ts` (→ `config.ts`) — the same intentional ESM
+  cycle as `guest-signing-key.ts`; it is safe only because no binding is used at module-eval time.
+  `getStoredCredentialKey()` is synchronous so the crypto hot path stays synchronous.
+
 ## A new `/api/v1/guests/:inviteId/...` route needs the `isGuestTokenAuthedPath` allowlist
 
 Guest-facing routes authenticate with the per-invite HMAC token *inside the handler*
@@ -99,3 +128,18 @@ caught Strom error in the TAKE PiP branches), call `restoreSwitchState` to roll 
 four PiP maps + the persisted doc and re-broadcast `TALLY`/`PIP_STATE`, then notify the operator
 (`notifySwitchRejected` — NACK with a cmdId, else ERROR; macro paths `throw` so the loop reports
 `MACRO_ERROR`). Never ACK `executed` on a rejected switch.
+
+## The controller WS reads `?mode` by exact key — confusable keys must be rejected, not ignored
+
+The controller WebSocket route (`src/ws/controller.ts`, `controllerWs`) decides watch-only vs
+operator from `req.query.mode`. Fastify's default querystring parser (node `querystring`) does
+**no** case-folding or bracket-array expansion, so `?Mode=watch` parses to the key `Mode` and
+`?mode[]=watch` to the literal key `mode[]` — neither populates `req.query.mode`. Left alone, a
+passive client (e.g. a tally logger) that typo'd the key silently opens as an **operator** and
+runs the first-connect audio-mixer reset (#424). The route therefore rejects any query key that
+is confusable with `mode` — a case variant or array-bracket form, matched by
+`/^mode(\[.*\])?$/i` with the exact `mode` key excluded — with an `ERROR` frame + WS close 1008,
+*before* the unknown-value check. Deliberately **not** `additionalProperties:false`: genuinely
+unrelated params (cache-busters, etc.) must still work, so only `mode`-confusable keys are
+rejected. An exact `mode` key keeps its existing value check (`watch` → watch-only, anything
+else → ERROR + 1008).

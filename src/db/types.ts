@@ -445,6 +445,33 @@ export interface GuestSigningKeyDoc {
   createdAt: string;        // ISO 8601
 }
 
+/**
+ * The backend-generated AES-256 credential encryption key (issue #438).
+ *
+ * On OSC no `SRT_PASSPHRASE_KEY` / `HTML_AUTH_KEY` is provisioned, so saving an
+ * SRT passphrase or an authenticated-HTML-source credential failed closed with a
+ * 503 (`Credential storage is not configured`). Mirroring the guest-invite
+ * signing key (#391), the backend now generates this key on first start and
+ * stores it under a SINGLE FIXED id (`CREDENTIAL_ENCRYPTION_KEY_DOC_ID`), reading
+ * it back on every subsequent start so restarts still decrypt existing
+ * credentials. It is the fallback key for the SRT passphrase crypto and the
+ * HTML-auth crypto; `SRT_PASSPHRASE_KEY` / `HTML_AUTH_KEY` (env) still override it
+ * when set, so self-hosted deployments are unchanged. RTMP stream keys keep their
+ * dedicated `RTMP_CREDENTIALS_KEY` and NEVER fall back here (ADR-004 Decision 2).
+ *
+ * `encryptionSecret` is a credential: it is NEVER logged (the `secret` substring
+ * is matched by `src/lib/log-redact.ts` and the Fastify logger redact paths in
+ * `src/server.ts`) and NEVER returned by any route.
+ */
+export interface CredentialEncryptionKeyDoc {
+  _id: string;              // fixed: "credential-encryption-key"
+  _rev?: string;
+  type: 'credential-encryption-key';
+  /** Randomly generated 32-byte AES-256 key (base64). Never logged or returned. */
+  encryptionSecret: string;
+  createdAt: string;        // ISO 8601
+}
+
 // --------------- Production config types ---------------
 
 export interface ProductionConfigDoc {

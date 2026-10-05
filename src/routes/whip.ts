@@ -1,8 +1,10 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify'
 import { getStromToken } from '../lib/strom-token.js'
 import { assertSameStromOrigin } from '../lib/url-validation.js'
-import { isUnderEndpointPath, resolveGuestSession } from '../lib/guest-scope.js'
+import { isUnderEndpointPath, resolveGuestSession, slotTakesWhip } from '../lib/guest-scope.js'
 import { config, isGuestCallingEnabled } from '../config.js'
+import { getDb } from '../db/index.js'
+import type { ProductionDoc, ProductionSourceAssignment } from '../db/types.js'
 
 /**
  * Validates that a session URL belongs to the configured Strom host.
@@ -183,6 +185,31 @@ async function resolveGuestWhipSlot(
   return { productionId: who.invite.productionId, mixerInput: who.session.mixerInput };
 }
 
+/**
+ * A guest on a return-only slot (its source is not WHIP) holds no publish
+ * right. Writes a 403 (or a 503 when the source cannot be read) and returns
+ * false unless the guest's slot takes WHIP.
+ */
+async function guestSlotMayPublish(
+  reply: FastifyReply,
+  sources: readonly ProductionSourceAssignment[],
+  mixerInput: string,
+): Promise<boolean> {
+  const slot = sources.find((s) => s.mixerInput === mixerInput)
+  let takesWhip: boolean
+  try {
+    takesWhip = !!slot && (await slotTakesWhip(slot))
+  } catch {
+    await reply.status(503).send({ error: 'Database unavailable', statusCode: 503 })
+    return false
+  }
+  if (!takesWhip) {
+    await reply.status(403).send({ error: 'This guest slot does not take WHIP', statusCode: 403 })
+    return false
+  }
+  return true
+}
+
 const whipRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.addContentTypeParser('application/sdp', { parseAs: 'string' }, (_req, body, done) => {
     done(null, body)
@@ -201,6 +228,9 @@ const whipRoutes: FastifyPluginAsync = async (fastify) => {
     { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
     async (req, reply) => {
       const { id: productionId, mixerInput } = req.params
+      if (req.guestScope && !(await guestSlotMayPublish(reply, req.guestScope.production.sources, mixerInput))) {
+        return reply
+      }
       return proxyWhipOffer(
         reply,
         productionId,
@@ -266,6 +296,16 @@ const whipRoutes: FastifyPluginAsync = async (fastify) => {
     async (req, reply) => {
       const slot = await resolveGuestWhipSlot(req, reply)
       if (!slot) return reply
+      let production: ProductionDoc
+      try {
+        production = await getDb().get(slot.productionId)
+      } catch (err) {
+        if ((err as { statusCode?: number }).statusCode === 404) {
+          return reply.status(404).send({ error: 'Production not found', statusCode: 404 })
+        }
+        return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 })
+      }
+      if (!(await guestSlotMayPublish(reply, production.sources, slot.mixerInput))) return reply
       return proxyWhipOffer(
         reply,
         slot.productionId,
