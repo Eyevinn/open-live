@@ -12,9 +12,9 @@ import {
 } from '../lib/clip-control.js';
 import { getClipStateEntry, getAllClipStates, setClipStateEntry, clearClipState } from '../services/clip-state.service.js';
 import { persistClipCue, clearPersistedClipCue } from '../services/clip-cue-store.js';
-import { startClipRelay, stopClipRelay } from '../services/clip-relay.js';
+import { startClipRelay, stopClipRelay, reconcileClipRelay } from '../services/clip-relay.js';
 import { CONTRACT_VERSION, computeTallyContributions } from '../services/automation-contract.js';
-import { startMeterRelay, stopMeterRelay } from '../services/meter-relay.js';
+import { startMeterRelay, stopMeterRelay, reconcileMeterRelay } from '../services/meter-relay.js';
 import { StromClient, StromClientError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms, type VideoEffect, type EffectTarget, type SetVideoEffectRequest } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { graphicUrl } from '../lib/url-validation.js';
@@ -1002,15 +1002,18 @@ export async function reinitConnectedControllers(productionId: string): Promise<
         broadcast(productionId, { type: 'GRP_STATE_RESET' });
       }
 
-      // Restart the meter relay against the NEW flow, once per operator socket
-      // so the refCount matches the sockets that will later call stopMeterRelay.
-      // A socket that connected after activation already holds a ref.
-      for (const ws of getOperatorSockets(productionId)) {
-        const hold = relayHold(ws);
-        if (hold.meter === flowId) continue;
-        startMeterRelay(productionId, flowId, audioBlockId, doc.loudnessMainBlockId);
-        hold.meter = flowId;
-      }
+      // Restart the meter relay against the NEW flow. Deactivate force-stopped
+      // (and forgot) the relay while leaving each socket's per-socket hold in
+      // place, and a connect mid-teardown may have re-created it on the retired
+      // flow. Reconcile to one ref per operator socket on the new flow rather
+      // than taking a per-socket ref: the latter both fails to re-create a
+      // force-stopped relay for an operator that stayed open AND double-counts
+      // the mid-teardown socket, orphaning a ref that never reaches zero
+      // (issue #434). Every operator socket then releases exactly one ref on
+      // close, landing the relay back at zero.
+      const meterOperators = getOperatorSockets(productionId);
+      reconcileMeterRelay(productionId, flowId, audioBlockId, doc.loudnessMainBlockId, meterOperators.length);
+      for (const ws of meterOperators) relayHold(ws).meter = flowId;
     }
   } catch (err) {
     console.warn('[controller] reinit audio/meter error:', err);
@@ -1023,12 +1026,10 @@ export async function reinitConnectedControllers(productionId: string): Promise<
       blockToInput.set(blockId, mixerInput);
     }
     if (blockToInput.size > 0) {
-      for (const ws of getOperatorSockets(productionId)) {
-        const hold = relayHold(ws);
-        if (hold.clip === flowId) continue;
-        startClipRelay(productionId, flowId, blockToInput);
-        hold.clip = flowId;
-      }
+      // Same reconciliation as the meter relay above (issue #434).
+      const clipOperators = getOperatorSockets(productionId);
+      reconcileClipRelay(productionId, flowId, blockToInput, clipOperators.length);
+      for (const ws of clipOperators) relayHold(ws).clip = flowId;
     }
   }
 }

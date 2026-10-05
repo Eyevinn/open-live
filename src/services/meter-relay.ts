@@ -118,6 +118,43 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
   relays.set(productionId, entry);
 }
 
+/**
+ * Reconcile the relay onto `flowId` with exactly `holderCount` refs — used by
+ * reactivation reinit (issue #434). Deactivate's `forceStopMeterRelay` zeroes
+ * the refCount but leaves each controller's per-socket hold intact, and a
+ * connect mid-teardown may have re-created the relay on the now-retired flow.
+ * Per-socket `startMeterRelay` calls there would either miss re-creating a
+ * force-stopped relay (losing meters for an operator that stayed open) or
+ * double-count the mid-teardown socket (an orphaned ref that never reaches
+ * zero). Since every operator socket backs exactly one ref (connect takes one,
+ * close releases one), this rebinds any existing relay onto the new flow and
+ * sets its refCount to the operator-socket count so the later per-socket stops
+ * land it back on zero. No-op when `holderCount <= 0`.
+ */
+export function reconcileMeterRelay(productionId: string, flowId: string, mixerBlockId: string, loudnessBlockId: string | null | undefined, holderCount: number): void {
+  if (holderCount <= 0) return;
+  const meterPrefix = `${mixerBlockId}:meter:`;
+  const existing = relays.get(productionId);
+  if (existing) {
+    // The production has exactly one flow at a time; any existing relay is on
+    // the retired flow (mid-teardown connect) or already on this flow. Either
+    // way rebinding onto `flowId` is correct here.
+    existing.flowId = flowId;
+    existing.meterPrefix = meterPrefix;
+    existing.loudnessBlockId = loudnessBlockId;
+    existing.refCount = holderCount;
+    return;
+  }
+  startMeterRelay(productionId, flowId, mixerBlockId, loudnessBlockId);
+  const created = relays.get(productionId);
+  if (created) created.refCount = holderCount;
+}
+
+/** Current ref count for a production's meter relay (0 when none). Diagnostic. */
+export function getMeterRelayRefCount(productionId: string): number {
+  return relays.get(productionId)?.refCount ?? 0;
+}
+
 export function stopMeterRelay(productionId: string): void {
   const entry = relays.get(productionId);
   if (!entry) return;
