@@ -30,6 +30,7 @@ import { config } from '../config.js';
 import { notifySubscriberJoin, resetIdleTimer } from '../services/idle-watchdog.js';
 import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot } from '../lib/production-health.js';
+import { getWhipIngestState } from '../services/whip-ingest-state.js';
 
 function stromErrorMessage(err: unknown): string {
   if (err instanceof StromClientError) return err.message;
@@ -3040,6 +3041,27 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             effectiveUrl: state.effectiveUrl,
             updatedAt: state.updatedAt,
           }));
+        }
+      }
+
+      // Replay the current WHIP live-ingest state for this production's assigned
+      // sources, so a freshly-connected controller immediately knows which WHIP
+      // publishers are sending (issue #439, interim — parent #437). Only sources
+      // with a recorded state (offer/teardown already observed) are emitted; the
+      // state is in-memory only and resets on server restart. KNOWN INTERIM
+      // LIMITATION: a `connected` here may be stale if a publisher dropped
+      // without sending DELETE — see `src/services/whip-ingest-state.ts`.
+      if (connectDoc) {
+        for (const assignment of connectDoc.sources) {
+          const liveIngest = getWhipIngestState(assignment.sourceId);
+          if (liveIngest) {
+            socket.send(JSON.stringify({
+              type: 'SOURCE_INGEST_STATE',
+              sourceId: assignment.sourceId,
+              state: liveIngest.state,
+              changedAt: liveIngest.changedAt,
+            }));
+          }
         }
       }
 
