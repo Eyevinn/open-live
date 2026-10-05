@@ -11,9 +11,14 @@
  *
  * Key: a DEDICATED `RTMP_CREDENTIALS_KEY` (ADR-004 Resolved Decision 2) — NOT a
  * reuse of / fallback to `SRT_PASSPHRASE_KEY`, so rotating the RTMP stream-key
- * key does not force an SRT-passphrase-key rotation (and vice-versa). A missing
- * key fails closed in production when a stored ciphertext exists; in
- * non-production it degrades to a loud no-op so local dev without a key works.
+ * key does not force an SRT-passphrase-key rotation (and vice-versa). When the
+ * env var is unset the key falls back to a DEDICATED backend-generated stored
+ * RTMP key (`src/lib/rtmp-credential-key.ts`, issue #447) — its OWN key, NEVER
+ * the SRT/credential key (#446) — so RTMP stream keys can be saved out of the box
+ * on OSC where no key env var is provisioned, while ADR-004's RTMP/SRT key
+ * separation is preserved. A missing key (no env var and no stored key yet) fails
+ * closed in production when a stored ciphertext exists; in non-production it
+ * degrades to a loud no-op so local dev without a key works.
  *
  * NEVER log the plaintext stream key or the raw key from this module. The
  * decrypted key is composed into `rtmp_url` only at flow-generation time and is
@@ -25,9 +30,18 @@ import {
   decryptPassphrase,
   type KeySource,
 } from './srt-passphrase-crypto.js';
+import { getStoredRtmpCredentialKey } from './rtmp-credential-key.js';
 
-/** Dedicated key source for RTMP stream keys (no SRT fallback). */
-export const RTMP_CREDENTIALS_KEY_SOURCE: KeySource = { envVar: 'RTMP_CREDENTIALS_KEY' };
+/**
+ * Dedicated key source for RTMP stream keys. Falls back to the DEDICATED stored
+ * RTMP key (issue #447), never the SRT/credential key — ADR-004 Resolved
+ * Decision 2 keeps RTMP and SRT key rotation isolated.
+ */
+export const RTMP_CREDENTIALS_KEY_SOURCE: KeySource = {
+  envVar: 'RTMP_CREDENTIALS_KEY',
+  allowStoredKeyFallback: true,
+  storedKeyProvider: getStoredRtmpCredentialKey,
+};
 
 /**
  * Encrypt a raw RTMP stream key into an `encv1:` bundle under
