@@ -2889,12 +2889,26 @@ function rejectWatchOnlyMessage(productionId: string, ws: WebSocket, raw: string
 }
 
 const controllerWs: FastifyPluginAsync = async (fastify) => {
-  fastify.get<{ Params: { id: string }; Querystring: { mode?: string } }>(
+  fastify.get<{ Params: { id: string }; Querystring: { mode?: string; [key: string]: unknown } }>(
     '/ws/productions/:id/controller',
     { websocket: true },
     async (socket, req) => {
       const { id } = req.params;
       const { mode } = req.query;
+      // Fail closed on a query key that is confusable with `mode` — a case
+      // variant (`Mode`, `MODE`) or array-bracket syntax (`mode[]`). The exact
+      // `mode` key is handled below; any genuinely unrelated param (a
+      // cache-buster, etc.) is left untouched and the connection proceeds. A
+      // passive client (e.g. a tally logger) that typo'd the key must not
+      // silently open as an operator and run first-connect audio init (#424).
+      const confusableModeKey = Object.keys(req.query).find(
+        (key) => key !== 'mode' && /^mode(\[.*\])?$/i.test(key),
+      );
+      if (confusableModeKey !== undefined) {
+        socket.send(JSON.stringify({ type: 'ERROR', error: `Ambiguous controller mode query key: ${confusableModeKey}` }));
+        socket.close(1008, 'ambiguous mode key');
+        return;
+      }
       // Fail closed on an unknown mode: a mistyped `watch` must not fall back to
       // an operator connection that can run first-connect audio init.
       if (mode !== undefined && mode !== 'watch') {
