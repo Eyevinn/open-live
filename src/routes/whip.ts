@@ -5,6 +5,8 @@ import { isUnderEndpointPath, resolveGuestSession, slotTakesWhip } from '../lib/
 import { config, isGuestCallingEnabled } from '../config.js'
 import { getDb } from '../db/index.js'
 import type { ProductionDoc, ProductionSourceAssignment } from '../db/types.js'
+import { broadcast } from '../services/tally.service.js'
+import { getWhipIngestState, setWhipIngestState, type WhipIngestState } from '../services/whip-ingest-state.js'
 
 /**
  * Validates that a session URL belongs to the configured Strom host.
@@ -95,6 +97,45 @@ export function resolveStromWhipUrl(productionId: string, mixerInput: string): s
 }
 
 /**
+ * Reflects a WHIP publisher's live-ingest state onto its source (issue #439,
+ * interim — parent #437). Maps the WHIP endpoint (productionId + mixerInput)
+ * back to the assigned `sourceId` the same way the rest of the codebase does
+ * (the production's `sources[].mixerInput` -> `sourceId`), records the state in
+ * the in-memory registry, and — only on a real change — broadcasts
+ * `SOURCE_INGEST_STATE` to that production's controllers so a live operator UI
+ * updates immediately. Best-effort: ingest-state bookkeeping must NEVER fail the
+ * WHIP proxy itself, so every error (DB unavailable, unassigned slot) is
+ * swallowed.
+ *
+ * KNOWN INTERIM LIMITATION: `disconnected` is only reached via the proxy DELETE,
+ * so a publisher that drops without sending DELETE stays `connected`. See
+ * `src/services/whip-ingest-state.ts` for the full rationale and the robust
+ * (Strom-session-event) follow-up that is out of scope here.
+ */
+async function reflectWhipIngestState(
+  productionId: string,
+  mixerInput: string,
+  state: WhipIngestState,
+): Promise<void> {
+  try {
+    const production: ProductionDoc = await getDb().get(productionId)
+    const sourceId = production.sources.find((s) => s.mixerInput === mixerInput)?.sourceId
+    if (!sourceId) return
+    if (setWhipIngestState(sourceId, state)) {
+      const snapshot = getWhipIngestState(sourceId)
+      broadcast(productionId, {
+        type: 'SOURCE_INGEST_STATE',
+        sourceId,
+        state,
+        changedAt: snapshot?.changedAt,
+      })
+    }
+  } catch {
+    /* best-effort: never fail WHIP signaling because ingest bookkeeping failed */
+  }
+}
+
+/**
  * Forwards an initial WHIP offer to Strom and rewrites the session Location so
  * subsequent ICE/teardown requests come back through this proxy. `buildProxyLocation`
  * maps the absolute Strom session URL to the caller-appropriate proxy path (crew
@@ -121,6 +162,10 @@ async function proxyWhipOffer(
 
   const answerSdp = await upstream.text()
 
+  // Offer accepted by Strom → this source is now sending. Reflect it as live
+  // ingest state and broadcast on change (issue #439, interim).
+  await reflectWhipIngestState(productionId, mixerInput, 'connected')
+
   const stromLocation = upstream.headers.get('Location')
   if (stromLocation) {
     const absoluteStromLocation = stromLocation.startsWith('http')
@@ -146,12 +191,20 @@ async function proxyWhipPatch(reply: FastifyReply, target: string, fragment: str
 }
 
 /** Tears down an already-resolved Strom WHIP session target. */
-async function proxyWhipDelete(reply: FastifyReply, target: string): Promise<FastifyReply> {
+async function proxyWhipDelete(
+  reply: FastifyReply,
+  target: string,
+  productionId: string,
+  mixerInput: string,
+): Promise<FastifyReply> {
   const token = await getStromToken(config.stromToken).catch(() => undefined)
   const headers: Record<string, string> = {}
   if (token) headers['Authorization'] = `Bearer ${token}`
 
   await fetch(target, { method: 'DELETE', headers }).catch(() => { /* ignore teardown errors */ })
+  // Teardown means the publisher has intentionally left — reflect it regardless
+  // of whether the upstream DELETE succeeded (issue #439, interim).
+  await reflectWhipIngestState(productionId, mixerInput, 'disconnected')
   return reply.status(204).send()
 }
 
@@ -279,7 +332,7 @@ const whipRoutes: FastifyPluginAsync = async (fastify) => {
       if (!resolved.ok) {
         return reply.status(resolved.status).send(resolved.body)
       }
-      return proxyWhipDelete(reply, resolved.target)
+      return proxyWhipDelete(reply, resolved.target, req.params.id, req.params.mixerInput)
     },
   )
 
@@ -358,7 +411,7 @@ const whipRoutes: FastifyPluginAsync = async (fastify) => {
       if (!resolved.ok) {
         return reply.status(resolved.status).send(resolved.body)
       }
-      return proxyWhipDelete(reply, resolved.target)
+      return proxyWhipDelete(reply, resolved.target, slot.productionId, slot.mixerInput)
     },
   )
 }
