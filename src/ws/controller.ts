@@ -1407,6 +1407,60 @@ export async function applyReturnMode(
 // Message handler
 // ---------------------------------------------------------------------------
 
+/**
+ * Commands that mutate the vision mixer (issue #431). Each one reads the
+ * production doc, calls Strom, and persists the resulting tally. Two of them
+ * racing — e.g. a CUT whose DB write is slow, then a TAKE sent 20 ms later —
+ * could otherwise reach Strom in the opposite order the operator pressed them,
+ * leaving Strom on one program while open-live reports another. They are
+ * serialised per production (see `runSerializedSwitcherCommand`) so one
+ * command's Strom calls and DB write finish before the next reads the doc.
+ *
+ * MACRO_EXEC is included because a macro inlines its own CUT/TRANSITION/TAKE
+ * sub-commands (it never re-enters `handleMessage`), so holding the lock for a
+ * whole macro serialises the macro's switcher effects without any risk of the
+ * macro deadlocking on its own queue.
+ */
+const SWITCHER_MESSAGE_TYPES = new Set([
+  'CUT',
+  'TRANSITION',
+  'TAKE',
+  'SET_PVW',
+  'SELECT_PVW_PIP',
+  'SET_PIP',
+  'MACRO_EXEC',
+]);
+
+/**
+ * Per-production tail of the switcher-command chain. Each entry is a
+ * never-rejecting promise that settles when the production's most recently
+ * queued switcher command finishes; the entry is pruned once the chain drains.
+ */
+const switcherCommandChains = new Map<string, Promise<unknown>>();
+
+/**
+ * Run `task` after the previous switcher command for the same production has
+ * fully settled (success or failure), guaranteeing per-production ordering of
+ * the doc read → Strom call → DB write sequence. The caller still observes its
+ * own task's outcome via the returned promise; the internal chain tail swallows
+ * rejections so one failed command never stalls the queue.
+ */
+function runSerializedSwitcherCommand(
+  productionId: string,
+  task: () => Promise<void>,
+): Promise<void> {
+  const prev = switcherCommandChains.get(productionId) ?? Promise.resolve();
+  const result = prev.then(() => task());
+  const tail = result.catch(() => {});
+  switcherCommandChains.set(productionId, tail);
+  void tail.then(() => {
+    if (switcherCommandChains.get(productionId) === tail) {
+      switcherCommandChains.delete(productionId);
+    }
+  });
+  return result;
+}
+
 /** Exported for tests: drives one inbound message against a production. */
 export async function handleMessage(
   productionId: string,
@@ -1459,6 +1513,12 @@ export async function handleMessage(
     return;
   }
 
+  // Everything below reads the production doc, may call Strom, and persists the
+  // result. For switcher-mutating commands this closure runs through the
+  // per-production serialisation chain (issue #431) so commands sent close
+  // together cannot reach Strom out of order; all other command types run
+  // immediately, exactly as before.
+  const dispatch = async (): Promise<void> => {
   const db = getDb();
   let doc: ProductionDoc;
   try {
@@ -2844,6 +2904,12 @@ export async function handleMessage(
       ws.send(JSON.stringify({ type: 'ERROR', error: 'Unknown message type' }));
     }
   }
+  };
+
+  if (SWITCHER_MESSAGE_TYPES.has(msg.type)) {
+    return runSerializedSwitcherCommand(productionId, dispatch);
+  }
+  return dispatch();
 }
 
 /**
