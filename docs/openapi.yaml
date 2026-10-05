@@ -184,6 +184,27 @@ components:
           minimum: 20
           maximum: 8000
           description: SRT latency in milliseconds
+        liveIngest:
+          type: object
+          description: >-
+            Read-only, server-observed WHIP live-ingest state (issue #439,
+            interim — parent #437). Separate from the client-writable `status`
+            field and NEVER overwrites it; clients cannot set `liveIngest`.
+            Present only once a WHIP offer/teardown has been observed for this
+            source and only for `whip` sources; absent otherwise. In-memory
+            only — resets on server restart. KNOWN INTERIM LIMITATION: a
+            publisher that drops without sending a WHIP DELETE stays
+            `connected`; a robust version keying off Strom session events is a
+            separate out-of-scope issue.
+          required: [state, changedAt]
+          properties:
+            state:
+              type: string
+              enum: [connected, disconnected]
+            changedAt:
+              type: string
+              format: date-time
+              description: ISO-8601 UTC time of the last ingest-state transition.
         createdAt:
           type: string
           format: date-time

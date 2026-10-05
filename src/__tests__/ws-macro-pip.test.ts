@@ -734,7 +734,14 @@ describe('macro TRANSITION with a PiP in preview only', () => {
   });
 });
 
-describe('macro PiP restore vs. concurrent SET_PVW', () => {
+// Since #431 switcher commands are serialised per production, so a SET_PVW sent
+// while a macro's transition is still in flight no longer interleaves with it:
+// it runs only once the macro has fully finished (restoring the PiP into Strom
+// preview). The operator's SET_PVW therefore lands last and cleanly supersedes
+// the restore, so Strom's preview still ends on the operator's source — now by
+// ordering rather than by the mid-transition guard the pre-serialisation code
+// relied on (that guard remains in place as defence in depth).
+describe('macro PiP restore then a SET_PVW queued behind it (#341, serialised by #431)', () => {
   const actions: Array<[string, Record<string, unknown>]> = [
     ['CUT', { type: 'CUT', sourceId: 'cam3' }],
     ['TRANSITION', { type: 'TRANSITION', sourceId: 'cam3', transitionType: 'fade', durationMs: 500 }],
@@ -742,7 +749,7 @@ describe('macro PiP restore vs. concurrent SET_PVW', () => {
   ];
 
   for (const [name, action] of actions) {
-    it(`${name} does not restore the PiP if the operator changed PVW mid-transition`, async () => {
+    it(`${name} lets the operator's later SET_PVW supersede the restore`, async () => {
       mockGet.mockResolvedValue(makeProductionDoc([action]));
 
       await send({ type: 'SELECT_PVW_PIP', pip: 0 });
@@ -752,13 +759,16 @@ describe('macro PiP restore vs. concurrent SET_PVW', () => {
       transitionDelayMs = 150;
       const macro = send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
       await delay(30);
-      await send({ type: 'SET_PVW', mixerInput: 'video_in_1' });
-      await macro;
+      const setPvw = send({ type: 'SET_PVW', mixerInput: 'video_in_1' });
+      await Promise.all([macro, setPvw]);
 
-      expect(requestsTo(PREVIEW).at(-1)?.body).toEqual({ source: { input: 1 } });
-      expect(requestsTo(PREVIEW)).not.toContainEqual(
-        expect.objectContaining({ body: { source: { pip: 0 } } }),
-      );
+      const previews = requestsTo(PREVIEW).map((r) => r.body);
+      // The macro's PiP restore (pip:0) is applied first, then the operator's
+      // SET_PVW (input:1) runs after it and wins — in operator order, never
+      // interleaved mid-transition.
+      expect(previews).toContainEqual({ source: { pip: 0 } });
+      expect(previews.at(-1)).toEqual({ source: { input: 1 } });
+      expect(pipStates().at(-1)).toMatchObject({ pvwPip: null });
     });
   }
 });
@@ -845,12 +855,16 @@ describe('macro CUT with no PiP anywhere', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Race: a PVW change during the Strom round trip must not be clobbered by the
-// PiP restore that a displacing CUT queues after the transition (issue #341).
+// A SET_PVW sent while a displacing CUT's /transition is in flight (issue
+// #341). Since #431 switcher commands are serialised per production, the
+// SET_PVW no longer lands mid-transition: it runs after the CUT has finished
+// (and restored the PiP into Strom preview), then supersedes it. Strom's
+// preview therefore still ends on the operator's source — by ordering rather
+// than by the mid-transition guard (which remains as defence in depth).
 // ---------------------------------------------------------------------------
 
-describe('interactive CUT PiP restore vs. concurrent SET_PVW (issue #341)', () => {
-  it('does not restore the displaced PiP into Strom preview if the operator changed PVW mid-transition', async () => {
+describe('interactive CUT PiP restore then a SET_PVW queued behind it (#341, serialised by #431)', () => {
+  it('lets the operator\'s later SET_PVW supersede the restore', async () => {
     mockGet.mockResolvedValue(makeProductionDoc([]));
 
     // Arrange: put PiP 0 on PGM via the real state machine.
@@ -859,27 +873,24 @@ describe('interactive CUT PiP restore vs. concurrent SET_PVW (issue #341)', () =
     resetRecordings();
 
     // A CUT to a real source displaces the PGM PiP into PVW, then restores it
-    // to Strom's preview *after* awaiting /transition. Delay that reply so the
-    // operator's SET_PVW lands inside the round-trip window.
+    // to Strom's preview *after* awaiting /transition. Delay that reply, then
+    // send a SET_PVW while the CUT is still in flight — it queues behind the CUT.
     transitionDelayMs = 150;
     const cutPromise = send({ type: 'CUT', mixerInput: 'video_in_2' });
     await delay(30);
+    const setPvwPromise = send({ type: 'SET_PVW', mixerInput: 'video_in_1' });
 
-    // Operator changes PVW to a real source while /transition is in flight.
-    await send({ type: 'SET_PVW', mixerInput: 'video_in_1' });
-
-    await cutPromise;
+    await Promise.all([cutPromise, setPvwPromise]);
     transitionDelayMs = 0;
 
     // Server state agrees the PiP is gone from PVW.
     expect(pipStates().at(-1)).toMatchObject({ pvwPip: null });
 
-    // Strom's preview must end on the operator's source (input 1), NOT a stale
-    // pip restore. Before the fix the final preview request was { pip: 0 }.
-    expect(requestsTo(PREVIEW).at(-1)?.body).toEqual({ source: { input: 1 } });
-    expect(requestsTo(PREVIEW)).not.toContainEqual(
-      expect.objectContaining({ body: { source: { pip: 0 } } }),
-    );
+    // The CUT's PiP restore (pip:0) runs first, then the operator's SET_PVW
+    // (input:1) runs after it and wins — operator order, never interleaved.
+    const previews = requestsTo(PREVIEW).map((r) => r.body);
+    expect(previews).toContainEqual({ source: { pip: 0 } });
+    expect(previews.at(-1)).toEqual({ source: { input: 1 } });
   });
 });
 
@@ -919,5 +930,73 @@ describe('interactive send of a real source over a preview-only PiP', () => {
     expect(states).toHaveLength(1);
     expect(states[0]).toMatchObject({ pgmPip: null, pvwPip: null });
     expect(tallies()[0]).toMatchObject({ pgm: 'video_in_2', pvw: 'video_in_0' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #431 — switcher commands are serialised per production
+//
+// The controller used to process each inbound command concurrently, so a CUT
+// whose DB write was slow could still be mid-persist when a TAKE arrived. The
+// TAKE then reached Strom first and the two were applied in the reverse of the
+// order the operator pressed them. A per-production queue now runs each
+// switcher-mutating command's doc read → Strom call → DB write to completion
+// before the next one starts, so Strom always sees operator order.
+// ---------------------------------------------------------------------------
+
+describe('serialisation of switcher commands sent close together (#431)', () => {
+  it('a CUT whose DB write is slow still reaches Strom before a TAKE sent 20 ms later', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+    // Program video_in_0, preview video_in_1 (set in beforeEach). Delay only the
+    // first DB write by 80 ms to widen the CUT's persist window — the exact
+    // condition from the issue — so a TAKE arriving mid-write would, without
+    // serialisation, race ahead of the CUT on the wire to Strom.
+    let inserts = 0;
+    mockInsert.mockImplementation(async () => {
+      inserts += 1;
+      if (inserts === 1) await delay(80);
+      return { ok: true };
+    });
+
+    const cut = send({ type: 'CUT', mixerInput: 'video_in_2' });
+    await delay(20);
+    const take = send({ type: 'TAKE' });
+    await Promise.all([cut, take]);
+
+    // Strom must see the CUT's transition (to_input 2) before the TAKE's
+    // (to_input 0), matching the order the operator pressed them. Before #431
+    // the TAKE's transition arrived first and Strom ended on the wrong program.
+    const order = requestsTo(TRANSITION).map((r) => (r.body as { to_input: number }).to_input);
+    expect(order).toEqual([2, 0]);
+
+    // And the controller's final tally reflects CUT-then-TAKE: video_in_2 was
+    // cut to program, then the TAKE swapped the old program (video_in_0) on air.
+    expect(tallies().at(-1)).toMatchObject({ pgm: 'video_in_0', pvw: 'video_in_2' });
+  });
+
+  it('holds a following CUT until a slow-writing SET_PVW ahead of it has persisted and called Strom', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+    let inserts = 0;
+    mockInsert.mockImplementation(async () => {
+      inserts += 1;
+      if (inserts === 1) await delay(80);
+      return { ok: true };
+    });
+
+    // SET_PVW persists but issues no Strom transition, so the only /transition on
+    // the wire is the CUT's — and it must not fire until SET_PVW's slow write has
+    // finished, i.e. the CUT waits its turn in the per-production queue.
+    const setPvw = send({ type: 'SET_PVW', mixerInput: 'video_in_1' });
+    await delay(20);
+    const cut = send({ type: 'CUT', mixerInput: 'video_in_2' });
+
+    // The CUT has been enqueued but must still be waiting behind SET_PVW's 80 ms
+    // write, so no transition has reached Strom yet.
+    expect(requestsTo(TRANSITION)).toHaveLength(0);
+
+    await Promise.all([setPvw, cut]);
+
+    // Once the queue drains the CUT runs to completion exactly once.
+    expect(requestsTo(TRANSITION).map((r) => (r.body as { to_input: number }).to_input)).toEqual([2]);
   });
 });

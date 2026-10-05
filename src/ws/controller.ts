@@ -30,6 +30,7 @@ import { config } from '../config.js';
 import { notifySubscriberJoin, resetIdleTimer } from '../services/idle-watchdog.js';
 import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot } from '../lib/production-health.js';
+import { getWhipIngestState } from '../services/whip-ingest-state.js';
 
 function stromErrorMessage(err: unknown): string {
   if (err instanceof StromClientError) return err.message;
@@ -1407,6 +1408,60 @@ export async function applyReturnMode(
 // Message handler
 // ---------------------------------------------------------------------------
 
+/**
+ * Commands that mutate the vision mixer (issue #431). Each one reads the
+ * production doc, calls Strom, and persists the resulting tally. Two of them
+ * racing — e.g. a CUT whose DB write is slow, then a TAKE sent 20 ms later —
+ * could otherwise reach Strom in the opposite order the operator pressed them,
+ * leaving Strom on one program while open-live reports another. They are
+ * serialised per production (see `runSerializedSwitcherCommand`) so one
+ * command's Strom calls and DB write finish before the next reads the doc.
+ *
+ * MACRO_EXEC is included because a macro inlines its own CUT/TRANSITION/TAKE
+ * sub-commands (it never re-enters `handleMessage`), so holding the lock for a
+ * whole macro serialises the macro's switcher effects without any risk of the
+ * macro deadlocking on its own queue.
+ */
+const SWITCHER_MESSAGE_TYPES = new Set([
+  'CUT',
+  'TRANSITION',
+  'TAKE',
+  'SET_PVW',
+  'SELECT_PVW_PIP',
+  'SET_PIP',
+  'MACRO_EXEC',
+]);
+
+/**
+ * Per-production tail of the switcher-command chain. Each entry is a
+ * never-rejecting promise that settles when the production's most recently
+ * queued switcher command finishes; the entry is pruned once the chain drains.
+ */
+const switcherCommandChains = new Map<string, Promise<unknown>>();
+
+/**
+ * Run `task` after the previous switcher command for the same production has
+ * fully settled (success or failure), guaranteeing per-production ordering of
+ * the doc read → Strom call → DB write sequence. The caller still observes its
+ * own task's outcome via the returned promise; the internal chain tail swallows
+ * rejections so one failed command never stalls the queue.
+ */
+function runSerializedSwitcherCommand(
+  productionId: string,
+  task: () => Promise<void>,
+): Promise<void> {
+  const prev = switcherCommandChains.get(productionId) ?? Promise.resolve();
+  const result = prev.then(() => task());
+  const tail = result.catch(() => {});
+  switcherCommandChains.set(productionId, tail);
+  void tail.then(() => {
+    if (switcherCommandChains.get(productionId) === tail) {
+      switcherCommandChains.delete(productionId);
+    }
+  });
+  return result;
+}
+
 /** Exported for tests: drives one inbound message against a production. */
 export async function handleMessage(
   productionId: string,
@@ -1459,6 +1514,12 @@ export async function handleMessage(
     return;
   }
 
+  // Everything below reads the production doc, may call Strom, and persists the
+  // result. For switcher-mutating commands this closure runs through the
+  // per-production serialisation chain (issue #431) so commands sent close
+  // together cannot reach Strom out of order; all other command types run
+  // immediately, exactly as before.
+  const dispatch = async (): Promise<void> => {
   const db = getDb();
   let doc: ProductionDoc;
   try {
@@ -1671,13 +1732,16 @@ export async function handleMessage(
         pvwBeforePipByProduction.set(productionId, reversePgmBg);
         pgmBgByProduction.delete(productionId);
       }
-      broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
+      // The transition type/duration actually sent to Strom below, surfaced on the
+      // TALLY so a controller-socket recorder can re-render the exact transition
+      // (issue #451), mirroring the TRANSITION broadcast at ~1598. Additive fields.
+      const takeTransition = toStromTransition(msg.transitionType ?? 'cut');
+      broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc), transitionType: takeTransition, durationMs: msg.durationMs });
       // Defer the PIP_STATE displacement broadcast until the Strom round trip
       // below reports success (issue #370, same class as #355/PR #369): announcing
       // the new PiP state before Strom has accepted the transition leaves clients
       // and Strom disagreeing when Strom rejects the /transition. The persist above
       // has already committed, so a DB failure never reaches this point.
-      const takeTransition = toStromTransition(msg.transitionType ?? 'cut');
       let takeTransitionOk = true;
       if (curPvwPip !== null) {
         // PiP is on PVW → moving to PGM.
@@ -1851,7 +1915,7 @@ export async function handleMessage(
       try {
         const strom = await makeStromClient();
         const result = await strom.mixer.fadeToBlack(doc.stromFlowId, doc.mixerBlockId, { active: msg.active ?? true, duration_ms: msg.durationMs ?? 1000 });
-        broadcast(productionId, { type: 'FTB_STATE', active: result.active });
+        broadcast(productionId, { type: 'FTB_STATE', active: result.active, durationMs: msg.durationMs ?? 1000 });
       } catch (err) {
         console.warn('[controller] Strom FTB error:', err);
         ws.send(JSON.stringify({ type: 'ERROR', error: 'FTB failed' }));
@@ -2087,7 +2151,10 @@ export async function handleMessage(
               macroTakePipEvent = { pvwPip: curPgmPip };
             }
             await persistMixerMutation(productionId, 'MACRO_EXEC:TAKE', (d) => ({ ...d, tally: newTally }));
-            broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, currentDoc) });
+            // A macro TAKE always cuts (no transitionType on the action), so
+            // surface 'cut' on the TALLY to match the interactive TAKE (#451)
+            // and the value sent to Strom below.
+            broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, currentDoc), transitionType: 'cut' });
             const macroTakeTransitionOk = await stromTransition(currentDoc, fromPad, tally.pvw, 'cut');
             if (!macroTakeTransitionOk) {
               // Strom rejected the take — roll back and surface it as a macro
@@ -2844,6 +2911,12 @@ export async function handleMessage(
       ws.send(JSON.stringify({ type: 'ERROR', error: 'Unknown message type' }));
     }
   }
+  };
+
+  if (SWITCHER_MESSAGE_TYPES.has(msg.type)) {
+    return runSerializedSwitcherCommand(productionId, dispatch);
+  }
+  return dispatch();
 }
 
 /**
@@ -3041,6 +3114,27 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             effectiveUrl: state.effectiveUrl,
             updatedAt: state.updatedAt,
           }));
+        }
+      }
+
+      // Replay the current WHIP live-ingest state for this production's assigned
+      // sources, so a freshly-connected controller immediately knows which WHIP
+      // publishers are sending (issue #439, interim — parent #437). Only sources
+      // with a recorded state (offer/teardown already observed) are emitted; the
+      // state is in-memory only and resets on server restart. KNOWN INTERIM
+      // LIMITATION: a `connected` here may be stale if a publisher dropped
+      // without sending DELETE — see `src/services/whip-ingest-state.ts`.
+      if (connectDoc) {
+        for (const assignment of connectDoc.sources) {
+          const liveIngest = getWhipIngestState(assignment.sourceId);
+          if (liveIngest) {
+            socket.send(JSON.stringify({
+              type: 'SOURCE_INGEST_STATE',
+              sourceId: assignment.sourceId,
+              state: liveIngest.state,
+              changedAt: liveIngest.changedAt,
+            }));
+          }
         }
       }
 

@@ -328,6 +328,21 @@ async function runActivationFlow(
   let whepOutputEntries: Array<{ outputId: string; endpointId: string }> | undefined;
   let pgmWhepEndpointId: string | undefined;
 
+  // Force-stop the meter and clip relays bound to this run's (dying) flow,
+  // mirroring deactivate (issue #435). A controller connecting while status is
+  // still 'activating' starts both relays on `stromFlowId` (the connect path
+  // checks only the doc's stromFlowId). If this activation then fails or is
+  // aborted, the relays would otherwise stay bound to the dead flow and the next
+  // activation's reinit/connects would only ref-count the stale relay — so no
+  // client gets METER_DATA / LOUDNESS_DATA / reactive CLIP_STATE until every
+  // controller disconnects. Passing the flow id records it as retired so a later
+  // start on it rebinds to the new flow. No-op before any flow was created.
+  const forceStopRelaysForDyingFlow = (): void => {
+    if (!stromFlowId) return;
+    forceStopMeterRelay(productionId, stromFlowId);
+    forceStopClipRelay(productionId, stromFlowId);
+  };
+
   try {
     // Load the current production doc
     const doc = await getDb().get(productionId);
@@ -364,6 +379,7 @@ async function runActivationFlow(
 
     // Step 2: Persist stromFlowId + mixerBlockId + audioMixerBlockId
     if (signal.aborted) {
+      forceStopRelaysForDyingFlow();
       await deactivateStromFlow(stromFlowId, strom).catch(() => undefined);
       return;
     }
@@ -384,6 +400,7 @@ async function runActivationFlow(
 
     while (Date.now() < deadline) {
       if (signal.aborted) {
+        forceStopRelaysForDyingFlow();
         await deactivateStromFlow(stromFlowId, strom).catch(() => undefined);
         return;
       }
@@ -443,6 +460,7 @@ async function runActivationFlow(
           // Without this check, updateProductionDoc would write status:'active' after
           // deactivate has already written status:'inactive'.
           if (signal.aborted) {
+            forceStopRelaysForDyingFlow();
             await deactivateStromFlow(stromFlowId, strom).catch(() => {});
             return;
           }
@@ -450,6 +468,7 @@ async function runActivationFlow(
         }
 
         if (signal.aborted) {
+          forceStopRelaysForDyingFlow();
           await deactivateStromFlow(stromFlowId, strom).catch(() => {});
           return;
         }
@@ -556,6 +575,13 @@ async function runActivationFlow(
     }
 
     log.error({ err, productionId, stromFlowId }, 'Activation flow failed — resetting to inactive');
+
+    // Force-stop the meter and clip relays bound to the failed flow (issue
+    // #435). Unlike the abort path above, nothing else cleans these up on a
+    // genuine failure (poll timeout, Strom error, failed final doc write), so
+    // without this they stay bound to the dead flow and the next successful
+    // activation never moves them.
+    forceStopRelaysForDyingFlow();
 
     // Best-effort flow cleanup
     if (stromFlowId) {
