@@ -7,7 +7,7 @@ import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssign
 import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js';
-import { setTally, broadcast, getSubscriberCount } from '../services/tally.service.js';
+import { setTally, broadcast, getSubscriberCount, getWatcherCount } from '../services/tally.service.js';
 import { clearProductionPflState } from '../services/pfl-state.js';
 import { clearPipState, clearAudioState, clearFxState, clearClipStateForProduction, reinitConnectedControllers } from '../ws/controller.js';
 import { forceStopMeterRelay } from '../services/meter-relay.js';
@@ -1208,11 +1208,12 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
     }
   );
   // Connected controller count for a production (used by the companion module
-  // to show a "peers connected" indicator on the landing page)
+  // to show a "peers connected" indicator on the landing page). `count` is
+  // operators only; watch-only connections are reported separately.
   fastify.get<{ Params: { id: string } }>(
     '/api/v1/productions/:id/controllers',
     async (req, reply) => {
-      return reply.send({ count: getSubscriberCount(req.params.id) });
+      return reply.send({ count: getSubscriberCount(req.params.id), watchers: getWatcherCount(req.params.id) });
     }
   );
 };

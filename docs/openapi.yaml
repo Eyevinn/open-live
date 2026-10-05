@@ -1693,6 +1693,10 @@ paths:
                 properties:
                   count:
                     type: integer
+                    description: Operator controller connections
+                  watchers:
+                    type: integer
+                    description: Watch-only connections (`?mode=watch`)
 
   # Production — Source assignments
 
