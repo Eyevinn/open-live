@@ -72,19 +72,32 @@ credential key itself (issue #438), via `src/lib/credential-encryption-key.ts`:
   HTML crypto already resolve to, so a stored key is unnecessary and the DB is never touched (keeps
   self-hosted deployments unchanged).
 - The crypto modules consume it as a *fallback*, not a replacement for the env override. In
-  `srt-passphrase-crypto.ts`, `loadKey()` falls back to `getStoredCredentialKey()` only for a
-  `KeySource` with `allowStoredKeyFallback: true` (set on `SRT_PASSPHRASE_KEY_SOURCE`). RTMP's
-  `RTMP_CREDENTIALS_KEY_SOURCE` leaves it unset, so **RTMP never falls back to the stored key**
-  (ADR-004 Resolved Decision 2 — rotation stays isolated). `html-auth-crypto.ts` `loadHtmlAuthKey()`
-  falls back to the stored key when neither `HTML_AUTH_KEY` nor `SRT_PASSPHRASE_KEY` is set.
-- Resolution order per kind: env override wins, then the stored key, then fail-closed-in-prod /
+  `srt-passphrase-crypto.ts`, `loadKey()` falls back to a stored key only for a `KeySource` with
+  `allowStoredKeyFallback: true`. The fallback key comes from `source.storedKeyProvider` when the
+  source sets one, otherwise from the shared `getStoredCredentialKey()`. `SRT_PASSPHRASE_KEY_SOURCE`
+  sets `allowStoredKeyFallback: true` with no provider, so it uses the shared credential key.
+  `html-auth-crypto.ts` `loadHtmlAuthKey()` falls back to the same shared stored key when neither
+  `HTML_AUTH_KEY` nor `SRT_PASSPHRASE_KEY` is set.
+- **RTMP has its OWN dedicated stored key — it never reuses the shared credential key** (issue
+  #447, ADR-004 Resolved Decision 2, which requires a dedicated `RTMP_CREDENTIALS_KEY` with no
+  reuse of the SRT key). `RTMP_CREDENTIALS_KEY_SOURCE` sets `allowStoredKeyFallback: true` with
+  `storedKeyProvider: getStoredRtmpCredentialKey` (`src/lib/rtmp-credential-key.ts`), a parallel
+  module that generates/stores a SEPARATE key under its OWN doc id
+  (`RTMP_CREDENTIAL_KEY_DOC_ID = 'rtmp-credentials-key'`, distinct from
+  `CREDENTIAL_ENCRYPTION_KEY_DOC_ID`). `ensureRtmpCredentialKey()` runs at startup right after
+  `ensureCredentialEncryptionKey()` and no-ops when `RTMP_CREDENTIALS_KEY` (env) is set. The two key
+  families never cross: SRT/HTML fall back to the credential key, RTMP falls back to the RTMP key.
+- Resolution order per kind: env override wins, then that kind's stored key, then fail-closed-in-prod /
   loud-plaintext-in-dev as before. Env overrides always win, so self-hosted setups are unchanged.
-- The stored key lives in `CredentialEncryptionKeyDoc.encryptionSecret`. The `secret` substring
-  makes it redacted by `log-redact.ts`; `server.ts` also lists `encryptionSecret` /
-  `*.encryptionSecret` in the Fastify logger redact paths. Never add a route that returns the doc.
-- `credential-encryption-key.ts` imports `db/index.ts` (→ `config.ts`) — the same intentional ESM
-  cycle as `guest-signing-key.ts`; it is safe only because no binding is used at module-eval time.
-  `getStoredCredentialKey()` is synchronous so the crypto hot path stays synchronous.
+- The stored keys live in `CredentialEncryptionKeyDoc.encryptionSecret` and
+  `RtmpCredentialKeyDoc.encryptionSecret`. The `secret` substring makes them redacted by
+  `log-redact.ts`; `server.ts` also lists `encryptionSecret` / `*.encryptionSecret` in the Fastify
+  logger redact paths (the field name is shared, so both docs are covered). Never add a route that
+  returns either doc.
+- `credential-encryption-key.ts` / `rtmp-credential-key.ts` import `db/index.ts` (→ `config.ts`) —
+  the same intentional ESM cycle as `guest-signing-key.ts`; it is safe only because no binding is
+  used at module-eval time. `getStoredCredentialKey()` / `getStoredRtmpCredentialKey()` are
+  synchronous so the crypto hot path stays synchronous.
 
 ## A new `/api/v1/guests/:inviteId/...` route needs the `isGuestTokenAuthedPath` allowlist
 
