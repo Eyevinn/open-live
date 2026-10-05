@@ -1732,13 +1732,16 @@ export async function handleMessage(
         pvwBeforePipByProduction.set(productionId, reversePgmBg);
         pgmBgByProduction.delete(productionId);
       }
-      broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
+      // The transition type/duration actually sent to Strom below, surfaced on the
+      // TALLY so a controller-socket recorder can re-render the exact transition
+      // (issue #451), mirroring the TRANSITION broadcast at ~1598. Additive fields.
+      const takeTransition = toStromTransition(msg.transitionType ?? 'cut');
+      broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc), transitionType: takeTransition, durationMs: msg.durationMs });
       // Defer the PIP_STATE displacement broadcast until the Strom round trip
       // below reports success (issue #370, same class as #355/PR #369): announcing
       // the new PiP state before Strom has accepted the transition leaves clients
       // and Strom disagreeing when Strom rejects the /transition. The persist above
       // has already committed, so a DB failure never reaches this point.
-      const takeTransition = toStromTransition(msg.transitionType ?? 'cut');
       let takeTransitionOk = true;
       if (curPvwPip !== null) {
         // PiP is on PVW → moving to PGM.
@@ -1912,7 +1915,7 @@ export async function handleMessage(
       try {
         const strom = await makeStromClient();
         const result = await strom.mixer.fadeToBlack(doc.stromFlowId, doc.mixerBlockId, { active: msg.active ?? true, duration_ms: msg.durationMs ?? 1000 });
-        broadcast(productionId, { type: 'FTB_STATE', active: result.active });
+        broadcast(productionId, { type: 'FTB_STATE', active: result.active, durationMs: msg.durationMs ?? 1000 });
       } catch (err) {
         console.warn('[controller] Strom FTB error:', err);
         ws.send(JSON.stringify({ type: 'ERROR', error: 'FTB failed' }));
@@ -2148,7 +2151,10 @@ export async function handleMessage(
               macroTakePipEvent = { pvwPip: curPgmPip };
             }
             await persistMixerMutation(productionId, 'MACRO_EXEC:TAKE', (d) => ({ ...d, tally: newTally }));
-            broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, currentDoc) });
+            // A macro TAKE always cuts (no transitionType on the action), so
+            // surface 'cut' on the TALLY to match the interactive TAKE (#451)
+            // and the value sent to Strom below.
+            broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, currentDoc), transitionType: 'cut' });
             const macroTakeTransitionOk = await stromTransition(currentDoc, fromPad, tally.pvw, 'cut');
             if (!macroTakeTransitionOk) {
               // Strom rejected the take — roll back and surface it as a macro
