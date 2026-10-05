@@ -251,6 +251,34 @@ export function startClipRelay(productionId: string, flowId: string, blockToInpu
   relays.set(productionId, entry);
 }
 
+/**
+ * Reconcile the relay onto `flowId` with exactly `holderCount` refs — the clip
+ * mirror of `reconcileMeterRelay` (issue #434). See that function for why
+ * reactivation reinit must rebind + set the refCount to the operator-socket
+ * count rather than taking a per-socket ref: deactivate's force-stop zeroes the
+ * refCount while per-socket holds persist, and a connect mid-teardown may have
+ * re-created the relay on the retired flow. No-op when `holderCount <= 0` or the
+ * production has no clip player blocks.
+ */
+export function reconcileClipRelay(productionId: string, flowId: string, blockToInput: Map<string, string>, holderCount: number): void {
+  if (holderCount <= 0 || blockToInput.size === 0) return;
+  const existing = relays.get(productionId);
+  if (existing) {
+    existing.flowId = flowId;
+    existing.blockToInput = blockToInput;
+    existing.refCount = holderCount;
+    return;
+  }
+  startClipRelay(productionId, flowId, blockToInput);
+  const created = relays.get(productionId);
+  if (created) created.refCount = holderCount;
+}
+
+/** Current ref count for a production's clip relay (0 when none). Diagnostic. */
+export function getClipRelayRefCount(productionId: string): number {
+  return relays.get(productionId)?.refCount ?? 0;
+}
+
 /** Ref-counted stop; tears down the WS on the last controller disconnect. */
 export function stopClipRelay(productionId: string): void {
   const entry = relays.get(productionId);

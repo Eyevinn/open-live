@@ -71,11 +71,13 @@ vi.mock('../services/meter-relay.js', () => ({
   startMeterRelay: (id: string) => { relayRefs(id).meter++; },
   stopMeterRelay: (id: string) => { if (relayRefs(id).meter > 0) relayRefs(id).meter--; },
   forceStopMeterRelay: (id: string) => { relayRefs(id).meter = 0; },
+  reconcileMeterRelay: (id: string, _flow: string, _block: string, _loud: unknown, count: number) => { if (count > 0) relayRefs(id).meter = count; },
 }));
 vi.mock('../services/clip-relay.js', () => ({
   startClipRelay: (id: string) => { relayRefs(id).clip++; },
   stopClipRelay: (id: string) => { if (relayRefs(id).clip > 0) relayRefs(id).clip--; },
   forceStopClipRelay: (id: string) => { relayRefs(id).clip = 0; },
+  reconcileClipRelay: (id: string, _flow: string, _blocks: Map<string, string>, count: number) => { if (count > 0) relayRefs(id).clip = count; },
 }));
 
 const FLOW = 'flow-watch-only';
