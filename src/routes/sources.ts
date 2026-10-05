@@ -10,6 +10,7 @@ import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-p
 import { encryptHtmlAuthValue } from '../lib/html-auth-crypto.js';
 import { getPortReservation } from '../services/port-reservation.js';
 import { clashesAfterWrite, listenerPortRequest, resolveListenerAddress, usedListenerPorts } from '../services/listener-ports.js';
+import { getWhipIngestState } from '../services/whip-ingest-state.js';
 
 /**
  * Token-header name allowlist for a Design-B auth header (issue #314,
@@ -244,6 +245,20 @@ function toApi(doc: SourceDoc) {
     // Echo the masked auth: `header.valueSet` reflects whether a credential is
     // stored; the value itself is write-only and never included (issue #314).
     api['auth'] = maskAuth(auth, authHeaderValueEnc);
+  }
+  // Read-only, separate from the client-writable `status` field: the observed
+  // WHIP live-ingest state (issue #439, interim — parent #437). Present only
+  // once a WHIP offer/teardown has been seen for this source; absent otherwise.
+  // Driven by `src/routes/whip.ts` and held in process memory (resets on
+  // restart). Clients may read it but CANNOT set it — a client-supplied
+  // `liveIngest` on create/patch is ignored (not in the input schemas), so this
+  // never overwrites `status`.
+  //
+  // KNOWN INTERIM LIMITATION: a publisher that drops without sending a WHIP
+  // DELETE stays `connected` here — see `src/services/whip-ingest-state.ts`.
+  const liveIngest = getWhipIngestState(_id);
+  if (liveIngest) {
+    api['liveIngest'] = { state: liveIngest.state, changedAt: liveIngest.changedAt };
   }
   return api;
 }
