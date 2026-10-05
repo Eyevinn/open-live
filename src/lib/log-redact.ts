@@ -4,10 +4,11 @@
  * The `secret` / `token` sub-patterns intentionally match by substring, so the
  * guest-calling credentials `GUEST_INVITE_SECRET` (HMAC signing key) and
  * `INTERCOM_MANAGER_TOKEN` — as well as their camelCase config keys
- * `guestInviteSecret` / `intercomManagerToken`, and the stored signing key's
- * `signingSecret` field (`GuestSigningKeyDoc`, issue #391) — are redacted here
- * without a dedicated rule (epic #208, issue #299, spec §Risks: "Redact
- * INTERCOM_MANAGER_TOKEN and GUEST_INVITE_SECRET in logs").
+ * `guestInviteSecret` / `intercomManagerToken`, the stored signing key's
+ * `signingSecret` field (`GuestSigningKeyDoc`, issue #391), and the stored
+ * credential key's `encryptionSecret` field (`CredentialEncryptionKeyDoc`, issue
+ * #438) — are redacted here without a dedicated rule (epic #208, issue #299, spec
+ * §Risks: "Redact INTERCOM_MANAGER_TOKEN and GUEST_INVITE_SECRET in logs").
  *
  * `address` / `url` are redacted because an authenticated HTML source (Design D,
  * token-in-URL — `docs/specs/authenticated-html-sources.md`, ADR-003) carries a
