@@ -575,6 +575,89 @@ function rebroadcastMixerState(productionId: string, doc: ProductionDoc): void {
 }
 
 // ---------------------------------------------------------------------------
+// #430: rolling back a switch Strom rejected
+//
+// A CUT/TRANSITION/TAKE mutates the tally, the PiP maps, and the persisted doc,
+// then broadcasts TALLY *before* awaiting Strom's /transition. #355 already
+// stopped the controller from *announcing a displaced PiP* (the deferred
+// PIP_STATE + preview restore) when that transition is rejected, but the tally,
+// the PiP-map mutations, and the persisted doc were still left on the new value.
+// Clients were therefore told the new source is on program (via the already-sent
+// TALLY) while Strom kept airing the old one, until the next successful switch.
+//
+// `snapshotSwitchState` captures the pre-switch state before any mutation, and
+// `restoreSwitchState` rolls all of it back and re-broadcasts the authoritative
+// TALLY + PIP_STATE so every client drops the switch it optimistically showed.
+// Applied on every CUT/TRANSITION/TAKE path, interactive and macro.
+// ---------------------------------------------------------------------------
+
+interface SwitchStateSnapshot {
+  tally: { pgm: string | null; pvw: string | null };
+  pgmPip: number | null;
+  pvwPip: number | null;
+  pvwBeforePip: string | null;
+  pgmBg: string | null;
+}
+
+/**
+ * Snapshot the controller's switch-related state so a rejected transition can be
+ * rolled back. Must be called before the handler mutates any of it. The tally is
+ * copied (getTally returns the live stored object, which some handlers mutate in
+ * place).
+ */
+function snapshotSwitchState(productionId: string): SwitchStateSnapshot {
+  return {
+    tally: { ...getTally(productionId) },
+    pgmPip: pgmPipByProduction.get(productionId) ?? null,
+    pvwPip: pvwPipByProduction.get(productionId) ?? null,
+    pvwBeforePip: pvwBeforePipByProduction.get(productionId) ?? null,
+    pgmBg: pgmBgByProduction.get(productionId) ?? null,
+  };
+}
+
+/**
+ * Restore the pre-switch snapshot after Strom rejected the transition (#430):
+ * roll back the tally, the four PiP maps, and the persisted doc, then re-broadcast
+ * the authoritative TALLY and PIP_STATE. The absent-key and null-value readings of
+ * these maps are equivalent everywhere they are consumed (reads coalesce with
+ * `?? null`), so restoring with `set` is faithful.
+ */
+async function restoreSwitchState(
+  productionId: string,
+  doc: ProductionDoc,
+  snapshot: SwitchStateSnapshot,
+): Promise<void> {
+  setTally(productionId, { pgm: snapshot.tally.pgm, pvw: snapshot.tally.pvw });
+  pgmPipByProduction.set(productionId, snapshot.pgmPip);
+  pvwPipByProduction.set(productionId, snapshot.pvwPip);
+  pvwBeforePipByProduction.set(productionId, snapshot.pvwBeforePip);
+  pgmBgByProduction.set(productionId, snapshot.pgmBg);
+  await persistMixerMutation(productionId, 'SWITCH_REJECTED_ROLLBACK', (d) => ({ ...d, tally: snapshot.tally }));
+  broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, snapshot.tally, doc) });
+  broadcast(productionId, {
+    type: 'PIP_STATE',
+    pgmPip: snapshot.pgmPip,
+    pvwPip: snapshot.pvwPip,
+    pips: pipConfigsByProduction.get(productionId) ?? [],
+  });
+}
+
+/**
+ * Tell the operator a switch was rejected by Strom. Mirrors the not-found guard:
+ * a NACK when the command carried a cmdId (two-phase ACK), an ERROR frame
+ * otherwise. The caller must NOT also send an `executed` ACK — the switch never
+ * reached air.
+ */
+function notifySwitchRejected(ws: WebSocket, productionId: string, cmdId: string | undefined): void {
+  const error = 'Switch rejected by Strom';
+  if (cmdId) {
+    sendNack(ws, productionId, cmdId, error);
+  } else {
+    ws.send(JSON.stringify({ type: 'ERROR', error }));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Audio volume debounce
 // ---------------------------------------------------------------------------
 
@@ -1474,6 +1557,8 @@ export async function handleMessage(
       const fromPadCut = (curPgmPipCut !== null && tally.pgm === null)
         ? (pgmBgByProduction.get(productionId) ?? null)
         : tally.pgm;
+      // Snapshot before any mutation so a Strom rejection can be rolled back (#430).
+      const preSwitchCut = snapshotSwitchState(productionId);
       const newTally = { pgm: msg.mixerInput, pvw: tally.pgm };
       setTally(productionId, newTally);
       const curPvwPipCut = pvwPipByProduction.get(productionId) ?? null;
@@ -1498,12 +1583,20 @@ export async function handleMessage(
       await persistMixerMutation(productionId, 'CUT', (d) => ({ ...d, tally: newTally }));
       broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
       const cutTransitionOk = await stromTransition(doc, fromPadCut, msg.mixerInput, 'cut');
+      if (!cutTransitionOk) {
+        // Strom rejected the cut, so it never reached air: roll the tally, PiP
+        // maps and persisted doc back to the pre-switch state, re-broadcast, and
+        // tell the operator (#430).
+        await restoreSwitchState(productionId, doc, preSwitchCut);
+        notifySwitchRejected(ws, productionId, cmdId);
+        break;
+      }
       // Announce the PiP move and restore it into Strom's preview only after the
       // transition succeeded (#355) and only if the operator has not changed PVW
       // during the Strom round trip (#341): a concurrent SET_PVW / SELECT_PVW_PIP
       // has already broadcast the authoritative PVW, so a stale displacement
       // broadcast or restore must not clobber it.
-      if (cutTransitionOk && cutPipEvent
+      if (cutPipEvent
           && (pvwPipByProduction.get(productionId) ?? null) === cutPipEvent.pvwPip) {
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: cutPipEvent.pvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
         if (curPgmPipCut !== null && doc.stromFlowId && doc.mixerBlockId) {
@@ -1541,6 +1634,8 @@ export async function handleMessage(
       const fromPadTrans = (curPgmPipTrans !== null && tally.pgm === null)
         ? (pgmBgByProduction.get(productionId) ?? null)
         : tally.pgm;
+      // Snapshot before any mutation so a Strom rejection can be rolled back (#430).
+      const preSwitchTrans = snapshotSwitchState(productionId);
       const newTally = { pgm: msg.mixerInput, pvw: tally.pgm };
       setTally(productionId, newTally);
       const curPvwPipTrans = pvwPipByProduction.get(productionId) ?? null;
@@ -1561,9 +1656,15 @@ export async function handleMessage(
       await persistMixerMutation(productionId, 'TRANSITION', (d) => ({ ...d, tally: newTally }));
       broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc), transitionType: msg.transitionType, durationMs: msg.durationMs });
       const transTransitionOk = await stromTransition(doc, fromPadTrans, msg.mixerInput, toStromTransition(msg.transitionType), msg.durationMs);
+      if (!transTransitionOk) {
+        // Strom rejected the transition — roll back and notify (#430).
+        await restoreSwitchState(productionId, doc, preSwitchTrans);
+        notifySwitchRejected(ws, productionId, cmdId);
+        break;
+      }
       // Announce + restore only after the transition succeeded (#355) and only if
       // PVW was not changed during the Strom round trip (#341).
-      if (transTransitionOk && transPipEvent
+      if (transPipEvent
           && (pvwPipByProduction.get(productionId) ?? null) === transPipEvent.pvwPip) {
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: transPipEvent.pvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
         if (curPgmPipTrans !== null && doc.stromFlowId && doc.mixerBlockId) {
@@ -1582,6 +1683,9 @@ export async function handleMessage(
       break;
     }
     case 'TAKE': {
+      // Snapshot before any mutation so a Strom rejection can be rolled back (#430).
+      // Taken first because the atomic-PiP block below mutates the live tally in place.
+      const preSwitchTake = snapshotSwitchState(productionId);
       const tally = getTally(productionId);
       // Atomic PiP take: pip supplied directly so no SELECT_PVW_PIP is needed,
       // avoiding the concurrent-broadcast race that puts the PiP in both PGM and PVW.
@@ -1688,12 +1792,19 @@ export async function handleMessage(
         pgmBgByProduction.delete(productionId);
         takeTransitionOk = await stromTransition(doc, tally.pgm, tally.pvw, takeTransition, msg.durationMs);
       }
+      if (!takeTransitionOk) {
+        // Strom rejected the take — roll back the tally, PiP maps and persisted
+        // doc, re-broadcast, and tell the operator (#430).
+        await restoreSwitchState(productionId, doc, preSwitchTake);
+        notifySwitchRejected(ws, productionId, cmdId);
+        break;
+      }
       // Announce the take's new PiP state, and restore a displaced PGM PiP into
       // Strom's preview, only after the transition succeeded (#370/#355) and only
       // if the operator has not changed PVW during the Strom round trip (#341): a
       // concurrent SET_PVW / SELECT_PVW_PIP has already broadcast the authoritative
       // PVW, so a stale displacement broadcast or restore must not clobber it.
-      if (takeTransitionOk && (pvwPipByProduction.get(productionId) ?? null) === newPvwPip) {
+      if ((pvwPipByProduction.get(productionId) ?? null) === newPvwPip) {
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: newPgmPip, pvwPip: newPvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
         // Reverse-PiP take (PiP was on PGM, nothing waiting in PVW): put the PiP
         // back on Strom's preview so subsequent forward takes work.
@@ -1906,6 +2017,8 @@ export async function handleMessage(
               const fromPad = (curPgmPip !== null && tally.pgm === null)
                 ? (pgmBgByProduction.get(productionId) ?? null)
                 : tally.pgm;
+              // Snapshot before any mutation so a Strom rejection can be rolled back (#430).
+              const preSwitchMacroCut = snapshotSwitchState(productionId);
               const newTally = { pgm: mixerInput, pvw: tally.pgm };
               setTally(productionId, newTally);
               const curPvwPip = pvwPipByProduction.get(productionId) ?? null;
@@ -1928,9 +2041,15 @@ export async function handleMessage(
               await persistMixerMutation(productionId, 'MACRO_EXEC:CUT', (d) => ({ ...d, tally: newTally }));
               broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, currentDoc) });
               const macroCutTransitionOk = await stromTransition(currentDoc, fromPad, mixerInput, 'cut');
+              if (!macroCutTransitionOk) {
+                // Strom rejected the cut — roll back and surface it as a macro
+                // action failure (the catch below reports MACRO_ERROR) (#430).
+                await restoreSwitchState(productionId, currentDoc, preSwitchMacroCut);
+                throw new Error('Switch rejected by Strom');
+              }
               // Announce + restore only after the transition succeeded (#355) and
               // only if PVW was not changed during the Strom round trip (#341).
-              if (macroCutTransitionOk && macroCutPipEvent
+              if (macroCutPipEvent
                   && (pvwPipByProduction.get(productionId) ?? null) === macroCutPipEvent.pvwPip) {
                 broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: macroCutPipEvent.pvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
                 if (curPgmPip !== null && currentDoc.stromFlowId && currentDoc.mixerBlockId) {
@@ -1955,6 +2074,8 @@ export async function handleMessage(
               const fromPad = (curPgmPip !== null && tally.pgm === null)
                 ? (pgmBgByProduction.get(productionId) ?? null)
                 : tally.pgm;
+              // Snapshot before any mutation so a Strom rejection can be rolled back (#430).
+              const preSwitchMacroTrans = snapshotSwitchState(productionId);
               const newTally = { pgm: mixerInput, pvw: tally.pgm };
               setTally(productionId, newTally);
               const curPvwPip = pvwPipByProduction.get(productionId) ?? null;
@@ -1977,9 +2098,15 @@ export async function handleMessage(
               await persistMixerMutation(productionId, 'MACRO_EXEC:TRANSITION', (d) => ({ ...d, tally: newTally }));
               broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, currentDoc), transitionType: action.transitionType, durationMs: action.durationMs });
               const macroTransTransitionOk = await stromTransition(currentDoc, fromPad, mixerInput, toStromTransition(action.transitionType ?? 'cut'), action.durationMs);
+              if (!macroTransTransitionOk) {
+                // Strom rejected the transition — roll back and surface it as a
+                // macro action failure (the catch below reports MACRO_ERROR) (#430).
+                await restoreSwitchState(productionId, currentDoc, preSwitchMacroTrans);
+                throw new Error('Switch rejected by Strom');
+              }
               // Announce + restore only after the transition succeeded (#355) and
               // only if PVW was not changed during the Strom round trip (#341).
-              if (macroTransTransitionOk && macroTransPipEvent
+              if (macroTransPipEvent
                   && (pvwPipByProduction.get(productionId) ?? null) === macroTransPipEvent.pvwPip) {
                 broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: macroTransPipEvent.pvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
                 if (curPgmPip !== null && currentDoc.stromFlowId && currentDoc.mixerBlockId) {
@@ -2002,6 +2129,8 @@ export async function handleMessage(
             const fromPad = (curPgmPip !== null && tally.pgm === null)
               ? (pgmBgByProduction.get(productionId) ?? null)
               : tally.pgm;
+            // Snapshot before any mutation so a Strom rejection can be rolled back (#430).
+            const preSwitchMacroTake = snapshotSwitchState(productionId);
             const newTally = { pgm: tally.pvw, pvw: tally.pgm };
             setTally(productionId, newTally);
             // Defer the PIP_STATE broadcast until persist and the Strom transition
@@ -2019,9 +2148,15 @@ export async function handleMessage(
             await persistMixerMutation(productionId, 'MACRO_EXEC:TAKE', (d) => ({ ...d, tally: newTally }));
             broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, currentDoc) });
             const macroTakeTransitionOk = await stromTransition(currentDoc, fromPad, tally.pvw, 'cut');
+            if (!macroTakeTransitionOk) {
+              // Strom rejected the take — roll back and surface it as a macro
+              // action failure (the catch below reports MACRO_ERROR) (#430).
+              await restoreSwitchState(productionId, currentDoc, preSwitchMacroTake);
+              throw new Error('Switch rejected by Strom');
+            }
             // Announce + restore only after the transition succeeded (#370/#355) and
             // only if PVW was not changed during the Strom round trip (#341).
-            if (macroTakeTransitionOk && macroTakePipEvent
+            if (macroTakePipEvent
                 && (pvwPipByProduction.get(productionId) ?? null) === macroTakePipEvent.pvwPip) {
               broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: macroTakePipEvent.pvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
               if (curPgmPip !== null && currentDoc.stromFlowId && currentDoc.mixerBlockId) {
