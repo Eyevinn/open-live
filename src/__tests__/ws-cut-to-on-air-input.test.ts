@@ -263,6 +263,57 @@ describe('CUT/TRANSITION to the input behind an on-air PiP (#342, #353)', () => 
   });
 });
 
+// ---------------------------------------------------------------------------
+// A TAKE's TALLY must carry the transitionType / durationMs it sent to Strom so
+// a controller-socket recorder can re-render the exact transition, matching the
+// TRANSITION broadcast. FTB_STATE must likewise carry the durationMs sent to
+// Strom. Additive, non-breaking fields (issue #451).
+// ---------------------------------------------------------------------------
+
+describe('TAKE surfaces the transition it sent to Strom on its TALLY (#451)', () => {
+  function ftbs() {
+    return broadcasts.filter((m) => m.type === 'FTB_STATE');
+  }
+
+  it('TALLY carries the given transitionType and durationMs', async () => {
+    await send({ type: 'TAKE', transitionType: 'fade', durationMs: 500 });
+
+    // pgm/pvw swap from the beforeEach state, plus the new transition fields.
+    expect(tallies().at(-1)).toMatchObject({
+      pgm: 'video_in_1',
+      pvw: 'video_in_0',
+      transitionType: 'fade',
+      durationMs: 500,
+    });
+    // The same values reach Strom's /transition call.
+    expect(transitions()[0]?.body).toMatchObject({ transition_type: 'fade', duration_ms: 500 });
+  });
+
+  it('TALLY defaults transitionType to cut when none is given', async () => {
+    await send({ type: 'TAKE' });
+
+    const tally = tallies().at(-1) as Record<string, unknown>;
+    expect(tally).toMatchObject({ pgm: 'video_in_1', pvw: 'video_in_0', transitionType: 'cut' });
+    expect(tally.durationMs).toBeUndefined();
+  });
+
+  it('FTB_STATE carries the durationMs sent to Strom', async () => {
+    await send({ type: 'FTB', active: true, durationMs: 700 });
+
+    expect(ftbs().at(-1)).toMatchObject({ durationMs: 700 });
+    const ftbReq = stromRequests.find((r) => r.path === '/api/flows/flow-1/blocks/mixer-1/ftb');
+    expect(ftbReq?.body).toMatchObject({ duration_ms: 700 });
+  });
+
+  it('FTB_STATE defaults durationMs to the Strom default (1000) when none is given', async () => {
+    await send({ type: 'FTB', active: true });
+
+    expect(ftbs().at(-1)).toMatchObject({ durationMs: 1000 });
+    const ftbReq = stromRequests.find((r) => r.path === '/api/flows/flow-1/blocks/mixer-1/ftb');
+    expect(ftbReq?.body).toMatchObject({ duration_ms: 1000 });
+  });
+});
+
 describe('macro actions targeting the input already on program', () => {
   it('CUT action is skipped without breaking the rest of the macro', async () => {
     mockGet.mockResolvedValue(

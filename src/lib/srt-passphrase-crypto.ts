@@ -53,13 +53,26 @@ export interface KeySource {
   /** Env var name holding the base64/hex 32-byte key. */
   envVar: string;
   /**
-   * When the env var is unset, fall back to the backend-generated stored
-   * credential key (`src/lib/credential-encryption-key.ts`, issue #438) instead
-   * of failing closed. This makes credential storage work out of the box on OSC,
-   * where no key env var is provisioned. RTMP stream keys deliberately leave this
-   * unset (ADR-004 Resolved Decision 2 — their rotation must stay isolated).
+   * When the env var is unset, fall back to a backend-generated stored key
+   * instead of failing closed. This makes credential storage work out of the box
+   * on OSC, where no key env var is provisioned.
+   *
+   * The fallback key comes from `storedKeyProvider` when the source sets one,
+   * otherwise from the shared credential-encryption key
+   * (`src/lib/credential-encryption-key.ts`, issue #438). RTMP stream keys set
+   * their OWN provider (`src/lib/rtmp-credential-key.ts`, issue #447) so they
+   * never read the SRT/credential key — ADR-004 Resolved Decision 2 keeps the
+   * RTMP and SRT key families isolated.
    */
   allowStoredKeyFallback?: boolean;
+  /**
+   * Optional, dedicated accessor for the stored fallback key of this credential
+   * kind. Only consulted when `allowStoredKeyFallback` is set. Lets a kind (RTMP)
+   * fall back to its OWN stored key rather than the shared credential key,
+   * without weakening the SRT/HTML path's default. Defaults to the shared
+   * credential-encryption key accessor when unset.
+   */
+  storedKeyProvider?: () => Buffer | null;
 }
 
 /** Default source — the historic SRT passphrase key (falls back to the stored key). */
@@ -117,10 +130,12 @@ export function loadKey(source: KeySource = SRT_PASSPHRASE_KEY_SOURCE): Buffer |
   const raw = process.env[source.envVar];
   if (!raw) {
     // No env override: for credential kinds that allow it, use the backend-
-    // generated stored key (issue #438) so storage works on OSC where no key env
-    // var is set. RTMP leaves `allowStoredKeyFallback` unset and never gets here.
+    // generated stored key so storage works on OSC where no key env var is set.
+    // SRT/HTML (#438) default to the shared credential key; RTMP (#447) injects
+    // its OWN `storedKeyProvider`, so the two key families never cross (ADR-004
+    // Resolved Decision 2).
     if (source.allowStoredKeyFallback) {
-      const stored = getStoredCredentialKey();
+      const stored = (source.storedKeyProvider ?? getStoredCredentialKey)();
       if (stored) {
         keyCache.set(source.envVar, stored);
         return stored;
