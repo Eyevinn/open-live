@@ -86,7 +86,8 @@ vi.mock('../db/index.js', () => ({
   getDb: () => prodDb,
   getGuestInvitesDb: () => invitesDb,
   getGuestSessionsDb: () => sessionsDb,
-  getSourcesDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn(), destroy: vi.fn() }),
+  // Every slot's source is a WHIP guest.
+  getSourcesDb: () => ({ get: vi.fn(async () => ({ streamType: 'whip' })), insert: vi.fn(), find: vi.fn(), destroy: vi.fn() }),
   getOutputsDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn(), destroy: vi.fn() }),
   getGatewaysDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn(), destroy: vi.fn() }),
   connectDb: vi.fn().mockResolvedValue(undefined),
