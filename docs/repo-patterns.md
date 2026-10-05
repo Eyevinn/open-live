@@ -85,3 +85,17 @@ branch for it (RTMP is an outbound connect, not a listener). The stream key is d
 composed into `rtmp_url` **only** in the flow generator at activation time, never persisted
 composed, and only ever logged through `safeFlowProjection()` (which strips all block
 properties).
+
+## A rejected Strom `/transition` must roll back the whole switch, not just the PiP announce
+
+In `ws/controller.ts`, CUT/TRANSITION/TAKE (interactive and macro) mutate the tally, the PiP
+maps (`pgmPip`/`pvwPip`/`pvwBeforePip`/`pgmBg`) and the persisted doc, and broadcast `TALLY`,
+**before** awaiting Strom's `/transition`. #355/#370 only deferred the *PIP_STATE displacement
+broadcast + preview restore* until the transition succeeded — the tally, the map mutations and
+the persisted doc were still left on the new value when Strom rejected the cut, so clients kept
+showing the new source while Strom aired the old one (#430). Any new switch path must snapshot
+state before mutating (`snapshotSwitchState`) and, on a `false` from `stromTransition` (or a
+caught Strom error in the TAKE PiP branches), call `restoreSwitchState` to roll back tally + the
+four PiP maps + the persisted doc and re-broadcast `TALLY`/`PIP_STATE`, then notify the operator
+(`notifySwitchRejected` — NACK with a cmdId, else ERROR; macro paths `throw` so the loop reports
+`MACRO_ERROR`). Never ACK `executed` on a rejected switch.
