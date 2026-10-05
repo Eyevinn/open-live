@@ -36,6 +36,8 @@ interface RelayEntry {
 }
 
 const relays = new Map<string, RelayEntry>();
+// Last flow each production's deactivate tore down (see meter-relay.ts).
+const retiredFlows = new Map<string, string>();
 const RECONNECT_DELAY_MS = 5000;
 
 /**
@@ -158,8 +160,12 @@ export function startClipRelay(productionId: string, flowId: string, blockToInpu
   const existing = relays.get(productionId);
   if (existing) {
     existing.refCount++;
-    // Refresh the mapping/flow in case the flow was rebuilt while connected.
-    existing.blockToInput = blockToInput;
+    // Move a relay off a torn-down flow, never off a live one (see
+    // startMeterRelay). The block map belongs to the flow, so it moves with it.
+    if (existing.flowId !== flowId && existing.flowId === retiredFlows.get(productionId)) {
+      existing.flowId = flowId;
+    }
+    if (existing.flowId === flowId) existing.blockToInput = blockToInput;
     return;
   }
   if (blockToInput.size === 0) return;
@@ -256,8 +262,12 @@ export function stopClipRelay(productionId: string): void {
   }
 }
 
-/** Force-stop and forget the relay regardless of refCount (deactivate/teardown). */
-export function forceStopClipRelay(productionId: string): void {
+/**
+ * Force-stop and forget the relay regardless of refCount (deactivate/teardown),
+ * and record `flowId` as torn down so a relay started on it later is rebound.
+ */
+export function forceStopClipRelay(productionId: string, flowId?: string): void {
+  if (flowId) retiredFlows.set(productionId, flowId);
   const entry = relays.get(productionId);
   if (!entry) return;
   entry.stop();
