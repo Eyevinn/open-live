@@ -7,7 +7,7 @@ import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssign
 import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js';
-import { setTally, broadcast, getSubscriberCount } from '../services/tally.service.js';
+import { setTally, broadcast, getSubscriberCount, getWatcherCount } from '../services/tally.service.js';
 import { clearProductionPflState } from '../services/pfl-state.js';
 import { clearPipState, clearAudioState, clearFxState, clearClipStateForProduction, reinitConnectedControllers } from '../ws/controller.js';
 import { forceStopMeterRelay } from '../services/meter-relay.js';
@@ -946,13 +946,12 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
     clearAudioState(doc._id);
     clearPipState(doc._id);
     clearFxState(doc._id);
-    // Force-stop the meter and clip relays regardless of refCount (issue #416).
-    // Controller sockets stay open across deactivate; if the relays were left
-    // alive they would stay bound to this (torn-down) flow and every connect
-    // after reactivation would ref-count into the stale relay, so no client
-    // would get METER_DATA/LOUDNESS_DATA/CLIP_STATE until all sockets closed.
-    forceStopMeterRelay(doc._id);
-    forceStopClipRelay(doc._id);
+    // Force-stop the meter and clip relays regardless of refCount (issue #416):
+    // they are bound to this flow. A controller connecting before the final doc
+    // write below can still start one on this flow; the next start with the new
+    // flow rebinds it.
+    forceStopMeterRelay(doc._id, doc.stromFlowId);
+    forceStopClipRelay(doc._id, doc.stromFlowId);
     // Stop any clip completion-poll timers and wipe the in-memory clip-state
     // registry — live-only clip state must not survive deactivation (#278).
     clearClipStateForProduction(doc._id);
@@ -1209,11 +1208,12 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
     }
   );
   // Connected controller count for a production (used by the companion module
-  // to show a "peers connected" indicator on the landing page)
+  // to show a "peers connected" indicator on the landing page). `count` is
+  // operators only; watch-only connections are reported separately.
   fastify.get<{ Params: { id: string } }>(
     '/api/v1/productions/:id/controllers',
     async (req, reply) => {
-      return reply.send({ count: getSubscriberCount(req.params.id) });
+      return reply.send({ count: getSubscriberCount(req.params.id), watchers: getWatcherCount(req.params.id) });
     }
   );
 };

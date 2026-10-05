@@ -267,11 +267,9 @@ describe('raw Strom frame through connectWebSocket -> clip-relay', () => {
   });
 });
 
-// Issue #416: on deactivate the clip relay must be force-stopped, because
-// `startClipRelay` on an existing relay only refreshes `blockToInput` and keeps
-// the OLD `entry.flowId` — so a connect after reactivation (which built a new
-// flow) would filter every event against the stale flow and drop it. A
-// force-stop + restart rebinds to the new flow.
+// A relay left on the torn-down flow (started by a connect mid-deactivate) is
+// rebound by the next start; a late start with the torn-down flow does not pull
+// a relay off the new flow.
 describe('deactivate→reactivate flow rebind (issue #416)', () => {
   const OLD_FLOW = 'flow-old';
   const NEW_FLOW = 'flow-new';
@@ -279,21 +277,36 @@ describe('deactivate→reactivate flow rebind (issue #416)', () => {
 
   beforeEach(() => {
     wsHandlers.clear();
-    forceStopClipRelay(PROD);
+    forceStopClipRelay(PROD, 'flow-none');
   });
 
-  it('a plain re-start keeps the stale flow (the bug); forceStop + restart rebinds', async () => {
+  it('a relay started on the torn-down flow is rebound by the next start', async () => {
+    forceStopClipRelay(PROD, OLD_FLOW);
     startClipRelay(PROD, OLD_FLOW, new Map([[BLOCK, INPUT]]));
     await Promise.resolve(); await Promise.resolve();
 
-    // Reactivation connect calls startClipRelay with the NEW flow, but it only
-    // refreshes blockToInput and ref-counts in — the filter stays OLD_FLOW.
     startClipRelay(PROD, NEW_FLOW, new Map([[BLOCK, INPUT]]));
     setClipStateEntry(PROD, { mixerInput: INPUT, state: 'playing', clipId: 'c1' });
+    pushRawFrame(JSON.stringify({ type: 'MediaPlayerStateChanged', data: { flow_id: OLD_FLOW, block_id: BLOCK, state: 'paused' } }));
+    expect(clipStates()).toHaveLength(0);
     pushRawFrame(JSON.stringify({ type: 'MediaPlayerStateChanged', data: { flow_id: NEW_FLOW, block_id: BLOCK, state: 'paused' } }));
-    expect(clipStates()).toHaveLength(0); // stale relay drops the new flow's events
+    expect(clipStates().at(-1)).toMatchObject({ mixerInput: INPUT, state: 'paused' });
+  });
 
-    // Fix: force-stop on deactivate, restart bound to the new flow on reactivate.
+  it('a late start with the torn-down flow does not pull the relay off the new flow', async () => {
+    const NEW_BLOCK = 'mediaplayer-2';
+    forceStopClipRelay(PROD, OLD_FLOW);
+    startClipRelay(PROD, NEW_FLOW, new Map([[NEW_BLOCK, INPUT]]));
+    await Promise.resolve(); await Promise.resolve();
+    startClipRelay(PROD, OLD_FLOW, new Map([[BLOCK, INPUT]]));
+
+    setClipStateEntry(PROD, { mixerInput: INPUT, state: 'playing', clipId: 'c1' });
+    pushRawFrame(JSON.stringify({ type: 'MediaPlayerStateChanged', data: { flow_id: NEW_FLOW, block_id: NEW_BLOCK, state: 'paused' } }));
+    expect(clipStates().at(-1)).toMatchObject({ mixerInput: INPUT, state: 'paused' });
+  });
+
+  it('forceStop + restart binds to the new flow', async () => {
+    startClipRelay(PROD, OLD_FLOW, new Map([[BLOCK, INPUT]]));
     forceStopClipRelay(PROD);
     startClipRelay(PROD, NEW_FLOW, new Map([[BLOCK, INPUT]]));
     await Promise.resolve(); await Promise.resolve();
