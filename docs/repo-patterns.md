@@ -129,6 +129,23 @@ four PiP maps + the persisted doc and re-broadcast `TALLY`/`PIP_STATE`, then not
 (`notifySwitchRejected` — NACK with a cmdId, else ERROR; macro paths `throw` so the loop reports
 `MACRO_ERROR`). Never ACK `executed` on a rejected switch.
 
+## Every flow-teardown path must force-stop the meter/clip relays with the dying flow id
+
+`runActivationFlow` persists `stromFlowId` on the doc while status is still `activating`, and a
+controller connecting in that window starts the meter and clip relays on that flow (the connect
+path keys only off `connectDoc.stromFlowId`). The relays are ref-counted and only rebind off a
+flow that was *recorded as retired* (`forceStop{Meter,Clip}Relay(id, flowId)`, #433) — a plain
+`stop`/new `start` on a live flow just ref-counts. So **any** path that tears a flow down must call
+both `forceStopMeterRelay`/`forceStopClipRelay` with that flow id, exactly like `deactivate`:
+otherwise the relays stay bound to the dead flow and the next activation only ref-counts the stale
+relay, starving every client of METER_DATA / LOUDNESS_DATA / reactive CLIP_STATE until all
+controllers disconnect. This bit the activation-failure and abort paths in `runActivationFlow`
+(#435), which tore down the flow + reset the doc but never touched the relays. The paths are now
+covered by `forceStopRelaysForDyingFlow()` (a local closure over the run's `stromFlowId`), invoked
+from the catch failure path and every `signal.aborted` early-return. Idle auto-deactivate has the
+same obligation (`idle-watchdog.ts`). `forceStop*` is idempotent and a no-op when no relay exists,
+so calling it defensively on abort (where `deactivate` also stops them) is safe.
+
 ## The controller WS reads `?mode` by exact key — confusable keys must be rejected, not ignored
 
 The controller WebSocket route (`src/ws/controller.ts`, `controllerWs`) decides watch-only vs
