@@ -2,13 +2,10 @@
  * Tests the meter relay's lifecycle across a deactivate→reactivate cycle
  * (issue #416).
  *
- * The relay filters Strom `MeterData`/`LoudnessData` by the `flowId` + mixer
- * block it was started with, and `startMeterRelay` only ref-counts into an
- * existing relay. So if a relay is left alive when a production is deactivated
- * (which, on reactivation, builds a NEW flow), every subsequent controller
- * connect reuses the stale relay bound to the OLD flow and no client receives
- * METER_DATA/LOUDNESS_DATA. `forceStopMeterRelay` tears the relay down
- * regardless of refCount so reactivation can rebind to the new flow.
+ * The relay filters Strom `MeterData`/`LoudnessData` by flow + mixer block.
+ * Reactivation builds a NEW flow, so the relay must follow it: deactivate
+ * force-stops the relay regardless of refCount, and a start with a different
+ * flow rebinds an existing relay instead of only ref-counting into it.
  *
  * Drives raw Strom frames through the real `connectWebSocket` onEvent path with
  * `ws` + the token exchange mocked, exactly like clip-relay.test.ts.
@@ -68,8 +65,8 @@ async function startAndFlush(flowId: string, mixerBlockId: string, loudnessBlock
 beforeEach(() => {
   broadcasts.length = 0;
   wsHandlers.clear();
-  // Ensure no relay survives from a prior test regardless of its refCount.
-  forceStopMeterRelay(PROD);
+  // Ensure no relay or torn-down flow survives from a prior test.
+  forceStopMeterRelay(PROD, 'flow-none');
 });
 
 describe('meter relay frame routing', () => {
@@ -95,20 +92,43 @@ describe('meter relay frame routing', () => {
 });
 
 describe('deactivate→reactivate rebind (issue #416)', () => {
-  it('a plain re-start keeps the stale flow binding (the bug) — forceStop + restart rebinds', async () => {
-    // First activation: relay bound to flow-A / mixer-A.
-    await startAndFlush('flow-A', 'mixer-A');
+  it('a relay started on the torn-down flow is rebound by the next start', async () => {
+    forceStopMeterRelay(PROD, 'flow-A'); // deactivate
+    await startAndFlush('flow-A', 'mixer-A', 'loud-A'); // connect mid-teardown
+    startMeterRelay(PROD, 'flow-B', 'mixer-B', 'loud-B'); // connect after reactivation
 
-    // A connect after reactivation calls startMeterRelay again with the NEW flow,
-    // but it only ref-counts into the existing relay — the binding stays flow-A.
-    startMeterRelay(PROD, 'flow-B', 'mixer-B');
-    await Promise.resolve();
+    pushRawFrame(JSON.stringify({ type: 'MeterData', data: { flow_id: 'flow-A', element_id: 'mixer-A:meter:1', rms: -30, peak: -15 } }));
+    expect(meters()).toHaveLength(0);
     pushRawFrame(JSON.stringify({ type: 'MeterData', data: { flow_id: 'flow-B', element_id: 'mixer-B:meter:1', rms: -30, peak: -15 } }));
-    expect(meters()).toHaveLength(0); // stale relay drops the new flow's meters
+    expect(meters().at(-1)).toMatchObject({ type: 'METER_DATA', elementId: 'ch1', peak: -15, rms: -30 });
+    pushRawFrame(JSON.stringify({ type: 'LoudnessData', data: { flow_id: 'flow-B', element_id: 'loud-B', momentary: -23, shortterm: -22, integrated: -24, loudness_range: 3, true_peak: -1 } }));
+    expect(loudness().at(-1)).toMatchObject({ elementId: 'main', integrated: -24 });
 
-    // Fix: deactivate force-stops the relay regardless of refCount...
+    // Both starts hold a ref: the relay survives the first stop.
+    stopMeterRelay(PROD);
+    broadcasts.length = 0;
+    pushRawFrame(JSON.stringify({ type: 'MeterData', data: { flow_id: 'flow-B', element_id: 'mixer-B:meter:2', rms: -30, peak: -15 } }));
+    expect(meters().at(-1)).toMatchObject({ elementId: 'ch2' });
+  });
+
+  it('a late start with the torn-down flow does not pull the relay off the new flow', async () => {
+    forceStopMeterRelay(PROD, 'flow-A');
+    await startAndFlush('flow-B', 'mixer-B', 'loud-B');
+    // A connect that read the doc before the deactivate finishes its sync late.
+    startMeterRelay(PROD, 'flow-A', 'mixer-A', 'loud-A');
+
+    pushRawFrame(JSON.stringify({ type: 'MeterData', data: { flow_id: 'flow-B', element_id: 'mixer-B:meter:1', rms: -30, peak: -15 } }));
+    expect(meters().at(-1)).toMatchObject({ elementId: 'ch1' });
+    pushRawFrame(JSON.stringify({ type: 'LoudnessData', data: { flow_id: 'flow-B', element_id: 'loud-B', momentary: -23, shortterm: -22, integrated: -24, loudness_range: 3, true_peak: -1 } }));
+    expect(loudness().at(-1)).toMatchObject({ elementId: 'main', integrated: -24 });
+    broadcasts.length = 0;
+    pushRawFrame(JSON.stringify({ type: 'MeterData', data: { flow_id: 'flow-A', element_id: 'mixer-A:meter:1', rms: -30, peak: -15 } }));
+    expect(meters()).toHaveLength(0);
+  });
+
+  it('forceStop + restart binds to the new flow', async () => {
+    await startAndFlush('flow-A', 'mixer-A');
     forceStopMeterRelay(PROD);
-    // ...and reactivation restarts it bound to the new flow.
     await startAndFlush('flow-B', 'mixer-B');
     pushRawFrame(JSON.stringify({ type: 'MeterData', data: { flow_id: 'flow-B', element_id: 'mixer-B:meter:2', rms: -30, peak: -15 } }));
     expect(meters().at(-1)).toMatchObject({ type: 'METER_DATA', elementId: 'ch2', peak: -15, rms: -30 });

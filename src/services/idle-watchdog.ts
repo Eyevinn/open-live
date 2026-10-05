@@ -245,8 +245,8 @@ export async function deactivateProduction(productionId: string, log: FastifyBas
   // the explicit deactivate path (issue #416): controller sockets survive the
   // idle auto-deactivate, so the relays must be torn down here too or a connect
   // after reactivation ref-counts into a relay bound to the old flow.
-  forceStopMeterRelay(doc._id);
-  forceStopClipRelay(doc._id);
+  forceStopMeterRelay(doc._id, doc.stromFlowId);
+  forceStopClipRelay(doc._id, doc.stromFlowId);
   broadcast(doc._id, { type: 'GRP_STATE_RESET' });
 
   if (doc.stromFlowId) {
