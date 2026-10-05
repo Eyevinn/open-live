@@ -25,8 +25,15 @@
  *   404 / 409 — production gone / production ended, mirroring the join route.
  */
 
-import { getDb, getGuestInvitesDb, getGuestSessionsDb } from '../db/index.js';
-import type { GuestInviteDoc, GuestSessionDoc, ProductionDoc } from '../db/types.js';
+import { getDb, getGuestInvitesDb, getGuestSessionsDb, getSourcesDb } from '../db/index.js';
+import type {
+  GuestInviteDoc,
+  GuestSessionDoc,
+  ProductionDoc,
+  ProductionSourceAssignment,
+  SourceDoc,
+} from '../db/types.js';
+import { VIRTUAL_SOURCES } from './audio-channels.js';
 import {
   verifyGuestInviteToken,
   hashGuestInviteToken,
@@ -190,4 +197,23 @@ export function isUnderEndpointPath(sessionUrl: string, expectedEndpointUrl: str
   return (
     session.pathname === expected.pathname || session.pathname.startsWith(`${expected.pathname}/`)
   );
+}
+
+/**
+ * True if a guest slot's source is a WHIP input, so the guest publishes from
+ * the browser. Any other source (an SRT encoder, say) carries the guest's
+ * picture and voice itself; the guest only receives the return. A missing
+ * source is false (the flow builds no input for it); a DB failure throws.
+ */
+export async function slotTakesWhip(slot: ProductionSourceAssignment): Promise<boolean> {
+  const virtual = VIRTUAL_SOURCES[slot.sourceId];
+  if (virtual) return virtual.streamType === 'whip';
+  let source: SourceDoc;
+  try {
+    source = await getSourcesDb().get(slot.sourceId);
+  } catch (err) {
+    if ((err as { statusCode?: number }).statusCode === 404) return false;
+    throw err;
+  }
+  return source.streamType === 'whip';
 }

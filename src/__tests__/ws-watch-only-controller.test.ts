@@ -336,6 +336,46 @@ describe('watch-only controller connection', () => {
     expect(getSubscriberCount(id)).toBe(0);
   });
 
+  it('rejects a query key confusable with `mode` (case variant / bracket array) instead of opening an operator connection', async () => {
+    const id = 'prod-watch-confusable-key';
+    productionDocs.set(id, makeProductionDoc(id));
+    await startApp();
+
+    // `?Mode=watch` (key case) must not silently become an operator connection.
+    const miscased = await connect(id, '?Mode=watch');
+    expect(await miscased.closed).toBe(1008);
+    expect(miscased.messages).toEqual([
+      expect.objectContaining({ type: 'ERROR', error: expect.stringMatching(/ambiguous controller mode query key/i) }),
+    ]);
+
+    // `?mode[]=watch` (bracket array syntax) is likewise rejected.
+    const bracketed = await connect(id, '?mode%5B%5D=watch');
+    expect(await bracketed.closed).toBe(1008);
+    expect(bracketed.messages).toEqual([
+      expect.objectContaining({ type: 'ERROR', error: expect.stringMatching(/ambiguous controller mode query key/i) }),
+    ]);
+
+    // Neither confusable key ran first-connect audio init or counted as an operator.
+    expect(audioInitWrites()).toHaveLength(0);
+    expect(getSubscriberCount(id)).toBe(0);
+  });
+
+  it('leaves a genuinely unrelated query param (cache-buster) working as an operator connection', async () => {
+    const id = 'prod-watch-unrelated-key';
+    productionDocs.set(id, makeProductionDoc(id));
+    await startApp();
+
+    // An unrelated param must be ignored: the connection proceeds as an operator
+    // (first-connect audio init runs) and is counted.
+    const operator = await connect(id, '?cb=123');
+    expect(operator.messages.map((m) => m.type)).toEqual(expect.arrayContaining(['HELLO', 'SNAPSHOT_END']));
+    expect(audioInitWrites()).toHaveLength(1);
+    expect(getSubscriberCount(id)).toBe(1);
+    expect(notifySubscriberJoin).toHaveBeenCalledWith(id);
+
+    operator.ws.close();
+  });
+
   it('does not re-init on reactivation when only watchers are connected', async () => {
     const id = 'prod-watch-reinit';
     productionDocs.set(id, makeProductionDoc(id, { clipPlayerBlockIds: { clip1: 'b-clip-0' } }));
