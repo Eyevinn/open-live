@@ -99,3 +99,18 @@ caught Strom error in the TAKE PiP branches), call `restoreSwitchState` to roll 
 four PiP maps + the persisted doc and re-broadcast `TALLY`/`PIP_STATE`, then notify the operator
 (`notifySwitchRejected` — NACK with a cmdId, else ERROR; macro paths `throw` so the loop reports
 `MACRO_ERROR`). Never ACK `executed` on a rejected switch.
+
+## The controller WS reads `?mode` by exact key — confusable keys must be rejected, not ignored
+
+The controller WebSocket route (`src/ws/controller.ts`, `controllerWs`) decides watch-only vs
+operator from `req.query.mode`. Fastify's default querystring parser (node `querystring`) does
+**no** case-folding or bracket-array expansion, so `?Mode=watch` parses to the key `Mode` and
+`?mode[]=watch` to the literal key `mode[]` — neither populates `req.query.mode`. Left alone, a
+passive client (e.g. a tally logger) that typo'd the key silently opens as an **operator** and
+runs the first-connect audio-mixer reset (#424). The route therefore rejects any query key that
+is confusable with `mode` — a case variant or array-bracket form, matched by
+`/^mode(\[.*\])?$/i` with the exact `mode` key excluded — with an `ERROR` frame + WS close 1008,
+*before* the unknown-value check. Deliberately **not** `additionalProperties:false`: genuinely
+unrelated params (cache-busters, etc.) must still work, so only `mode`-confusable keys are
+rejected. An exact `mode` key keeps its existing value check (`watch` → watch-only, anything
+else → ERROR + 1008).
