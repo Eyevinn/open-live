@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { getDb, getSourcesDb, getGuestSessionsDb, getGuestInvitesDb } from '../db/index.js';
 import { updateProductionDoc } from '../routes/productions.js';
 import type { ProductionDoc, ClipState, SourceDoc, GuestSessionState } from '../db/types.js';
-import { getTally, setTally, subscribe, unsubscribe, broadcast, nextSeq, currentSeq, getOperatorSockets } from '../services/tally.service.js';
+import { getTally, setTally, subscribe, unsubscribe, broadcast, nextSeq, currentSeq, getOperatorSockets, beginSnapshot, endSnapshot } from '../services/tally.service.js';
 import {
   cueClip, playClip, stopClip, pauseClip, seekClip,
   resolveClipSource, resolveClipTarget,
@@ -3164,8 +3164,18 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
       // are not counted as operators.
       const watchOnly = mode === 'watch';
       subscribe(id, socket, { watchOnly });
+      // Buffer any broadcast to this socket until its connect snapshot is
+      // complete, so live broadcasts never arrive interleaved with (and
+      // indistinguishable from) the point-to-point snapshot frames (#456).
+      // Must be before notifySubscriberJoin, which can itself broadcast.
+      beginSnapshot(socket);
       if (!watchOnly) notifySubscriberJoin(id);
 
+      // The whole connect snapshot runs inside this try so that if a frame send
+      // or a Strom/CouchDB call throws after HELLO, the `finally` still flushes
+      // the buffered broadcasts and sends SNAPSHOT_END — otherwise the socket
+      // would stay in buffering mode and never receive another broadcast (#456).
+      try {
       // Per-connection context — mutable so the audio block ID can be populated
       // at connect time and reused on every subsequent AUDIO_SET without a flow fetch.
       const ctx: { audioBlockId?: string; rateLimit?: RateLimitState } = {};
@@ -3755,17 +3765,25 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
         }
       }
 
-      // -----------------------------------------------------------------------
-      // Automation contract §4: SNAPSHOT_END (spec §4).
-      // Signals to reconnecting automation clients that the resync is complete.
-      // seq echoes the last event seq emitted during this snapshot so the client
-      // can resume applying live broadcast events with seq > snapshotEnd.seq.
-      // -----------------------------------------------------------------------
-      socket.send(JSON.stringify({
-        type: 'SNAPSHOT_END',
-        seq: currentSeq(id),
-        ts: new Date().toISOString(),
-      }));
+      } finally {
+        // Flush broadcasts that landed during the snapshot (in order), then send
+        // SNAPSHOT_END. endSnapshot() must run with no `await` before the
+        // SNAPSHOT_END send so a later broadcast cannot overtake it (#456).
+        endSnapshot(socket);
+        // -----------------------------------------------------------------------
+        // Automation contract §4: SNAPSHOT_END (spec §4).
+        // Signals to reconnecting automation clients that the resync is complete.
+        // seq echoes the last event seq emitted during this snapshot so the client
+        // can resume applying live broadcast events with seq > snapshotEnd.seq.
+        // -----------------------------------------------------------------------
+        if (socket.readyState === socket.OPEN) {
+          socket.send(JSON.stringify({
+            type: 'SNAPSHOT_END',
+            seq: currentSeq(id),
+            ts: new Date().toISOString(),
+          }));
+        }
+      }
     }
   );
 };
