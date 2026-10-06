@@ -438,18 +438,41 @@ export async function activateStromFlow(
     a.mixerInput.localeCompare(b.mixerInput),
   );
 
-  // Set num_inputs on the vision mixer based solely on the number of dynamic sources.
+  // Set num_inputs on the vision mixer so that EVERY assigned pad exists.
   // All static template video inputs are stripped above, so no static pad count needed.
   // Allowed values: 2, 4, 6, 8, 10 (non-live property — must be set at creation).
   // Also set input_{N}_label for each assigned source so Strom renders the name
   // in the multiview overlay (verified: property format from strom/backend/src/blocks/builtin/vision_mixer/properties.rs).
-  const numSourceInputs = Math.max(2, sortedAssignments.length);
+  //
+  // num_inputs must be sized by the HIGHEST assigned pad index, NOT merely the
+  // source count. The vision mixer exposes pads video_in_0 … video_in_{num_inputs-1}
+  // (strom-block-config.md), so a mixer with num_inputs=N only has pads 0..N-1.
+  // Guest slots are allocated from the top of the input range down (video_in_5,
+  // video_in_4, …; see the "Guest N" labelling below and open-live-studio#171)
+  // while the live source count is usually small and the low pads are left
+  // unassigned — so sizing by count alone (e.g. 2 sources at video_in_0 and
+  // video_in_5 → num_inputs=2 → pads video_in_0/video_in_1 only) leaves the
+  // guest's high-index pad (video_in_5) uncreated. The generated
+  // whip_input → offset → mixer:video_in_5 link then targets a pad the mixer
+  // never had: WHIP still negotiates (201) because the whip_input block exists,
+  // low-index cameras still mix, but the guest's decoded picture dead-ends at
+  // the missing pad and the tile stays black. Same for audio_in_{padIndex}, which
+  // shares num_inputs. This is issue #436 ("guest picture never reaches the mixer").
+  const maxAssignedPadIndex = sortedAssignments.reduce((max, a) => {
+    const m = /video_in_(\d+)$/.exec(a.mixerInput);
+    return m ? Math.max(max, parseInt(m[1], 10)) : max;
+  }, -1);
+  // Need a pad for index maxAssignedPadIndex → at least maxAssignedPadIndex + 1 pads.
+  const numSourceInputs = Math.max(2, sortedAssignments.length, maxAssignedPadIndex + 1);
 
   if (mixerBlock && mixerBlockId) {
-    // num_inputs = real sources only, rounded up to Strom's allowed range (2..16).
+    // Round up to Strom's allowed even range (2,4,6,8,10,…) and clamp to the
+    // MAX_NUM_INPUTS=16 ceiling. Rounding up only ever adds an unused (black,
+    // never-selectable) pad, so it can never remove a pad a source needs.
     // PiPs are a separate first-class concept in Strom 0.5+ — set via num_pips, NOT
-    // by expanding num_inputs. max num_inputs is 16 per Strom's MAX_NUM_INPUTS constant.
-    const numTotalInputs = Math.max(2, Math.min(16, numSourceInputs));
+    // by expanding num_inputs.
+    const roundedUp = numSourceInputs % 2 === 0 ? numSourceInputs : numSourceInputs + 1;
+    const numTotalInputs = Math.max(2, Math.min(16, roundedUp));
     const props = (mixerBlock['properties'] ?? {}) as Record<string, unknown>;
     props['num_inputs'] = String(numTotalInputs);
 
