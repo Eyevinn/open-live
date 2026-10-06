@@ -159,6 +159,39 @@ from the catch failure path and every `signal.aborted` early-return. Idle auto-d
 same obligation (`idle-watchdog.ts`). `forceStop*` is idempotent and a no-op when no relay exists,
 so calling it defensively on abort (where `deactivate` also stops them) is safe.
 
+## Connect-snapshot broadcasts are buffered per-socket until SNAPSHOT_END
+
+The controller WS (`src/ws/controller.ts`, `controllerWs`) `subscribe()`s a socket to broadcasts
+*before* it builds the connect snapshot (HELLO … per-point `socket.send` frames … SNAPSHOT_END),
+and the snapshot `await`s Strom/CouchDB in the middle. So a `broadcast()` fired during that window
+used to reach the socket interleaved between snapshot frames and indistinguishable from them —
+most snapshot frames carry no `seq`/`ts`, but some (`GRAPHIC_STATE`, `RETURN_STATE`, the connect
+`TALLY`) stamp both from the same `nextSeq(id)` `broadcast()` uses, so `seq` alone could not tell
+them apart. Worse, a *staler* snapshot frame emitted after a newer live broadcast could overwrite
+it on the client (#456).
+
+Fix (in `tally.service.ts`, not per-frame tagging): `beginSnapshot(ws)` is called right after
+`subscribe()` (before `notifySubscriberJoin`, which can itself broadcast). While a socket is
+"snapshotting", `broadcast()` pushes its copy into a per-socket buffer instead of sending. The
+whole snapshot body runs inside a `try`; the `finally` calls `endSnapshot(ws)` — which flushes the
+buffer *in order* — and then sends SNAPSHOT_END. Invariants that keep this correct:
+
+- `beginSnapshot` must be before any code path that can `broadcast()`, or a live frame slips
+  through unbuffered ahead of HELLO.
+- `endSnapshot` must run with **no `await` before the SNAPSHOT_END send** (both live in the same
+  synchronous `finally` tail) so a later broadcast cannot overtake SNAPSHOT_END.
+- Flushing *before* SNAPSHOT_END (not after) is deliberate: buffered broadcasts were allocated
+  their `seq` during the window, so they are all `<= currentSeq(id)` = SNAPSHOT_END's `seq`. A
+  client resumes live events at `seq > snapshotEnd.seq`; delivering them inside the snapshot phase
+  keeps the contract (`docs/specs/automation-control-contract.md` §4) intact and means the final
+  applied state is snapshot-then-latest, never a stale frame clobbering a newer one.
+- The `try/finally` also guarantees SNAPSHOT_END (and the flush) on a throw after HELLO — without
+  it a thrown snapshot would leave the socket stuck buffering and it would never get another
+  broadcast (strictly worse than the original bug). A *hung* Strom call is still unbounded; that is
+  out of scope (no new timeouts were added beyond what the surrounding code already uses).
+- `unsubscribe()` drops the buffer, so a socket closing mid-snapshot does not leak or deliver late;
+  `endSnapshot`/the SNAPSHOT_END send are both guarded by `readyState === OPEN`.
+
 ## A guest slot's multiview label must be set to `Guest N` at flow build — the source name is not enough
 
 A guest slot is a source assignment carrying a `returnFeed` (same definition as
