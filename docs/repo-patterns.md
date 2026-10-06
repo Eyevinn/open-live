@@ -159,6 +159,25 @@ from the catch failure path and every `signal.aborted` early-return. Idle auto-d
 same obligation (`idle-watchdog.ts`). `forceStop*` is idempotent and a no-op when no relay exists,
 so calling it defensively on abort (where `deactivate` also stops them) is safe.
 
+## A guest slot's multiview label must be set to `Guest N` at flow build — the source name is not enough
+
+A guest slot is a source assignment carrying a `returnFeed` (same definition as
+`guestSlotAssignment` in `routes/guests.ts` and `assignReturnBuses`). Its WHIP source is the
+virtual `Whip` (`audio-channels.ts`, name `WHIP Input`) or a nameless WHIP input, so the
+vision-mixer `input_${padIndex}_label` loop in `flow-generator.ts` — which otherwise writes the
+source name — would either emit the generic `WHIP Input` or leave the label unset, and Strom's
+`parse_input_labels` then falls back to its default `In N+1`. Either way the multiviewer disagrees
+with the Studio controller, which labels the same slots `Guest 1`/`Guest 2` (open-live-studio#171,
+issue #458). So for a WHIP guest slot the generator now emits a `Guest N` label that takes
+**precedence** over the generic source name. The numbering must match the controller exactly:
+`returnFeed` assignments ordered by **trailing pad index DESCENDING** (Studio allocates guest
+slots from the top of the mixer-input range down — `video_in_15` is Guest 1 — see
+`guestSlotMixerInput`/`guestSlotIndex` in open-live-studio), numbered `1..N`. Note this is NOT the
+ascending `mixerInput.localeCompare` order the audio-channel / return-bus numbering uses, so do not
+reuse `returnBuses` order for the label. The label is a non-live creation-time property; updating
+it to the joined guest's invite label live is a separate stretch goal (needs Strom live-label
+support).
+
 ## The controller WS reads `?mode` by exact key — confusable keys must be rejected, not ignored
 
 The controller WebSocket route (`src/ws/controller.ts`, `controllerWs`) decides watch-only vs
