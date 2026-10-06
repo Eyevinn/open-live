@@ -458,13 +458,41 @@ export async function activateStromFlow(
     const configuredPips = Number(production.values?.num_pips ?? 0);
     props['num_pips'] = String(Math.min(4, Math.max(0, configuredPips)));
 
+    // Guest-slot labels (issue #458). A guest slot is a source assignment
+    // carrying a `returnFeed` (the same definition the guest routes and
+    // assignReturnBuses use). A WHIP guest slot's source resolves only to the
+    // generic virtual-source name ("WHIP Input", audio-channels.ts) or none, so
+    // Strom's multiview falls back to its default "In N+1" and shows a different
+    // label than the Studio controller's "Guest N" tile (open-live-studio#171).
+    // Number the guest slots exactly the way the controller does — returnFeed
+    // assignments ordered by trailing pad index DESCENDING (slots are allocated
+    // from the top of the input range down, so the highest index is Guest 1) —
+    // and emit the matching "Guest N" label so the multiviewer agrees. Updating
+    // the label to the invite/guest name live while a guest is joined is a
+    // separate (live) concern and out of scope here.
+    const guestSlotPadIndex = (mixerInput: string): number =>
+      parseInt(/(\d+)$/.exec(mixerInput)?.[1] ?? '0', 10);
+    const guestSlotNumber = new Map<string, number>();
+    [...production.sources]
+      .filter((a) => !!a.returnFeed)
+      .sort((a, b) => guestSlotPadIndex(b.mixerInput) - guestSlotPadIndex(a.mixerInput))
+      .forEach((a, i) => guestSlotNumber.set(a.mixerInput, i + 1));
+
     // Label source inputs
     for (const assignment of sortedAssignments) {
       const padMatch = /video_in_(\d+)$/.exec(assignment.mixerInput);
       if (!padMatch) continue;
       const padIndex = parseInt(padMatch[1], 10);
       const src = sourceMap.get(assignment.sourceId) ?? (VIRTUAL_SOURCES[assignment.sourceId] as SourceDoc | undefined);
-      if (src?.name) {
+      // A WHIP guest slot takes the controller's "Guest N" label in preference
+      // to the generic "WHIP Input" virtual-source name; every other input keeps
+      // its own source name.
+      const guestNum = assignment.returnFeed && src?.streamType === 'whip'
+        ? guestSlotNumber.get(assignment.mixerInput)
+        : undefined;
+      if (guestNum !== undefined) {
+        props[`input_${padIndex}_label`] = `Guest ${guestNum}`;
+      } else if (src?.name) {
         props[`input_${padIndex}_label`] = src.name;
       }
     }

@@ -2324,6 +2324,10 @@ export async function handleMessage(
               await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
                 properties: { [propName]: capturedValue },
               });
+              // The debounced write reached Strom: tell every client what was
+              // actually applied, so they converge on the value Strom received
+              // (not the intermediate drag steps already broadcast above).
+              broadcast(productionId, { type: 'AUDIO_STATE', elementId: capturedLogicalId, property: 'volume', value: capturedValue, applied: true });
             } catch (err) {
               console.warn('[controller] Strom audio update error:', err);
               if (err instanceof StromPropertiesRejectedError) {
@@ -2622,6 +2626,8 @@ export async function handleMessage(
             await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
               properties: { [`ch${chNum}_aux${capturedAuxBus}_level`]: stromValue },
             });
+            // Confirm to all clients what reached Strom (the debounced final value).
+            broadcast(productionId, { type: 'AUX_SEND_STATE', elementId: msg.elementId, auxBus: msg.auxBus, level: msg.level, enabled: msg.enabled, ...(msg.pre !== undefined && { pre: msg.pre }), applied: true });
           } catch (err) {
             console.warn('[controller] AUX_SEND_SET error:', err);
           }
@@ -2657,6 +2663,8 @@ export async function handleMessage(
                 [`aux${msg.auxBus}_fader`]: msg.muted ? 0 : msg.volume,
               },
             });
+            // Confirm to all clients what reached Strom (the debounced final value).
+            broadcast(productionId, { type: 'AUX_MASTER_STATE', auxBus: msg.auxBus, volume: msg.volume, muted: msg.muted, applied: true });
           } catch (err) {
             console.warn('[controller] AUX_MASTER_SET error:', err);
           }
@@ -2689,6 +2697,8 @@ export async function handleMessage(
             await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
               properties: { [`ch${chIdx + 1}_to_grp${msg.grpBus}`]: msg.enabled },
             });
+            // Confirm to all clients what reached Strom (the debounced final value).
+            broadcast(productionId, { type: 'GRP_SEND_STATE', elementId: msg.elementId, grpBus: msg.grpBus, level: msg.level, enabled: msg.enabled, applied: true });
           } catch (err) {
             console.warn('[controller] GRP_SEND_SET error:', err);
           }
@@ -2727,6 +2737,8 @@ export async function handleMessage(
                 [`group${msg.grpBus}_fader`]: msg.muted ? 0 : msg.volume,
               },
             });
+            // Confirm to all clients what reached Strom (the debounced final value).
+            broadcast(productionId, { type: 'GRP_MASTER_STATE', grpBus: msg.grpBus, volume: msg.volume, muted: msg.muted, applied: true });
           } catch (err) {
             console.warn('[controller] GRP_MASTER_SET error:', err);
           }
@@ -2762,6 +2774,8 @@ export async function handleMessage(
                 monitor_fader: msg.muted ? 0 : msg.volume,
               },
             });
+            // Confirm to all clients what reached Strom (the debounced final value).
+            broadcast(productionId, { type: 'MONITOR_STATE', volume: msg.volume, muted: msg.muted, applied: true });
           } catch (err) {
             console.warn('[controller] MONITOR_SET error:', err);
           }
@@ -2805,6 +2819,8 @@ export async function handleMessage(
               property_name: 'offset_ms',
               value: offsetMs,
             });
+            // Confirm to all clients what reached Strom (the debounced final value).
+            broadcast(productionId, { type: 'SOURCE_OFFSET_STATE', mixerInput, offsetMs, applied: true });
           } catch (err) {
             console.warn(`[controller] SOURCE_OFFSET_SET error (${mixerInput}):`, String(err));
           }
