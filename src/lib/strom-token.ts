@@ -10,6 +10,10 @@
 const TOKEN_EXCHANGE_URL = 'https://token.svc.prod.osaas.io/servicetoken'
 const STROM_SERVICE_ID = 'eyevinn-strom'
 const REFRESH_BUFFER_MS = 5 * 60 * 1000 // refresh 5 min before expiry
+// Abort a token exchange that hangs. Without this a token service that
+// accepts the connection but never answers would leave the shared
+// inflightExchange pending forever, blocking every Strom caller.
+const EXCHANGE_TIMEOUT_MS = 10 * 1000
 
 interface SatCache {
   token: string
@@ -52,6 +56,10 @@ export async function getStromToken(pat: string | undefined): Promise<string | u
     return inflightExchange
   }
 
+  // Snapshot the current cache so a failed refresh can fall back to a SAT
+  // that is still valid (expiring soon, but not actually expired yet).
+  const previous = cache
+
   inflightExchange = fetch(TOKEN_EXCHANGE_URL, {
     method: 'POST',
     headers: {
@@ -60,6 +68,9 @@ export async function getStromToken(pat: string | undefined): Promise<string | u
       'x-pat-jwt': `Bearer ${pat}`,
     },
     body: JSON.stringify({ serviceId: STROM_SERVICE_ID }),
+    // Bound the exchange so a hung token service rejects (and clears
+    // inflightExchange below) instead of blocking every caller forever.
+    signal: AbortSignal.timeout(EXCHANGE_TIMEOUT_MS),
   })
     .then(async (res) => {
       if (!res.ok) {
@@ -69,6 +80,14 @@ export async function getStromToken(pat: string | undefined): Promise<string | u
       const data = (await res.json()) as { token: string; expiry: number }
       cache = { token: data.token, expiresAt: data.expiry * 1000 }
       return cache.token
+    })
+    .catch((err) => {
+      // If the refresh failed/timed out but we still hold a SAT that has not
+      // actually expired yet, keep serving it rather than failing the caller.
+      if (previous && Date.now() < previous.expiresAt) {
+        return previous.token
+      }
+      throw err
     })
     .finally(() => {
       inflightExchange = null

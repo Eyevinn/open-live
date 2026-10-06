@@ -191,6 +191,14 @@ function resetRecordings() {
   stromRequests.length = 0;
 }
 
+/** Frames the controller sent directly to the originating operator socket. */
+function sentFrames() {
+  return vi.mocked(ws.send).mock.calls.map(([raw]) => JSON.parse(raw as string) as Record<string, unknown>);
+}
+function framesOfType(type: string) {
+  return sentFrames().filter((m) => m.type === type);
+}
+
 beforeEach(() => {
   clearPipState(PROD);
   setTally(PROD, { pgm: 'video_in_0', pvw: 'video_in_1' });
@@ -287,8 +295,15 @@ describe('macro TRANSITION with a PiP on program', () => {
 });
 
 // ---------------------------------------------------------------------------
-// issue #355 — a displaced PiP must not be announced or restored when the Strom
-// transition or the DB write fails, or clients and Strom end up disagreeing.
+// issue #355 / #430 — when the Strom transition is rejected, the switch never
+// reached air. The displaced PiP must not be announced as moved to preview and
+// must not be restored into Strom's preview bus (#355); and the whole switch must
+// be rolled back to the pre-switch state, with the authoritative TALLY + PIP_STATE
+// re-broadcast so clients drop the switch they optimistically showed (#430).
+//
+// Pre-switch state here (from arrangePgmPip): PiP 0 is on program, so the rollback
+// PIP_STATE restores { pgmPip: 0, pvwPip: null }, never the displacement
+// { pgmPip: null, pvwPip: 0 }.
 // ---------------------------------------------------------------------------
 
 function serverError(): Error & { statusCode: number } {
@@ -309,7 +324,12 @@ function restoredPip0() {
   return requestsTo(PREVIEW).some((r) => JSON.stringify(r.body) === JSON.stringify({ source: { pip: 0 } }));
 }
 
-describe('PiP on program when the Strom transition is rejected (issue #355)', () => {
+/** True if any PIP_STATE announced the displacement (PiP moved off program to preview). */
+function announcedDisplacement() {
+  return pipStates().some((s) => s.pgmPip === null && s.pvwPip === 0);
+}
+
+describe('PiP on program when the Strom transition is rejected (issue #355 / #430)', () => {
   let warnSpy: ReturnType<typeof vi.spyOn>;
   beforeEach(() => {
     warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -318,7 +338,7 @@ describe('PiP on program when the Strom transition is rejected (issue #355)', ()
     warnSpy.mockRestore();
   });
 
-  it('interactive CUT: does not announce the move or restore the PiP on a /transition 500', async () => {
+  it('interactive CUT: rolls back to the pre-switch PiP and never restores it into preview on a /transition 500', async () => {
     mockGet.mockResolvedValue(makeProductionDoc([]));
     await arrangePgmPip();
     transitionStatus = 500;
@@ -327,13 +347,15 @@ describe('PiP on program when the Strom transition is rejected (issue #355)', ()
 
     // The transition was attempted, but Strom rejected it...
     expect(requestsTo(TRANSITION)).toHaveLength(1);
-    // ...so clients are NOT told the PiP left program...
-    expect(pipStates()).toHaveLength(0);
-    // ...and the PiP is NOT put back on Strom's preview (it is still on air).
+    // ...so clients are NOT told the PiP left program (no displacement)...
+    expect(announcedDisplacement()).toBe(false);
+    // ...and the PiP is NOT put back on Strom's preview (it is still on air)...
     expect(restoredPip0()).toBe(false);
+    // ...and the pre-switch PiP state is restored for every client (#430).
+    expect(pipStates().at(-1)).toMatchObject({ pgmPip: 0, pvwPip: null });
   });
 
-  it('interactive TRANSITION: does not announce the move or restore the PiP on a /transition 500', async () => {
+  it('interactive TRANSITION: rolls back to the pre-switch PiP and never restores it into preview on a /transition 500', async () => {
     mockGet.mockResolvedValue(makeProductionDoc([]));
     await arrangePgmPip();
     transitionStatus = 500;
@@ -341,11 +363,12 @@ describe('PiP on program when the Strom transition is rejected (issue #355)', ()
     await send({ type: 'TRANSITION', mixerInput: 'video_in_2', transitionType: 'fade', durationMs: 500 });
 
     expect(requestsTo(TRANSITION)).toHaveLength(1);
-    expect(pipStates()).toHaveLength(0);
+    expect(announcedDisplacement()).toBe(false);
     expect(restoredPip0()).toBe(false);
+    expect(pipStates().at(-1)).toMatchObject({ pgmPip: 0, pvwPip: null });
   });
 
-  it('macro CUT: does not announce the move or restore the PiP on a /transition 500', async () => {
+  it('macro CUT: rolls back to the pre-switch PiP and never restores it into preview on a /transition 500', async () => {
     mockGet.mockResolvedValue(makeProductionDoc([{ type: 'CUT', sourceId: 'cam3' }]));
     await arrangePgmPip();
     transitionStatus = 500;
@@ -353,11 +376,12 @@ describe('PiP on program when the Strom transition is rejected (issue #355)', ()
     await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
 
     expect(requestsTo(TRANSITION)).toHaveLength(1);
-    expect(pipStates()).toHaveLength(0);
+    expect(announcedDisplacement()).toBe(false);
     expect(restoredPip0()).toBe(false);
+    expect(pipStates().at(-1)).toMatchObject({ pgmPip: 0, pvwPip: null });
   });
 
-  it('macro TRANSITION: does not announce the move or restore the PiP on a /transition 500', async () => {
+  it('macro TRANSITION: rolls back to the pre-switch PiP and never restores it into preview on a /transition 500', async () => {
     mockGet.mockResolvedValue(
       makeProductionDoc([{ type: 'TRANSITION', sourceId: 'cam3', transitionType: 'mix', durationMs: 500 }]),
     );
@@ -367,11 +391,12 @@ describe('PiP on program when the Strom transition is rejected (issue #355)', ()
     await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
 
     expect(requestsTo(TRANSITION)).toHaveLength(1);
-    expect(pipStates()).toHaveLength(0);
+    expect(announcedDisplacement()).toBe(false);
     expect(restoredPip0()).toBe(false);
+    expect(pipStates().at(-1)).toMatchObject({ pgmPip: 0, pvwPip: null });
   });
 
-  it('interactive TAKE: does not announce the move or restore the PiP on a /transition 500', async () => {
+  it('interactive TAKE: rolls back to the pre-switch PiP and never restores it into preview on a /transition 500', async () => {
     mockGet.mockResolvedValue(makeProductionDoc([]));
     await arrangePgmPip();
     transitionStatus = 500;
@@ -379,11 +404,12 @@ describe('PiP on program when the Strom transition is rejected (issue #355)', ()
     await send({ type: 'TAKE' });
 
     expect(requestsTo(TRANSITION)).toHaveLength(1);
-    expect(pipStates()).toHaveLength(0);
+    expect(announcedDisplacement()).toBe(false);
     expect(restoredPip0()).toBe(false);
+    expect(pipStates().at(-1)).toMatchObject({ pgmPip: 0, pvwPip: null });
   });
 
-  it('macro TAKE: does not announce the move or restore the PiP on a /transition 500', async () => {
+  it('macro TAKE: rolls back to the pre-switch PiP and never restores it into preview on a /transition 500', async () => {
     mockGet.mockResolvedValue(makeProductionDoc([{ type: 'TAKE' }]));
     await arrangePgmPip();
     transitionStatus = 500;
@@ -391,8 +417,103 @@ describe('PiP on program when the Strom transition is rejected (issue #355)', ()
     await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
 
     expect(requestsTo(TRANSITION)).toHaveLength(1);
-    expect(pipStates()).toHaveLength(0);
+    expect(announcedDisplacement()).toBe(false);
     expect(restoredPip0()).toBe(false);
+    expect(pipStates().at(-1)).toMatchObject({ pgmPip: 0, pvwPip: null });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #430 — the GENERAL case: a switch Strom rejects (any CUT/TAKE/TRANSITION,
+// PiP or not) must not stay in open-live's tally and state. On a /transition 500
+// the controller rolls the tally, the persisted doc and the PiP maps back to the
+// pre-switch value, re-broadcasts the authoritative TALLY, and tells the operator.
+// Before the fix the TALLY kept naming the new source while Strom aired the old.
+// ---------------------------------------------------------------------------
+
+describe('a switch Strom rejects must not stay in tally/state (issue #430)', () => {
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.mocked(ws.send).mockClear();
+  });
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  it('interactive CUT with no PiP: rolls tally + persisted doc back and sends ERROR on a /transition 500', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+    // beforeEach leaves tally { pgm: video_in_0, pvw: video_in_1 } and no PiP.
+    transitionStatus = 500;
+
+    await send({ type: 'CUT', mixerInput: 'video_in_2' });
+
+    // The transition reached Strom and was rejected.
+    expect(requestsTo(TRANSITION)).toHaveLength(1);
+    // The last TALLY broadcast restores the pre-switch program, not video_in_2.
+    expect(tallies().at(-1)).toMatchObject({ pgm: 'video_in_0', pvw: 'video_in_1' });
+    // The persisted doc was rolled back too (reconnecting clients read it).
+    expect(vi.mocked(mockInsert).mock.calls.at(-1)?.[0]).toMatchObject({
+      tally: { pgm: 'video_in_0', pvw: 'video_in_1' },
+    });
+    // The operator is told the switch was rejected, and never gets an executed ACK.
+    expect(framesOfType('ERROR')).toContainEqual(
+      expect.objectContaining({ type: 'ERROR', error: 'Switch rejected by Strom' }),
+    );
+  });
+
+  it('interactive TAKE with no PiP: rolls the swapped tally back on a /transition 500', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+    transitionStatus = 500;
+
+    // A plain TAKE swaps PGM/PVW to { pgm: video_in_1, pvw: video_in_0 }.
+    await send({ type: 'TAKE' });
+
+    expect(requestsTo(TRANSITION)).toHaveLength(1);
+    expect(tallies().at(-1)).toMatchObject({ pgm: 'video_in_0', pvw: 'video_in_1' });
+    expect(framesOfType('ERROR')).toContainEqual(
+      expect.objectContaining({ type: 'ERROR', error: 'Switch rejected by Strom' }),
+    );
+  });
+
+  it('a rejected CUT carrying a cmdId gets a NACK, not an executed ACK', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+    transitionStatus = 500;
+
+    await send({ type: 'CUT', mixerInput: 'video_in_2', cmdId: 'cmd-1' });
+
+    const nacks = framesOfType('NACK');
+    expect(nacks).toContainEqual(
+      expect.objectContaining({ type: 'NACK', cmdId: 'cmd-1', error: 'Switch rejected by Strom' }),
+    );
+    // The switch never reached air, so it must not be acked as executed.
+    expect(framesOfType('ACK').some((f) => f.cmdId === 'cmd-1' && f.phase === 'executed')).toBe(false);
+  });
+
+  it('macro CUT with no PiP: rolls tally back and reports MACRO_ERROR on a /transition 500', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([{ type: 'CUT', sourceId: 'cam3' }]));
+    transitionStatus = 500;
+
+    await send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
+
+    expect(requestsTo(TRANSITION)).toHaveLength(1);
+    expect(tallies().at(-1)).toMatchObject({ pgm: 'video_in_0', pvw: 'video_in_1' });
+    // The macro loop surfaces the rejected action as a MACRO_ERROR, not MACRO_EXECUTED.
+    expect(framesOfType('MACRO_ERROR')).toContainEqual(
+      expect.objectContaining({ type: 'MACRO_ERROR', macroId: 'macro-1', failedActionIndex: 0 }),
+    );
+    expect(broadcasts.some((m) => m.type === 'MACRO_EXECUTED')).toBe(false);
+  });
+
+  it('a successful CUT is unaffected: no rollback, no ERROR', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+    transitionStatus = 200;
+
+    await send({ type: 'CUT', mixerInput: 'video_in_2' });
+
+    // The forward TALLY stands; nothing is rolled back and the operator sees no error.
+    expect(tallies().at(-1)).toMatchObject({ pgm: 'video_in_2', pvw: 'video_in_0' });
+    expect(framesOfType('ERROR')).toHaveLength(0);
   });
 });
 
@@ -613,7 +734,14 @@ describe('macro TRANSITION with a PiP in preview only', () => {
   });
 });
 
-describe('macro PiP restore vs. concurrent SET_PVW', () => {
+// Since #431 switcher commands are serialised per production, so a SET_PVW sent
+// while a macro's transition is still in flight no longer interleaves with it:
+// it runs only once the macro has fully finished (restoring the PiP into Strom
+// preview). The operator's SET_PVW therefore lands last and cleanly supersedes
+// the restore, so Strom's preview still ends on the operator's source — now by
+// ordering rather than by the mid-transition guard the pre-serialisation code
+// relied on (that guard remains in place as defence in depth).
+describe('macro PiP restore then a SET_PVW queued behind it (#341, serialised by #431)', () => {
   const actions: Array<[string, Record<string, unknown>]> = [
     ['CUT', { type: 'CUT', sourceId: 'cam3' }],
     ['TRANSITION', { type: 'TRANSITION', sourceId: 'cam3', transitionType: 'fade', durationMs: 500 }],
@@ -621,7 +749,7 @@ describe('macro PiP restore vs. concurrent SET_PVW', () => {
   ];
 
   for (const [name, action] of actions) {
-    it(`${name} does not restore the PiP if the operator changed PVW mid-transition`, async () => {
+    it(`${name} lets the operator's later SET_PVW supersede the restore`, async () => {
       mockGet.mockResolvedValue(makeProductionDoc([action]));
 
       await send({ type: 'SELECT_PVW_PIP', pip: 0 });
@@ -631,13 +759,16 @@ describe('macro PiP restore vs. concurrent SET_PVW', () => {
       transitionDelayMs = 150;
       const macro = send({ type: 'MACRO_EXEC', macroId: 'macro-1' });
       await delay(30);
-      await send({ type: 'SET_PVW', mixerInput: 'video_in_1' });
-      await macro;
+      const setPvw = send({ type: 'SET_PVW', mixerInput: 'video_in_1' });
+      await Promise.all([macro, setPvw]);
 
-      expect(requestsTo(PREVIEW).at(-1)?.body).toEqual({ source: { input: 1 } });
-      expect(requestsTo(PREVIEW)).not.toContainEqual(
-        expect.objectContaining({ body: { source: { pip: 0 } } }),
-      );
+      const previews = requestsTo(PREVIEW).map((r) => r.body);
+      // The macro's PiP restore (pip:0) is applied first, then the operator's
+      // SET_PVW (input:1) runs after it and wins — in operator order, never
+      // interleaved mid-transition.
+      expect(previews).toContainEqual({ source: { pip: 0 } });
+      expect(previews.at(-1)).toEqual({ source: { input: 1 } });
+      expect(pipStates().at(-1)).toMatchObject({ pvwPip: null });
     });
   }
 });
@@ -724,12 +855,16 @@ describe('macro CUT with no PiP anywhere', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Race: a PVW change during the Strom round trip must not be clobbered by the
-// PiP restore that a displacing CUT queues after the transition (issue #341).
+// A SET_PVW sent while a displacing CUT's /transition is in flight (issue
+// #341). Since #431 switcher commands are serialised per production, the
+// SET_PVW no longer lands mid-transition: it runs after the CUT has finished
+// (and restored the PiP into Strom preview), then supersedes it. Strom's
+// preview therefore still ends on the operator's source — by ordering rather
+// than by the mid-transition guard (which remains as defence in depth).
 // ---------------------------------------------------------------------------
 
-describe('interactive CUT PiP restore vs. concurrent SET_PVW (issue #341)', () => {
-  it('does not restore the displaced PiP into Strom preview if the operator changed PVW mid-transition', async () => {
+describe('interactive CUT PiP restore then a SET_PVW queued behind it (#341, serialised by #431)', () => {
+  it('lets the operator\'s later SET_PVW supersede the restore', async () => {
     mockGet.mockResolvedValue(makeProductionDoc([]));
 
     // Arrange: put PiP 0 on PGM via the real state machine.
@@ -738,27 +873,24 @@ describe('interactive CUT PiP restore vs. concurrent SET_PVW (issue #341)', () =
     resetRecordings();
 
     // A CUT to a real source displaces the PGM PiP into PVW, then restores it
-    // to Strom's preview *after* awaiting /transition. Delay that reply so the
-    // operator's SET_PVW lands inside the round-trip window.
+    // to Strom's preview *after* awaiting /transition. Delay that reply, then
+    // send a SET_PVW while the CUT is still in flight — it queues behind the CUT.
     transitionDelayMs = 150;
     const cutPromise = send({ type: 'CUT', mixerInput: 'video_in_2' });
     await delay(30);
+    const setPvwPromise = send({ type: 'SET_PVW', mixerInput: 'video_in_1' });
 
-    // Operator changes PVW to a real source while /transition is in flight.
-    await send({ type: 'SET_PVW', mixerInput: 'video_in_1' });
-
-    await cutPromise;
+    await Promise.all([cutPromise, setPvwPromise]);
     transitionDelayMs = 0;
 
     // Server state agrees the PiP is gone from PVW.
     expect(pipStates().at(-1)).toMatchObject({ pvwPip: null });
 
-    // Strom's preview must end on the operator's source (input 1), NOT a stale
-    // pip restore. Before the fix the final preview request was { pip: 0 }.
-    expect(requestsTo(PREVIEW).at(-1)?.body).toEqual({ source: { input: 1 } });
-    expect(requestsTo(PREVIEW)).not.toContainEqual(
-      expect.objectContaining({ body: { source: { pip: 0 } } }),
-    );
+    // The CUT's PiP restore (pip:0) runs first, then the operator's SET_PVW
+    // (input:1) runs after it and wins — operator order, never interleaved.
+    const previews = requestsTo(PREVIEW).map((r) => r.body);
+    expect(previews).toContainEqual({ source: { pip: 0 } });
+    expect(previews.at(-1)).toEqual({ source: { input: 1 } });
   });
 });
 
@@ -798,5 +930,73 @@ describe('interactive send of a real source over a preview-only PiP', () => {
     expect(states).toHaveLength(1);
     expect(states[0]).toMatchObject({ pgmPip: null, pvwPip: null });
     expect(tallies()[0]).toMatchObject({ pgm: 'video_in_2', pvw: 'video_in_0' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #431 — switcher commands are serialised per production
+//
+// The controller used to process each inbound command concurrently, so a CUT
+// whose DB write was slow could still be mid-persist when a TAKE arrived. The
+// TAKE then reached Strom first and the two were applied in the reverse of the
+// order the operator pressed them. A per-production queue now runs each
+// switcher-mutating command's doc read → Strom call → DB write to completion
+// before the next one starts, so Strom always sees operator order.
+// ---------------------------------------------------------------------------
+
+describe('serialisation of switcher commands sent close together (#431)', () => {
+  it('a CUT whose DB write is slow still reaches Strom before a TAKE sent 20 ms later', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+    // Program video_in_0, preview video_in_1 (set in beforeEach). Delay only the
+    // first DB write by 80 ms to widen the CUT's persist window — the exact
+    // condition from the issue — so a TAKE arriving mid-write would, without
+    // serialisation, race ahead of the CUT on the wire to Strom.
+    let inserts = 0;
+    mockInsert.mockImplementation(async () => {
+      inserts += 1;
+      if (inserts === 1) await delay(80);
+      return { ok: true };
+    });
+
+    const cut = send({ type: 'CUT', mixerInput: 'video_in_2' });
+    await delay(20);
+    const take = send({ type: 'TAKE' });
+    await Promise.all([cut, take]);
+
+    // Strom must see the CUT's transition (to_input 2) before the TAKE's
+    // (to_input 0), matching the order the operator pressed them. Before #431
+    // the TAKE's transition arrived first and Strom ended on the wrong program.
+    const order = requestsTo(TRANSITION).map((r) => (r.body as { to_input: number }).to_input);
+    expect(order).toEqual([2, 0]);
+
+    // And the controller's final tally reflects CUT-then-TAKE: video_in_2 was
+    // cut to program, then the TAKE swapped the old program (video_in_0) on air.
+    expect(tallies().at(-1)).toMatchObject({ pgm: 'video_in_0', pvw: 'video_in_2' });
+  });
+
+  it('holds a following CUT until a slow-writing SET_PVW ahead of it has persisted and called Strom', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([]));
+    let inserts = 0;
+    mockInsert.mockImplementation(async () => {
+      inserts += 1;
+      if (inserts === 1) await delay(80);
+      return { ok: true };
+    });
+
+    // SET_PVW persists but issues no Strom transition, so the only /transition on
+    // the wire is the CUT's — and it must not fire until SET_PVW's slow write has
+    // finished, i.e. the CUT waits its turn in the per-production queue.
+    const setPvw = send({ type: 'SET_PVW', mixerInput: 'video_in_1' });
+    await delay(20);
+    const cut = send({ type: 'CUT', mixerInput: 'video_in_2' });
+
+    // The CUT has been enqueued but must still be waiting behind SET_PVW's 80 ms
+    // write, so no transition has reached Strom yet.
+    expect(requestsTo(TRANSITION)).toHaveLength(0);
+
+    await Promise.all([setPvw, cut]);
+
+    // Once the queue drains the CUT runs to completion exactly once.
+    expect(requestsTo(TRANSITION).map((r) => (r.body as { to_input: number }).to_input)).toEqual([2]);
   });
 });

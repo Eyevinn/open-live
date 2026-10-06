@@ -93,13 +93,14 @@ function isGatewayHeartbeatPath(path: string): boolean {
  * are operator/automation surfaces behind the shared key.
  */
 function isGuestTokenAuthedPath(path: string): boolean {
-  // join, session (leave), session/return (guest return-mode switch, #300),
-  // session/mute (guest mic mute toggle, #382), and the guest-scoped WHIP
-  // publish + its session PATCH/DELETE and the return-picture WHEP + its
-  // teardown (issue #423) — needed because the OSC ingress gate only passes
-  // `^/api/v1/guests` (osaas-app#6143). Each handler verifies the per-invite
-  // token itself (whip.ts / returns.ts), exactly like join/session.
-  return /^\/api\/v1\/guests\/[^/]+\/(join|session|session\/return|session\/mute|whip|returns\/picture\/whep(?:\/[^/]+)?)$/.test(path);
+  // join, slot (read-only: does the slot take WHIP), session (leave),
+  // session/return (guest return-mode switch, #300), session/mute (guest mic
+  // mute toggle, #382), and the guest-scoped WHIP publish + its session
+  // PATCH/DELETE and the return-picture WHEP + its teardown (issue #423) —
+  // needed because the OSC ingress gate only passes `^/api/v1/guests`
+  // (osaas-app#6143). Each handler verifies the per-invite token itself
+  // (whip.ts / returns.ts), exactly like join/session.
+  return /^\/api\/v1\/guests\/[^/]+\/(join|slot|session|session\/return|session\/mute|whip|returns\/picture\/whep(?:\/[^/]+)?)$/.test(path);
 }
 
 // Sentinel subprotocols used to carry the API key through the
@@ -223,6 +224,7 @@ export async function buildServer() {
           'token',
           'secret',
           'signingSecret',
+          'encryptionSecret',
           'address',
           '*.srt_uri',
           '*.passphrase',
@@ -230,6 +232,7 @@ export async function buildServer() {
           '*.token',
           '*.secret',
           '*.signingSecret',
+          '*.encryptionSecret',
           '*.address',
           'req.headers.authorization',
           'headers.authorization',

@@ -7,7 +7,7 @@ import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssign
 import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js';
-import { setTally, broadcast, getSubscriberCount } from '../services/tally.service.js';
+import { setTally, broadcast, getSubscriberCount, getWatcherCount } from '../services/tally.service.js';
 import { clearProductionPflState } from '../services/pfl-state.js';
 import { clearPipState, clearAudioState, clearFxState, clearClipStateForProduction, reinitConnectedControllers } from '../ws/controller.js';
 import { forceStopMeterRelay } from '../services/meter-relay.js';
@@ -328,6 +328,21 @@ async function runActivationFlow(
   let whepOutputEntries: Array<{ outputId: string; endpointId: string }> | undefined;
   let pgmWhepEndpointId: string | undefined;
 
+  // Force-stop the meter and clip relays bound to this run's (dying) flow,
+  // mirroring deactivate (issue #435). A controller connecting while status is
+  // still 'activating' starts both relays on `stromFlowId` (the connect path
+  // checks only the doc's stromFlowId). If this activation then fails or is
+  // aborted, the relays would otherwise stay bound to the dead flow and the next
+  // activation's reinit/connects would only ref-count the stale relay — so no
+  // client gets METER_DATA / LOUDNESS_DATA / reactive CLIP_STATE until every
+  // controller disconnects. Passing the flow id records it as retired so a later
+  // start on it rebinds to the new flow. No-op before any flow was created.
+  const forceStopRelaysForDyingFlow = (): void => {
+    if (!stromFlowId) return;
+    forceStopMeterRelay(productionId, stromFlowId);
+    forceStopClipRelay(productionId, stromFlowId);
+  };
+
   try {
     // Load the current production doc
     const doc = await getDb().get(productionId);
@@ -364,6 +379,7 @@ async function runActivationFlow(
 
     // Step 2: Persist stromFlowId + mixerBlockId + audioMixerBlockId
     if (signal.aborted) {
+      forceStopRelaysForDyingFlow();
       await deactivateStromFlow(stromFlowId, strom).catch(() => undefined);
       return;
     }
@@ -384,6 +400,7 @@ async function runActivationFlow(
 
     while (Date.now() < deadline) {
       if (signal.aborted) {
+        forceStopRelaysForDyingFlow();
         await deactivateStromFlow(stromFlowId, strom).catch(() => undefined);
         return;
       }
@@ -443,6 +460,7 @@ async function runActivationFlow(
           // Without this check, updateProductionDoc would write status:'active' after
           // deactivate has already written status:'inactive'.
           if (signal.aborted) {
+            forceStopRelaysForDyingFlow();
             await deactivateStromFlow(stromFlowId, strom).catch(() => {});
             return;
           }
@@ -450,6 +468,7 @@ async function runActivationFlow(
         }
 
         if (signal.aborted) {
+          forceStopRelaysForDyingFlow();
           await deactivateStromFlow(stromFlowId, strom).catch(() => {});
           return;
         }
@@ -556,6 +575,13 @@ async function runActivationFlow(
     }
 
     log.error({ err, productionId, stromFlowId }, 'Activation flow failed — resetting to inactive');
+
+    // Force-stop the meter and clip relays bound to the failed flow (issue
+    // #435). Unlike the abort path above, nothing else cleans these up on a
+    // genuine failure (poll timeout, Strom error, failed final doc write), so
+    // without this they stay bound to the dead flow and the next successful
+    // activation never moves them.
+    forceStopRelaysForDyingFlow();
 
     // Best-effort flow cleanup
     if (stromFlowId) {
@@ -946,13 +972,12 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
     clearAudioState(doc._id);
     clearPipState(doc._id);
     clearFxState(doc._id);
-    // Force-stop the meter and clip relays regardless of refCount (issue #416).
-    // Controller sockets stay open across deactivate; if the relays were left
-    // alive they would stay bound to this (torn-down) flow and every connect
-    // after reactivation would ref-count into the stale relay, so no client
-    // would get METER_DATA/LOUDNESS_DATA/CLIP_STATE until all sockets closed.
-    forceStopMeterRelay(doc._id);
-    forceStopClipRelay(doc._id);
+    // Force-stop the meter and clip relays regardless of refCount (issue #416):
+    // they are bound to this flow. A controller connecting before the final doc
+    // write below can still start one on this flow; the next start with the new
+    // flow rebinds it.
+    forceStopMeterRelay(doc._id, doc.stromFlowId);
+    forceStopClipRelay(doc._id, doc.stromFlowId);
     // Stop any clip completion-poll timers and wipe the in-memory clip-state
     // registry — live-only clip state must not survive deactivation (#278).
     clearClipStateForProduction(doc._id);
@@ -1209,11 +1234,12 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
     }
   );
   // Connected controller count for a production (used by the companion module
-  // to show a "peers connected" indicator on the landing page)
+  // to show a "peers connected" indicator on the landing page). `count` is
+  // operators only; watch-only connections are reported separately.
   fastify.get<{ Params: { id: string } }>(
     '/api/v1/productions/:id/controllers',
     async (req, reply) => {
-      return reply.send({ count: getSubscriberCount(req.params.id) });
+      return reply.send({ count: getSubscriberCount(req.params.id), watchers: getWatcherCount(req.params.id) });
     }
   );
 };

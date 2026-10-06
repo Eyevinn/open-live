@@ -24,6 +24,7 @@ import { resolvePublicBaseUrl, updateProductionDoc } from './productions.js';
 import { applyReturnMode } from '../ws/controller.js';
 import { resolveStromWhipUrl } from './whip.js';
 import { getStromToken } from '../lib/strom-token.js';
+import { slotTakesWhip } from '../lib/guest-scope.js';
 import {
   isIntercomEnabled,
   provisionGuestLine,
@@ -351,6 +352,57 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
   // Guest join / session (token-authed — exempt from shared API_KEY in server.ts)
   // -------------------------------------------------------------------------
 
+  // What the guest page needs before it asks for a camera: whether this slot
+  // takes WHIP from the browser or is return-only. Read-only — creates no
+  // session, so opening the link does not occupy the slot.
+  fastify.get<{ Params: { inviteId: string } }>(
+    '/api/v1/guests/:inviteId/slot',
+    { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
+    async (req, reply) => {
+      if (!isGuestCallingEnabled()) return reply.status(503).send(guestsDisabled());
+      const secret = getGuestSigningKey()!;
+      const token = bearerToken(req);
+      const verified = token ? verifyGuestInviteToken(token, secret) : undefined;
+      if (!verified?.ok || verified.claims.inviteId !== req.params.inviteId) {
+        return reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
+      }
+      let invite: GuestInviteDoc;
+      try {
+        invite = await getGuestInvitesDb().get(req.params.inviteId);
+      } catch {
+        return reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
+      }
+      if (invite.tokenHash !== hashGuestInviteToken(token!)) {
+        return reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
+      }
+      if (Date.parse(invite.expiresAt) <= Date.now()) {
+        return reply.status(409).send({ error: 'Invite expired', statusCode: 409 });
+      }
+      let production: ProductionDoc;
+      try {
+        production = await getDb().get(invite.productionId);
+      } catch {
+        return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+      }
+      if (production.status === 'ended') {
+        return reply.status(409).send({ error: 'Production is not active', statusCode: 409 });
+      }
+      const slot = guestSlotAssignment(production, invite.mixerInput);
+      if (!slot) {
+        return reply.status(409).send({
+          error: 'Invite is not bound to an available guest slot',
+          statusCode: 409,
+        });
+      }
+      try {
+        return reply.send({ mixerInput: slot.mixerInput, returnOnly: !(await slotTakesWhip(slot)) });
+      } catch (err) {
+        fastify.log.warn({ err }, 'GET guests/:id/slot — source lookup failed');
+        return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
+      }
+    },
+  );
+
   fastify.post<{ Params: { inviteId: string } }>(
     '/api/v1/guests/:inviteId/join',
     { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
@@ -419,6 +471,15 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         });
       }
       const mixerInput = invite.mixerInput;
+      // A slot whose source is not WHIP (an SRT encoder) is return-only: the
+      // guest's picture and voice reach the slot another way.
+      let takesWhip: boolean;
+      try {
+        takesWhip = await slotTakesWhip(slot);
+      } catch (err) {
+        fastify.log.warn({ err }, 'POST guests/:id/join — source lookup failed');
+        return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
+      }
 
       // 4. Create (or reuse) the guest session, enforcing one guest per slot
       //    (#381 item 3):
@@ -534,10 +595,10 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
       //    ingress gate only passes `^/api/v1/guests` (osaas-app#6143), so the
       //    guest page must reach WHIP/WHEP through its own invite-scoped routes.
       //    The crew paths are unchanged and still serve operator/automation
-      //    callers. The return feed is only live once the production is active
-      //    (spec §"Return feeds").
+      //    callers. whipUrl is absent on a return-only slot. The return feed is
+      //    only live once the production is active (spec §"Return feeds").
       const base = resolvePublicBaseUrl(req);
-      const whipUrl = `${base}/api/v1/guests/${req.params.inviteId}/whip`;
+      const whipUrl = takesWhip ? `${base}/api/v1/guests/${req.params.inviteId}/whip` : undefined;
       const returnLive =
         production.status === 'active' &&
         !!production.stromFlowId &&
@@ -551,7 +612,8 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         : [];
       return reply.status(200).send({
         guestId: session._id,
-        whipUrl,
+        ...(whipUrl ? { whipUrl } : {}),
+        returnOnly: !takesWhip,
         feeds,
         modes: returnModesFor(mixerInput),
         defaultMode: 'program-minus',

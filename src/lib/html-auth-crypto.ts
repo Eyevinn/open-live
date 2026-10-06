@@ -36,6 +36,7 @@
 
 import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
 import { decodeKey } from './srt-passphrase-crypto.js';
+import { getStoredCredentialKey } from './credential-encryption-key.js';
 import { ConfigurationError } from './config-error.js';
 
 const SCHEME_PREFIX = 'encv1:';
@@ -61,6 +62,14 @@ export function loadHtmlAuthKey(): Buffer | null {
 
   const raw = process.env['HTML_AUTH_KEY'] ?? process.env['SRT_PASSPHRASE_KEY'];
   if (!raw) {
+    // Neither env override is set: use the backend-generated stored credential
+    // key (issue #438) so HTML-source credential storage works on OSC, where no
+    // key env var is provisioned. Mirrors the SRT passphrase crypto fallback.
+    const stored = getStoredCredentialKey();
+    if (stored) {
+      cachedKey = stored;
+      return cachedKey;
+    }
     if (isProduction()) {
       // Fail closed (ADR-003 Decision 4) — never store a header credential in
       // plaintext. A ConfigurationError surfaces as a clear 503 rather than a

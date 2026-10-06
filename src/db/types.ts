@@ -445,6 +445,66 @@ export interface GuestSigningKeyDoc {
   createdAt: string;        // ISO 8601
 }
 
+/**
+ * The backend-generated AES-256 credential encryption key (issue #438).
+ *
+ * On OSC no `SRT_PASSPHRASE_KEY` / `HTML_AUTH_KEY` is provisioned, so saving an
+ * SRT passphrase or an authenticated-HTML-source credential failed closed with a
+ * 503 (`Credential storage is not configured`). Mirroring the guest-invite
+ * signing key (#391), the backend now generates this key on first start and
+ * stores it under a SINGLE FIXED id (`CREDENTIAL_ENCRYPTION_KEY_DOC_ID`), reading
+ * it back on every subsequent start so restarts still decrypt existing
+ * credentials. It is the fallback key for the SRT passphrase crypto and the
+ * HTML-auth crypto; `SRT_PASSPHRASE_KEY` / `HTML_AUTH_KEY` (env) still override it
+ * when set, so self-hosted deployments are unchanged. RTMP stream keys keep their
+ * dedicated `RTMP_CREDENTIALS_KEY` and NEVER fall back here (ADR-004 Decision 2).
+ *
+ * `encryptionSecret` is a credential: it is NEVER logged (the `secret` substring
+ * is matched by `src/lib/log-redact.ts` and the Fastify logger redact paths in
+ * `src/server.ts`) and NEVER returned by any route.
+ */
+export interface CredentialEncryptionKeyDoc {
+  _id: string;              // fixed: "credential-encryption-key"
+  _rev?: string;
+  type: 'credential-encryption-key';
+  /** Randomly generated 32-byte AES-256 key (base64). Never logged or returned. */
+  encryptionSecret: string;
+  createdAt: string;        // ISO 8601
+}
+
+/**
+ * The backend-generated AES-256 RTMP stream-key encryption key (issue #447).
+ *
+ * This is the RTMP analogue of `CredentialEncryptionKeyDoc` (#438/#446), kept
+ * DELIBERATELY SEPARATE: ADR-004 Resolved Decision 2 requires a dedicated
+ * `RTMP_CREDENTIALS_KEY` with NO reuse of / fallback to the SRT/credential key,
+ * so RTMP stream-key rotation stays isolated from SRT-passphrase / HTML-auth key
+ * rotation. On OSC `RTMP_CREDENTIALS_KEY` is never provisioned, so saving an RTMP
+ * stream key previously failed closed with a 503 and RTMP publishing was
+ * unavailable on every OSC instance.
+ *
+ * Mirroring `CredentialEncryptionKeyDoc`, the backend now generates this key on
+ * first start and stores it under its OWN single fixed id
+ * (`RTMP_CREDENTIAL_KEY_DOC_ID`, distinct from
+ * `CREDENTIAL_ENCRYPTION_KEY_DOC_ID`), reading it back on every subsequent start
+ * so restarts still decrypt existing RTMP stream keys. It is the fallback key for
+ * the RTMP stream-key crypto ONLY (`src/lib/rtmp-credentials-crypto.ts`);
+ * `RTMP_CREDENTIALS_KEY` (env) still overrides it when set, so self-hosted
+ * deployments are unchanged.
+ *
+ * `encryptionSecret` is a credential: it is NEVER logged (the `secret` substring
+ * is matched by `src/lib/log-redact.ts` and the Fastify logger redact paths in
+ * `src/server.ts`) and NEVER returned by any route.
+ */
+export interface RtmpCredentialKeyDoc {
+  _id: string;              // fixed: "rtmp-credentials-key"
+  _rev?: string;
+  type: 'rtmp-credentials-key';
+  /** Randomly generated 32-byte AES-256 key (base64). Never logged or returned. */
+  encryptionSecret: string;
+  createdAt: string;        // ISO 8601
+}
+
 // --------------- Production config types ---------------
 
 export interface ProductionConfigDoc {

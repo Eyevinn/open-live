@@ -4,6 +4,8 @@ import { startPortReservation, stopPortReservation } from './services/port-reser
 import { connectDb } from './db/index.js';
 import { cleanLegacyFixtures } from './db/seed.js';
 import { ensureGuestSigningKey } from './lib/guest-signing-key.js';
+import { ensureCredentialEncryptionKey } from './lib/credential-encryption-key.js';
+import { ensureRtmpCredentialKey } from './lib/rtmp-credential-key.js';
 import { buildServer } from './server.js';
 import { reconcileProductionStatuses } from './services/reconcile.js';
 
@@ -90,6 +92,37 @@ async function main() {
     } catch (err: any) {
       app.log.error(
         '[guest-calling] Failed to load/generate invite signing key — guest routes will 503 until it is available (reason: %s)',
+        err?.statusCode ?? err?.message ?? 'unknown',
+      );
+    }
+    // Credential encryption key (issue #438): generated and stored on first start,
+    // reused on every restart, so SRT passphrases / HTML-source credentials can be
+    // stored at rest on OSC without a key env var. `SRT_PASSPHRASE_KEY` /
+    // `HTML_AUTH_KEY` still override it. The key is never logged. Best-effort: a
+    // failure here must not block startup (credential writes degrade to 503 until
+    // a key is available), mirroring the signing-key handling above.
+    try {
+      await ensureCredentialEncryptionKey();
+      app.log.info('[credential-storage] Encryption key ready');
+    } catch (err: any) {
+      app.log.error(
+        '[credential-storage] Failed to load/generate credential encryption key — credential writes will 503 until it is available (reason: %s)',
+        err?.statusCode ?? err?.message ?? 'unknown',
+      );
+    }
+    // RTMP stream-key encryption key (issue #447): a DEDICATED key, generated and
+    // stored on first start under its own doc id, reused on every restart, so RTMP
+    // stream keys can be stored at rest on OSC without a key env var. Kept separate
+    // from the credential key above — RTMP never reuses the SRT/credential key
+    // (ADR-004 Resolved Decision 2). `RTMP_CREDENTIALS_KEY` still overrides it. The
+    // key is never logged. Best-effort: a failure here must not block startup (RTMP
+    // stream-key writes degrade to 503 until a key is available).
+    try {
+      await ensureRtmpCredentialKey();
+      app.log.info('[credential-storage] RTMP stream-key encryption key ready');
+    } catch (err: any) {
+      app.log.error(
+        '[credential-storage] Failed to load/generate RTMP stream-key encryption key — RTMP stream-key writes will 503 until it is available (reason: %s)',
         err?.statusCode ?? err?.message ?? 'unknown',
       );
     }

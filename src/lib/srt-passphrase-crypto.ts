@@ -33,6 +33,7 @@
 
 import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
 import { ConfigurationError } from './config-error.js';
+import { getStoredCredentialKey } from './credential-encryption-key.js';
 
 const SCHEME_PREFIX = 'encv1:';
 const ALGORITHM = 'aes-256-gcm';
@@ -51,10 +52,34 @@ const PASSPHRASE_RE = /([?&]passphrase=)([^&]*)/gi;
 export interface KeySource {
   /** Env var name holding the base64/hex 32-byte key. */
   envVar: string;
+  /**
+   * When the env var is unset, fall back to a backend-generated stored key
+   * instead of failing closed. This makes credential storage work out of the box
+   * on OSC, where no key env var is provisioned.
+   *
+   * The fallback key comes from `storedKeyProvider` when the source sets one,
+   * otherwise from the shared credential-encryption key
+   * (`src/lib/credential-encryption-key.ts`, issue #438). RTMP stream keys set
+   * their OWN provider (`src/lib/rtmp-credential-key.ts`, issue #447) so they
+   * never read the SRT/credential key — ADR-004 Resolved Decision 2 keeps the
+   * RTMP and SRT key families isolated.
+   */
+  allowStoredKeyFallback?: boolean;
+  /**
+   * Optional, dedicated accessor for the stored fallback key of this credential
+   * kind. Only consulted when `allowStoredKeyFallback` is set. Lets a kind (RTMP)
+   * fall back to its OWN stored key rather than the shared credential key,
+   * without weakening the SRT/HTML path's default. Defaults to the shared
+   * credential-encryption key accessor when unset.
+   */
+  storedKeyProvider?: () => Buffer | null;
 }
 
-/** Default source — the historic SRT passphrase key. */
-export const SRT_PASSPHRASE_KEY_SOURCE: KeySource = { envVar: 'SRT_PASSPHRASE_KEY' };
+/** Default source — the historic SRT passphrase key (falls back to the stored key). */
+export const SRT_PASSPHRASE_KEY_SOURCE: KeySource = {
+  envVar: 'SRT_PASSPHRASE_KEY',
+  allowStoredKeyFallback: true,
+};
 
 // Per-env-var key cache so distinct credential kinds (SRT, RTMP) never collide.
 const keyCache = new Map<string, Buffer | null>();
@@ -104,6 +129,18 @@ export function loadKey(source: KeySource = SRT_PASSPHRASE_KEY_SOURCE): Buffer |
 
   const raw = process.env[source.envVar];
   if (!raw) {
+    // No env override: for credential kinds that allow it, use the backend-
+    // generated stored key so storage works on OSC where no key env var is set.
+    // SRT/HTML (#438) default to the shared credential key; RTMP (#447) injects
+    // its OWN `storedKeyProvider`, so the two key families never cross (ADR-004
+    // Resolved Decision 2).
+    if (source.allowStoredKeyFallback) {
+      const stored = (source.storedKeyProvider ?? getStoredCredentialKey)();
+      if (stored) {
+        keyCache.set(source.envVar, stored);
+        return stored;
+      }
+    }
     if (isProduction()) {
       // Fail closed (ADR-003 Decision 4) — never store a credential in plaintext.
       // A ConfigurationError surfaces as a clear 503 rather than a generic 500

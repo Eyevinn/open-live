@@ -6,19 +6,33 @@ import { broadcast } from './tally.service.js';
 interface RelayEntry {
   stop: () => void;
   refCount: number;
+  flowId: string;
+  meterPrefix: string;
+  loudnessBlockId?: string | null;
 }
 
 const relays = new Map<string, RelayEntry>();
+// Last flow each production's deactivate tore down. Flow ids are never reused,
+// so an entry only goes stale, never wrong; the next deactivate overwrites it.
+const retiredFlows = new Map<string, string>();
 const RECONNECT_DELAY_MS = 5000;
 
 export function startMeterRelay(productionId: string, flowId: string, mixerBlockId: string, loudnessBlockId?: string | null): void {
+  const meterPrefix = `${mixerBlockId}:meter:`;
   const existing = relays.get(productionId);
   if (existing) {
     existing.refCount++;
+    // A connect that read the doc mid-deactivate can start the relay on the
+    // torn-down flow. Move it to the next flow seen, but never off a live one:
+    // a start that is late with the old flow only takes a ref.
+    if (existing.flowId !== flowId && existing.flowId === retiredFlows.get(productionId)) {
+      existing.flowId = flowId;
+      existing.meterPrefix = meterPrefix;
+      existing.loudnessBlockId = loudnessBlockId;
+    }
     return;
   }
 
-  const meterPrefix = `${mixerBlockId}:meter:`;
   let stopped = false;
   let wsCleanup: (() => void) | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -33,17 +47,17 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
 
       const closeCleanup = strom.connectWebSocket(
         (event) => {
-          if (event.type === 'LoudnessData' && loudnessBlockId) {
+          if (event.type === 'LoudnessData' && entry.loudnessBlockId) {
             const { flow_id, element_id, momentary, shortterm, integrated, loudness_range, true_peak } = event.data;
-            if (flow_id !== flowId || element_id !== loudnessBlockId) return;
+            if (flow_id !== entry.flowId || element_id !== entry.loudnessBlockId) return;
             broadcast(productionId, { type: 'LOUDNESS_DATA', elementId: 'main', momentary, shortterm, integrated, loudness_range, true_peak });
             return;
           }
           if (event.type !== 'MeterData') return;
           const { flow_id, element_id, rms, peak } = event.data;
-          if (flow_id !== flowId) return;
-          if (!element_id.startsWith(meterPrefix)) return;
-          const suffix = element_id.slice(meterPrefix.length);
+          if (flow_id !== entry.flowId) return;
+          if (!element_id.startsWith(entry.meterPrefix)) return;
+          const suffix = element_id.slice(entry.meterPrefix.length);
           if (suffix === 'main') {
             broadcast(productionId, { type: 'METER_DATA', elementId: 'main', peak, rms });
             return;
@@ -88,16 +102,57 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
     });
   }
 
-  connect();
-
-  relays.set(productionId, {
+  const entry: RelayEntry = {
     refCount: 1,
+    flowId,
+    meterPrefix,
+    loudnessBlockId,
     stop: () => {
       stopped = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
       wsCleanup?.();
     },
-  });
+  };
+
+  connect();
+  relays.set(productionId, entry);
+}
+
+/**
+ * Reconcile the relay onto `flowId` with exactly `holderCount` refs — used by
+ * reactivation reinit (issue #434). Deactivate's `forceStopMeterRelay` zeroes
+ * the refCount but leaves each controller's per-socket hold intact, and a
+ * connect mid-teardown may have re-created the relay on the now-retired flow.
+ * Per-socket `startMeterRelay` calls there would either miss re-creating a
+ * force-stopped relay (losing meters for an operator that stayed open) or
+ * double-count the mid-teardown socket (an orphaned ref that never reaches
+ * zero). Since every operator socket backs exactly one ref (connect takes one,
+ * close releases one), this rebinds any existing relay onto the new flow and
+ * sets its refCount to the operator-socket count so the later per-socket stops
+ * land it back on zero. No-op when `holderCount <= 0`.
+ */
+export function reconcileMeterRelay(productionId: string, flowId: string, mixerBlockId: string, loudnessBlockId: string | null | undefined, holderCount: number): void {
+  if (holderCount <= 0) return;
+  const meterPrefix = `${mixerBlockId}:meter:`;
+  const existing = relays.get(productionId);
+  if (existing) {
+    // The production has exactly one flow at a time; any existing relay is on
+    // the retired flow (mid-teardown connect) or already on this flow. Either
+    // way rebinding onto `flowId` is correct here.
+    existing.flowId = flowId;
+    existing.meterPrefix = meterPrefix;
+    existing.loudnessBlockId = loudnessBlockId;
+    existing.refCount = holderCount;
+    return;
+  }
+  startMeterRelay(productionId, flowId, mixerBlockId, loudnessBlockId);
+  const created = relays.get(productionId);
+  if (created) created.refCount = holderCount;
+}
+
+/** Current ref count for a production's meter relay (0 when none). Diagnostic. */
+export function getMeterRelayRefCount(productionId: string): number {
+  return relays.get(productionId)?.refCount ?? 0;
 }
 
 export function stopMeterRelay(productionId: string): void {
@@ -111,18 +166,12 @@ export function stopMeterRelay(productionId: string): void {
 }
 
 /**
- * Force-stop and forget the relay regardless of refCount (deactivate/teardown).
- *
- * Mirrors `forceStopClipRelay`. The relay filters Strom `MeterData`/`LoudnessData`
- * by the `flowId` + mixer-block it was started with, and `startMeterRelay` only
- * ref-counts into an existing relay — so if the relay is left alive across a
- * deactivate→reactivate (which builds a NEW flow) every subsequent connect
- * reuses the stale relay bound to the old flow and no client gets METER_DATA/
- * LOUDNESS_DATA until every socket closes and the refCount reaches 0 (issue
- * #416). Deactivate must force-stop here so reactivation can rebind to the new
- * flow.
+ * Force-stop and forget the relay regardless of refCount (deactivate/teardown),
+ * and record `flowId` as torn down so a relay started on it later is rebound.
+ * Mirrors `forceStopClipRelay` (#416).
  */
-export function forceStopMeterRelay(productionId: string): void {
+export function forceStopMeterRelay(productionId: string, flowId?: string): void {
+  if (flowId) retiredFlows.set(productionId, flowId);
   const entry = relays.get(productionId);
   if (!entry) return;
   entry.stop();

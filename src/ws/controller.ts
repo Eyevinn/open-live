@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { getDb, getSourcesDb, getGuestSessionsDb, getGuestInvitesDb } from '../db/index.js';
 import { updateProductionDoc } from '../routes/productions.js';
 import type { ProductionDoc, ClipState, SourceDoc, GuestSessionState } from '../db/types.js';
-import { getTally, setTally, subscribe, unsubscribe, broadcast, nextSeq, currentSeq, getSubscriberCount } from '../services/tally.service.js';
+import { getTally, setTally, subscribe, unsubscribe, broadcast, nextSeq, currentSeq, getOperatorSockets } from '../services/tally.service.js';
 import {
   cueClip, playClip, stopClip, pauseClip, seekClip,
   resolveClipSource, resolveClipTarget,
@@ -12,9 +12,9 @@ import {
 } from '../lib/clip-control.js';
 import { getClipStateEntry, getAllClipStates, setClipStateEntry, clearClipState } from '../services/clip-state.service.js';
 import { persistClipCue, clearPersistedClipCue } from '../services/clip-cue-store.js';
-import { startClipRelay, stopClipRelay } from '../services/clip-relay.js';
+import { startClipRelay, stopClipRelay, reconcileClipRelay } from '../services/clip-relay.js';
 import { CONTRACT_VERSION, computeTallyContributions } from '../services/automation-contract.js';
-import { startMeterRelay, stopMeterRelay } from '../services/meter-relay.js';
+import { startMeterRelay, stopMeterRelay, reconcileMeterRelay } from '../services/meter-relay.js';
 import { StromClient, StromClientError, StromPropertiesRejectedError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms, type VideoEffect, type EffectTarget, type SetVideoEffectRequest } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { graphicUrl } from '../lib/url-validation.js';
@@ -30,6 +30,7 @@ import { config } from '../config.js';
 import { notifySubscriberJoin, resetIdleTimer } from '../services/idle-watchdog.js';
 import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot } from '../lib/production-health.js';
+import { getWhipIngestState } from '../services/whip-ingest-state.js';
 
 function stromErrorMessage(err: unknown): string {
   if (err instanceof StromClientError) return err.message;
@@ -575,6 +576,89 @@ function rebroadcastMixerState(productionId: string, doc: ProductionDoc): void {
 }
 
 // ---------------------------------------------------------------------------
+// #430: rolling back a switch Strom rejected
+//
+// A CUT/TRANSITION/TAKE mutates the tally, the PiP maps, and the persisted doc,
+// then broadcasts TALLY *before* awaiting Strom's /transition. #355 already
+// stopped the controller from *announcing a displaced PiP* (the deferred
+// PIP_STATE + preview restore) when that transition is rejected, but the tally,
+// the PiP-map mutations, and the persisted doc were still left on the new value.
+// Clients were therefore told the new source is on program (via the already-sent
+// TALLY) while Strom kept airing the old one, until the next successful switch.
+//
+// `snapshotSwitchState` captures the pre-switch state before any mutation, and
+// `restoreSwitchState` rolls all of it back and re-broadcasts the authoritative
+// TALLY + PIP_STATE so every client drops the switch it optimistically showed.
+// Applied on every CUT/TRANSITION/TAKE path, interactive and macro.
+// ---------------------------------------------------------------------------
+
+interface SwitchStateSnapshot {
+  tally: { pgm: string | null; pvw: string | null };
+  pgmPip: number | null;
+  pvwPip: number | null;
+  pvwBeforePip: string | null;
+  pgmBg: string | null;
+}
+
+/**
+ * Snapshot the controller's switch-related state so a rejected transition can be
+ * rolled back. Must be called before the handler mutates any of it. The tally is
+ * copied (getTally returns the live stored object, which some handlers mutate in
+ * place).
+ */
+function snapshotSwitchState(productionId: string): SwitchStateSnapshot {
+  return {
+    tally: { ...getTally(productionId) },
+    pgmPip: pgmPipByProduction.get(productionId) ?? null,
+    pvwPip: pvwPipByProduction.get(productionId) ?? null,
+    pvwBeforePip: pvwBeforePipByProduction.get(productionId) ?? null,
+    pgmBg: pgmBgByProduction.get(productionId) ?? null,
+  };
+}
+
+/**
+ * Restore the pre-switch snapshot after Strom rejected the transition (#430):
+ * roll back the tally, the four PiP maps, and the persisted doc, then re-broadcast
+ * the authoritative TALLY and PIP_STATE. The absent-key and null-value readings of
+ * these maps are equivalent everywhere they are consumed (reads coalesce with
+ * `?? null`), so restoring with `set` is faithful.
+ */
+async function restoreSwitchState(
+  productionId: string,
+  doc: ProductionDoc,
+  snapshot: SwitchStateSnapshot,
+): Promise<void> {
+  setTally(productionId, { pgm: snapshot.tally.pgm, pvw: snapshot.tally.pvw });
+  pgmPipByProduction.set(productionId, snapshot.pgmPip);
+  pvwPipByProduction.set(productionId, snapshot.pvwPip);
+  pvwBeforePipByProduction.set(productionId, snapshot.pvwBeforePip);
+  pgmBgByProduction.set(productionId, snapshot.pgmBg);
+  await persistMixerMutation(productionId, 'SWITCH_REJECTED_ROLLBACK', (d) => ({ ...d, tally: snapshot.tally }));
+  broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, snapshot.tally, doc) });
+  broadcast(productionId, {
+    type: 'PIP_STATE',
+    pgmPip: snapshot.pgmPip,
+    pvwPip: snapshot.pvwPip,
+    pips: pipConfigsByProduction.get(productionId) ?? [],
+  });
+}
+
+/**
+ * Tell the operator a switch was rejected by Strom. Mirrors the not-found guard:
+ * a NACK when the command carried a cmdId (two-phase ACK), an ERROR frame
+ * otherwise. The caller must NOT also send an `executed` ACK — the switch never
+ * reached air.
+ */
+function notifySwitchRejected(ws: WebSocket, productionId: string, cmdId: string | undefined): void {
+  const error = 'Switch rejected by Strom';
+  if (cmdId) {
+    sendNack(ws, productionId, cmdId, error);
+  } else {
+    ws.send(JSON.stringify({ type: 'ERROR', error }));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Audio volume debounce
 // ---------------------------------------------------------------------------
 
@@ -832,6 +916,41 @@ export function clearAudioState(productionId: string): void {
 }
 
 /**
+ * Tells every connected socket the mixer state after first-connect init. Levels
+ * come from the cache rather than the init defaults, so a fader moved while the
+ * init write was in flight is not reported back at unity.
+ */
+function broadcastAudioReset(productionId: string, numChannels: number, muted: Set<string>): void {
+  const levels = channelLevelsByProduction.get(productionId);
+  // A fader Strom refused is absent from the cache; skip it rather than report unity.
+  const sendLevel = (elementId: string) => {
+    const level = levels?.get(elementId);
+    if (level !== undefined) broadcast(productionId, { type: 'AUDIO_STATE', elementId, property: 'volume', value: level });
+  };
+  for (let i = 1; i <= numChannels; i++) {
+    sendLevel(`ch${i}`);
+    broadcast(productionId, { type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'mute', value: muted.has(`ch${i}`) });
+  }
+  sendLevel('main');
+}
+
+/**
+ * The flow whose meter/clip relay each operator socket holds one ref on. A
+ * socket releases on close only what it holds, and reinit takes refs on behalf
+ * of sockets that stayed open across a reactivation.
+ */
+const relayHolds = new WeakMap<WebSocket, { meter?: string; clip?: string }>();
+
+function relayHold(ws: WebSocket): { meter?: string; clip?: string } {
+  let hold = relayHolds.get(ws);
+  if (!hold) {
+    hold = {};
+    relayHolds.set(ws, hold);
+  }
+  return hold;
+}
+
+/**
  * Re-run first-connect audio init and restart the meter/clip relays for a
  * production that has just (re)activated with a NEW Strom flow, targeting the
  * controller operators that stayed connected across a deactivate→reactivate
@@ -847,19 +966,14 @@ export function clearAudioState(productionId: string): void {
  *
  * Fixing it here: when at least one controller is connected, initialise the new
  * flow's audio ONCE (so a later fresh connect inherits rather than re-inits) and
- * restart both relays bound to the new flow, ref-counted once per connected
- * controller so each is torn down only when the last of those sockets closes.
- * A no-op when nobody is connected — the next connect runs the normal path.
- *
- * TODO(#415): once watch-only controller connections land (draft PR #417), a
- * watch-only viewer must not count here — exclude it from the connected-operator
- * count below (and therefore from the relay ref-count and the init trigger).
+ * restart both relays bound to the new flow, taking one ref per connected
+ * operator socket that does not already hold one on this flow, so each relay is
+ * torn down only when the last of those sockets closes. Watch-only sockets
+ * neither trigger init nor hold relay refs. A no-op when no operator is
+ * connected — the next connect runs the normal path.
  */
 export async function reinitConnectedControllers(productionId: string): Promise<void> {
-  // Watch-only connections (#415) are not yet on main, so every subscriber is a
-  // full controller operator today (see TODO above).
-  const connectedCount = getSubscriberCount(productionId);
-  if (connectedCount === 0) return;
+  if (getOperatorSockets(productionId).length === 0) return;
 
   let doc: ProductionDoc;
   try {
@@ -914,36 +1028,39 @@ export async function reinitConnectedControllers(productionId: string): Promise<
             if (Object.hasOwn(rejected, toMainKey) || current[toMainKey] === false) muted.add(`ch${i}`);
           }
         };
-        await strom.flows.updateBlockProperties(flowId, audioBlockId, { properties: initProps })
-          .then((res) => seedMutes(res.rejected ?? {}, res.properties ?? {}))
+        const applied = await strom.flows.updateBlockProperties(flowId, audioBlockId, { properties: initProps })
+          .then((res) => { seedMutes(res.rejected ?? {}, res.properties ?? {}); return true; })
           .catch((err) => {
             console.warn('[controller] reinit channel props error:', err);
             // Keys are independent, so keep what applied; forget a refused fader's
             // unity level so it is not broadcast below.
-            if (!(err instanceof StromPropertiesRejectedError)) return;
+            if (!(err instanceof StromPropertiesRejectedError)) return false;
             for (const key of Object.keys(err.rejected)) {
               const fader = /^(ch\d+|main)_fader$/.exec(key);
               if (fader) levelCache.delete(fader[1]);
             }
             seedMutes(err.rejected, err.current);
+            return true;
           });
-        // Push the freshly-initialised defaults to every connected operator so a
-        // socket that stayed open across reactivation drops its stale mixer view.
-        for (let i = 1; i <= numChannels; i++) {
-          const level = levelCache.get(`ch${i}`);
-          if (level !== undefined) broadcast(productionId, { type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'volume', value: level });
-          broadcast(productionId, { type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'mute', value: muted.has(`ch${i}`) });
-        }
-        const mainLevel = levelCache.get('main');
-        if (mainLevel !== undefined) broadcast(productionId, { type: 'AUDIO_STATE', elementId: 'main', property: 'volume', value: mainLevel });
+        // Push the freshly-initialised defaults to every connected socket so one
+        // that stayed open across reactivation drops its stale mixer view.
+        // Skipped when the write failed outright: Strom still holds the old values.
+        if (applied) broadcastAudioReset(productionId, numChannels, muted);
         broadcast(productionId, { type: 'GRP_STATE_RESET' });
       }
 
-      // Restart the meter relay against the NEW flow, once per connected operator
-      // so the refCount matches the sockets that will later call stopMeterRelay.
-      for (let i = 0; i < connectedCount; i++) {
-        startMeterRelay(productionId, flowId, audioBlockId, doc.loudnessMainBlockId);
-      }
+      // Restart the meter relay against the NEW flow. Deactivate force-stopped
+      // (and forgot) the relay while leaving each socket's per-socket hold in
+      // place, and a connect mid-teardown may have re-created it on the retired
+      // flow. Reconcile to one ref per operator socket on the new flow rather
+      // than taking a per-socket ref: the latter both fails to re-create a
+      // force-stopped relay for an operator that stayed open AND double-counts
+      // the mid-teardown socket, orphaning a ref that never reaches zero
+      // (issue #434). Every operator socket then releases exactly one ref on
+      // close, landing the relay back at zero.
+      const meterOperators = getOperatorSockets(productionId);
+      reconcileMeterRelay(productionId, flowId, audioBlockId, doc.loudnessMainBlockId, meterOperators.length);
+      for (const ws of meterOperators) relayHold(ws).meter = flowId;
     }
   } catch (err) {
     console.warn('[controller] reinit audio/meter error:', err);
@@ -956,9 +1073,10 @@ export async function reinitConnectedControllers(productionId: string): Promise<
       blockToInput.set(blockId, mixerInput);
     }
     if (blockToInput.size > 0) {
-      for (let i = 0; i < connectedCount; i++) {
-        startClipRelay(productionId, flowId, blockToInput);
-      }
+      // Same reconciliation as the meter relay above (issue #434).
+      const clipOperators = getOperatorSockets(productionId);
+      reconcileClipRelay(productionId, flowId, blockToInput, clipOperators.length);
+      for (const ws of clipOperators) relayHold(ws).clip = flowId;
     }
   }
 }
@@ -1016,6 +1134,13 @@ export function setPipConfigSlot(productionId: string, pip: number, cfg: PipConf
  */
 export function hydratePipConfigsFromDoc(doc: ProductionDoc): PipConfig[] | null {
   if (pipConfigsByProduction.has(doc._id)) return null
+  const { configs, persisted } = pipConfigsFromDoc(doc)
+  if (configs) pipConfigsByProduction.set(doc._id, configs)
+  return persisted ? configs : null
+}
+
+/** The PiP layout the doc implies, without touching the cache. */
+function pipConfigsFromDoc(doc: ProductionDoc): { configs: PipConfig[] | null; persisted: boolean } {
   const rawNumPips = doc.values?.num_pips
   const numPips = typeof rawNumPips === 'number' ? Math.max(0, Math.round(rawNumPips))
     : typeof rawNumPips === 'string' ? Math.max(0, parseInt(rawNumPips, 10) || 0)
@@ -1026,13 +1151,12 @@ export function hydratePipConfigsFromDoc(doc: ProductionDoc): PipConfig[] | null
     // num_pips even if it changed since the layout was saved.
     const restored = Array.from({ length: Math.max(numPips, persisted.length) }, (_, i) =>
       persisted[i] ?? { bg: null, zones: [], transforms: {} })
-    pipConfigsByProduction.set(doc._id, restored)
-    return restored
+    return { configs: restored, persisted: true }
   }
   if (numPips > 0) {
-    pipConfigsByProduction.set(doc._id, Array.from({ length: numPips }, () => ({ bg: null, zones: [], transforms: {} })))
+    return { configs: Array.from({ length: numPips }, () => ({ bg: null, zones: [], transforms: {} })), persisted: false }
   }
-  return null
+  return { configs: null, persisted: false }
 }
 
 /** Wipe all per-production FX state. Called when the pipeline changes or production deactivates. */
@@ -1331,6 +1455,60 @@ export async function applyReturnMode(
 // Message handler
 // ---------------------------------------------------------------------------
 
+/**
+ * Commands that mutate the vision mixer (issue #431). Each one reads the
+ * production doc, calls Strom, and persists the resulting tally. Two of them
+ * racing — e.g. a CUT whose DB write is slow, then a TAKE sent 20 ms later —
+ * could otherwise reach Strom in the opposite order the operator pressed them,
+ * leaving Strom on one program while open-live reports another. They are
+ * serialised per production (see `runSerializedSwitcherCommand`) so one
+ * command's Strom calls and DB write finish before the next reads the doc.
+ *
+ * MACRO_EXEC is included because a macro inlines its own CUT/TRANSITION/TAKE
+ * sub-commands (it never re-enters `handleMessage`), so holding the lock for a
+ * whole macro serialises the macro's switcher effects without any risk of the
+ * macro deadlocking on its own queue.
+ */
+const SWITCHER_MESSAGE_TYPES = new Set([
+  'CUT',
+  'TRANSITION',
+  'TAKE',
+  'SET_PVW',
+  'SELECT_PVW_PIP',
+  'SET_PIP',
+  'MACRO_EXEC',
+]);
+
+/**
+ * Per-production tail of the switcher-command chain. Each entry is a
+ * never-rejecting promise that settles when the production's most recently
+ * queued switcher command finishes; the entry is pruned once the chain drains.
+ */
+const switcherCommandChains = new Map<string, Promise<unknown>>();
+
+/**
+ * Run `task` after the previous switcher command for the same production has
+ * fully settled (success or failure), guaranteeing per-production ordering of
+ * the doc read → Strom call → DB write sequence. The caller still observes its
+ * own task's outcome via the returned promise; the internal chain tail swallows
+ * rejections so one failed command never stalls the queue.
+ */
+function runSerializedSwitcherCommand(
+  productionId: string,
+  task: () => Promise<void>,
+): Promise<void> {
+  const prev = switcherCommandChains.get(productionId) ?? Promise.resolve();
+  const result = prev.then(() => task());
+  const tail = result.catch(() => {});
+  switcherCommandChains.set(productionId, tail);
+  void tail.then(() => {
+    if (switcherCommandChains.get(productionId) === tail) {
+      switcherCommandChains.delete(productionId);
+    }
+  });
+  return result;
+}
+
 /** Exported for tests: drives one inbound message against a production. */
 export async function handleMessage(
   productionId: string,
@@ -1383,6 +1561,12 @@ export async function handleMessage(
     return;
   }
 
+  // Everything below reads the production doc, may call Strom, and persists the
+  // result. For switcher-mutating commands this closure runs through the
+  // per-production serialisation chain (issue #431) so commands sent close
+  // together cannot reach Strom out of order; all other command types run
+  // immediately, exactly as before.
+  const dispatch = async (): Promise<void> => {
   const db = getDb();
   let doc: ProductionDoc;
   try {
@@ -1422,6 +1606,8 @@ export async function handleMessage(
       const fromPadCut = (curPgmPipCut !== null && tally.pgm === null)
         ? (pgmBgByProduction.get(productionId) ?? null)
         : tally.pgm;
+      // Snapshot before any mutation so a Strom rejection can be rolled back (#430).
+      const preSwitchCut = snapshotSwitchState(productionId);
       const newTally = { pgm: msg.mixerInput, pvw: tally.pgm };
       setTally(productionId, newTally);
       const curPvwPipCut = pvwPipByProduction.get(productionId) ?? null;
@@ -1446,12 +1632,20 @@ export async function handleMessage(
       await persistMixerMutation(productionId, 'CUT', (d) => ({ ...d, tally: newTally }));
       broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
       const cutTransitionOk = await stromTransition(doc, fromPadCut, msg.mixerInput, 'cut');
+      if (!cutTransitionOk) {
+        // Strom rejected the cut, so it never reached air: roll the tally, PiP
+        // maps and persisted doc back to the pre-switch state, re-broadcast, and
+        // tell the operator (#430).
+        await restoreSwitchState(productionId, doc, preSwitchCut);
+        notifySwitchRejected(ws, productionId, cmdId);
+        break;
+      }
       // Announce the PiP move and restore it into Strom's preview only after the
       // transition succeeded (#355) and only if the operator has not changed PVW
       // during the Strom round trip (#341): a concurrent SET_PVW / SELECT_PVW_PIP
       // has already broadcast the authoritative PVW, so a stale displacement
       // broadcast or restore must not clobber it.
-      if (cutTransitionOk && cutPipEvent
+      if (cutPipEvent
           && (pvwPipByProduction.get(productionId) ?? null) === cutPipEvent.pvwPip) {
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: cutPipEvent.pvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
         if (curPgmPipCut !== null && doc.stromFlowId && doc.mixerBlockId) {
@@ -1489,6 +1683,8 @@ export async function handleMessage(
       const fromPadTrans = (curPgmPipTrans !== null && tally.pgm === null)
         ? (pgmBgByProduction.get(productionId) ?? null)
         : tally.pgm;
+      // Snapshot before any mutation so a Strom rejection can be rolled back (#430).
+      const preSwitchTrans = snapshotSwitchState(productionId);
       const newTally = { pgm: msg.mixerInput, pvw: tally.pgm };
       setTally(productionId, newTally);
       const curPvwPipTrans = pvwPipByProduction.get(productionId) ?? null;
@@ -1509,9 +1705,15 @@ export async function handleMessage(
       await persistMixerMutation(productionId, 'TRANSITION', (d) => ({ ...d, tally: newTally }));
       broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc), transitionType: msg.transitionType, durationMs: msg.durationMs });
       const transTransitionOk = await stromTransition(doc, fromPadTrans, msg.mixerInput, toStromTransition(msg.transitionType), msg.durationMs);
+      if (!transTransitionOk) {
+        // Strom rejected the transition — roll back and notify (#430).
+        await restoreSwitchState(productionId, doc, preSwitchTrans);
+        notifySwitchRejected(ws, productionId, cmdId);
+        break;
+      }
       // Announce + restore only after the transition succeeded (#355) and only if
       // PVW was not changed during the Strom round trip (#341).
-      if (transTransitionOk && transPipEvent
+      if (transPipEvent
           && (pvwPipByProduction.get(productionId) ?? null) === transPipEvent.pvwPip) {
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: transPipEvent.pvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
         if (curPgmPipTrans !== null && doc.stromFlowId && doc.mixerBlockId) {
@@ -1530,6 +1732,9 @@ export async function handleMessage(
       break;
     }
     case 'TAKE': {
+      // Snapshot before any mutation so a Strom rejection can be rolled back (#430).
+      // Taken first because the atomic-PiP block below mutates the live tally in place.
+      const preSwitchTake = snapshotSwitchState(productionId);
       const tally = getTally(productionId);
       // Atomic PiP take: pip supplied directly so no SELECT_PVW_PIP is needed,
       // avoiding the concurrent-broadcast race that puts the PiP in both PGM and PVW.
@@ -1574,13 +1779,16 @@ export async function handleMessage(
         pvwBeforePipByProduction.set(productionId, reversePgmBg);
         pgmBgByProduction.delete(productionId);
       }
-      broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
+      // The transition type/duration actually sent to Strom below, surfaced on the
+      // TALLY so a controller-socket recorder can re-render the exact transition
+      // (issue #451), mirroring the TRANSITION broadcast at ~1598. Additive fields.
+      const takeTransition = toStromTransition(msg.transitionType ?? 'cut');
+      broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc), transitionType: takeTransition, durationMs: msg.durationMs });
       // Defer the PIP_STATE displacement broadcast until the Strom round trip
       // below reports success (issue #370, same class as #355/PR #369): announcing
       // the new PiP state before Strom has accepted the transition leaves clients
       // and Strom disagreeing when Strom rejects the /transition. The persist above
       // has already committed, so a DB failure never reaches this point.
-      const takeTransition = toStromTransition(msg.transitionType ?? 'cut');
       let takeTransitionOk = true;
       if (curPvwPip !== null) {
         // PiP is on PVW → moving to PGM.
@@ -1636,12 +1844,19 @@ export async function handleMessage(
         pgmBgByProduction.delete(productionId);
         takeTransitionOk = await stromTransition(doc, tally.pgm, tally.pvw, takeTransition, msg.durationMs);
       }
+      if (!takeTransitionOk) {
+        // Strom rejected the take — roll back the tally, PiP maps and persisted
+        // doc, re-broadcast, and tell the operator (#430).
+        await restoreSwitchState(productionId, doc, preSwitchTake);
+        notifySwitchRejected(ws, productionId, cmdId);
+        break;
+      }
       // Announce the take's new PiP state, and restore a displaced PGM PiP into
       // Strom's preview, only after the transition succeeded (#370/#355) and only
       // if the operator has not changed PVW during the Strom round trip (#341): a
       // concurrent SET_PVW / SELECT_PVW_PIP has already broadcast the authoritative
       // PVW, so a stale displacement broadcast or restore must not clobber it.
-      if (takeTransitionOk && (pvwPipByProduction.get(productionId) ?? null) === newPvwPip) {
+      if ((pvwPipByProduction.get(productionId) ?? null) === newPvwPip) {
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: newPgmPip, pvwPip: newPvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
         // Reverse-PiP take (PiP was on PGM, nothing waiting in PVW): put the PiP
         // back on Strom's preview so subsequent forward takes work.
@@ -1747,7 +1962,7 @@ export async function handleMessage(
       try {
         const strom = await makeStromClient();
         const result = await strom.mixer.fadeToBlack(doc.stromFlowId, doc.mixerBlockId, { active: msg.active ?? true, duration_ms: msg.durationMs ?? 1000 });
-        broadcast(productionId, { type: 'FTB_STATE', active: result.active });
+        broadcast(productionId, { type: 'FTB_STATE', active: result.active, durationMs: msg.durationMs ?? 1000 });
       } catch (err) {
         console.warn('[controller] Strom FTB error:', err);
         ws.send(JSON.stringify({ type: 'ERROR', error: 'FTB failed' }));
@@ -1854,6 +2069,8 @@ export async function handleMessage(
               const fromPad = (curPgmPip !== null && tally.pgm === null)
                 ? (pgmBgByProduction.get(productionId) ?? null)
                 : tally.pgm;
+              // Snapshot before any mutation so a Strom rejection can be rolled back (#430).
+              const preSwitchMacroCut = snapshotSwitchState(productionId);
               const newTally = { pgm: mixerInput, pvw: tally.pgm };
               setTally(productionId, newTally);
               const curPvwPip = pvwPipByProduction.get(productionId) ?? null;
@@ -1876,9 +2093,15 @@ export async function handleMessage(
               await persistMixerMutation(productionId, 'MACRO_EXEC:CUT', (d) => ({ ...d, tally: newTally }));
               broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, currentDoc) });
               const macroCutTransitionOk = await stromTransition(currentDoc, fromPad, mixerInput, 'cut');
+              if (!macroCutTransitionOk) {
+                // Strom rejected the cut — roll back and surface it as a macro
+                // action failure (the catch below reports MACRO_ERROR) (#430).
+                await restoreSwitchState(productionId, currentDoc, preSwitchMacroCut);
+                throw new Error('Switch rejected by Strom');
+              }
               // Announce + restore only after the transition succeeded (#355) and
               // only if PVW was not changed during the Strom round trip (#341).
-              if (macroCutTransitionOk && macroCutPipEvent
+              if (macroCutPipEvent
                   && (pvwPipByProduction.get(productionId) ?? null) === macroCutPipEvent.pvwPip) {
                 broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: macroCutPipEvent.pvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
                 if (curPgmPip !== null && currentDoc.stromFlowId && currentDoc.mixerBlockId) {
@@ -1903,6 +2126,8 @@ export async function handleMessage(
               const fromPad = (curPgmPip !== null && tally.pgm === null)
                 ? (pgmBgByProduction.get(productionId) ?? null)
                 : tally.pgm;
+              // Snapshot before any mutation so a Strom rejection can be rolled back (#430).
+              const preSwitchMacroTrans = snapshotSwitchState(productionId);
               const newTally = { pgm: mixerInput, pvw: tally.pgm };
               setTally(productionId, newTally);
               const curPvwPip = pvwPipByProduction.get(productionId) ?? null;
@@ -1925,9 +2150,15 @@ export async function handleMessage(
               await persistMixerMutation(productionId, 'MACRO_EXEC:TRANSITION', (d) => ({ ...d, tally: newTally }));
               broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, currentDoc), transitionType: action.transitionType, durationMs: action.durationMs });
               const macroTransTransitionOk = await stromTransition(currentDoc, fromPad, mixerInput, toStromTransition(action.transitionType ?? 'cut'), action.durationMs);
+              if (!macroTransTransitionOk) {
+                // Strom rejected the transition — roll back and surface it as a
+                // macro action failure (the catch below reports MACRO_ERROR) (#430).
+                await restoreSwitchState(productionId, currentDoc, preSwitchMacroTrans);
+                throw new Error('Switch rejected by Strom');
+              }
               // Announce + restore only after the transition succeeded (#355) and
               // only if PVW was not changed during the Strom round trip (#341).
-              if (macroTransTransitionOk && macroTransPipEvent
+              if (macroTransPipEvent
                   && (pvwPipByProduction.get(productionId) ?? null) === macroTransPipEvent.pvwPip) {
                 broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: macroTransPipEvent.pvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
                 if (curPgmPip !== null && currentDoc.stromFlowId && currentDoc.mixerBlockId) {
@@ -1950,6 +2181,8 @@ export async function handleMessage(
             const fromPad = (curPgmPip !== null && tally.pgm === null)
               ? (pgmBgByProduction.get(productionId) ?? null)
               : tally.pgm;
+            // Snapshot before any mutation so a Strom rejection can be rolled back (#430).
+            const preSwitchMacroTake = snapshotSwitchState(productionId);
             const newTally = { pgm: tally.pvw, pvw: tally.pgm };
             setTally(productionId, newTally);
             // Defer the PIP_STATE broadcast until persist and the Strom transition
@@ -1965,11 +2198,20 @@ export async function handleMessage(
               macroTakePipEvent = { pvwPip: curPgmPip };
             }
             await persistMixerMutation(productionId, 'MACRO_EXEC:TAKE', (d) => ({ ...d, tally: newTally }));
-            broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, currentDoc) });
+            // A macro TAKE always cuts (no transitionType on the action), so
+            // surface 'cut' on the TALLY to match the interactive TAKE (#451)
+            // and the value sent to Strom below.
+            broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, currentDoc), transitionType: 'cut' });
             const macroTakeTransitionOk = await stromTransition(currentDoc, fromPad, tally.pvw, 'cut');
+            if (!macroTakeTransitionOk) {
+              // Strom rejected the take — roll back and surface it as a macro
+              // action failure (the catch below reports MACRO_ERROR) (#430).
+              await restoreSwitchState(productionId, currentDoc, preSwitchMacroTake);
+              throw new Error('Switch rejected by Strom');
+            }
             // Announce + restore only after the transition succeeded (#370/#355) and
             // only if PVW was not changed during the Strom round trip (#341).
-            if (macroTakeTransitionOk && macroTakePipEvent
+            if (macroTakePipEvent
                 && (pvwPipByProduction.get(productionId) ?? null) === macroTakePipEvent.pvwPip) {
               broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: macroTakePipEvent.pvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
               if (curPgmPip !== null && currentDoc.stromFlowId && currentDoc.mixerBlockId) {
@@ -2822,6 +3064,12 @@ export async function handleMessage(
       ws.send(JSON.stringify({ type: 'ERROR', error: 'Unknown message type' }));
     }
   }
+  };
+
+  if (SWITCHER_MESSAGE_TYPES.has(msg.type)) {
+    return runSerializedSwitcherCommand(productionId, dispatch);
+  }
+  return dispatch();
 }
 
 /**
@@ -2849,14 +3097,59 @@ export function deriveGuestDisplayState(
   return 'joined';
 }
 
+/**
+ * Watch-only connections may not send commands. Every inbound frame is
+ * answered with a NACK when it carries a cmdId, otherwise an ERROR, so a client
+ * that sends commands by mistake finds out instead of being silently ignored.
+ */
+function rejectWatchOnlyMessage(productionId: string, ws: WebSocket, raw: string): void {
+  const error = 'Watch-only connection: commands are not accepted';
+  let cmdId: unknown;
+  try {
+    cmdId = (JSON.parse(raw) as { cmdId?: unknown } | null)?.cmdId;
+  } catch { /* not JSON: plain ERROR below */ }
+  if (typeof cmdId === 'string' && cmdId) {
+    sendNack(ws, productionId, cmdId, error);
+  } else {
+    ws.send(JSON.stringify({ type: 'ERROR', error }));
+  }
+}
+
 const controllerWs: FastifyPluginAsync = async (fastify) => {
-  fastify.get<{ Params: { id: string } }>(
+  fastify.get<{ Params: { id: string }; Querystring: { mode?: string; [key: string]: unknown } }>(
     '/ws/productions/:id/controller',
     { websocket: true },
     async (socket, req) => {
       const { id } = req.params;
-      subscribe(id, socket);
-      notifySubscriberJoin(id);
+      const { mode } = req.query;
+      // Fail closed on a query key that is confusable with `mode` — a case
+      // variant (`Mode`, `MODE`) or array-bracket syntax (`mode[]`). The exact
+      // `mode` key is handled below; any genuinely unrelated param (a
+      // cache-buster, etc.) is left untouched and the connection proceeds. A
+      // passive client (e.g. a tally logger) that typo'd the key must not
+      // silently open as an operator and run first-connect audio init (#424).
+      const confusableModeKey = Object.keys(req.query).find(
+        (key) => key !== 'mode' && /^mode(\[.*\])?$/i.test(key),
+      );
+      if (confusableModeKey !== undefined) {
+        socket.send(JSON.stringify({ type: 'ERROR', error: `Ambiguous controller mode query key: ${confusableModeKey}` }));
+        socket.close(1008, 'ambiguous mode key');
+        return;
+      }
+      // Fail closed on an unknown mode: a mistyped `watch` must not fall back to
+      // an operator connection that can run first-connect audio init.
+      if (mode !== undefined && mode !== 'watch') {
+        socket.send(JSON.stringify({ type: 'ERROR', error: `Unknown controller mode: ${mode}` }));
+        socket.close(1008, 'unknown mode');
+        return;
+      }
+      // Watch-only connections receive the snapshot and broadcasts but never
+      // write: no commands, no Strom writes, no registry/cache seeding that would
+      // change what a later operator connect does, no idle-timer reset, and they
+      // are not counted as operators.
+      const watchOnly = mode === 'watch';
+      subscribe(id, socket, { watchOnly });
+      if (!watchOnly) notifySubscriberJoin(id);
 
       // Per-connection context — mutable so the audio block ID can be populated
       // at connect time and reused on every subsequent AUDIO_SET without a flow fetch.
@@ -2865,15 +3158,23 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
       // Register message/close handlers immediately so no messages are dropped
       // while we perform the async connect-time sync below.
       socket.on('message', (raw: Buffer | string) => {
+        if (watchOnly) {
+          rejectWatchOnlyMessage(id, socket, raw.toString());
+          return;
+        }
         handleMessage(id, socket, raw.toString(), ctx).catch((err) => {
           console.error('[controller] unhandled message error:', err);
         });
       });
 
+      let socketClosed = false;
       socket.on('close', () => {
+        socketClosed = true;
         unsubscribe(id, socket);
-        stopMeterRelay(id);
-        stopClipRelay(id);
+        // Relays are ref-counted, so only release what this socket holds.
+        const hold = relayHolds.get(socket);
+        if (hold?.meter) stopMeterRelay(id);
+        if (hold?.clip) stopClipRelay(id);
         // Audio state registries are kept in memory so other connected clients
         // and future reconnects inherit the current AFV/mute configuration.
         // State is only wiped when the pipeline changes (new stromFlowId).
@@ -2889,7 +3190,7 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
       // If the pipeline changed while a client stayed connected across the restart,
       // stale channel-index registries would apply mutes/AFV to the wrong channels.
       // Wipe immediately so this connect is treated as a fresh start.
-      if (connectDoc?.stromFlowId) {
+      if (connectDoc?.stromFlowId && !watchOnly) {
         const lastFlowId = activeFlowIdByProduction.get(id)
         if (lastFlowId && lastFlowId !== connectDoc.stromFlowId) {
           clearAudioState(id)
@@ -2969,18 +3270,44 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
         }
       }
 
+      // Replay the current WHIP live-ingest state for this production's assigned
+      // sources, so a freshly-connected controller immediately knows which WHIP
+      // publishers are sending (issue #439, interim — parent #437). Only sources
+      // with a recorded state (offer/teardown already observed) are emitted; the
+      // state is in-memory only and resets on server restart. KNOWN INTERIM
+      // LIMITATION: a `connected` here may be stale if a publisher dropped
+      // without sending DELETE — see `src/services/whip-ingest-state.ts`.
+      if (connectDoc) {
+        for (const assignment of connectDoc.sources) {
+          const liveIngest = getWhipIngestState(assignment.sourceId);
+          if (liveIngest) {
+            socket.send(JSON.stringify({
+              type: 'SOURCE_INGEST_STATE',
+              sourceId: assignment.sourceId,
+              state: liveIngest.state,
+              changedAt: liveIngest.changedAt,
+            }));
+          }
+        }
+      }
+
       // Sync PiP state from in-memory server cache (populated by SET_PIP / SELECT_PVW_PIP).
       // If the cache is cold (fresh connect after deactivate or server restart),
       // hydrate it from the persisted pipConfigs on the ProductionDoc (issue #177)
       // so the operator's PiP layout is restored. If nothing was persisted, seed
       // empty slots from num_pips so the PipPanel shows the correct number of slots
       // without requiring a SET_PIP first.
-      const restoredPipConfigs = connectDoc ? hydratePipConfigsFromDoc(connectDoc) : null;
+      // A watcher reads the doc's layout without caching it: a warm cache would
+      // make the next operator connect skip the Strom re-push below.
+      const restoredPipConfigs = connectDoc && !watchOnly ? hydratePipConfigsFromDoc(connectDoc) : null;
+      const watcherPips = watchOnly && connectDoc && !pipConfigsByProduction.has(id)
+        ? pipConfigsFromDoc(connectDoc).configs
+        : null;
       socket.send(JSON.stringify({
         type: 'PIP_STATE',
         pgmPip: pgmPipByProduction.get(id) ?? null,
         pvwPip: pvwPipByProduction.get(id) ?? null,
-        pips:   pipConfigsByProduction.get(id) ?? [],
+        pips:   pipConfigsByProduction.get(id) ?? watcherPips ?? [],
       }));
 
       // On the first connect after (re)activation, Strom's PiP slots start empty
@@ -3028,10 +3355,11 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             const numChannels = typeof rawNumCh === 'number' ? rawNumCh
               : typeof rawNumCh === 'string' ? parseInt(rawNumCh, 10)
               : 0;
-            numAudioChannelsByProduction.set(id, numChannels);
+            if (!watchOnly) numAudioChannelsByProduction.set(id, numChannels);
             // Only initialise registries on first connect for this production.
             // Subsequent connects (refresh, second operator) inherit existing state.
-            const isFirstConnect = !afvChannelsByProduction.has(id);
+            // A watcher never initialises; the first operator connect does.
+            const isFirstConnect = !watchOnly && !afvChannelsByProduction.has(id);
             if (isFirstConnect) {
               afvChannelsByProduction.set(id, new Set());
               mutedElementsByProduction.set(id, new Set());
@@ -3061,26 +3389,30 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
                 }
                 mutedElementsByProduction.set(id, initMuted);
               };
-              await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: initProps })
-                .then((res) => seedMutes(res.rejected ?? {}, res.properties ?? {}))
+              const applied = await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: initProps })
+                .then((res) => { seedMutes(res.rejected ?? {}, res.properties ?? {}); return true; })
                 .catch((err) => {
                   console.warn('[controller] init channel props error:', err);
                   // Keys are independent, so keep what applied; forget a refused fader's
                   // unity level so the restore below reports Strom's value instead.
-                  if (!(err instanceof StromPropertiesRejectedError)) return;
+                  if (!(err instanceof StromPropertiesRejectedError)) return false;
                   for (const key of Object.keys(err.rejected)) {
                     const fader = /^(ch\d+|main)_fader$/.exec(key);
                     if (fader) levelCache.delete(fader[1]);
                   }
                   seedMutes(err.rejected, err.current);
+                  return true;
                 });
+              // Watchers that connected first were shown Strom's pre-reset values.
+              // Skipped when the write failed outright: Strom still holds those values.
+              if (applied) broadcastAudioReset(id, numChannels, mutedElementsByProduction.get(id) ?? new Set<string>());
             }
             // Restore fader levels and mute state.
             // Server-side cache (channelLevelsByProduction) is authoritative — it is updated
             // on every AUDIO_SET volume and survives page refreshes / new tabs within the
             // same server session. Strom block properties are used as a fallback for
             // values set before the server started (e.g. pipeline defaults).
-            const mutedSet = mutedElementsByProduction.get(id) ?? new Set<string>();
+            const mutedSet = mutedElementsByProduction.get(id);
             const levelCache = channelLevelsByProduction.get(id);
             const blockProps = await strom.flows.getBlockProperties(connectDoc.stromFlowId, audioBlockId).catch(() => null);
             for (let i = 1; i <= numChannels; i++) {
@@ -3090,7 +3422,10 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               if (volume !== undefined) {
                 socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'volume', value: volume }));
               }
-              const isMuted = mutedSet.has(`ch${i}`);
+              // No registry yet (only a watcher has connected): report Strom's routing.
+              const isMuted = mutedSet
+                ? mutedSet.has(`ch${i}`)
+                : blockProps?.properties[`ch${i}_to_main`] === false;
               socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'mute', value: isMuted }));
             }
             // Restore main fader level
@@ -3229,7 +3564,12 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               inputEffects: inputEffectsByProduction.get(id) ?? [],
               masterEffect: masterEffectByProduction.get(id) ?? { type: 'none' },
             }));
-            startMeterRelay(id, connectDoc.stromFlowId, audioBlockId, connectDoc.loudnessMainBlockId);
+            // Watchers get meters only while an operator's relay is running. A socket
+            // that closed during the connect sync must not take a ref it never releases.
+            if (!watchOnly && !socketClosed) {
+              startMeterRelay(id, connectDoc.stromFlowId, audioBlockId, connectDoc.loudnessMainBlockId);
+              relayHold(socket).meter = connectDoc.stromFlowId;
+            }
           }
         } catch (err) {
           console.warn('[controller] audio sync error:', err);
@@ -3278,9 +3618,10 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
           }
           // Cold registry: prefer restoring a persisted cue (OQ3) before falling
           // back to Strom's live state. A restored cue is put back into `cued` at
-          // the cue point and MUST NOT auto-play.
+          // the cue point and MUST NOT auto-play. A watcher leaves the re-cue
+          // (a Strom write) to the next operator connect.
           const persistedCue = connectDoc.clipCues?.[mixerInput];
-          if (persistedCue) {
+          if (persistedCue && !watchOnly) {
             try {
               if (!clipStrom) clipStrom = await makeStromClient();
               const source = await resolveClipSource(connectDoc, mixerInput, (sid) => getSourcesDb().get(sid) as Promise<SourceDoc>);
@@ -3317,7 +3658,8 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               ...(player.position_ns !== undefined ? { positionMs: Math.round(player.position_ns / 1e6) } : {}),
               ...(player.duration_ns !== undefined ? { durationMs: Math.round(player.duration_ns / 1e6) } : {}),
             };
-            setClipStateEntry(id, state);
+            // Not cached for a watcher: a warm registry would skip the operator's cue restore.
+            if (!watchOnly) setClipStateEntry(id, state);
             socket.send(JSON.stringify({ type: 'CLIP_STATE', ...state }));
           } catch (err) {
             console.warn(`[controller] clip state connect sync error (${mixerInput}):`, String(err));
@@ -3327,12 +3669,14 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
         // Start the reactive clip-relay for this production's clip player blocks
         // (OQ2). blockToInput is the inverse of clipPlayerBlockIds. Ref-counted:
         // one WS per production, stopped on the last controller disconnect.
-        if (connectDoc.stromFlowId) {
+        // The relay writes the registry, so a watcher does not start it.
+        if (connectDoc.stromFlowId && !watchOnly && !socketClosed) {
           const blockToInput = new Map<string, string>();
           for (const [mixerInput, blockId] of Object.entries(connectDoc.clipPlayerBlockIds)) {
             blockToInput.set(blockId, mixerInput);
           }
           startClipRelay(id, connectDoc.stromFlowId, blockToInput);
+          relayHold(socket).clip = connectDoc.stromFlowId;
         }
       }
 

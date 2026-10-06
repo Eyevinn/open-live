@@ -57,6 +57,48 @@ Guest calling is on by default (issue #391). The signing key is resolved via
   redacted by `log-redact.ts`; `server.ts` also lists `signingSecret` / `*.signingSecret` in the
   Fastify logger redact paths. Never add a route that returns the doc.
 
+## The credential encryption key is backend-generated and stored, not just an env var
+
+On OSC no `SRT_PASSPHRASE_KEY` / `HTML_AUTH_KEY` is provisioned, so storing an SRT passphrase or
+an authenticated-HTML-source credential used to fail closed with a 503 ("Credential storage is
+not configured"). Mirroring the guest signing key (#391), the backend now generates and stores a
+credential key itself (issue #438), via `src/lib/credential-encryption-key.ts`:
+
+- `ensureCredentialEncryptionKey()` runs once at startup (`src/main.ts`, after `connectDb()`). It
+  reads the single fixed-id doc (`CREDENTIAL_ENCRYPTION_KEY_DOC_ID = 'credential-encryption-key'`)
+  or creates it (32-byte AES-256, base64) if absent, decodes it to a Buffer and caches it. A
+  concurrent-create `409` is handled by re-reading the winner's key. It is a **no-op that returns
+  `null`** when `SRT_PASSPHRASE_KEY` is set — that env var is the shared base key both the SRT and
+  HTML crypto already resolve to, so a stored key is unnecessary and the DB is never touched (keeps
+  self-hosted deployments unchanged).
+- The crypto modules consume it as a *fallback*, not a replacement for the env override. In
+  `srt-passphrase-crypto.ts`, `loadKey()` falls back to a stored key only for a `KeySource` with
+  `allowStoredKeyFallback: true`. The fallback key comes from `source.storedKeyProvider` when the
+  source sets one, otherwise from the shared `getStoredCredentialKey()`. `SRT_PASSPHRASE_KEY_SOURCE`
+  sets `allowStoredKeyFallback: true` with no provider, so it uses the shared credential key.
+  `html-auth-crypto.ts` `loadHtmlAuthKey()` falls back to the same shared stored key when neither
+  `HTML_AUTH_KEY` nor `SRT_PASSPHRASE_KEY` is set.
+- **RTMP has its OWN dedicated stored key — it never reuses the shared credential key** (issue
+  #447, ADR-004 Resolved Decision 2, which requires a dedicated `RTMP_CREDENTIALS_KEY` with no
+  reuse of the SRT key). `RTMP_CREDENTIALS_KEY_SOURCE` sets `allowStoredKeyFallback: true` with
+  `storedKeyProvider: getStoredRtmpCredentialKey` (`src/lib/rtmp-credential-key.ts`), a parallel
+  module that generates/stores a SEPARATE key under its OWN doc id
+  (`RTMP_CREDENTIAL_KEY_DOC_ID = 'rtmp-credentials-key'`, distinct from
+  `CREDENTIAL_ENCRYPTION_KEY_DOC_ID`). `ensureRtmpCredentialKey()` runs at startup right after
+  `ensureCredentialEncryptionKey()` and no-ops when `RTMP_CREDENTIALS_KEY` (env) is set. The two key
+  families never cross: SRT/HTML fall back to the credential key, RTMP falls back to the RTMP key.
+- Resolution order per kind: env override wins, then that kind's stored key, then fail-closed-in-prod /
+  loud-plaintext-in-dev as before. Env overrides always win, so self-hosted setups are unchanged.
+- The stored keys live in `CredentialEncryptionKeyDoc.encryptionSecret` and
+  `RtmpCredentialKeyDoc.encryptionSecret`. The `secret` substring makes them redacted by
+  `log-redact.ts`; `server.ts` also lists `encryptionSecret` / `*.encryptionSecret` in the Fastify
+  logger redact paths (the field name is shared, so both docs are covered). Never add a route that
+  returns either doc.
+- `credential-encryption-key.ts` / `rtmp-credential-key.ts` import `db/index.ts` (→ `config.ts`) —
+  the same intentional ESM cycle as `guest-signing-key.ts`; it is safe only because no binding is
+  used at module-eval time. `getStoredCredentialKey()` / `getStoredRtmpCredentialKey()` are
+  synchronous so the crypto hot path stays synchronous.
+
 ## A new `/api/v1/guests/:inviteId/...` route needs the `isGuestTokenAuthedPath` allowlist
 
 Guest-facing routes authenticate with the per-invite HMAC token *inside the handler*
@@ -85,3 +127,49 @@ branch for it (RTMP is an outbound connect, not a listener). The stream key is d
 composed into `rtmp_url` **only** in the flow generator at activation time, never persisted
 composed, and only ever logged through `safeFlowProjection()` (which strips all block
 properties).
+
+## A rejected Strom `/transition` must roll back the whole switch, not just the PiP announce
+
+In `ws/controller.ts`, CUT/TRANSITION/TAKE (interactive and macro) mutate the tally, the PiP
+maps (`pgmPip`/`pvwPip`/`pvwBeforePip`/`pgmBg`) and the persisted doc, and broadcast `TALLY`,
+**before** awaiting Strom's `/transition`. #355/#370 only deferred the *PIP_STATE displacement
+broadcast + preview restore* until the transition succeeded — the tally, the map mutations and
+the persisted doc were still left on the new value when Strom rejected the cut, so clients kept
+showing the new source while Strom aired the old one (#430). Any new switch path must snapshot
+state before mutating (`snapshotSwitchState`) and, on a `false` from `stromTransition` (or a
+caught Strom error in the TAKE PiP branches), call `restoreSwitchState` to roll back tally + the
+four PiP maps + the persisted doc and re-broadcast `TALLY`/`PIP_STATE`, then notify the operator
+(`notifySwitchRejected` — NACK with a cmdId, else ERROR; macro paths `throw` so the loop reports
+`MACRO_ERROR`). Never ACK `executed` on a rejected switch.
+
+## Every flow-teardown path must force-stop the meter/clip relays with the dying flow id
+
+`runActivationFlow` persists `stromFlowId` on the doc while status is still `activating`, and a
+controller connecting in that window starts the meter and clip relays on that flow (the connect
+path keys only off `connectDoc.stromFlowId`). The relays are ref-counted and only rebind off a
+flow that was *recorded as retired* (`forceStop{Meter,Clip}Relay(id, flowId)`, #433) — a plain
+`stop`/new `start` on a live flow just ref-counts. So **any** path that tears a flow down must call
+both `forceStopMeterRelay`/`forceStopClipRelay` with that flow id, exactly like `deactivate`:
+otherwise the relays stay bound to the dead flow and the next activation only ref-counts the stale
+relay, starving every client of METER_DATA / LOUDNESS_DATA / reactive CLIP_STATE until all
+controllers disconnect. This bit the activation-failure and abort paths in `runActivationFlow`
+(#435), which tore down the flow + reset the doc but never touched the relays. The paths are now
+covered by `forceStopRelaysForDyingFlow()` (a local closure over the run's `stromFlowId`), invoked
+from the catch failure path and every `signal.aborted` early-return. Idle auto-deactivate has the
+same obligation (`idle-watchdog.ts`). `forceStop*` is idempotent and a no-op when no relay exists,
+so calling it defensively on abort (where `deactivate` also stops them) is safe.
+
+## The controller WS reads `?mode` by exact key — confusable keys must be rejected, not ignored
+
+The controller WebSocket route (`src/ws/controller.ts`, `controllerWs`) decides watch-only vs
+operator from `req.query.mode`. Fastify's default querystring parser (node `querystring`) does
+**no** case-folding or bracket-array expansion, so `?Mode=watch` parses to the key `Mode` and
+`?mode[]=watch` to the literal key `mode[]` — neither populates `req.query.mode`. Left alone, a
+passive client (e.g. a tally logger) that typo'd the key silently opens as an **operator** and
+runs the first-connect audio-mixer reset (#424). The route therefore rejects any query key that
+is confusable with `mode` — a case variant or array-bracket form, matched by
+`/^mode(\[.*\])?$/i` with the exact `mode` key excluded — with an `ERROR` frame + WS close 1008,
+*before* the unknown-value check. Deliberately **not** `additionalProperties:false`: genuinely
+unrelated params (cache-busters, etc.) must still work, so only `mode`-confusable keys are
+rejected. An exact `mode` key keeps its existing value check (`watch` → watch-only, anything
+else → ERROR + 1008).
