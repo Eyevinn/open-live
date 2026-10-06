@@ -5,6 +5,7 @@ import { loadAudioChannels } from '../lib/audio-channels.js';
 import { StromClient } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
+import { broadcast } from '../services/tally.service.js';
 
 const AudioPatch = z.object({
   property: z.enum(['volume', 'mute']),
@@ -161,6 +162,17 @@ const audioRoutes: FastifyPluginAsync = async (fastify) => {
           strom.properties.updateElement(doc.stromFlowId, elemId, { property_name: property, value: body.value }),
           5000,
         );
+        // The write reached Strom: tell every connected controller client what was
+        // applied, in the same AUDIO_STATE shape the WS mixer path uses, so a REST
+        // fader/mute change no longer leaves live UIs stale. Additive `applied: true`
+        // marks it as a confirmed-at-Strom value; clients that ignore the flag still work.
+        broadcast(req.params.id, {
+          type: 'AUDIO_STATE',
+          elementId: req.params.elementId,
+          property: body.property,
+          value: body.value,
+          applied: true,
+        });
         return reply.send({ element_id: req.params.elementId, properties: { [body.property]: body.value } });
       } catch (err) {
         const e = err as { statusCode?: number };

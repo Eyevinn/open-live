@@ -173,3 +173,22 @@ is confusable with `mode` — a case variant or array-bracket form, matched by
 unrelated params (cache-busters, etc.) must still work, so only `mode`-confusable keys are
 rejected. An exact `mode` key keeps its existing value check (`watch` → watch-only, anything
 else → ERROR + 1008).
+
+## Audio mix changes are broadcast twice: optimistic move, then `applied: true` after Strom
+
+The audio paths in `src/ws/controller.ts` (`AUDIO_SET` volume, `AUX_SEND_SET`, `AUX_MASTER_SET`,
+`GRP_SEND_SET`, `GRP_MASTER_SET`, `MONITOR_SET`, `SOURCE_OFFSET_SET`) **debounce** the Strom write
+(~150 ms) but broadcast the operator's move immediately for UI responsiveness. So during a drag
+every step is broadcast, while Strom only ever receives the final value when the fader stops
+(#453). The convention (issue #453): once the debounced write to Strom *succeeds*, re-broadcast the
+value that was written in the same `*_STATE` shape, with an added **`applied: true`** flag, so all
+clients converge on what actually reached Strom. The flag is additive — clients that ignore it keep
+working. Any new debounced audio path must emit the same confirmation on success. Do **not** emit
+`applied: true` on failure/refusal: refusal handling is tracked separately (#394), and the existing
+`StromPropertiesRejectedError` branch in the volume path broadcasts Strom's *actual* level
+(without `applied`), which must stay untouched. The REST route
+`PATCH /api/v1/productions/:id/audio/:elementId` (`src/routes/audio.ts`) is **not** debounced but
+previously broadcast nothing; it now emits the same `AUDIO_STATE { ..., applied: true }` after its
+write so a REST mix change no longer leaves live WS clients stale. `broadcast()`
+(`src/services/tally.service.ts`) takes `message: unknown`, so there is no outgoing-message union
+to extend — the extra field is accepted as-is.
