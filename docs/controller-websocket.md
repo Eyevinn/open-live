@@ -198,7 +198,7 @@ are emitted from `src/ws/controller.ts` and `src/services/meter-relay.ts`:
 | `DSK_STATE` | `layer: number`, `visible: boolean` | A DSK layer toggles; also replayed on connect |
 | `MACRO_EXECUTED` | `macroId: string` | A macro completed successfully |
 | `MACRO_ERROR` | `macroId: string`, `failedActionIndex: number`, `error: string` | A macro action failed (sent to originating socket) |
-| `AUDIO_STATE` | `elementId: string`, `property: 'volume' \| 'mute'`, `value: unknown` | A channel/main fader or mute changes; also replayed on connect |
+| `AUDIO_STATE` | `elementId: string`, `property: 'volume' \| 'mute'`, `value: unknown` | A channel/main fader or mute changes; also replayed on connect; also broadcast for each audio-follow-video channel whose `chN_to_main` is switched at a cut (`property: 'mute'`, `value` = !routed, as reported by Strom) |
 | `AFV_STATE` | `mixerInput: string`, `enabled: boolean` | AFV toggled for an input; also replayed on connect |
 | `AFV_RAMP_STATE` | `rampUpMs: number`, `rampDownMs: number` | AFV ramp times change; also sent on connect |
 | `PFL_STATE` | `elementId: string`, `enabled: boolean` | PFL state changes; also replayed on connect |
