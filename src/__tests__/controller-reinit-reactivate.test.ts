@@ -50,6 +50,8 @@ vi.mock('ws', () => {
 
 // --- Throwaway Strom: serves the running flow, counts init PATCHes ---
 let numChannels = 2;
+// Properties the init PATCH refuses, with the current value Strom reports for each.
+let patchRejected: Record<string, { reason: string; current: unknown }> = {};
 const propertyPatches: Array<Record<string, unknown>> = [];
 const stromServer: Server = createServer((req, res) => {
   const chunks: Buffer[] = [];
@@ -64,7 +66,13 @@ const stromServer: Server = createServer((req, res) => {
     if (req.method === 'PATCH' && url.endsWith('/properties')) {
       const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {};
       propertyPatches.push(body.properties ?? {});
-      res.end(JSON.stringify({ block_id: 'audio-mixer-1', properties: body.properties ?? {}, rejected: {} }));
+      const properties: Record<string, unknown> = { ...(body.properties ?? {}) };
+      const rejected: Record<string, string> = {};
+      for (const [key, { reason, current }] of Object.entries(patchRejected)) {
+        properties[key] = current;
+        rejected[key] = reason;
+      }
+      res.end(JSON.stringify({ block_id: 'audio-mixer-1', properties, rejected }));
       return;
     }
     res.end(JSON.stringify({ success: true }));
@@ -90,6 +98,7 @@ function activeDoc(): Record<string, unknown> {
 
 beforeEach(() => {
   propertyPatches.length = 0;
+  patchRejected = {};
   clearAudioState(PROD); // simulate deactivate having wiped the registries
   productionDocs.clear();
   productionDocs.set(PROD, activeDoc());
@@ -112,6 +121,26 @@ describe('reinitConnectedControllers', () => {
       expect(audio).toContainEqual(expect.objectContaining({ type: 'AUDIO_STATE', elementId: 'ch1', property: 'mute', value: false }));
       expect(audio).toContainEqual(expect.objectContaining({ type: 'AUDIO_STATE', elementId: 'main', property: 'volume', value: 1.0 }));
       expect(sock.sent.some((m) => m.type === 'GRP_STATE_RESET')).toBe(true);
+    } finally {
+      unsubscribe(PROD, sock as never);
+    }
+  });
+
+  it('reports a channel Strom refused to route to main as muted, and skips a refused fader', async () => {
+    patchRejected = {
+      ch1_to_main: { reason: 'guarded', current: false },
+      ch2_fader: { reason: 'out of range', current: 0.4 },
+    };
+    const sock = makeSocket();
+    subscribe(PROD, sock as never);
+    try {
+      await reinitConnectedControllers(PROD);
+
+      const audio = sock.sent.filter((m) => m.type === 'AUDIO_STATE');
+      expect(audio).toContainEqual(expect.objectContaining({ elementId: 'ch1', property: 'mute', value: true }));
+      expect(audio).toContainEqual(expect.objectContaining({ elementId: 'ch2', property: 'mute', value: false }));
+      expect(audio).not.toContainEqual(expect.objectContaining({ elementId: 'ch2', property: 'volume' }));
+      expect(audio).toContainEqual(expect.objectContaining({ elementId: 'ch1', property: 'volume', value: 1.0 }));
     } finally {
       unsubscribe(PROD, sock as never);
     }
