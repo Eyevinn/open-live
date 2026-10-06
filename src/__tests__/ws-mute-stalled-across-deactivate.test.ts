@@ -81,6 +81,8 @@ const AUDIO_BLOCK = 'b-audio-mixer-0';
 let heldMuteRes: ServerResponse | null = null;
 let heldMuteProps: Record<string, unknown> | null = null;
 let onMutePatchReceived: (() => void) | null = null;
+// When set, a mute PATCH that is not held is refused: Strom keeps ch1 on program.
+let refuseUnheldMute = false;
 
 function isMutePatch(props: Record<string, unknown>): boolean {
   // The mute PATCH routes a single channel (`ch1_to_main`) and carries no fader
@@ -110,15 +112,23 @@ const stromServer: Server = createServer((req, res) => {
     }
     if (req.method === 'PATCH' && url === `/api/flows/${FLOW}/blocks/${AUDIO_BLOCK}/properties`) {
       const props = (body?.['properties'] as Record<string, unknown>) ?? {};
-      if (isMutePatch(props)) {
-        // Stall: hold the response open. The test releases it only after a
-        // deactivate + reactivate has replaced the mute registry.
+      if (isMutePatch(props) && heldMuteRes === null) {
+        // Stall: hold the first mute's response open. The test releases it only
+        // after a deactivate + reactivate has replaced the mute registry.
         heldMuteRes = res;
         heldMuteProps = props;
         onMutePatchReceived?.();
         return;
       }
       res.writeHead(200, { 'content-type': 'application/json' });
+      if (isMutePatch(props) && refuseUnheldMute) {
+        res.end(JSON.stringify({
+          block_id: AUDIO_BLOCK,
+          properties: { ...props, ch1_to_main: true },
+          rejected: { ch1_to_main: 'guarded' },
+        }));
+        return;
+      }
       res.end(JSON.stringify({ block_id: AUDIO_BLOCK, properties: { ...props }, rejected: {} }));
       return;
     }
@@ -215,6 +225,7 @@ afterEach(async () => {
   heldMuteRes = null;
   heldMuteProps = null;
   onMutePatchReceived = null;
+  refuseUnheldMute = false;
   await app.close();
 });
 
@@ -266,5 +277,42 @@ describe('WS mute stalled across deactivate + reactivate (#402)', () => {
     s1.close();
     s2.close();
     s3.close();
+  });
+
+  it('settles a write made after reactivation on its own, not as overlapping a write from before', async () => {
+    productionDocs.clear();
+    sourceDocs.clear();
+    productionDocs.set(PROD, makeProductionDoc());
+    app = await buildServer();
+    await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const s1 = await openSocket(PROD);
+    await s1.waitFor(isSnapshotEnd);
+    const mutePatchReceived = new Promise<void>((resolve) => { onMutePatchReceived = resolve; });
+    s1.ws.send(JSON.stringify({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true }));
+    await mutePatchReceived;
+
+    clearAudioState(PROD);
+    const s2 = await openSocket(PROD);
+    await s2.waitFor(isSnapshotEnd);
+
+    // A mute from the new session that Strom refuses settles from Strom's reply
+    // straight away. Had it been counted as overlapping the held write from
+    // before the deactivate, it would wait for that write and the sender's
+    // toggle would stay on.
+    refuseUnheldMute = true;
+    const sentAt = s2.messages.length;
+    const afterSend = (m: Record<string, unknown>) => s2.messages.indexOf(m) >= sentAt;
+    s2.ws.send(JSON.stringify({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true, cmdId: 'c2' }));
+    await s2.waitFor((m) => m['type'] === 'NACK');
+    const resync = await s2.waitFor((m) => afterSend(m) && ch1Mute(m) && m['value'] === false);
+    expect(resync).toMatchObject({ value: false });
+
+    heldMuteRes!.writeHead(200, { 'content-type': 'application/json' });
+    heldMuteRes!.end(JSON.stringify({ block_id: AUDIO_BLOCK, properties: { ...heldMuteProps }, rejected: {} }));
+    await s1.waitFor((m) => ch1Mute(m) && m['value'] === true);
+
+    s1.close();
+    s2.close();
   });
 });
