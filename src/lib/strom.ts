@@ -735,19 +735,43 @@ export class StromClientError extends Error {
   }
 }
 
+/**
+ * Strom answers a block-properties PATCH with 200 even when it could not apply
+ * some of the properties: it lists them under `rejected` with a reason each
+ * (unknown name, not live, transform mismatch, failed pipeline write) and
+ * applies the rest. `updateBlockProperties` turns a refused key into this error
+ * so callers' error paths run. Keys not listed in `rejected` were applied;
+ * `current` is Strom's view of the block's values after the writes.
+ */
+export class StromPropertiesRejectedError extends Error {
+  constructor(
+    public readonly blockId: string,
+    public readonly rejected: Record<string, string>,
+    public readonly current: Record<string, unknown>,
+  ) {
+    const detail = Object.entries(rejected).map(([k, reason]) => `${k} (${reason})`).join(', ')
+    super(`Strom refused block ${blockId} properties: ${detail}`)
+    this.name = 'StromPropertiesRejectedError'
+  }
+}
+
 export interface StromClientOptions {
   baseUrl: string
   /** Optional Bearer token — API key or SAT for OSC-hosted instances */
   token?: string
+  /** How long a block-properties read may wait for Strom's answer (default 5000 ms). Writes have no limit. */
+  blockPropertiesReadTimeoutMs?: number
 }
 
 export class StromClient {
   private readonly baseUrl: string
   private token: string | undefined
+  private readonly blockPropertiesReadTimeoutMs: number
 
   constructor(options: StromClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, '')
     this.token = options.token
+    this.blockPropertiesReadTimeoutMs = options.blockPropertiesReadTimeoutMs ?? 5000
   }
 
   private headers(): Record<string, string> {
@@ -756,7 +780,7 @@ export class StromClient {
     return h
   }
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async request<T>(method: string, path: string, body?: unknown, timeoutMs?: number): Promise<T> {
     const url = `${this.baseUrl}${path}`
     // Retry once on UND_ERR_SOCKET: undici doesn't auto-retry unsafe methods (PATCH/POST)
     // when a pooled connection was closed by the server. The stale connection is evicted on
@@ -774,6 +798,7 @@ export class StromClient {
             // always receives a JSON number with a fractional part.
             ? JSON.stringify(body).replace(/"value":(-?\d+)([,}])/g, '"value":$1.0$2')
             : undefined,
+          ...(timeoutMs !== undefined && { signal: AbortSignal.timeout(timeoutMs) }),
         })
         break
       } catch (err) {
@@ -783,6 +808,9 @@ export class StromClient {
           // first failure, so the immediate retry opens a fresh TCP connection — no
           // sleep needed (sleeping gave Strom time to close the fresh socket too).
           continue
+        }
+        if (e.name === 'TimeoutError') {
+          throw new StromClientError(0, `Strom did not answer within ${timeoutMs} ms — ${method} ${url}`)
         }
         const cause = e.cause ? ` [cause: ${e.cause.message ?? String(e.cause)}${e.cause.code ? ` code=${e.cause.code}` : ''}]` : ''
         throw new StromClientError(0, `Strom unreachable: ${e.message}${cause} — ${method} ${url}`)
@@ -922,9 +950,21 @@ export class StromClient {
       return `${this.baseUrl}/api/flows/${id}/blocks/${blockId}/thumbnail${q}`
     },
     getBlockProperties: (flowId: string, blockId: string) =>
-      this.get<BlockPropertiesResponse>(`/api/flows/${flowId}/blocks/${blockId}/properties`),
-    updateBlockProperties: (flowId: string, blockId: string, body: UpdateBlockPropertiesRequest) =>
-      this.patch<BlockPropertiesResponse>(`/api/flows/${flowId}/blocks/${blockId}/properties`, body),
+      this.request<BlockPropertiesResponse>(
+        'GET', `/api/flows/${flowId}/blocks/${blockId}/properties`, undefined, this.blockPropertiesReadTimeoutMs),
+    /** Throws {@link StromPropertiesRejectedError} when Strom refuses any written key. */
+    updateBlockProperties: async (flowId: string, blockId: string, body: UpdateBlockPropertiesRequest) => {
+      // No time limit: a write Strom has not answered may still land, and only
+      // its reply says how it ended. A stalled write waits on fetch's own
+      // timeouts (minutes), the same as every other Strom request.
+      const res = await this.request<BlockPropertiesResponse>(
+        'PATCH', `/api/flows/${flowId}/blocks/${blockId}/properties`, body)
+      const refused = Object.entries(res?.rejected ?? {}).filter(([key]) => Object.hasOwn(body.properties, key))
+      if (refused.length > 0) {
+        throw new StromPropertiesRejectedError(blockId, Object.fromEntries(refused), res.properties ?? {})
+      }
+      return res
+    },
   }
 
   // -------------------------------------------------------------------------
