@@ -141,3 +141,101 @@ describe('activateStromFlow — guest-slot multiview labels (#458)', () => {
     expect(props['input_1_label']).toBe('WHIP Input');
   });
 });
+
+/**
+ * Regression tests for issue #436 — "Guest picture never reaches the mixer".
+ *
+ * Guest slots are allocated from the top of the input range down (video_in_5,
+ * video_in_4, …) while the live source count is usually small. Sizing the vision
+ * mixer's `num_inputs` by the source COUNT alone left the guest's high-index pad
+ * (e.g. video_in_5) uncreated — the mixer only has pads video_in_0 …
+ * video_in_{num_inputs-1}. The whip_input → offset → mixer:video_in_5 link then
+ * targeted a pad the mixer never had, so the guest's decoded picture dead-ended
+ * and the slot tile stayed black even though WHIP negotiated (201). num_inputs
+ * must be sized by the HIGHEST assigned pad index.
+ */
+describe('activateStromFlow — vision mixer num_inputs covers the highest pad index (#436)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sourceDocs.clear();
+  });
+
+  /** The numeric pad index every link into the vision mixer's video_in_N pads targets. */
+  function mixerVideoInLinkIndices(flow: Record<string, unknown>): number[] {
+    const blocks = flow['blocks'] as Array<Record<string, unknown>>;
+    const mixerId = blocks.find((b) => b['block_definition_id'] === 'builtin.vision_mixer')!['id'] as string;
+    const links = flow['links'] as Array<Record<string, unknown>>;
+    return links
+      .map((l) => {
+        const m = new RegExp(`^${mixerId}:video_in_(\\d+)$`).exec((l['to'] as string | undefined) ?? '');
+        return m ? parseInt(m[1], 10) : null;
+      })
+      .filter((n): n is number => n !== null);
+  }
+
+  it('sizes num_inputs for a sparse guest slot at video_in_5 (2 sources, count would under-provision)', async () => {
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    const strom = makeStromClient();
+    const production = makeProduction([
+      { sourceId: '__test1__', mixerInput: 'video_in_0' },
+      { sourceId: 'Whip', mixerInput: 'video_in_5', returnFeed: { synced: 'program-minus' } },
+    ]);
+
+    await activateStromFlow(production as never, strom as never);
+
+    const props = visionMixerProps(strom.capturedFlows[0]!);
+    // Before the fix this was "2" (pads video_in_0/video_in_1 only), so the
+    // offset → mixer:video_in_5 link had no pad to connect to.
+    const numInputs = parseInt(props['num_inputs'] as string, 10);
+    expect(numInputs).toBeGreaterThanOrEqual(6);
+
+    // Every generated link into the mixer must target a pad that now exists
+    // (pads are video_in_0 … video_in_{num_inputs-1}).
+    for (const idx of mixerVideoInLinkIndices(strom.capturedFlows[0]!)) {
+      expect(idx).toBeLessThan(numInputs);
+    }
+  });
+
+  it('covers the highest pad index with cameras at 0/1 and guests at 4/5', async () => {
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    const strom = makeStromClient();
+    sourceDocs.set('src-a', { _id: 'src-a', type: 'source', name: 'Cam A', streamType: 'srt', address: 'srt://:5000?mode=listener' });
+    sourceDocs.set('src-b', { _id: 'src-b', type: 'source', name: 'Cam B', streamType: 'srt', address: 'srt://:5001?mode=listener' });
+    const production = makeProduction([
+      { sourceId: 'src-a', mixerInput: 'video_in_0' },
+      { sourceId: 'src-b', mixerInput: 'video_in_1' },
+      { sourceId: 'Whip', mixerInput: 'video_in_4', returnFeed: { synced: 'program-minus' } },
+      { sourceId: 'Whip', mixerInput: 'video_in_5', returnFeed: { synced: 'program-minus' } },
+    ]);
+
+    await activateStromFlow(production as never, strom as never);
+
+    const props = visionMixerProps(strom.capturedFlows[0]!);
+    const numInputs = parseInt(props['num_inputs'] as string, 10);
+    // 4 sources would give num_inputs=4 (pads 0..3) — missing video_in_4/5.
+    expect(numInputs).toBeGreaterThanOrEqual(6);
+    for (const idx of mixerVideoInLinkIndices(strom.capturedFlows[0]!)) {
+      expect(idx).toBeLessThan(numInputs);
+    }
+  });
+
+  it('still produces an even, enum-valid num_inputs within the 2..16 range for contiguous sources', async () => {
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    const strom = makeStromClient();
+    const production = makeProduction([
+      { sourceId: '__test1__', mixerInput: 'video_in_0' },
+      { sourceId: '__test2__', mixerInput: 'video_in_1' },
+      { sourceId: 'Whip', mixerInput: 'video_in_2', returnFeed: { synced: 'program-minus' } },
+    ]);
+
+    await activateStromFlow(production as never, strom as never);
+
+    const props = visionMixerProps(strom.capturedFlows[0]!);
+    const numInputs = parseInt(props['num_inputs'] as string, 10);
+    // 3 sources at video_in_0..2 need pads 0..2 → rounded up to the even 4.
+    expect(numInputs).toBe(4);
+    for (const idx of mixerVideoInLinkIndices(strom.capturedFlows[0]!)) {
+      expect(idx).toBeLessThan(numInputs);
+    }
+  });
+});
