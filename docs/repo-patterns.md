@@ -159,6 +159,25 @@ from the catch failure path and every `signal.aborted` early-return. Idle auto-d
 same obligation (`idle-watchdog.ts`). `forceStop*` is idempotent and a no-op when no relay exists,
 so calling it defensively on abort (where `deactivate` also stops them) is safe.
 
+## A guest slot's multiview label must be set to `Guest N` at flow build — the source name is not enough
+
+A guest slot is a source assignment carrying a `returnFeed` (same definition as
+`guestSlotAssignment` in `routes/guests.ts` and `assignReturnBuses`). Its WHIP source is the
+virtual `Whip` (`audio-channels.ts`, name `WHIP Input`) or a nameless WHIP input, so the
+vision-mixer `input_${padIndex}_label` loop in `flow-generator.ts` — which otherwise writes the
+source name — would either emit the generic `WHIP Input` or leave the label unset, and Strom's
+`parse_input_labels` then falls back to its default `In N+1`. Either way the multiviewer disagrees
+with the Studio controller, which labels the same slots `Guest 1`/`Guest 2` (open-live-studio#171,
+issue #458). So for a WHIP guest slot the generator now emits a `Guest N` label that takes
+**precedence** over the generic source name. The numbering must match the controller exactly:
+`returnFeed` assignments ordered by **trailing pad index DESCENDING** (Studio allocates guest
+slots from the top of the mixer-input range down — `video_in_15` is Guest 1 — see
+`guestSlotMixerInput`/`guestSlotIndex` in open-live-studio), numbered `1..N`. Note this is NOT the
+ascending `mixerInput.localeCompare` order the audio-channel / return-bus numbering uses, so do not
+reuse `returnBuses` order for the label. The label is a non-live creation-time property; updating
+it to the joined guest's invite label live is a separate stretch goal (needs Strom live-label
+support).
+
 ## The controller WS reads `?mode` by exact key — confusable keys must be rejected, not ignored
 
 The controller WebSocket route (`src/ws/controller.ts`, `controllerWs`) decides watch-only vs
@@ -173,3 +192,22 @@ is confusable with `mode` — a case variant or array-bracket form, matched by
 unrelated params (cache-busters, etc.) must still work, so only `mode`-confusable keys are
 rejected. An exact `mode` key keeps its existing value check (`watch` → watch-only, anything
 else → ERROR + 1008).
+
+## Audio mix changes are broadcast twice: optimistic move, then `applied: true` after Strom
+
+The audio paths in `src/ws/controller.ts` (`AUDIO_SET` volume, `AUX_SEND_SET`, `AUX_MASTER_SET`,
+`GRP_SEND_SET`, `GRP_MASTER_SET`, `MONITOR_SET`, `SOURCE_OFFSET_SET`) **debounce** the Strom write
+(~150 ms) but broadcast the operator's move immediately for UI responsiveness. So during a drag
+every step is broadcast, while Strom only ever receives the final value when the fader stops
+(#453). The convention (issue #453): once the debounced write to Strom *succeeds*, re-broadcast the
+value that was written in the same `*_STATE` shape, with an added **`applied: true`** flag, so all
+clients converge on what actually reached Strom. The flag is additive — clients that ignore it keep
+working. Any new debounced audio path must emit the same confirmation on success. Do **not** emit
+`applied: true` on failure/refusal: refusal handling is tracked separately (#394), and the existing
+`StromPropertiesRejectedError` branch in the volume path broadcasts Strom's *actual* level
+(without `applied`), which must stay untouched. The REST route
+`PATCH /api/v1/productions/:id/audio/:elementId` (`src/routes/audio.ts`) is **not** debounced but
+previously broadcast nothing; it now emits the same `AUDIO_STATE { ..., applied: true }` after its
+write so a REST mix change no longer leaves live WS clients stale. `broadcast()`
+(`src/services/tally.service.ts`) takes `message: unknown`, so there is no outgoing-message union
+to extend — the extra field is accepted as-is.
