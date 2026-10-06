@@ -5,6 +5,18 @@ import type { Tally } from '../db/types.js';
 const tallyState = new Map<string, Tally>();
 const subscribers = new Map<string, Set<WebSocket>>();
 
+// Sockets currently receiving their connect-time snapshot (HELLO … SNAPSHOT_END).
+// A socket is subscribed to broadcasts *before* its snapshot is built, so live
+// broadcasts can race the point-to-point snapshot frames and arrive interleaved
+// and indistinguishable from them (#456). While a socket is "snapshotting",
+// broadcast() buffers its copies here instead of sending them; endSnapshot()
+// flushes the buffer in order right before SNAPSHOT_END, so the client sees the
+// full snapshot first, then any broadcasts that landed during it (all with
+// seq <= snapshotEnd.seq), then resumes live events with seq > snapshotEnd.seq.
+// Buffering (rather than tagging each frame) also means a newer live broadcast
+// can never be overwritten by a staler snapshot frame emitted after it.
+const snapshotBuffers = new Map<WebSocket, string[]>();
+
 /**
  * Per-production monotonically increasing sequence counter (#169).
  * Incremented by `nextSeq()` before every outbound state event.
@@ -57,6 +69,32 @@ export function subscribe(productionId: string, ws: WebSocket, opts: { watchOnly
 
 export function unsubscribe(productionId: string, ws: WebSocket): void {
   subscribers.get(productionId)?.delete(ws);
+  // Drop any snapshot buffer so a socket that closes mid-snapshot (before
+  // endSnapshot runs) does not leak its queued broadcasts.
+  snapshotBuffers.delete(ws);
+}
+
+/**
+ * Begin buffering broadcasts for a socket while its connect-time snapshot is
+ * built (#456). Must be called immediately after `subscribe()` and before any
+ * broadcast can be triggered, so no live broadcast slips through unbuffered.
+ */
+export function beginSnapshot(ws: WebSocket): void {
+  snapshotBuffers.set(ws, []);
+}
+
+/**
+ * Stop buffering for a socket and flush the broadcasts that arrived during its
+ * snapshot, in arrival order, right before SNAPSHOT_END. Idempotent and safe to
+ * call on a socket that was never buffering or has since closed. Must be the
+ * last thing before the SNAPSHOT_END send, with no `await` in between, so a
+ * later broadcast cannot land ahead of SNAPSHOT_END.
+ */
+export function endSnapshot(ws: WebSocket): void {
+  const buffered = snapshotBuffers.get(ws);
+  snapshotBuffers.delete(ws);
+  if (!buffered || ws.readyState !== ws.OPEN) return;
+  for (const payload of buffered) ws.send(payload);
 }
 
 /** Operator (non-watch-only) sockets for a production. */
@@ -98,8 +136,11 @@ export function broadcast(productionId: string, message: unknown): void {
     : message;
   const payload = JSON.stringify(stamped);
   for (const ws of subs) {
-    if (ws.readyState === ws.OPEN) {
-      ws.send(payload);
-    }
+    if (ws.readyState !== ws.OPEN) continue;
+    // A socket still receiving its connect snapshot buffers the broadcast; it is
+    // flushed (in order) by endSnapshot() just before SNAPSHOT_END (#456).
+    const buffer = snapshotBuffers.get(ws);
+    if (buffer) buffer.push(payload);
+    else ws.send(payload);
   }
 }
