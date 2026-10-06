@@ -1317,8 +1317,23 @@ async function applyAudioFollow(
     toMainChanges,
   ));
   if (Object.keys(properties).length > 0) {
-    await strom.flows.updateBlockProperties(stromFlowId, audioBlockId, { properties, ramp_ms_overrides })
-      .catch((err) => console.warn('[controller] audio follow error:', String(err)));
+    const result = await strom.flows.updateBlockProperties(stromFlowId, audioBlockId, { properties, ramp_ms_overrides })
+      .catch((err) => { console.warn('[controller] audio follow error:', String(err)); return null; });
+    // Tell clients what actually reached Strom, in the same AUDIO_STATE mute shape
+    // as AFV_SET / manual mute (mute = !chN_to_main), instead of leaving them to
+    // infer the mix from AFV_STATE + TALLY (#452). Skipped when the write failed;
+    // a channel Strom refused is reported at the value it kept (as in #396), and
+    // omitted if Strom gave no value back for it.
+    if (result) {
+      for (const [channel, routed] of toMainChanges) {
+        const key = `ch${channel + 1}_to_main`;
+        const reported = result.properties?.[key];
+        const rejected = Object.prototype.hasOwnProperty.call(result.rejected ?? {}, key);
+        const actual = typeof reported === 'boolean' ? reported : rejected ? null : routed;
+        if (actual === null) continue;
+        broadcast(productionId, { type: 'AUDIO_STATE', elementId: `ch${channel + 1}`, property: 'mute', value: !actual });
+      }
+    }
   }
 }
 

@@ -90,7 +90,7 @@ const { activateStromFlow } = await import('../lib/flow-generator.js');
 const { StromClient } = await import('../lib/strom.js');
 const { default: audioRoutes } = await import('../routes/audio.js');
 const { handleMessage } = await import('../ws/controller.js');
-const { setTally } = await import('../services/tally.service.js');
+const { setTally, broadcast } = await import('../services/tally.service.js');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -213,6 +213,27 @@ describe('audio channel numbering with test pattern sources', () => {
     expect(routing[0]!.body['properties']).toEqual({
       [`ch${channelByMixerInput['video_in_2']}_to_main`]: true,
       [`ch${channelByMixerInput['video_in_4']}_to_main`]: false,
+    });
+  });
+  it('CUT broadcasts the AFV channel switches as AUDIO_STATE mute (#452)', async () => {
+    const { audioMixerId, channelByMixerInput } = await generate(MIXED);
+    setTally(PROD, { pgm: 'video_in_4', pvw: 'video_in_2' });
+
+    const ws = { send: vi.fn() } as unknown as import('@fastify/websocket').WebSocket;
+    const ctx = { audioBlockId: audioMixerId };
+    await handleMessage(PROD, ws, JSON.stringify({ type: 'AFV_SET', mixerInput: 'video_in_2', enabled: true }), ctx);
+    await handleMessage(PROD, ws, JSON.stringify({ type: 'AFV_SET', mixerInput: 'video_in_4', enabled: true }), ctx);
+    patches.length = 0;
+    vi.mocked(broadcast).mockClear();
+
+    await handleMessage(PROD, ws, JSON.stringify({ type: 'CUT', mixerInput: 'video_in_2' }), ctx);
+    const ch2 = `ch${channelByMixerInput['video_in_2']}`;
+    const ch4 = `ch${channelByMixerInput['video_in_4']}`;
+    // applyAudioFollow is fired without awaiting; wait for its broadcasts.
+    await vi.waitFor(() => {
+      const frames = vi.mocked(broadcast).mock.calls.map((c) => c[1] as Record<string, unknown>);
+      expect(frames).toContainEqual({ type: 'AUDIO_STATE', elementId: ch2, property: 'mute', value: false });
+      expect(frames).toContainEqual({ type: 'AUDIO_STATE', elementId: ch4, property: 'mute', value: true });
     });
   });
 });
