@@ -140,6 +140,7 @@ function makeActivationResult(flowId: string, mixerBlockId: string) {
     clipPlayerBlockIds: {},
     returnBuses: [],
     returnWhepEntries: [],
+    mixerInputMap: {},
   };
 }
 
