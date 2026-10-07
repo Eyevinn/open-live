@@ -86,6 +86,29 @@ export function buildCouchdbUrl(): string {
   return url.toString();
 }
 
+/**
+ * Parse `STROM_PUBLIC_URL`, trailing slashes removed. It is the base of the
+ * WHEP URLs given to browsers, so it must be an absolute http(s) URL: without
+ * a scheme (`strom.example.com`) the stored links would be relative.
+ */
+export function buildStromPublicUrl(): string | undefined {
+  const raw = optionalEnv('STROM_PUBLIC_URL');
+  if (!raw) return undefined;
+  let protocol: string | undefined;
+  try {
+    protocol = new URL(raw).protocol;
+  } catch {
+    // reported below
+  }
+  if (protocol !== 'http:' && protocol !== 'https:') {
+    throw new Error(
+      `Invalid STROM_PUBLIC_URL: "${redactUrlCredentials(raw)}" is not an http(s) URL. ` +
+        `Expected the form http(s)://host[:port][/path].`,
+    );
+  }
+  return raw.replace(/\/+$/, '');
+}
+
 export const config = {
   port: parseInt(process.env['PORT'] ?? '3000', 10),
   couchdbUrl: buildCouchdbUrl(),
@@ -97,7 +120,7 @@ export const config = {
    * (`whepEndpoint`, `pgmWhepEndpoint`, `whepOutputUrls`); the WHEP proxy maps
    * URLs under it back to `STROM_URL` before forwarding. Unset: `STROM_URL`.
    */
-  stromPublicUrl: optionalEnv('STROM_PUBLIC_URL')?.replace(/\/+$/, ''),
+  stromPublicUrl: buildStromPublicUrl(),
   stromToken: process.env['STROM_AUTH_TOKEN'] ?? process.env['STROM_TOKEN'] ?? undefined,
   /** 'osc' = PAT→SAT exchange via token.svc.prod.osaas.io (default for OSC-hosted Strom)
    *  'direct' = API key used as Bearer token directly (self-hosted / non-OSC Strom) */
