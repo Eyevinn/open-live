@@ -317,6 +317,21 @@ describe('deactivate — per-input recordings', () => {
     expect(deletedDirs).toEqual([`${ACT_DIR}/video_in_1`, `${ACT_DIR}/video_in_2`, ACT_DIR]);
   });
 
+  it('stops the sweep, leaving every file on Strom, once the store rejects the credentials', async () => {
+    const attempts: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      if (init?.method === 'PUT') {
+        attempts.push(new URL(url).pathname);
+        return new Response('<Error><Code>InvalidAccessKeyId</Code></Error>', { status: 403 });
+      }
+      return new Response('bytes', { status: 200 });
+    }));
+    await deactivate();
+    expect(attempts).toHaveLength(1);
+    expect(mediaFiles).toHaveLength(5);
+    expect(recordings.size).toBe(0);
+  });
+
   it('clears the input recorder ids', async () => {
     await deactivate();
     expect(production['inputRecorderBlockIds']).toBeUndefined();
