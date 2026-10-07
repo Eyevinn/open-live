@@ -297,6 +297,98 @@ describe('recording-uploader — SigV4 PutObject + upload-from-local (#41)', () 
     expect(strom.media.deleteFile).not.toHaveBeenCalled();
     expect(strom.media.deleteDirectory).not.toHaveBeenCalled();
   });
+
+  it('aborts the sweep on the first object-store auth failure instead of re-PUTting every segment (#465)', async () => {
+    // Downloads always succeed; the S3 PUT is rejected with a 403 /
+    // InvalidAccessKeyId — a deterministic credential failure that would hit
+    // every remaining segment identically.
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url.includes('/api/media/file/')) {
+        return Promise.resolve({ ok: true, arrayBuffer: async () => new TextEncoder().encode('data').buffer });
+      }
+      return Promise.resolve({
+        ok: false,
+        status: 403,
+        text: async () => '<Error><Code>InvalidAccessKeyId</Code></Error>',
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const strom = makeStromMediaClient([
+      { name: 'seg_00001.mp4', path: 'recordings/prod-rec-1/seg_00001.mp4', is_dir: false, size: 4 },
+      { name: 'seg_00002.mp4', path: 'recordings/prod-rec-1/seg_00002.mp4', is_dir: false, size: 4 },
+      { name: 'seg_00003.mp4', path: 'recordings/prod-rec-1/seg_00003.mp4', is_dir: false, size: 4 },
+    ]);
+
+    const { uploadRecordings } = await import('../lib/recording-uploader.js');
+    const res = await uploadRecordings({
+      strom: strom as never,
+      stromUrl: 'http://localhost:7000',
+      stromToken: 'tok',
+      outputDir: 'recordings/prod-rec-1',
+      productionId: 'prod-rec-1',
+      target,
+      isStillRecording: () => false,
+    });
+
+    // Only the first segment was attempted: one download + one PUT. The other
+    // two segments were never downloaded or re-PUT.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.some(([u]) => (u as string).includes('seg_00002'))).toBe(false);
+    expect(fetchMock.mock.calls.some(([u]) => (u as string).includes('seg_00003'))).toBe(false);
+
+    expect(res.uploaded).toHaveLength(0);
+    expect(res.failed).toHaveLength(1);
+    expect(res.failed[0]!.file).toBe('recordings/prod-rec-1/seg_00001.mp4');
+    expect(res.abortedOnAuthError).toEqual({
+      file: 'recordings/prod-rec-1/seg_00001.mp4',
+      code: 'InvalidAccessKeyId',
+    });
+    // Nothing uploaded + failures present → no deletes, folder left for retry.
+    expect(strom.media.deleteFile).not.toHaveBeenCalled();
+    expect(strom.media.deleteDirectory).not.toHaveBeenCalled();
+  });
+
+  it('does not abort the sweep on a single transient per-file failure (#465)', async () => {
+    // The first segment's PUT fails with a transient 500; the rest must still
+    // be attempted (best-effort per-file semantics, not a short-circuit).
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url.includes('/api/media/file/')) {
+        return Promise.resolve({ ok: true, arrayBuffer: async () => new TextEncoder().encode('data').buffer });
+      }
+      if (url.includes('seg_00001')) {
+        return Promise.resolve({ ok: false, status: 500, text: async () => 'InternalError' });
+      }
+      return Promise.resolve({ ok: true, text: async () => '' });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const strom = makeStromMediaClient([
+      { name: 'seg_00001.mp4', path: 'recordings/prod-rec-1/seg_00001.mp4', is_dir: false, size: 4 },
+      { name: 'seg_00002.mp4', path: 'recordings/prod-rec-1/seg_00002.mp4', is_dir: false, size: 4 },
+    ]);
+
+    const { uploadRecordings } = await import('../lib/recording-uploader.js');
+    const res = await uploadRecordings({
+      strom: strom as never,
+      stromUrl: 'http://localhost:7000',
+      stromToken: 'tok',
+      outputDir: 'recordings/prod-rec-1',
+      productionId: 'prod-rec-1',
+      target,
+      isStillRecording: () => false,
+    });
+
+    // The transient failure did not short-circuit: both segments were attempted.
+    expect(res.abortedOnAuthError).toBeUndefined();
+    expect(res.failed.map((f) => f.file)).toEqual(['recordings/prod-rec-1/seg_00001.mp4']);
+    expect(res.uploaded.map((u) => u.key)).toEqual(['prod-rec-1/seg_00002.mp4']);
+    // The one segment that uploaded is deleted; the folder still holds the
+    // failed one, so no directory cleanup.
+    expect(strom.media.deleteFile).toHaveBeenCalledTimes(1);
+    expect(strom.media.deleteFile).toHaveBeenCalledWith('recordings/prod-rec-1/seg_00002.mp4');
+    expect(strom.media.deleteDirectory).not.toHaveBeenCalled();
+  });
 });
 
 describe('recording-uploader — recordingStartFromFileName', () => {

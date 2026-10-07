@@ -65,6 +65,58 @@ export interface UploadResult {
   uploaded: UploadedSegment[];
   /** Segments that failed to download or upload — logged, non-fatal. */
   failed: Array<{ file: string; error: string }>;
+  /**
+   * Set when the sweep short-circuited on a deterministic object-store
+   * auth/permission failure (HTTP 401/403, or an S3 `InvalidAccessKeyId` /
+   * `AccessDenied` / `SignatureDoesNotMatch` error code). Such a failure is the
+   * same for every object in the bucket, so the sweep stops after the first one
+   * rather than re-downloading + re-PUTting (and re-failing) the rest — the
+   * whole point is that a rejected store must not make deactivate grind through
+   * the backlog. The offending file is also recorded in `failed`.
+   */
+  abortedOnAuthError?: { file: string; code: string };
+}
+
+/**
+ * S3 `<Code>` values that signal a deterministic credential/permission
+ * rejection — they fail identically for every object in the bucket, so the
+ * upload sweep treats the first one as fatal to the whole sweep rather than a
+ * per-file transient error (see `uploadRecordings`).
+ */
+const S3_AUTH_ERROR_CODES = ['InvalidAccessKeyId', 'AccessDenied', 'SignatureDoesNotMatch'];
+
+/**
+ * Thrown by `putObject` when the object store rejects the request with a
+ * deterministic auth/permission error — an HTTP 401/403, or one of the
+ * `S3_AUTH_ERROR_CODES`. `code` is the S3 error code when the body carried one,
+ * else the HTTP status as a string.
+ */
+export class S3AuthError extends Error {
+  readonly code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = 'S3AuthError';
+    this.code = code;
+  }
+}
+
+/**
+ * Returns the auth/permission error code when an S3/MinIO error response
+ * signals a deterministic credential/permission rejection, else null (a
+ * transient/other error the sweep should treat as per-file best-effort). An S3
+ * error body carries the code as `<Code>…</Code>`; MinIO may also surface it as
+ * plain text, so we substring-match the known codes first and fall back to the
+ * 401/403 status.
+ */
+function detectS3AuthError(status: number, body: string): string | null {
+  for (const code of S3_AUTH_ERROR_CODES) {
+    if (body.includes(code)) return code;
+  }
+  if (status === 401 || status === 403) {
+    const match = /<Code>([^<]+)<\/Code>/.exec(body);
+    return match?.[1] ?? String(status);
+  }
+  return null;
 }
 
 /**
@@ -187,7 +239,12 @@ export async function putObject(
 
   if (!res.ok) {
     const text = await res.text().catch(() => '');
-    throw new Error(`S3 PutObject ${key} failed: ${res.status} ${text.slice(0, 200)}`);
+    const message = `S3 PutObject ${key} failed: ${res.status} ${text.slice(0, 200)}`;
+    const authCode = detectS3AuthError(res.status, text);
+    if (authCode) {
+      throw new S3AuthError(authCode, message);
+    }
+    throw new Error(message);
   }
 }
 
@@ -368,6 +425,15 @@ export async function uploadRecordings(args: UploadRecordingsArgs): Promise<Uplo
         file: entry.path,
         error: err instanceof Error ? err.message : String(err),
       });
+      // A credential/permission rejection is deterministic across the whole
+      // bucket — every remaining segment would fail identically, each only
+      // after a full (wasted) download from Strom. Stop the sweep now so a
+      // rejected store cannot keep deactivate running for the length of the
+      // backlog; the caller logs the abort and teardown still proceeds.
+      if (err instanceof S3AuthError) {
+        result.abortedOnAuthError = { file: entry.path, code: err.code };
+        break;
+      }
     }
   }
 

@@ -1056,6 +1056,20 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
                 log.error({ persistErr, productionId: doc._id, key: seg.key }, 'RecordingDoc persist failed — object uploaded but unlisted');
               }
             }
+            if (uploadRes.abortedOnAuthError) {
+              // Best-effort upload is bounded by time, not just failures: the
+              // store rejected our credentials, so the sweep stopped after the
+              // first rejection instead of grinding through every segment.
+              // Teardown (deactivateStromFlow + guest sweep, below) continues.
+              log.warn(
+                {
+                  productionId: doc._id,
+                  code: uploadRes.abortedOnAuthError.code,
+                  file: uploadRes.abortedOnAuthError.file,
+                },
+                'VOD recording upload sweep aborted on object-store auth/permission error — skipping remaining segments; deactivation continues',
+              );
+            }
             log.info(
               { productionId: doc._id, uploaded: uploadRes.uploaded.length, failed: uploadRes.failed.length },
               'VOD recordings uploaded to object storage',
