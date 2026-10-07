@@ -7,6 +7,7 @@ import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssign
 import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js';
+import { expandToStoredPadIndex } from '../lib/mixer-input-map.js';
 import { setTally, broadcast, getSubscriberCount, getWatcherCount } from '../services/tally.service.js';
 import { clearProductionPflState } from '../services/pfl-state.js';
 import { clearPipState, clearAudioState, clearFxState, clearClipStateForProduction, reinitConnectedControllers } from '../ws/controller.js';
@@ -192,6 +193,7 @@ function deactivatedDoc(
     sourceOffsetBlockIds: undefined,
     sourceAudioOffsetBlockIds: undefined,
     clipPlayerBlockIds: undefined,
+    mixerInputMap: undefined,
     whepEndpoint: undefined,
     pgmWhepEndpoint: undefined,
     whipEndpoints: undefined,
@@ -393,6 +395,7 @@ async function runActivationFlow(
       ...(Object.keys(activation.sourceAudioOffsetBlockIds).length > 0 && { sourceAudioOffsetBlockIds: activation.sourceAudioOffsetBlockIds }),
       ...(Object.keys(activation.clipPlayerBlockIds).length > 0 && { clipPlayerBlockIds: activation.clipPlayerBlockIds }),
       ...(activation.returnBuses.length > 0 && { returnBuses: activation.returnBuses }),
+      ...(Object.keys(activation.mixerInputMap).length > 0 && { mixerInputMap: activation.mixerInputMap }),
     });
 
     // Step 3: Poll until flow reaches 'playing' or we time out
@@ -779,7 +782,13 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       const stromToken = await getStromToken(config.stromToken);
       const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
       const mixerState = await strom.mixer.getState(doc.stromFlowId, doc.mixerBlockId);
-      return reply.send({ ...doc, inputResolutions: mixerState.input_resolutions });
+      // Strom returns input_resolutions indexed by the COMPACT mixer pad. The
+      // client indexes by the stored mixerInput, so invert the pad compaction
+      // (issue #463) and re-expand to a stored-pad-indexed array. Identity /
+      // pass-through when no compaction map is present (older flows, or a
+      // contiguous-from-0 production).
+      const inputResolutions = expandToStoredPadIndex(mixerState.input_resolutions, doc.mixerInputMap);
+      return reply.send({ ...doc, inputResolutions });
     } catch (err) {
       fastify.log.warn({ err }, 'GET /api/v1/productions/:id — failed to fetch input_resolutions from Strom');
       return reply.send(doc);
