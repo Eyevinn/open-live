@@ -302,7 +302,10 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         trackEnded = {};
         trackMuted = {};
         reconnectFailed = {};
-        stream.getTracks().forEach(watchTrack);
+        stream.getTracks().forEach(function (t) {
+          if (t.muted) trackMuted[t.kind] = true;
+          watchTrack(t);
+        });
         updateDeviceAlert();
         // Re-apply the current mute state to the fresh audio track.
         applyMuteToTrack();
@@ -398,7 +401,11 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
           return;
         }
         var sender = senders[kind];
-        return (sender ? sender.replaceTrack(fresh) : Promise.resolve()).then(function () {
+        var swapped = sender ? sender.replaceTrack(fresh).catch(function (err) {
+          fresh.stop();
+          throw err;
+        }) : Promise.resolve();
+        return swapped.then(function () {
           if (seq !== deviceSeq[kind] || left) { fresh.stop(); return; }
           var old = trackOf(kind);
           var rest = localStream.getTracks().filter(function (t) { return t.kind !== kind; });
@@ -415,6 +422,12 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         });
       }).catch(function (err) {
         if (seq !== deviceSeq[kind] || left) return;
+        // A superseded request may have put its own track, since stopped,
+        // on the sender: send the track in use again.
+        var current = trackOf(kind);
+        if (senders[kind] && current && senders[kind].track !== current) {
+          senders[kind].replaceTrack(current).catch(function () {});
+        }
         reconnectFailed[kind] = true;
         updateDeviceAlert();
         throw err;
@@ -647,7 +660,8 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       }).then(function () {
         live = true;
         // The pickers stay while live: picking a device swaps it in.
-        if (!joinData.whipUrl) hide(pickers);
+        if (joinData.whipUrl) show(pickers);
+        else hide(pickers);
         hide(goLiveBtn);
         if (joinData.whipUrl) show(muteBtn);
         show(leaveBtn);
@@ -694,18 +708,20 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
 
     // ---- Leave -------------------------------------------------------------
     function teardown() {
-      left = true;
       senders = {};
       hide(deviceAlert);
       stopReturnMode();
       if (publishPc) { try { publishPc.close(); } catch (e) {} publishPc = null; }
       if (returnPc) { try { returnPc.close(); } catch (e) {} returnPc = null; }
       if (localStream) { localStream.getTracks().forEach(function (t) { t.stop(); }); }
+      // A page restored from the back/forward cache opens the devices afresh.
+      localStream = null;
     }
 
     function leave() {
       leaveBtn.disabled = true;
       live = false;
+      left = true;
       fetch(apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/session", {
         method: "DELETE",
         headers: { "Authorization": "Bearer " + token },

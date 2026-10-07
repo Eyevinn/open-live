@@ -10,7 +10,12 @@
  *  - the pickers stay while live and swap a device the same way;
  *  - a picked device that cannot be opened falls back to the default; when
  *    that fails too, the alert says so;
- *  - the pickers keep showing the device in use after the list is rebuilt;
+ *  - a device that cannot be swapped in is released, and a failed pick puts
+ *    the connection back on the device in use;
+ *  - a device already silent when the preview opens raises the alert;
+ *  - the pickers show on a camera join, and keep showing the device in use
+ *    after the list is rebuilt;
+ *  - a page hidden before going live opens the devices again on a pick;
  *  - after leaving, nothing shows the alert or opens a device.
  */
 import { describe, it, expect } from 'vitest';
@@ -112,6 +117,14 @@ interface PageOpts {
   broken?: Set<string>;
   /** When set, every getUserMedia call fails. */
   denyAll?: () => boolean;
+  /** When set, replaceTrack rejects. */
+  replaceFails?: () => boolean;
+  /** When set, replaceTrack waits until the test releases it. */
+  holdReplace?: boolean;
+  /** Device ids whose tracks open muted. */
+  mutedAtOpen?: Set<string>;
+  /** The slot check at page load answers return-only. */
+  returnOnlyAtLoad?: boolean;
 }
 
 function runPage(script: string, opts: PageOpts = {}) {
@@ -125,6 +138,10 @@ function runPage(script: string, opts: PageOpts = {}) {
   const gumCalls: Array<{ audio?: Constraint; video?: Constraint }> = [];
   const replaced: Array<{ kind: string; track: FakeTrack }> = [];
   const senders: Record<string, { track: FakeTrack }> = {};
+  const heldReplaces: Array<() => void> = [];
+  const opened: FakeTrack[] = [];
+  let denied = 0;
+  const windowListeners: Record<string, Array<() => void>> = {};
 
   class RTCPeerConnection {
     iceGatheringState = 'complete';
@@ -133,9 +150,16 @@ function runPage(script: string, opts: PageOpts = {}) {
       const sender = {
         track: t,
         replaceTrack(next: FakeTrack) {
-          sender.track = next;
-          replaced.push({ kind: next.kind, track: next });
-          return Promise.resolve();
+          if (opts.replaceFails?.()) return Promise.reject(new Error('InvalidStateError'));
+          const apply = () => {
+            sender.track = next;
+            replaced.push({ kind: next.kind, track: next });
+          };
+          if (!opts.holdReplace) {
+            apply();
+            return Promise.resolve();
+          }
+          return new Promise<void>((resolve) => heldReplaces.push(() => { apply(); resolve(); }));
         },
       };
       senders[t.kind] = sender;
@@ -161,7 +185,7 @@ function runPage(script: string, opts: PageOpts = {}) {
   const fetch = (url: string, init: { method?: string } = {}) => {
     const method = init.method ?? 'GET';
     requests.push({ method, url });
-    if (url.endsWith('/slot')) return respond(200, { returnOnly: false });
+    if (url.endsWith('/slot')) return respond(200, { returnOnly: !!opts.returnOnlyAtLoad });
     if (url.endsWith('/join')) return respond(200, { whipUrl: 'https://live.example.com/whip', feeds: [] });
     return respond(201, {}, '/whip/s1');
   };
@@ -170,12 +194,15 @@ function runPage(script: string, opts: PageOpts = {}) {
     const fallback = kind === 'audio' ? 'mic-a' : 'cam-a';
     const id = c && typeof c === 'object' ? c.deviceId.exact : fallback;
     if (opts.broken?.has(id)) return null;
-    return new FakeTrack(kind, id);
+    const t = new FakeTrack(kind, id);
+    t.muted = !!opts.mutedAtOpen?.has(id);
+    opened.push(t);
+    return t;
   };
 
   const getUserMedia = (c: { audio?: Constraint; video?: Constraint }) => {
     gumCalls.push(c);
-    if (opts.denyAll?.()) return Promise.reject(new Error('NotAllowedError'));
+    if (opts.denyAll?.() || (denied > 0 && denied--)) return Promise.reject(new Error('NotAllowedError'));
     const tracks: FakeTrack[] = [];
     for (const kind of ['video', 'audio'] as const) {
       if (!c[kind]) continue;
@@ -190,7 +217,10 @@ function runPage(script: string, opts: PageOpts = {}) {
     document: { getElementById: el, createElement: () => new FakeElement() },
     location: { pathname: '/guest/inv-1', hash: '#tok', origin: 'https://live.example.com' },
     navigator: { mediaDevices: { getUserMedia, enumerateDevices: () => Promise.resolve(DEVICES) } },
-    window: { RTCPeerConnection, addEventListener() {} },
+    window: {
+      RTCPeerConnection,
+      addEventListener: (type: string, fn: () => void) => (windowListeners[type] ??= []).push(fn),
+    },
     RTCPeerConnection,
     MediaStream: FakeStream,
     fetch,
@@ -213,6 +243,12 @@ function runPage(script: string, opts: PageOpts = {}) {
     senders,
     /** The preview's current track of a kind. */
     track: (kind: 'audio' | 'video') => preview().getTracks().find((t) => t.kind === kind)!,
+    /** Every track getUserMedia has opened. */
+    opened,
+    /** The next pick fails on both its tries (picked device, then default). */
+    denyNext: () => { denied = 2; },
+    releaseReplaces: () => heldReplaces.splice(0).forEach((fn) => fn()),
+    fireWindow: (type: string) => (windowListeners[type] ?? []).forEach((fn) => fn()),
     whipPosts: () => requests.filter((r) => r.method === 'POST' && r.url.endsWith('/whip')).length,
     pick: (id: 'cam' | 'mic', value: string) => {
       el(id).value = value;
@@ -360,6 +396,59 @@ describe('guest page devices', () => {
     page.els['golive']!.fire('click');
     await flush();
     expect(page.senders['audio']!.track).toBe(mic);
+  });
+
+  it('releases a new device that could not be swapped into the connection', async () => {
+    let fail = false;
+    const page = await goLive({ replaceFails: () => fail });
+    const before = page.track('audio');
+    fail = true;
+    page.pick('mic', 'mic-b');
+    await flush();
+    expect(page.track('audio')).toBe(before);
+    expect(page.senders['audio']!.track).toBe(before);
+    expect(page.opened.filter((t) => t.deviceId === 'mic-b').every((t) => t.stopped)).toBe(true);
+  });
+
+  it('puts the connection back on the device in use when a newer pick fails', async () => {
+    const page = await goLive({ holdReplace: true, broken: new Set(['mic-b']) });
+    const before = page.track('audio');
+    page.pick('mic', 'mic-a');
+    await flush(); // the first pick is now waiting in replaceTrack
+    // The second pick cannot open mic-b and falls back to the default (mic-a);
+    // make that fail too.
+    page.denyNext();
+    page.pick('mic', 'mic-b');
+    page.releaseReplaces();
+    await flush();
+    page.releaseReplaces();
+    await flush();
+    expect(page.track('audio')).toBe(before);
+    expect(page.senders['audio']!.track).toBe(before);
+    expect(before.stopped).toBe(false);
+  });
+
+  it('alerts when a device is already silent when the preview opens', async () => {
+    const page = await boot({ mutedAtOpen: new Set(['cam-a']) });
+    expect(page.els['device-alert']!.hidden).toBe(false);
+    expect(page.els['device-alert-text']!.textContent).toMatch(/camera stopped working/);
+  });
+
+  it('shows the pickers when a slot that was return-only at page load joins with a camera', async () => {
+    const page = await goLive({ returnOnlyAtLoad: true });
+    expect(page.whipPosts()).toBe(1);
+    expect(page.els['pickers']!.hidden).toBe(false);
+  });
+
+  it('reopens the devices on a pick after the page was hidden before going live', async () => {
+    const page = await boot();
+    const before = page.track('audio');
+    page.fireWindow('pagehide');
+    expect(before.stopped).toBe(true);
+    page.pick('cam', 'cam-b');
+    await flush();
+    expect(page.track('audio').stopped).toBe(false);
+    expect(page.track('video').deviceId).toBe('cam-b');
   });
 
   it('after leaving, shows no alert and opens no device', async () => {
