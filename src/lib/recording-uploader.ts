@@ -432,6 +432,8 @@ export interface UploadProductionRecordingsArgs extends Omit<UploadRecordingsArg
  * whose upload failed at its own deactivate is picked up by a later one.
  * A production that never recorded (no directory on Strom) uploads nothing.
  *
+ * Stops at the first object-store auth rejection (abortedOnAuthError).
+ *
  * Then deletes from Strom every swept file that is in object storage,
  * including ones skipped as already uploaded, and removes each directory
  * that leaves empty (issue #366).
@@ -459,8 +461,10 @@ export async function uploadProductionRecordings(args: UploadProductionRecording
     }
     const done = await uploadFiles(args, files, activationStartFromDirName(dir.name), isUploaded, result);
     swept.push({ path: dir.path, fileCount: files.length, done });
+    // The store rejected our credentials; every other directory would fail the same way.
+    if (result.abortedOnAuthError) break;
   }
-  if (includeSharedDir) {
+  if (includeSharedDir && !result.abortedOnAuthError) {
     // Listed last so its directory, the production's, is only removed once
     // every activation directory inside it has been.
     const files = entries.filter((e) => !e.is_directory);

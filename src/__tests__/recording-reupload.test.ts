@@ -275,6 +275,26 @@ describe('deactivate — each recording is uploaded and registered once', () => 
     expect(mockMediaDeleteDirectory).not.toHaveBeenCalled();
   });
 
+  it('stops the sweep at the first object-store auth rejection, across activation directories', async () => {
+    production = activeProduction({ recorderOutputDir: undefined });
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation(async (_url, init) => {
+      if (init?.method === 'PUT') {
+        return new Response('<Error><Code>InvalidAccessKeyId</Code></Error>', { status: 403 });
+      }
+      return new Response('mp4-bytes', { status: 200 });
+    });
+
+    const res = await deactivate();
+
+    expect(res.statusCode).toBe(200);
+    // One download and one rejected PUT; the other directories are not swept.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(String(fetchMock.mock.calls[0]![0])).toContain(encodeURIComponent(ACT1.split('/').pop()!));
+    expect(mockRecordingInsert).not.toHaveBeenCalled();
+    expect(mediaFiles).toEqual([LEGACY, ACT1, ACT2]);
+  });
+
   it('a production that never recorded uploads nothing', async () => {
     mediaFiles = [];
     production = activeProduction({ recorderBlockId: undefined, recorderOutputDir: undefined });
