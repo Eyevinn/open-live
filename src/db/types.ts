@@ -411,7 +411,17 @@ export interface GuestSessionDoc {
    * A rejoin resets it to unmuted.
    */
   muted?: boolean;
-  whipSessionId?: string;
+  /**
+   * Absolute Strom WHIP **session-resource** URL for this guest's live publish
+   * (`/whip/{endpoint_id}/resource/{resource_id}`), captured from the `Location`
+   * header Strom returns on the WHIP offer POST (`proxyWhipOffer`, issue #467).
+   * Server-side teardown (`teardownGuestWhip` on leave/kick) DELETEs THIS URL —
+   * a DELETE on the bare endpoint URL does not end the session, so without this
+   * Strom kept the guest session until its 10 s inactivity reaper. Absent on a
+   * return-only slot or before the guest has published; stale after a reconnect
+   * until the next offer overwrites it. Internal — stripped from `sessionToApi`.
+   */
+  whipSessionUrl?: string;
   /**
    * Strom WHEP session id of this guest's most recent return-picture feed
    * (issue #380). Bound on `POST .../returns/:mixerInput/picture/whep` so the

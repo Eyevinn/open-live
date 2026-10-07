@@ -477,14 +477,32 @@ describe('guest slots — one guest per slot, reconnect, server-side teardown (#
     expect((res.json() as { returnMode: string }).returnMode).toBe('program-minus');
   });
 
-  it('frees the slot on the server on kick, so the next guest can take it', async () => {
-    // Active production with a live flow: kick must tear down the WHIP publisher
-    // in Strom from the backend (not the browser) and free the slot.
+  // Publish a WHIP offer through the guest-scoped alias so Strom (mocked) mints a
+  // session resource and the backend persists its Location for teardown (#467).
+  function publishWhip(invite: { id: string; token: string }) {
+    return slotApp.inject({
+      method: 'POST',
+      url: `/api/v1/guests/${invite.id}/whip`,
+      headers: { authorization: `Bearer ${invite.token}`, 'content-type': 'application/sdp' },
+      payload: 'v=0',
+    });
+  }
+
+  it('ends the guest WHIP session RESOURCE on kick (not the endpoint), so the next guest can take the slot (#467)', async () => {
+    // Active production with a live flow: kick must end the guest's Strom WHIP
+    // session from the backend (not the browser) and free the slot.
     seedProduction('prod-1', { status: 'active', stromFlowId: 'flow-1' });
     const whipDeletes: string[] = [];
     const fetchMock = vi.fn(async (url: unknown, init?: { method?: string }) => {
-      if (init?.method === 'DELETE') whipDeletes.push(String(url));
-      return new Response(null, { status: 204 });
+      if (init?.method === 'DELETE') {
+        whipDeletes.push(String(url));
+        return new Response(null, { status: 204 });
+      }
+      // WHIP offer POST → Strom answers 201 with the session-resource Location.
+      return new Response('v=0 answer', {
+        status: 201,
+        headers: { Location: '/whip/whip-0-1/resource/res-1' },
+      });
     });
     vi.stubGlobal('fetch', fetchMock);
     try {
@@ -493,12 +511,17 @@ describe('guest slots — one guest per slot, reconnect, server-side teardown (#
       expect(joinA.statusCode).toBe(200);
       const guestId = (joinA.json() as { guestId: string }).guestId;
 
+      // The guest publishes — the backend captures the Strom session-resource URL.
+      expect((await publishWhip(a)).statusCode).toBe(201);
+      expect(sessionsStore.get(guestId)?.whipSessionUrl).toBe(
+        'http://localhost:7000/whip/whip-0-1/resource/res-1',
+      );
+
       // A different guest cannot take the occupied slot yet.
       const b = await mkInvite('video_in_0');
       expect((await join(b)).statusCode).toBe(409);
 
-      // Operator kicks guest A — the server tears down the Strom WHIP session
-      // (does not wait for the guest's browser).
+      // Operator kicks guest A — the server ends the Strom WHIP session.
       const kick = await slotApp.inject({
         method: 'DELETE',
         url: `/api/v1/productions/prod-1/guests/${guestId}`,
@@ -506,13 +529,52 @@ describe('guest slots — one guest per slot, reconnect, server-side teardown (#
       });
       expect(kick.statusCode).toBe(204);
       expect(sessionsStore.get(guestId)?.state).toBe('left');
-      // Teardown hit the slot's WHIP endpoint on Strom, server-side.
-      expect(whipDeletes.some((u) => u.includes('/whip/whip-0-'))).toBe(true);
+      // Teardown hit the SESSION RESOURCE URL (/resource/...), not the bare
+      // endpoint — a DELETE on the endpoint does not end the Strom session (#467).
+      expect(whipDeletes).toContain('http://localhost:7000/whip/whip-0-1/resource/res-1');
+      expect(whipDeletes.every((u) => u.includes('/resource/'))).toBe(true);
 
       // The slot is now free: guest B can join.
       expect((await join(b)).statusCode).toBe(200);
     } finally {
       vi.unstubAllGlobals();
+    }
+  });
+
+  it('logs a warning when the Strom teardown DELETE fails, but still frees the slot (#467)', async () => {
+    seedProduction('prod-1', { status: 'active', stromFlowId: 'flow-1' });
+    const warnSpy = vi.spyOn(slotApp.log, 'warn');
+    const fetchMock = vi.fn(async (_url: unknown, init?: { method?: string }) => {
+      if (init?.method === 'DELETE') return new Response(null, { status: 500 });
+      return new Response('v=0 answer', {
+        status: 201,
+        headers: { Location: '/whip/whip-0-1/resource/res-err' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const a = await mkInvite('video_in_0');
+      const joinA = await join(a);
+      const guestId = (joinA.json() as { guestId: string }).guestId;
+      expect((await publishWhip(a)).statusCode).toBe(201);
+
+      const leave = await slotApp.inject({
+        method: 'DELETE',
+        url: `/api/v1/guests/${a.id}/session`,
+        headers: { authorization: `Bearer ${a.token}` },
+      });
+      // A failed teardown must NOT fail the leave — the slot is freed regardless.
+      expect(leave.statusCode).toBe(204);
+      expect(sessionsStore.get(guestId)?.state).toBe('left');
+      // The non-2xx from Strom is now logged (previously silently swallowed).
+      expect(
+        warnSpy.mock.calls.some(
+          (c) => typeof c[1] === 'string' && (c[1] as string).includes('WHIP teardown'),
+        ),
+      ).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+      warnSpy.mockRestore();
     }
   });
 });
