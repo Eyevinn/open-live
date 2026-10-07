@@ -90,6 +90,14 @@ export const config = {
   port: parseInt(process.env['PORT'] ?? '3000', 10),
   couchdbUrl: buildCouchdbUrl(),
   stromUrl: process.env['STROM_URL'] ?? 'http://localhost:7000',
+  /**
+   * Base URL browsers use to reach Strom, when it differs from `STROM_URL`
+   * (e.g. Open Live reaches Strom in-cluster, browsers through a public
+   * ingress). Used for the WHEP URLs stored on an active production
+   * (`whepEndpoint`, `pgmWhepEndpoint`, `whepOutputUrls`); the WHEP proxy maps
+   * URLs under it back to `STROM_URL` before forwarding. Unset: `STROM_URL`.
+   */
+  stromPublicUrl: optionalEnv('STROM_PUBLIC_URL')?.replace(/\/+$/, ''),
   stromToken: process.env['STROM_AUTH_TOKEN'] ?? process.env['STROM_TOKEN'] ?? undefined,
   /** 'osc' = PAT→SAT exchange via token.svc.prod.osaas.io (default for OSC-hosted Strom)
    *  'direct' = API key used as Bearer token directly (self-hosted / non-OSC Strom) */
