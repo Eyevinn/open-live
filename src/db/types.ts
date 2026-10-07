@@ -636,6 +636,17 @@ export interface ProductionDoc {
   /** Maps mixerInput → media-player (builtin.media_player) block ID for clip sources — set on activate, cleared on deactivate */
   clipPlayerBlockIds?: Record<string, string>;
   /**
+   * Maps a stored `mixerInput` (e.g. 'video_in_15') to the COMPACT vision-mixer
+   * pad index actually wired in the live Strom flow (issue #463) — set on
+   * activate, cleared on deactivate. Studio allocates guest slots from the top of
+   * the mixer-input range down, so the mixer is sized to what the production uses
+   * and the sparse stored pads are compacted to 0..N-1. The stored `mixerInput`
+   * stays the external identity; the WS layer applies this map only at the Strom
+   * boundary (switch/PiP/effect) and inverts it for Strom state read-backs.
+   * Absent / identity for contiguous-from-0 productions.
+   */
+  mixerInputMap?: Record<string, number>;
+  /**
    * Persisted clip cue points (epic #206, issue #307 / OQ3). Maps a clip source's
    * mixerInput to the currently-cued clip and its cue position. A cued clip
    * survives deactivate/reactivate AND server restart — on restore it is put back

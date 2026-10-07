@@ -56,6 +56,20 @@ export interface ActivationResult {
   returnBuses: Array<{ mixerInput: string; auxBus: number; ownChannel: number; mode: 'program' | 'program-minus' }>;
   /** WHEP endpoint IDs for per-guest return outputs, keyed by the guest's mixerInput. */
   returnWhepEntries: Array<{ mixerInput: string; endpointId: string }>;
+  /**
+   * Maps a stored `mixerInput` (e.g. 'video_in_15') to the COMPACT vision-mixer
+   * pad index actually wired in the live Strom flow (issue #463). Studio allocates
+   * guest slots from the top of the mixer-input range down (video_in_15,
+   * video_in_14, …), so sizing the mixer by the highest stored pad produced a
+   * 16-input mixer full of empty tiles. The flow is instead sized to what the
+   * production uses and the sparse stored pads are compacted to 0..N-1, while the
+   * stored `mixerInput` stays the stable external identity (invites, return feeds,
+   * the controller all key off it). The WS layer applies this map at the Strom
+   * boundary (switch/PiP/effect) and inverts it for Strom state read-backs, so the
+   * open-live↔Studio API contract is unchanged. Identity for contiguous-from-0
+   * productions. Returned so the activation route can persist it on the doc.
+   */
+  mixerInputMap: Record<string, number>;
 }
 
 /** `builtin.mixer`'s own `min_upstream_latency` default (strom `types/src/mixer.rs`). */
@@ -438,32 +452,46 @@ export async function activateStromFlow(
     a.mixerInput.localeCompare(b.mixerInput),
   );
 
-  // Set num_inputs on the vision mixer so that EVERY assigned pad exists.
-  // All static template video inputs are stripped above, so no static pad count needed.
-  // Allowed values: 2, 4, 6, 8, 10 (non-live property — must be set at creation).
-  // Also set input_{N}_label for each assigned source so Strom renders the name
-  // in the multiview overlay (verified: property format from strom/backend/src/blocks/builtin/vision_mixer/properties.rs).
+  // Compact stored mixer-input pads to a contiguous 0..N-1 range for the live
+  // Strom flow (issue #463). Studio allocates guest slots from the top of the
+  // mixer-input range DOWN (video_in_15, video_in_14, …; see the "Guest N"
+  // labelling below and open-live-studio#171), so a production with e.g. 4
+  // sources (video_in_0..3) and 2 guest slots (video_in_15/14) would, if the
+  // mixer were sized by the highest stored pad, get a 16-input mixer whose tiles
+  // video_in_4..13 are empty. Instead we size the mixer to exactly what the
+  // production uses and renumber every assigned pad to a dense index, ordered by
+  // the NUMERIC stored pad index ascending (NOT the lexical `localeCompare` order
+  // `sortedAssignments` uses — "video_in_15" sorts before "video_in_4" as a
+  // string). The STORED mixerInput stays the stable external identity: invites,
+  // return feeds and the controller all key off it, and the WS layer translates
+  // stored↔compact only at the Strom boundary (see `mixerInputMap` in
+  // controller.ts). Identity for a contiguous-from-0 production.
+  const storedPadIndexOf = (mixerInput: string): number | null => {
+    const m = /video_in_(\d+)$/.exec(mixerInput);
+    return m ? parseInt(m[1], 10) : null;
+  };
+  const mixerInputMap: Record<string, number> = {};
+  [...production.sources]
+    .filter((a) => storedPadIndexOf(a.mixerInput) !== null)
+    .sort((a, b) => storedPadIndexOf(a.mixerInput)! - storedPadIndexOf(b.mixerInput)!)
+    .forEach((a, i) => { mixerInputMap[a.mixerInput] = i; });
+  /** Compact Strom pad index for an assignment (falls back to the stored index). */
+  const stromPadOf = (mixerInput: string): number | null =>
+    mixerInputMap[mixerInput] ?? storedPadIndexOf(mixerInput);
+
+  // Set num_inputs on the vision mixer so that EVERY (compacted) assigned pad
+  // exists. All static template video inputs are stripped above, so no static pad
+  // count needed. Allowed values: 2, 4, 6, 8, … (non-live property — must be set
+  // at creation). Also set input_{N}_label for each assigned source so Strom
+  // renders the name in the multiview overlay (verified: property format from
+  // strom/backend/src/blocks/builtin/vision_mixer/properties.rs).
   //
-  // num_inputs must be sized by the HIGHEST assigned pad index, NOT merely the
-  // source count. The vision mixer exposes pads video_in_0 … video_in_{num_inputs-1}
+  // The vision mixer exposes pads video_in_0 … video_in_{num_inputs-1}
   // (strom-block-config.md), so a mixer with num_inputs=N only has pads 0..N-1.
-  // Guest slots are allocated from the top of the input range down (video_in_5,
-  // video_in_4, …; see the "Guest N" labelling below and open-live-studio#171)
-  // while the live source count is usually small and the low pads are left
-  // unassigned — so sizing by count alone (e.g. 2 sources at video_in_0 and
-  // video_in_5 → num_inputs=2 → pads video_in_0/video_in_1 only) leaves the
-  // guest's high-index pad (video_in_5) uncreated. The generated
-  // whip_input → offset → mixer:video_in_5 link then targets a pad the mixer
-  // never had: WHIP still negotiates (201) because the whip_input block exists,
-  // low-index cameras still mix, but the guest's decoded picture dead-ends at
-  // the missing pad and the tile stays black. Same for audio_in_{padIndex}, which
-  // shares num_inputs. This is issue #436 ("guest picture never reaches the mixer").
-  const maxAssignedPadIndex = sortedAssignments.reduce((max, a) => {
-    const m = /video_in_(\d+)$/.exec(a.mixerInput);
-    return m ? Math.max(max, parseInt(m[1], 10)) : max;
-  }, -1);
-  // Need a pad for index maxAssignedPadIndex → at least maxAssignedPadIndex + 1 pads.
-  const numSourceInputs = Math.max(2, sortedAssignments.length, maxAssignedPadIndex + 1);
+  // Because the pads are now compacted to 0..N-1 (above), sizing by the compacted
+  // count is both sufficient (every wired pad exists — the #436 "guest picture
+  // never reaches the mixer" invariant) and tight (no empty tiles — issue #463).
+  const numSourceInputs = Math.max(2, Object.keys(mixerInputMap).length);
 
   // Guest-slot numbering (issues #458, #464). A guest slot is a source assignment
   // carrying a `returnFeed` (the same definition the guest routes and
@@ -504,15 +532,15 @@ export async function activateStromFlow(
     const configuredPips = Number(production.values?.num_pips ?? 0);
     props['num_pips'] = String(Math.min(4, Math.max(0, configuredPips)));
 
-    // Label source inputs on the multiviewer. A WHIP guest slot takes the
-    // controller's "Guest N" label (from the shared guestSlotNumber map above) in
-    // preference to the generic "WHIP Input" virtual-source name; Strom would
-    // otherwise fall back to its default "In N+1". Every other input keeps its
-    // own source name. (issues #458, #464)
+    // Label source inputs on the multiviewer — at the COMPACT pad the input is
+    // actually wired to (issue #463), so the overlay labels line up with the real
+    // tiles. A WHIP guest slot takes the controller's "Guest N" label (from the
+    // shared guestSlotNumber map above) in preference to the generic "WHIP Input"
+    // virtual-source name; Strom would otherwise fall back to its default "In N+1".
+    // Every other input keeps its own source name. (issues #458, #463, #464)
     for (const assignment of sortedAssignments) {
-      const padMatch = /video_in_(\d+)$/.exec(assignment.mixerInput);
-      if (!padMatch) continue;
-      const padIndex = parseInt(padMatch[1], 10);
+      const padIndex = stromPadOf(assignment.mixerInput);
+      if (padIndex === null) continue;
       const src = sourceMap.get(assignment.sourceId) ?? (VIRTUAL_SOURCES[assignment.sourceId] as SourceDoc | undefined);
       const guestNum = assignment.returnFeed && src?.streamType === 'whip'
         ? guestSlotNumber.get(assignment.mixerInput)
@@ -622,13 +650,19 @@ export async function activateStromFlow(
   for (const assignment of sortedAssignments) {
     const padMatch = /video_in_(\d+)$/.exec(assignment.mixerInput);
     if (!padMatch || !mixerBlockId) continue;
+    // `padIndex` is the STORED pad index — it keys the deterministic block/element
+    // IDs (`b-input-N`, `b-offset-N`, `e-html-N`, the `Offset V{N}` block names the
+    // activation route re-resolves by) so those reconstruction paths keep working.
+    // `stromPad` is the COMPACT index the input is actually wired to on the mixer
+    // (issue #463) — used for the mixer pad link targets and layout only.
     const padIndex = parseInt(padMatch[1], 10);
+    const stromPad = mixerInputMap[assignment.mixerInput] ?? padIndex;
 
     const source = sourceMap.get(assignment.sourceId) ?? (VIRTUAL_SOURCES[assignment.sourceId] as SourceDoc | undefined);
     if (!source) continue;
     const audioChannel = audioChannelByAssignment.get(assignment)!;
 
-    const yPos = ROW_START + padIndex * ROW_H;
+    const yPos = ROW_START + stromPad * ROW_H;
     const inputId = `b-input-${padIndex}-${endpointSuffix}`;
 
     // Insert a time_offset block between this source and the vision mixer.
@@ -642,8 +676,8 @@ export async function activateStromFlow(
       position: { x: COL_OFFSET, y: yPos },
     });
     sourceOffsetBlockIds[assignment.mixerInput] = offsetId;
-    // Final link: offset → mixer (applies to all source types below)
-    flow.links.push({ from: `${offsetId}:out`, to: `${mixerBlockId}:${assignment.mixerInput}` });
+    // Final link: offset → mixer compact pad (applies to all source types below).
+    flow.links.push({ from: `${offsetId}:out`, to: `${mixerBlockId}:video_in_${stromPad}` });
 
     const TEST_PATTERNS: Record<string, string> = { test1: 'Pinwheel', test2: 'Colors' }
     if (source.streamType === 'test1' || source.streamType === 'test2') {
@@ -686,7 +720,7 @@ export async function activateStromFlow(
       });
       sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetId;
       flow.links.push({ from: `${audioElemId}:src`, to: `${audioOffsetId}:in` });
-      flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${stromPad}` });
       if (audioMixerBlock && audioMixerBlockId) {
         flow.links.push({ from: `${audioOffsetId}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
         if (source.name) {
@@ -726,7 +760,7 @@ export async function activateStromFlow(
       sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetId;
       flow.links.push({ from: `${demuxId}:audio`, to: `${audioOffsetId}:in` });
       // Audio to vision mixer and audio mixer both come from the delay block.
-      flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${stromPad}` });
       if (audioMixerBlock && audioMixerBlockId) {
         flow.links.push({ from: `${audioOffsetId}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
         if (source.name) {
@@ -786,7 +820,7 @@ export async function activateStromFlow(
       });
       sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetIdClip;
       flow.links.push({ from: `${playerId}:audio_out`, to: `${audioOffsetIdClip}:in` });
-      flow.links.push({ from: `${audioOffsetIdClip}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      flow.links.push({ from: `${audioOffsetIdClip}:out`, to: `${mixerBlockId}:audio_in_${stromPad}` });
       if (audioMixerBlock && audioMixerBlockId) {
         flow.links.push({ from: `${audioOffsetIdClip}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
         if (source.name) {
@@ -815,7 +849,7 @@ export async function activateStromFlow(
       });
       sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetIdWhip;
       flow.links.push({ from: `${inputId}:audio_out`, to: `${audioOffsetIdWhip}:in` });
-      flow.links.push({ from: `${audioOffsetIdWhip}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      flow.links.push({ from: `${audioOffsetIdWhip}:out`, to: `${mixerBlockId}:audio_in_${stromPad}` });
       if (audioMixerBlock && audioMixerBlockId) {
         flow.links.push({ from: `${audioOffsetIdWhip}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
         // A WHIP guest slot's audio strip takes the same "Guest N" label as its
@@ -856,7 +890,7 @@ export async function activateStromFlow(
       });
       sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetId;
       flow.links.push({ from: `${inputId}:audio_out_0`, to: `${audioOffsetId}:in` });
-      flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${stromPad}` });
       if (audioMixerBlock && audioMixerBlockId) {
         flow.links.push({ from: `${audioOffsetId}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
         if (source.name) {
@@ -1233,6 +1267,7 @@ export async function activateStromFlow(
       mode: rb.mode,
     })),
     returnWhepEntries,
+    mixerInputMap,
   };
 }
 
