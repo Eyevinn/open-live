@@ -493,6 +493,29 @@ export async function activateStromFlow(
   // never reaches the mixer" invariant) and tight (no empty tiles — issue #463).
   const numSourceInputs = Math.max(2, Object.keys(mixerInputMap).length);
 
+  // Guest-slot numbering (issues #458, #464). A guest slot is a source assignment
+  // carrying a `returnFeed` (the same definition the guest routes and
+  // assignReturnBuses use). A WHIP guest slot's source resolves only to the
+  // generic virtual-source name ("WHIP Input", audio-channels.ts), so both the
+  // Strom multiviewer (input_{N}_label, below) and the audio mixer strips
+  // (ch{N}_label, in the per-source loop) would otherwise show that generic name
+  // instead of the Studio controller's "Guest N" tile (open-live-studio#171).
+  // Number the guest slots exactly the way the controller does — returnFeed
+  // assignments ordered by trailing pad index DESCENDING (slots are allocated
+  // from the top of the input range down, so the highest index is Guest 1) — so
+  // the multiviewer AND the audio mixer agree with the controller. This single
+  // shared map is the source of truth for both labels; do not re-derive the
+  // numbering (e.g. from returnBuses order, which is ascending) anywhere else.
+  // Updating the label to the invite/guest name live while a guest is joined is a
+  // separate (live) concern and out of scope here.
+  const guestSlotPadIndex = (mixerInput: string): number =>
+    parseInt(/(\d+)$/.exec(mixerInput)?.[1] ?? '0', 10);
+  const guestSlotNumber = new Map<string, number>();
+  [...production.sources]
+    .filter((a) => !!a.returnFeed)
+    .sort((a, b) => guestSlotPadIndex(b.mixerInput) - guestSlotPadIndex(a.mixerInput))
+    .forEach((a, i) => guestSlotNumber.set(a.mixerInput, i + 1));
+
   if (mixerBlock && mixerBlockId) {
     // Round up to Strom's allowed even range (2,4,6,8,10,…) and clamp to the
     // MAX_NUM_INPUTS=16 ceiling. Rounding up only ever adds an unused (black,
@@ -509,35 +532,16 @@ export async function activateStromFlow(
     const configuredPips = Number(production.values?.num_pips ?? 0);
     props['num_pips'] = String(Math.min(4, Math.max(0, configuredPips)));
 
-    // Guest-slot labels (issue #458). A guest slot is a source assignment
-    // carrying a `returnFeed` (the same definition the guest routes and
-    // assignReturnBuses use). A WHIP guest slot's source resolves only to the
-    // generic virtual-source name ("WHIP Input", audio-channels.ts) or none, so
-    // Strom's multiview falls back to its default "In N+1" and shows a different
-    // label than the Studio controller's "Guest N" tile (open-live-studio#171).
-    // Number the guest slots exactly the way the controller does — returnFeed
-    // assignments ordered by trailing pad index DESCENDING (slots are allocated
-    // from the top of the input range down, so the highest index is Guest 1) —
-    // and emit the matching "Guest N" label so the multiviewer agrees. Updating
-    // the label to the invite/guest name live while a guest is joined is a
-    // separate (live) concern and out of scope here.
-    const guestSlotPadIndex = (mixerInput: string): number =>
-      parseInt(/(\d+)$/.exec(mixerInput)?.[1] ?? '0', 10);
-    const guestSlotNumber = new Map<string, number>();
-    [...production.sources]
-      .filter((a) => !!a.returnFeed)
-      .sort((a, b) => guestSlotPadIndex(b.mixerInput) - guestSlotPadIndex(a.mixerInput))
-      .forEach((a, i) => guestSlotNumber.set(a.mixerInput, i + 1));
-
-    // Label source inputs — at the COMPACT pad the input is actually wired to
-    // (issue #463), so the multiview overlay labels line up with the real tiles.
+    // Label source inputs on the multiviewer — at the COMPACT pad the input is
+    // actually wired to (issue #463), so the overlay labels line up with the real
+    // tiles. A WHIP guest slot takes the controller's "Guest N" label (from the
+    // shared guestSlotNumber map above) in preference to the generic "WHIP Input"
+    // virtual-source name; Strom would otherwise fall back to its default "In N+1".
+    // Every other input keeps its own source name. (issues #458, #463, #464)
     for (const assignment of sortedAssignments) {
       const padIndex = stromPadOf(assignment.mixerInput);
       if (padIndex === null) continue;
       const src = sourceMap.get(assignment.sourceId) ?? (VIRTUAL_SOURCES[assignment.sourceId] as SourceDoc | undefined);
-      // A WHIP guest slot takes the controller's "Guest N" label in preference
-      // to the generic "WHIP Input" virtual-source name; every other input keeps
-      // its own source name.
       const guestNum = assignment.returnFeed && src?.streamType === 'whip'
         ? guestSlotNumber.get(assignment.mixerInput)
         : undefined;
@@ -848,9 +852,16 @@ export async function activateStromFlow(
       flow.links.push({ from: `${audioOffsetIdWhip}:out`, to: `${mixerBlockId}:audio_in_${stromPad}` });
       if (audioMixerBlock && audioMixerBlockId) {
         flow.links.push({ from: `${audioOffsetIdWhip}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
-        if (source.name) {
+        // A WHIP guest slot's audio strip takes the same "Guest N" label as its
+        // multiviewer tile (from the shared guestSlotNumber map) in preference to
+        // the generic "WHIP Input" virtual-source name, so the audio mixer agrees
+        // with the multiviewer and the Studio controller. A plain WHIP input with
+        // no returnFeed keeps its own source name. (issue #464)
+        const guestNum = assignment.returnFeed ? guestSlotNumber.get(assignment.mixerInput) : undefined;
+        const label = guestNum !== undefined ? `Guest ${guestNum}` : source.name;
+        if (label) {
           const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
-          props[`ch${audioChannel + 1}_label`] = source.name;
+          props[`ch${audioChannel + 1}_label`] = label;
           audioMixerBlock['properties'] = props;
         }
       }
