@@ -68,6 +68,20 @@ function visionMixerProps(flow: Record<string, unknown>): Record<string, unknown
   return mixer['properties'] as Record<string, unknown>;
 }
 
+function audioMixerProps(flow: Record<string, unknown>): Record<string, unknown> {
+  const blocks = flow['blocks'] as Array<Record<string, unknown>>;
+  const mixer = blocks.find((b) => b['block_definition_id'] === 'builtin.mixer')!;
+  return (mixer['properties'] ?? {}) as Record<string, unknown>;
+}
+
+/** Collects every `ch{N}_label` value set on the audio mixer block. */
+function audioChannelLabels(flow: Record<string, unknown>): string[] {
+  const props = audioMixerProps(flow);
+  return Object.entries(props)
+    .filter(([k]) => /^ch\d+_label$/.test(k))
+    .map(([, v]) => v as string);
+}
+
 describe('activateStromFlow — guest-slot multiview labels (#458)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -139,6 +153,86 @@ describe('activateStromFlow — guest-slot multiview labels (#458)', () => {
     const props = visionMixerProps(strom.capturedFlows[0]!);
     // Keeps the virtual WHIP source's own name, never a "Guest N" label.
     expect(props['input_1_label']).toBe('WHIP Input');
+  });
+});
+
+describe('activateStromFlow — guest-slot audio mixer strip labels (#464)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sourceDocs.clear();
+  });
+
+  it('labels a WHIP guest slot audio strip "Guest N", never the generic "WHIP Input"', async () => {
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    const strom = makeStromClient();
+    const production = makeProduction([
+      { sourceId: '__test1__', mixerInput: 'video_in_0' },
+      { sourceId: 'Whip', mixerInput: 'video_in_5', returnFeed: { synced: 'program-minus' } },
+    ]);
+
+    await activateStromFlow(production as never, strom as never);
+
+    const labels = audioChannelLabels(strom.capturedFlows[0]!);
+    // The audio strip for the guest slot must read "Guest 1", matching the
+    // multiviewer tile — not the virtual source's generic "WHIP Input" name.
+    expect(labels).toContain('Guest 1');
+    expect(labels).not.toContain('WHIP Input');
+  });
+
+  it('numbers multiple guest-slot audio strips the same way as the multiviewer (pad index descending)', async () => {
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    const strom = makeStromClient();
+    const production = makeProduction([
+      { sourceId: '__test1__', mixerInput: 'video_in_0' },
+      { sourceId: 'Whip', mixerInput: 'video_in_4', returnFeed: { synced: 'program-minus' } },
+      { sourceId: 'Whip', mixerInput: 'video_in_5', returnFeed: { synced: 'program-minus' } },
+    ]);
+
+    await activateStromFlow(production as never, strom as never);
+
+    const flow = strom.capturedFlows[0]!;
+    const visProps = visionMixerProps(flow);
+    const audioLabels = audioChannelLabels(flow);
+    // Highest trailing index is Guest 1, next is Guest 2 — identical to the
+    // multiviewer's input_{N}_label numbering (the shared guestSlotNumber map).
+    expect(visProps['input_5_label']).toBe('Guest 1');
+    expect(visProps['input_4_label']).toBe('Guest 2');
+    expect(audioLabels).toContain('Guest 1');
+    expect(audioLabels).toContain('Guest 2');
+    expect(audioLabels).not.toContain('WHIP Input');
+  });
+
+  it('keeps a named non-guest source audio strip label and does not label it "Guest N"', async () => {
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    const strom = makeStromClient();
+    sourceDocs.set('src-cam', { _id: 'src-cam', type: 'source', name: 'Camera A', streamType: 'srt', address: 'srt://:5000?mode=listener' });
+    const production = makeProduction([
+      { sourceId: 'src-cam', mixerInput: 'video_in_0' },
+      { sourceId: 'Whip', mixerInput: 'video_in_5', returnFeed: { synced: 'program-minus' } },
+    ]);
+
+    await activateStromFlow(production as never, strom as never);
+
+    const labels = audioChannelLabels(strom.capturedFlows[0]!);
+    expect(labels).toContain('Camera A');
+    expect(labels).toContain('Guest 1');
+  });
+
+  it('does not apply the "Guest N" label to a WHIP audio strip without a returnFeed (not a guest slot)', async () => {
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    const strom = makeStromClient();
+    const production = makeProduction([
+      { sourceId: '__test1__', mixerInput: 'video_in_0' },
+      // WHIP input with no returnFeed is an ordinary WHIP source, not a guest slot.
+      { sourceId: 'Whip', mixerInput: 'video_in_1' },
+    ]);
+
+    await activateStromFlow(production as never, strom as never);
+
+    const labels = audioChannelLabels(strom.capturedFlows[0]!);
+    // Keeps the virtual WHIP source's own name, never a "Guest N" label.
+    expect(labels).toContain('WHIP Input');
+    expect(labels).not.toContain('Guest 1');
   });
 });
 
