@@ -258,6 +258,38 @@ write so a REST mix change no longer leaves live WS clients stale. `broadcast()`
 (`src/services/tally.service.ts`) takes `message: unknown`, so there is no outgoing-message union
 to extend — the extra field is accepted as-is.
 
+## Controller WS rate-limit drops are coalesced and idempotent setters are replayed
+
+The per-connection WS rate limiter (`src/ws/controller.ts`, `checkRateLimit`, 20 msg/s general +
+5/s expensive) used to emit one `ERROR`/`NACK` per dropped message and log nothing, so an
+unthrottled slider drag (~100 `SET_EFFECT`/s) became a storm of toasts and a dropped *final*
+slider position left the effect stale (#469). `handleRateLimitedMessage` now opens a single
+**drop window** (one `RATE_LIMIT_WINDOW_MS` timer, scheduled on the first drop) in which:
+
+- correlated commands (those carrying a `cmdId`) still get their **own** `NACK` — the automation
+  contract (§2) requires every `cmdId` to resolve, so these are deliberately NOT folded into the
+  coalesced frame;
+- all *uncorrelated* drops share **one** `ERROR` frame (`errorSentThisWindow`);
+- the latest value of each idempotent setter is retained per target in `pendingSetters`, keyed by
+  `coalesceKey(msg)` (`SET_EFFECT` by target, `AUDIO_SET`/`AUX_*`/`GRP_*`/`MONITOR_SET`/
+  `SOURCE_*_OFFSET_SET` by element/bus). `coalesceKey` returns `null` for commands and anything
+  whose intermediate values matter — those keep the old drop-outright semantics.
+
+When the window drains (`drainDropWindow`) it logs the aggregate count once at `warn` and
+**re-enters `handleMessage`** for each retained setter. Non-obvious invariants:
+
+- The drain **must** receive the full `ControllerMsgCtx` (not just the `RateLimitState`), because
+  the replayed `AUDIO_SET` relies on `ctx.audioBlockId` resolved at connect time; passing a bare
+  ctx would force a redundant flow fetch.
+- Replay runs through the *now-drained* sliding window, so if a burst is still saturating the
+  limiter the replay is simply re-dropped and re-retained — the final value still converges across
+  successive windows rather than being lost.
+- The drain timer is `unref()`ed so a pending window never keeps the process alive, and
+  `createRateLimitState()` (not an inline literal) must be used to seed the state or the new
+  `pendingSetters`/counter fields are undefined. Tests drive the window with
+  `vi.advanceTimersByTimeAsync(RATE_LIMIT_WINDOW_MS)` — a plain `setSystemTime` jump does **not**
+  fire the drain timer.
+
 ## Strom ends a WHIP publish only on the session RESOURCE, never the endpoint
 
 Strom routes `DELETE` only on the WHIP session resource

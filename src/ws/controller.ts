@@ -59,11 +59,34 @@ const RATE_LIMIT_WINDOW_MS = 1000;
 /** Message types whose processing is expensive enough to warrant a tighter cap. */
 const EXPENSIVE_MESSAGE_TYPES = new Set(['MACRO_EXEC', 'GO_LIVE', 'CUT_STREAM', 'HTML_SOURCE_EVENT']);
 
-/** Per-connection sliding-window timestamps. Lives on the connection ctx so it
- * is garbage-collected when the socket closes (no global registry to leak). */
+/** Human-facing error string for a rate-limited message. Kept as a single
+ * constant so the coalesced ERROR frame and the per-cmdId NACK stay identical. */
+const RATE_LIMIT_ERROR = 'Rate limit exceeded';
+
+/** Per-connection sliding-window timestamps plus the coalesced drop-handling
+ * state (issue #469). Lives on the connection ctx so it is garbage-collected
+ * when the socket closes (no global registry to leak). */
 interface RateLimitState {
   general: number[];
   expensive: number[];
+  /**
+   * Drop-window bookkeeping. When a message is dropped we open a window that
+   * drains after one RATE_LIMIT_WINDOW_MS; while it is open at most one ERROR
+   * frame is emitted for all uncorrelated drops, the latest value of each
+   * idempotent setter target is retained, and on drain we log the aggregate
+   * drop count and re-apply the retained setters so the final value lands.
+   */
+  droppedCount: number;
+  errorSentThisWindow: boolean;
+  /** Latest retained raw message per coalesce key (idempotent setters only). */
+  pendingSetters: Map<string, string>;
+  /** Active drain timer, or undefined when no drop window is open. */
+  flushTimer?: ReturnType<typeof setTimeout>;
+}
+
+/** Fresh per-connection rate-limit state. */
+function createRateLimitState(): RateLimitState {
+  return { general: [], expensive: [], droppedCount: 0, errorSentThisWindow: false, pendingSetters: new Map() };
 }
 
 /**
@@ -85,6 +108,128 @@ function checkRateLimit(state: RateLimitState, isExpensive: boolean, now: number
 
   state.general.push(now);
   return true;
+}
+
+/** Per-connection message context, threaded through `handleMessage`. Mutable so
+ * the audio block id resolved at connect time is reused on later AUDIO_SET
+ * messages, and so the rate-limit state survives across messages. */
+interface ControllerMsgCtx {
+  audioBlockId?: string;
+  rateLimit?: RateLimitState;
+}
+
+/**
+ * Coalesce key for an idempotent "set latest value" message (issue #469). When
+ * such a message is dropped by the rate limit we keep only the newest value per
+ * target, so the final value of a drag always lands when the window drains.
+ * Returns null for commands and anything whose intermediate values matter — those
+ * keep today's drop semantics (dropped outright, not replayed).
+ */
+function coalesceKey(msg: InboundMessage): string | null {
+  switch (msg.type) {
+    case 'SET_EFFECT':
+      return `SET_EFFECT:${msg.target === 'master' ? 'master' : `input:${msg.target.input}`}`;
+    case 'AUDIO_SET':
+      return `AUDIO_SET:${msg.elementId}:${msg.property}`;
+    case 'AUX_SEND_SET':
+      return `AUX_SEND_SET:${msg.elementId}:${msg.auxBus}`;
+    case 'AUX_MASTER_SET':
+      return `AUX_MASTER_SET:${msg.auxBus}`;
+    case 'GRP_SEND_SET':
+      return `GRP_SEND_SET:${msg.elementId}:${msg.grpBus}`;
+    case 'GRP_MASTER_SET':
+      return `GRP_MASTER_SET:${msg.grpBus}`;
+    case 'MONITOR_SET':
+      return 'MONITOR_SET';
+    case 'SOURCE_OFFSET_SET':
+      return `SOURCE_OFFSET_SET:${msg.mixerInput}`;
+    case 'SOURCE_AUDIO_OFFSET_SET':
+      return `SOURCE_AUDIO_OFFSET_SET:${msg.mixerInput}`;
+    default:
+      return null;
+  }
+}
+
+/**
+ * Handle a message rejected by the rate limiter (issue #469). Previously every
+ * dropped message produced its own ERROR/NACK and nothing was logged, so a
+ * ~100/s slider drag became a storm of toasts and a dropped final position left
+ * the effect stale. Now, for the duration of one drop window:
+ *   - correlated commands (carrying a `cmdId`) still get their individual NACK,
+ *     so the automation contract's per-cmdId resolution is preserved;
+ *   - all uncorrelated drops share a single ERROR frame;
+ *   - the latest value of each idempotent setter target is retained and
+ *     re-applied when the window drains, so the final value is never lost;
+ *   - the aggregate drop count is logged once, at `warn`, when the window drains.
+ */
+function handleRateLimitedMessage(
+  ctx: ControllerMsgCtx,
+  productionId: string,
+  ws: WebSocket,
+  msg: InboundMessage,
+  raw: string,
+): void {
+  const state = ctx.rateLimit!;
+
+  // Open a drop window on the first drop; it drains after one window length.
+  if (state.flushTimer === undefined) {
+    state.droppedCount = 0;
+    state.errorSentThisWindow = false;
+    state.pendingSetters.clear();
+    state.flushTimer = setTimeout(() => drainDropWindow(ctx, productionId, ws), RATE_LIMIT_WINDOW_MS);
+    // Do not keep the event loop alive solely for a pending drop window.
+    state.flushTimer.unref?.();
+  }
+  state.droppedCount++;
+
+  const cmdId = 'cmdId' in msg ? (msg.cmdId as string | undefined) : undefined;
+  if (cmdId) {
+    // Correlated command: keep existing semantics — one NACK per command so the
+    // client's cmdId always resolves. These are not the source of the toast storm.
+    sendNack(ws, productionId, cmdId, RATE_LIMIT_ERROR);
+    return;
+  }
+
+  // Idempotent setter: retain only the latest value for this target.
+  const key = coalesceKey(msg);
+  if (key) state.pendingSetters.set(key, raw);
+
+  // At most one ERROR frame per window for all uncorrelated drops.
+  if (!state.errorSentThisWindow) {
+    ws.send(JSON.stringify({ type: 'ERROR', error: RATE_LIMIT_ERROR }));
+    state.errorSentThisWindow = true;
+  }
+}
+
+/**
+ * Drain an open drop window: log the aggregate drop count once at `warn`, then
+ * re-apply the latest retained value for each setter target. Re-entering
+ * `handleMessage` runs each replay through the (now-drained) sliding window; if
+ * the burst is still saturating the window the replay is simply re-dropped and
+ * retained again, so the final value still converges.
+ */
+function drainDropWindow(ctx: ControllerMsgCtx, productionId: string, ws: WebSocket): void {
+  const state = ctx.rateLimit;
+  if (!state) return;
+
+  const dropped = state.droppedCount;
+  const pending = state.pendingSetters;
+  state.flushTimer = undefined;
+  state.droppedCount = 0;
+  state.errorSentThisWindow = false;
+  state.pendingSetters = new Map();
+
+  if (dropped > 0) {
+    console.warn(
+      `[controller] rate limit: dropped ${dropped} message(s) on production ${productionId} in the last ${RATE_LIMIT_WINDOW_MS}ms`,
+    );
+  }
+
+  for (const raw of pending.values()) {
+    void handleMessage(productionId, ws, raw, ctx).catch((err) => {
+      console.error('[controller] rate-limit replay error:', err);
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1542,7 +1687,7 @@ export async function handleMessage(
   productionId: string,
   ws: WebSocket,
   raw: string,
-  ctx: { audioBlockId?: string; rateLimit?: RateLimitState },
+  ctx: ControllerMsgCtx,
 ): Promise<void> {
   let rawParsed: unknown;
   try {
@@ -1559,15 +1704,12 @@ export async function handleMessage(
   const msg: InboundMessage = parseResult.data as unknown as InboundMessage;
 
   // Per-connection rate limiting: drop (do not process) messages that exceed
-  // the sliding-window caps and inform the client via the standard ERROR frame.
-  if (!ctx.rateLimit) ctx.rateLimit = { general: [], expensive: [] };
+  // the sliding-window caps. Dropped messages are coalesced (one ERROR per
+  // window), logged, and — for idempotent setters — their latest value is
+  // retained and re-applied when the window drains (issue #469).
+  if (!ctx.rateLimit) ctx.rateLimit = createRateLimitState();
   if (!checkRateLimit(ctx.rateLimit, EXPENSIVE_MESSAGE_TYPES.has(msg.type), Date.now())) {
-    const rateLimitError = 'Rate limit exceeded';
-    if ('cmdId' in msg && msg.cmdId) {
-      sendNack(ws, productionId, msg.cmdId, rateLimitError);
-    } else {
-      ws.send(JSON.stringify({ type: 'ERROR', error: rateLimitError }));
-    }
+    handleRateLimitedMessage(ctx, productionId, ws, msg, raw);
     return;
   }
 
@@ -3214,7 +3356,7 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
       try {
       // Per-connection context — mutable so the audio block ID can be populated
       // at connect time and reused on every subsequent AUDIO_SET without a flow fetch.
-      const ctx: { audioBlockId?: string; rateLimit?: RateLimitState } = {};
+      const ctx: ControllerMsgCtx = {};
 
       // Register message/close handlers immediately so no messages are dropped
       // while we perform the async connect-time sync below.
