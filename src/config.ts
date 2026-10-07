@@ -94,13 +94,16 @@ export function buildCouchdbUrl(): string {
 export function buildStromPublicUrl(): string | undefined {
   const raw = optionalEnv('STROM_PUBLIC_URL');
   if (!raw) return undefined;
-  let protocol: string | undefined;
-  try {
-    protocol = new URL(raw).protocol;
-  } catch {
-    // reported below
+  // new URL() also accepts `https:host` and `https:/host`, but the raw value is what gets stored.
+  let valid = /^https?:\/\//i.test(raw);
+  if (valid) {
+    try {
+      new URL(raw);
+    } catch {
+      valid = false;
+    }
   }
-  if (protocol !== 'http:' && protocol !== 'https:') {
+  if (!valid) {
     throw new Error(
       `Invalid STROM_PUBLIC_URL: "${redactUrlCredentials(raw)}" is not an http(s) URL. ` +
         `Expected the form http(s)://host[:port][/path].`,

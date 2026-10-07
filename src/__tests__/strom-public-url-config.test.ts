@@ -23,7 +23,13 @@ describe('buildStromPublicUrl', () => {
     expect(buildStromPublicUrl()).toBe('http://localhost:8080/strom');
   });
 
-  it.each(['strom.example.com', 'strom.example.com:8080', 'ftp://strom.example.com'])(
+  it.each([
+    'strom.example.com',
+    'strom.example.com:8080',
+    'ftp://strom.example.com',
+    'https:strom.example.com',
+    'https:/strom.example.com',
+  ])(
     'rejects %s with an error naming STROM_PUBLIC_URL',
     (value) => {
       process.env['STROM_PUBLIC_URL'] = value;
