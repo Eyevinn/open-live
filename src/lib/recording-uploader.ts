@@ -502,6 +502,7 @@ export async function uploadProductionRecordings(args: UploadProductionRecording
         done.push(index.path);
       } catch (err) {
         result.failed.push({ file: index.path, error: err instanceof Error ? err.message : String(err) });
+        if (err instanceof S3AuthError) result.abortedOnAuthError = { file: index.path, code: err.code };
       }
     }
     swept.push({ path: dir.path, fileCount: files.length + (index ? 1 : 0), done });

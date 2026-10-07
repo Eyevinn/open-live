@@ -332,6 +332,20 @@ describe('deactivate — per-input recordings', () => {
     expect(recordings.size).toBe(0);
   });
 
+  it('stops the sweep when the sidecar is the first upload the store rejects', async () => {
+    const attempts: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      if (init?.method === 'PUT') {
+        attempts.push(new URL(url).pathname);
+        return new Response('<Error><Code>InvalidAccessKeyId</Code></Error>', { status: 403 });
+      }
+      return new Response('bytes', { status: 200 });
+    }));
+    mediaFiles = [SIDECAR, 'recordings/prod-iso-1/20261001T110000Z-22222222-2222-4222-8222-222222222222/prod-iso-1_20261001_110000_00000.mp4'];
+    await deactivate();
+    expect(attempts).toEqual([`/vod/prod-iso-1/${ACT_NAME}/recordings.json`]);
+  });
+
   it('clears the input recorder ids', async () => {
     await deactivate();
     expect(production['inputRecorderBlockIds']).toBeUndefined();
