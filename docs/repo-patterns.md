@@ -211,6 +211,19 @@ reuse `returnBuses` order for the label. The label is a non-live creation-time p
 it to the joined guest's invite label live is a separate stretch goal (needs Strom live-label
 support).
 
+The same precedence must be repeated in the `GET /audio` route (`src/routes/audio.ts`, issue
+#464): the generator writes the guest slot's `ch{N}_label = Guest N` on the audio mixer block, but
+the route resolved each strip's label from `loadAudioChannels` FIRST — and a WHIP guest slot
+resolves to the virtual `Whip` source's name `WHIP Input`, so a naive
+`audioChannelNameMap.get(i) ?? ch{N}_label` short-circuits and every guest strip reads
+`WHIP Input`. So the route detects a WHIP guest slot the same way the generator does (an
+assignment carrying a `returnFeed` whose resolved source has `streamType === 'whip'`) and, for
+those channels only, prefers the flow's `ch{N}_label` over the resolved name; every non-guest
+channel keeps resolved-name-first. The flow-generator property test is not enough on its own — a
+guest-slot label regression only shows at the endpoint, so cover it with an endpoint-level test
+(`src/__tests__/audio-guest-slot-labels.test.ts` generates a real flow, serves it from a throwaway
+Strom, and asserts `GET /audio` returns `Guest N`).
+
 ## The controller WS reads `?mode` by exact key — confusable keys must be rejected, not ignored
 
 The controller WebSocket route (`src/ws/controller.ts`, `controllerWs`) decides watch-only vs

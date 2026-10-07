@@ -60,19 +60,33 @@ const audioRoutes: FastifyPluginAsync = async (fastify) => {
         // Build audio-channel-index → source name / mixerInput maps.
         const audioChannelNameMap = new Map<number, string>();
         const audioChannelMixerInputMap = new Map<number, string>();
+        // Channels that are WHIP guest slots. For these, the generic virtual-source
+        // name is "WHIP Input" (audio-channels.ts VIRTUAL_SOURCES['Whip']), so the
+        // "Guest N" value the flow generator wrote to ch{N}_label must WIN over that
+        // name — otherwise every guest strip reads "WHIP Input" (issue #464). A WHIP
+        // guest slot is detected exactly as flow-generator.ts does: an assignment
+        // carrying a `returnFeed` whose source resolves to streamType 'whip'. Plain
+        // WHIP inputs (no returnFeed) and every other source keep their own name.
+        const guestWhipChannels = new Set<number>();
         try {
           for (const { channel, assignment, source } of await loadAudioChannels(doc.sources ?? [])) {
             audioChannelNameMap.set(channel, source.name);
             audioChannelMixerInputMap.set(channel, assignment.mixerInput);
+            if (assignment.returnFeed && source.streamType === 'whip') {
+              guestWhipChannels.add(channel);
+            }
           }
         } catch { /* sources DB unavailable */ }
 
         const channels = Array.from({ length: numChannels }, (_, i) => {
           const chIdx = i + 1;
-          const label =
-            audioChannelNameMap.get(i) ??
-            (mixerBlock.properties?.[`ch${chIdx}_label`] as string | undefined) ??
-            `Ch ${chIdx}`;
+          const chLabel = mixerBlock.properties?.[`ch${chIdx}_label`] as string | undefined;
+          // Guest slots: the flow's ch{N}_label ("Guest N") takes precedence over
+          // the generic "WHIP Input" virtual-source name. Everything else keeps the
+          // resolved source name first, falling back to the flow label then "Ch N".
+          const label = guestWhipChannels.has(i)
+            ? (chLabel ?? audioChannelNameMap.get(i) ?? `Ch ${chIdx}`)
+            : (audioChannelNameMap.get(i) ?? chLabel ?? `Ch ${chIdx}`);
           return { id: `ch${chIdx}`, elementId: `ch${chIdx}`, blockId: mixerBlock.id, label, mixerInput: audioChannelMixerInputMap.get(i) ?? null };
         });
 
