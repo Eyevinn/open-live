@@ -478,8 +478,10 @@ export async function uploadProductionRecordings(args: UploadProductionRecording
     }
     const startedAt = activationStartFromDirName(dir.name);
     // Subdirectories first, so the activation's own directory is only removed
-    // once they have been.
+    // once they have been. After an auth abort every upload would fail the
+    // same way, so the rest of the activation is left on Strom.
     for (const sub of listed.filter((e) => e.is_directory && INPUT_RECORDING_DIR_RE.test(e.name))) {
+      if (result.abortedOnAuthError) break;
       let files: MediaEntry[];
       try {
         files = ((await strom.media.list(sub.path)).entries ?? []).filter((e) => !e.is_directory);
@@ -491,9 +493,9 @@ export async function uploadProductionRecordings(args: UploadProductionRecording
       swept.push({ path: sub.path, fileCount: files.length, done });
     }
     const files = listed.filter((e) => !e.is_directory && e.name !== RECORDING_INDEX_FILE);
-    const done = await uploadFiles(args, files, startedAt, isUploaded, result);
+    const done = result.abortedOnAuthError ? [] : await uploadFiles(args, files, startedAt, isUploaded, result);
     const index = listed.find((e) => !e.is_directory && e.name === RECORDING_INDEX_FILE);
-    if (index) {
+    if (index && !result.abortedOnAuthError) {
       try {
         const bytes = await downloadFromStrom(args.stromUrl, args.stromToken, index.path);
         await putObject(args.target, recordingIndexObjectKey(productionId, dir.name), bytes, 'application/json');
