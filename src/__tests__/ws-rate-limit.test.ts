@@ -40,9 +40,25 @@ vi.mock('../services/tally.service.js', async (importOriginal) => {
   return { ...actual, broadcast: () => {} };
 });
 
+// Capture SET_EFFECT writes so the "last value wins after a burst" test can
+// assert the final value reached Strom (issue #469). Other tests use a
+// non-activated doc so this is never called.
+const setVideoEffectMock = vi.fn().mockResolvedValue({});
+
+vi.mock('../lib/strom.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../lib/strom.js')>();
+  class StromClient {
+    mixer = { setVideoEffect: setVideoEffectMock };
+    flows = { get: vi.fn(), updateBlockProperties: vi.fn().mockResolvedValue({}) };
+  }
+  return { ...actual, StromClient };
+});
+
 const { handleMessage } = await import('../ws/controller.js');
 
 const PROD = 'prod-rate-1';
+const FLOW = 'flow-rate-1';
+const MIXER_BLOCK = 'mixer-block-1';
 
 // A non-activated production: GO_LIVE short-circuits with an ERROR and never
 // calls Strom, so every accepted message is a pure control-path exercise.
@@ -64,6 +80,18 @@ function makeDoc() {
   };
 }
 
+// An activated production so SET_EFFECT actually calls Strom and we can observe
+// which value landed.
+function makeActiveDoc() {
+  return {
+    ...makeDoc(),
+    status: 'live',
+    stromFlowId: FLOW,
+    mixerBlockId: MIXER_BLOCK,
+    mixerInputMap: null,
+  };
+}
+
 function makeWs() {
   const sent: Array<Record<string, unknown>> = [];
   const ws = {
@@ -82,22 +110,24 @@ describe('WebSocket per-connection rate limiting', () => {
     vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
     mockGet.mockReset();
     mockGet.mockResolvedValue(makeDoc());
+    setVideoEffectMock.mockClear();
   });
 
   afterEach(() => {
     vi.useRealTimers();
   });
 
-  it('allows up to the general cap then drops excess with an ERROR frame', async () => {
+  it('allows up to the general cap then coalesces excess to a single ERROR frame', async () => {
     const { ws, sent } = makeWs();
     const ctx: Record<string, unknown> = {};
 
-    // 25 cheap SET_OVL messages within the same window. First 20 pass, rest drop.
+    // 25 cheap SET_OVL messages within the same window. First 20 pass, rest
+    // drop — but the 5 drops now share ONE coalesced ERROR frame (issue #469).
     for (let i = 0; i < 25; i++) {
       await handleMessage(PROD, ws, JSON.stringify({ type: 'SET_OVL', alpha: 0.5 }), ctx);
     }
 
-    expect(rateLimitFrames(sent)).toHaveLength(5);
+    expect(rateLimitFrames(sent)).toHaveLength(1);
   });
 
   it('does not process a message that exceeds the limit', async () => {
@@ -156,5 +186,102 @@ describe('WebSocket per-connection rate limiting', () => {
 
     expect(rateLimitFrames(a.sent)).toHaveLength(1);
     expect(rateLimitFrames(b.sent)).toHaveLength(0);
+  });
+
+  // --- Coalesced drop handling (issue #469) ----------------------------------
+
+  it('coalesces a SET_EFFECT burst to a single ERROR per window', async () => {
+    mockGet.mockResolvedValue(makeActiveDoc());
+    const { ws, sent } = makeWs();
+    const ctx: Record<string, unknown> = {};
+
+    // 30 SET_EFFECT to the same target: 20 pass, 10 drop. The 10 drops share one
+    // ERROR frame rather than producing one toast each.
+    for (let i = 0; i < 30; i++) {
+      await handleMessage(
+        PROD,
+        ws,
+        JSON.stringify({ type: 'SET_EFFECT', target: { input: 1 }, effect: { type: 'blur', radius: i } }),
+        ctx,
+      );
+    }
+
+    expect(rateLimitFrames(sent)).toHaveLength(1);
+  });
+
+  it('logs the aggregate drop count at warn when the window drains', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { ws } = makeWs();
+      const ctx: Record<string, unknown> = {};
+
+      // 25 cheap messages: 20 pass, 5 drop. Nothing is logged until the window
+      // drains, then a single aggregated warn carries the count.
+      for (let i = 0; i < 25; i++) {
+        await handleMessage(PROD, ws, JSON.stringify({ type: 'SET_OVL', alpha: 0.5 }), ctx);
+      }
+
+      const dropWarnsBeforeDrain = warnSpy.mock.calls.filter((c) =>
+        String(c[0]).includes('rate limit: dropped'),
+      );
+      expect(dropWarnsBeforeDrain).toHaveLength(0);
+
+      await vi.advanceTimersByTimeAsync(1000);
+
+      const dropWarns = warnSpy.mock.calls.filter((c) => String(c[0]).includes('rate limit: dropped'));
+      expect(dropWarns).toHaveLength(1);
+      expect(String(dropWarns[0][0])).toContain('dropped 5 message(s)');
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('keeps the last setter value: the final SET_EFFECT of a burst is applied after the window drains', async () => {
+    mockGet.mockResolvedValue(makeActiveDoc());
+    const { ws } = makeWs();
+    const ctx: Record<string, unknown> = {};
+
+    // 30 SET_EFFECT to one target with blur radius 0..29. First 20 reach Strom;
+    // radii 20..29 are dropped, with 29 (the final position) retained.
+    for (let i = 0; i < 30; i++) {
+      await handleMessage(
+        PROD,
+        ws,
+        JSON.stringify({ type: 'SET_EFFECT', target: { input: 1 }, effect: { type: 'blur', radius: i } }),
+        ctx,
+      );
+    }
+
+    // Before the window drains the retained final value has NOT landed yet: the
+    // newest value Strom has seen is the last one that passed (radius 19).
+    const radiiBeforeDrain = setVideoEffectMock.mock.calls.map((c) => c[2].effect.radius);
+    expect(radiiBeforeDrain).toHaveLength(20);
+    expect(Math.max(...radiiBeforeDrain)).toBe(19);
+
+    // Drain the window: the retained final value is re-applied so it is never lost.
+    await vi.advanceTimersByTimeAsync(1000);
+
+    const radiiAfterDrain = setVideoEffectMock.mock.calls.map((c) => c[2].effect.radius);
+    expect(radiiAfterDrain).toHaveLength(21);
+    // The very last write to Strom is the final slider position, not a stale value.
+    expect(radiiAfterDrain[radiiAfterDrain.length - 1]).toBe(29);
+  });
+
+  it('still NACKs each correlated (cmdId) command individually when rate-limited', async () => {
+    const { ws, sent } = makeWs();
+    const ctx: Record<string, unknown> = {};
+
+    // GO_LIVE is expensive (cap 5). Six carry distinct cmdIds; the 6th is dropped
+    // and — to preserve the automation contract's per-cmdId resolution — gets its
+    // own NACK rather than being folded into the coalesced ERROR.
+    for (let i = 0; i < 6; i++) {
+      await handleMessage(PROD, ws, JSON.stringify({ type: 'GO_LIVE', cmdId: `cmd-${i}` }), ctx);
+    }
+
+    const nacks = sent.filter((m) => m.type === 'NACK' && m.error === 'Rate limit exceeded');
+    expect(nacks).toHaveLength(1);
+    expect(nacks[0].cmdId).toBe('cmd-5');
+    // No bare ERROR frame for a correlated drop.
+    expect(rateLimitFrames(sent)).toHaveLength(0);
   });
 });

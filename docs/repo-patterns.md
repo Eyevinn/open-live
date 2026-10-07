@@ -211,6 +211,19 @@ reuse `returnBuses` order for the label. The label is a non-live creation-time p
 it to the joined guest's invite label live is a separate stretch goal (needs Strom live-label
 support).
 
+The same precedence must be repeated in the `GET /audio` route (`src/routes/audio.ts`, issue
+#464): the generator writes the guest slot's `ch{N}_label = Guest N` on the audio mixer block, but
+the route resolved each strip's label from `loadAudioChannels` FIRST — and a WHIP guest slot
+resolves to the virtual `Whip` source's name `WHIP Input`, so a naive
+`audioChannelNameMap.get(i) ?? ch{N}_label` short-circuits and every guest strip reads
+`WHIP Input`. So the route detects a WHIP guest slot the same way the generator does (an
+assignment carrying a `returnFeed` whose resolved source has `streamType === 'whip'`) and, for
+those channels only, prefers the flow's `ch{N}_label` over the resolved name; every non-guest
+channel keeps resolved-name-first. The flow-generator property test is not enough on its own — a
+guest-slot label regression only shows at the endpoint, so cover it with an endpoint-level test
+(`src/__tests__/audio-guest-slot-labels.test.ts` generates a real flow, serves it from a throwaway
+Strom, and asserts `GET /audio` returns `Guest N`).
+
 ## The controller WS reads `?mode` by exact key — confusable keys must be rejected, not ignored
 
 The controller WebSocket route (`src/ws/controller.ts`, `controllerWs`) decides watch-only vs
@@ -244,3 +257,55 @@ previously broadcast nothing; it now emits the same `AUDIO_STATE { ..., applied:
 write so a REST mix change no longer leaves live WS clients stale. `broadcast()`
 (`src/services/tally.service.ts`) takes `message: unknown`, so there is no outgoing-message union
 to extend — the extra field is accepted as-is.
+
+## Controller WS rate-limit drops are coalesced and idempotent setters are replayed
+
+The per-connection WS rate limiter (`src/ws/controller.ts`, `checkRateLimit`, 20 msg/s general +
+5/s expensive) used to emit one `ERROR`/`NACK` per dropped message and log nothing, so an
+unthrottled slider drag (~100 `SET_EFFECT`/s) became a storm of toasts and a dropped *final*
+slider position left the effect stale (#469). `handleRateLimitedMessage` now opens a single
+**drop window** (one `RATE_LIMIT_WINDOW_MS` timer, scheduled on the first drop) in which:
+
+- correlated commands (those carrying a `cmdId`) still get their **own** `NACK` — the automation
+  contract (§2) requires every `cmdId` to resolve, so these are deliberately NOT folded into the
+  coalesced frame;
+- all *uncorrelated* drops share **one** `ERROR` frame (`errorSentThisWindow`);
+- the latest value of each idempotent setter is retained per target in `pendingSetters`, keyed by
+  `coalesceKey(msg)` (`SET_EFFECT` by target, `AUDIO_SET`/`AUX_*`/`GRP_*`/`MONITOR_SET`/
+  `SOURCE_*_OFFSET_SET` by element/bus). `coalesceKey` returns `null` for commands and anything
+  whose intermediate values matter — those keep the old drop-outright semantics.
+
+When the window drains (`drainDropWindow`) it logs the aggregate count once at `warn` and
+**re-enters `handleMessage`** for each retained setter. Non-obvious invariants:
+
+- The drain **must** receive the full `ControllerMsgCtx` (not just the `RateLimitState`), because
+  the replayed `AUDIO_SET` relies on `ctx.audioBlockId` resolved at connect time; passing a bare
+  ctx would force a redundant flow fetch.
+- Replay runs through the *now-drained* sliding window, so if a burst is still saturating the
+  limiter the replay is simply re-dropped and re-retained — the final value still converges across
+  successive windows rather than being lost.
+- The drain timer is `unref()`ed so a pending window never keeps the process alive, and
+  `createRateLimitState()` (not an inline literal) must be used to seed the state or the new
+  `pendingSetters`/counter fields are undefined. Tests drive the window with
+  `vi.advanceTimersByTimeAsync(RATE_LIMIT_WINDOW_MS)` — a plain `setSystemTime` jump does **not**
+  fire the drain timer.
+
+## Strom ends a WHIP publish only on the session RESOURCE, never the endpoint
+
+Strom routes `DELETE` only on the WHIP session resource
+(`/whip/{endpoint_id}/resource/{resource_id}`), not on the bare endpoint URL
+`resolveStromWhipUrl()` (`src/routes/whip.ts`) builds (`/whip/{endpoint_id}`). A `DELETE` on the
+endpoint returns but does **not** end the session — Strom keeps the publisher alive until its 10 s
+inactivity reaper. So guest leave/kick appeared to work (204) yet a rejoining guest could be off
+air for tens of seconds (#467). The resource URL is only knowable from the `Location` header Strom
+returns on the WHIP offer POST; the proxy (`proxyWhipOffer`) rewrites that for the client but the
+server must also *keep* it. It is now persisted on the guest session as
+`GuestSessionDoc.whipSessionUrl` (via `proxyWhipOffer`'s `onStromLocation` sink →
+`persistGuestWhipSessionUrl`, guest POST path only — crew teardown stays client-driven through the
+proxy), and `teardownGuestWhip` (`src/routes/guests.ts`) DELETEs **that** URL, not the endpoint.
+Any new server-side WHIP teardown must target the stored session resource, re-check it is
+`assertSameStromOrigin` before the DELETE (the stored Location is defence-in-depth untrusted), and
+**log** a non-2xx/network failure instead of swallowing it — a swallowed teardown is an invisible
+lingering session. `whipSessionUrl` is internal: it is destructured out of `sessionToApi` so it
+never reaches operator clients, and it is absent on return-only slots / before the first publish
+(teardown no-ops then) and stale after a reconnect until the next offer overwrites it.

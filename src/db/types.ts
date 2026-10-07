@@ -411,7 +411,17 @@ export interface GuestSessionDoc {
    * A rejoin resets it to unmuted.
    */
   muted?: boolean;
-  whipSessionId?: string;
+  /**
+   * Absolute Strom WHIP **session-resource** URL for this guest's live publish
+   * (`/whip/{endpoint_id}/resource/{resource_id}`), captured from the `Location`
+   * header Strom returns on the WHIP offer POST (`proxyWhipOffer`, issue #467).
+   * Server-side teardown (`teardownGuestWhip` on leave/kick) DELETEs THIS URL —
+   * a DELETE on the bare endpoint URL does not end the session, so without this
+   * Strom kept the guest session until its 10 s inactivity reaper. Absent on a
+   * return-only slot or before the guest has published; stale after a reconnect
+   * until the next offer overwrites it. Internal — stripped from `sessionToApi`.
+   */
+  whipSessionUrl?: string;
   /**
    * Strom WHEP session id of this guest's most recent return-picture feed
    * (issue #380). Bound on `POST .../returns/:mixerInput/picture/whep` so the
@@ -635,6 +645,17 @@ export interface ProductionDoc {
   sourceAudioOffsetBlockIds?: Record<string, string>;
   /** Maps mixerInput → media-player (builtin.media_player) block ID for clip sources — set on activate, cleared on deactivate */
   clipPlayerBlockIds?: Record<string, string>;
+  /**
+   * Maps a stored `mixerInput` (e.g. 'video_in_15') to the COMPACT vision-mixer
+   * pad index actually wired in the live Strom flow (issue #463) — set on
+   * activate, cleared on deactivate. Studio allocates guest slots from the top of
+   * the mixer-input range down, so the mixer is sized to what the production uses
+   * and the sparse stored pads are compacted to 0..N-1. The stored `mixerInput`
+   * stays the external identity; the WS layer applies this map only at the Strom
+   * boundary (switch/PiP/effect) and inverts it for Strom state read-backs.
+   * Absent / identity for contiguous-from-0 productions.
+   */
+  mixerInputMap?: Record<string, number>;
   /**
    * Persisted clip cue points (epic #206, issue #307 / OQ3). Maps a clip source's
    * mixerInput to the currently-cued clip and its cue position. A cued clip

@@ -3,7 +3,7 @@ import { getStromToken } from '../lib/strom-token.js'
 import { assertSameStromOrigin } from '../lib/url-validation.js'
 import { isUnderEndpointPath, resolveGuestSession, slotTakesWhip } from '../lib/guest-scope.js'
 import { config, isGuestCallingEnabled } from '../config.js'
-import { getDb } from '../db/index.js'
+import { getDb, getGuestSessionsDb } from '../db/index.js'
 import type { ProductionDoc, ProductionSourceAssignment } from '../db/types.js'
 import { broadcast } from '../services/tally.service.js'
 import { getWhipIngestState, setWhipIngestState, type WhipIngestState } from '../services/whip-ingest-state.js'
@@ -147,6 +147,14 @@ async function proxyWhipOffer(
   mixerInput: string,
   offerSdp: string,
   buildProxyLocation: (absoluteStromLocation: string) => string,
+  /**
+   * Optional sink for the absolute Strom session-resource URL Strom minted for
+   * this publish (its `Location`). The guest path uses it to persist the URL on
+   * the guest session so server-side teardown can DELETE the session resource
+   * (issue #467). Awaited but never allowed to fail the publish — a persist error
+   * only means a later teardown falls back to Strom's inactivity reaper.
+   */
+  onStromLocation?: (absoluteStromLocation: string) => Promise<void> | void,
 ): Promise<FastifyReply> {
   const stromTarget = resolveStromWhipUrl(productionId, mixerInput)
 
@@ -172,6 +180,7 @@ async function proxyWhipOffer(
       ? stromLocation
       : `${new URL(stromTarget).origin}${stromLocation}`
     reply.header('Location', buildProxyLocation(absoluteStromLocation))
+    if (onStromLocation) await onStromLocation(absoluteStromLocation)
   }
 
   reply.header('Content-Type', 'application/sdp')
@@ -220,7 +229,7 @@ async function proxyWhipDelete(
 async function resolveGuestWhipSlot(
   req: FastifyRequest<{ Params: { inviteId: string } }>,
   reply: FastifyReply,
-): Promise<{ productionId: string; mixerInput: string } | null> {
+): Promise<{ productionId: string; mixerInput: string; guestId: string } | null> {
   if (!isGuestCallingEnabled()) {
     await reply.status(503).send({ error: 'Guest calling is disabled', statusCode: 503 });
     return null;
@@ -235,7 +244,38 @@ async function resolveGuestWhipSlot(
     await reply.status(404).send({ error: 'No guest slot on this session', statusCode: 404 });
     return null;
   }
-  return { productionId: who.invite.productionId, mixerInput: who.session.mixerInput };
+  return {
+    productionId: who.invite.productionId,
+    mixerInput: who.session.mixerInput,
+    guestId: who.session._id,
+  };
+}
+
+/**
+ * Persists the absolute Strom WHIP session-resource URL on the guest's live
+ * session so server-side teardown (`teardownGuestWhip`) can DELETE the session
+ * resource on leave/kick instead of the bare endpoint (issue #467). Best-effort:
+ * a re-read/write failure, or a session that has since left, only means a later
+ * teardown falls back to Strom's inactivity reaper — it must never fail the WHIP
+ * publish, so every error is logged and swallowed.
+ */
+async function persistGuestWhipSessionUrl(
+  req: FastifyRequest,
+  guestId: string,
+  absoluteStromLocation: string,
+): Promise<void> {
+  try {
+    const db = getGuestSessionsDb()
+    const current = await db.get(guestId)
+    if (current.state === 'left') return
+    await db.insert({
+      ...current,
+      whipSessionUrl: absoluteStromLocation,
+      updatedAt: new Date().toISOString(),
+    })
+  } catch (err) {
+    req.log.warn({ err, guestId }, 'POST guests/:id/whip — failed to persist Strom WHIP session URL for teardown')
+  }
 }
 
 /**
@@ -367,6 +407,9 @@ const whipRoutes: FastifyPluginAsync = async (fastify) => {
         (absoluteStromLocation) =>
           `/api/v1/guests/${req.params.inviteId}/whip` +
           `?session=${encodeURIComponent(absoluteStromLocation)}`,
+        // Capture the Strom session-resource URL so leave/kick can end THIS
+        // session, not just the endpoint (issue #467).
+        (absoluteStromLocation) => persistGuestWhipSessionUrl(req, slot.guestId, absoluteStromLocation),
       )
     },
   )

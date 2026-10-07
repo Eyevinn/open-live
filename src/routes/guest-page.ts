@@ -83,6 +83,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     #golive { background: #2f9e44; }
+    #rejoin { background: #2f9e44; }
     #mute { background: #364fc7; }
     #mute.muted { background: #c92a2a; }
     #leave { background: #495057; }
@@ -157,6 +158,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
 
     <div class="actions">
       <button id="golive">Go live</button>
+      <button id="rejoin" class="hidden">Rejoin</button>
       <button id="mute" class="hidden">Mute mic</button>
       <button id="leave" class="hidden">Leave</button>
     </div>
@@ -188,6 +190,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     var micSel = document.getElementById("mic");
     var pickers = document.getElementById("pickers");
     var goLiveBtn = document.getElementById("golive");
+    var rejoinBtn = document.getElementById("rejoin");
     var muteBtn = document.getElementById("mute");
     var leaveBtn = document.getElementById("leave");
     var returnModeBox = document.getElementById("return-mode");
@@ -208,6 +211,17 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     var muted = false;
     var live = false;
     var left = false;
+    // The studio connection has dropped for good (the publish peer connection
+    // reached "failed", or stayed "disconnected" past the grace window). While
+    // true the live banner is replaced by a "connection lost" warning and the
+    // Rejoin button is offered. returnLost is the softer equivalent for the
+    // return feed: the guest stops hearing the studio, but the studio still
+    // gets them, so it only shows a hint.
+    var publishLost = false;
+    var returnLost = false;
+    // "disconnected" often recovers by itself; wait this long before warning.
+    var DISCONNECT_GRACE_MS = 5000;
+    var publishDisconnectTimer = null;
     // The publish connection's sender for each kind ("audio", "video"), so a
     // new device can be swapped in with replaceTrack, without renegotiating.
     var senders = {};
@@ -358,8 +372,9 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     function updateDeviceAlert() {
       var kinds = left ? [] : failingKinds();
       // While publishing, the live banner must not claim the studio gets a
-      // medium it does not.
-      if (live && Object.keys(senders).length) {
+      // medium it does not. When the studio connection itself is lost, leave
+      // the "connection lost" warning in place instead of the live banner.
+      if (live && !publishLost && Object.keys(senders).length) {
         setBanner(kinds.length ? "You are live." : "You are live. The studio can see and hear you.", "live");
       }
       if (!kinds.length) { hide(deviceAlert); return; }
@@ -498,6 +513,71 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       });
     }
 
+    // ---- Connection loss ---------------------------------------------------
+    function clearPublishDisconnect() {
+      if (publishDisconnectTimer) { clearTimeout(publishDisconnectTimer); publishDisconnectTimer = null; }
+    }
+
+    // The publish connection has gone for good: the studio no longer gets the
+    // guest. Replace the live banner with a warning and offer Rejoin.
+    function onPublishLost() {
+      if (left) return;
+      clearPublishDisconnect();
+      publishLost = true;
+      hide(muteBtn);
+      show(rejoinBtn);
+      rejoinBtn.disabled = false;
+      setBanner("Connection to the studio lost. The studio can no longer see or hear you. Press \\u201cRejoin\\u201d to reconnect.", "error");
+    }
+
+    // Watches the publish peer connection. "failed" is terminal; "disconnected"
+    // is given a few seconds to recover on its own before it is treated the same.
+    function watchPublishConnection(pc) {
+      if (!pc.addEventListener) return;
+      pc.addEventListener("connectionstatechange", function () {
+        if (publishPc !== pc || left) return;
+        var state = pc.connectionState;
+        if (state === "failed") {
+          onPublishLost();
+        } else if (state === "disconnected") {
+          if (!publishLost && !publishDisconnectTimer) {
+            setBanner("Reconnecting to the studio\\u2026", "");
+            publishDisconnectTimer = setTimeout(function () {
+              publishDisconnectTimer = null;
+              if (publishPc === pc && !left &&
+                  (pc.connectionState === "disconnected" || pc.connectionState === "failed")) {
+                onPublishLost();
+              }
+            }, DISCONNECT_GRACE_MS);
+          }
+        } else if (state === "connected") {
+          // Recovered by itself before the grace window elapsed.
+          clearPublishDisconnect();
+          if (!publishLost && live) updateDeviceAlert();
+        }
+      });
+    }
+
+    // Watches the return peer connection. Losing it only stops the guest hearing
+    // the studio, so it is a hint rather than a blocking warning.
+    function watchReturnConnection(pc) {
+      if (!pc.addEventListener) return;
+      pc.addEventListener("connectionstatechange", function () {
+        if (returnPc !== pc || left) return;
+        var state = pc.connectionState;
+        if (state === "failed") {
+          returnLost = true;
+          returnHint.textContent = "Lost the return feed from the studio. The studio still sees and hears you.";
+          show(returnHint);
+        } else if (state === "connected") {
+          if (returnLost) {
+            returnLost = false;
+            returnHint.textContent = "Return feed from the studio.";
+          }
+        }
+      });
+    }
+
     function whipPublish(url, stream) {
       var pc = new RTCPeerConnection(ICE);
       senders = {};
@@ -520,6 +600,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         return pc.setRemoteDescription({ type: "answer", sdp: answer });
       }).then(function () {
         publishPc = pc;
+        watchPublishConnection(pc);
       });
     }
 
@@ -547,6 +628,8 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         return pc.setRemoteDescription({ type: "answer", sdp: answer });
       }).then(function () {
         returnPc = pc;
+        returnLost = false;
+        watchReturnConnection(pc);
         show(returnVideo);
         show(returnHint);
       });
@@ -642,11 +725,12 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     }
 
     // ---- Go live -----------------------------------------------------------
-    function goLive() {
-      goLiveBtn.disabled = true;
-      setBanner("Connecting\\u2026", "");
+    // Joins the session and publishes (and plays the return feed). Shared by the
+    // first "Go live" and by "Rejoin" after the connection drops; both reuse the
+    // invite's live session via the join route's rejoin branch.
+    function connect() {
       var joinData = null;
-      fetch(apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/join", {
+      return fetch(apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/join", {
         method: "POST",
         headers: { "Authorization": "Bearer " + token }
       }).then(function (res) {
@@ -666,10 +750,13 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         });
       }).then(function () {
         live = true;
+        publishLost = false;
+        clearPublishDisconnect();
         // The pickers stay while live: picking a device swaps it in.
         if (joinData.whipUrl) show(pickers);
         else hide(pickers);
         hide(goLiveBtn);
+        hide(rejoinBtn);
         if (joinData.whipUrl) show(muteBtn);
         show(leaveBtn);
         setBanner(joinData.whipUrl
@@ -689,10 +776,39 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
           returnHint.textContent = "Return feed not available yet. Leave and open the link again once the show is running.";
           show(returnHint);
         }
-      }).catch(function (err) {
+      });
+    }
+
+    function goLive() {
+      goLiveBtn.disabled = true;
+      setBanner("Connecting\\u2026", "");
+      connect().catch(function (err) {
         senders = {};
         goLiveBtn.disabled = false;
         setBanner(err && err.handled ? err.message : "Could not go live. Please check your connection and try again.", "error");
+      });
+    }
+
+    // Tears down the dead connections (keeping the camera/mic) and connects
+    // again. Join reuses the invite's live session, so the crew's slot is kept.
+    function rejoin() {
+      if (left) return;
+      rejoinBtn.disabled = true;
+      clearPublishDisconnect();
+      stopReturnMode();
+      if (publishPc) { try { publishPc.close(); } catch (e) {} publishPc = null; }
+      if (returnPc) { try { returnPc.close(); } catch (e) {} returnPc = null; }
+      senders = {};
+      publishLost = false;
+      returnLost = false;
+      setBanner("Reconnecting to the studio\\u2026", "");
+      connect().catch(function (err) {
+        senders = {};
+        publishLost = true;
+        show(rejoinBtn);
+        rejoinBtn.disabled = false;
+        hide(muteBtn);
+        setBanner(err && err.handled ? err.message : "Could not reconnect to the studio. Please try again.", "error");
       });
     }
 
@@ -717,6 +833,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     function teardown() {
       senders = {};
       hide(deviceAlert);
+      clearPublishDisconnect();
       stopReturnMode();
       if (publishPc) { try { publishPc.close(); } catch (e) {} publishPc = null; }
       if (returnPc) { try { returnPc.close(); } catch (e) {} returnPc = null; }
@@ -742,6 +859,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     function showLeft() {
       hide(muteBtn);
       hide(leaveBtn);
+      hide(rejoinBtn);
       hide(pickers);
       mutedIndicator.classList.remove("show");
       setBanner("You have left the broadcast. You can close this page.", "left");
@@ -767,6 +885,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
 
     // ---- Wire up -----------------------------------------------------------
     goLiveBtn.addEventListener("click", goLive);
+    rejoinBtn.addEventListener("click", rejoin);
     muteBtn.addEventListener("click", function () { setMuted(!muted); });
     leaveBtn.addEventListener("click", leave);
     Object.keys(modeInputs).forEach(function (k) {
