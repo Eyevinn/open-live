@@ -244,3 +244,23 @@ previously broadcast nothing; it now emits the same `AUDIO_STATE { ..., applied:
 write so a REST mix change no longer leaves live WS clients stale. `broadcast()`
 (`src/services/tally.service.ts`) takes `message: unknown`, so there is no outgoing-message union
 to extend — the extra field is accepted as-is.
+
+## Strom ends a WHIP publish only on the session RESOURCE, never the endpoint
+
+Strom routes `DELETE` only on the WHIP session resource
+(`/whip/{endpoint_id}/resource/{resource_id}`), not on the bare endpoint URL
+`resolveStromWhipUrl()` (`src/routes/whip.ts`) builds (`/whip/{endpoint_id}`). A `DELETE` on the
+endpoint returns but does **not** end the session — Strom keeps the publisher alive until its 10 s
+inactivity reaper. So guest leave/kick appeared to work (204) yet a rejoining guest could be off
+air for tens of seconds (#467). The resource URL is only knowable from the `Location` header Strom
+returns on the WHIP offer POST; the proxy (`proxyWhipOffer`) rewrites that for the client but the
+server must also *keep* it. It is now persisted on the guest session as
+`GuestSessionDoc.whipSessionUrl` (via `proxyWhipOffer`'s `onStromLocation` sink →
+`persistGuestWhipSessionUrl`, guest POST path only — crew teardown stays client-driven through the
+proxy), and `teardownGuestWhip` (`src/routes/guests.ts`) DELETEs **that** URL, not the endpoint.
+Any new server-side WHIP teardown must target the stored session resource, re-check it is
+`assertSameStromOrigin` before the DELETE (the stored Location is defence-in-depth untrusted), and
+**log** a non-2xx/network failure instead of swallowing it — a swallowed teardown is an invisible
+lingering session. `whipSessionUrl` is internal: it is destructured out of `sessionToApi` so it
+never reaches operator clients, and it is absent on return-only slots / before the first publish
+(teardown no-ops then) and stale after a reconnect until the next offer overwrites it.
