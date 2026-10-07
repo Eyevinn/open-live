@@ -16,6 +16,7 @@ import { startClipRelay, stopClipRelay, reconcileClipRelay } from '../services/c
 import { CONTRACT_VERSION, computeTallyContributions } from '../services/automation-contract.js';
 import { startMeterRelay, stopMeterRelay, reconcileMeterRelay } from '../services/meter-relay.js';
 import { StromClient, StromClientError, StromPropertiesRejectedError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms, type VideoEffect, type EffectTarget, type SetVideoEffectRequest } from '../lib/strom.js';
+import { mixerInputToStromPad, storedPadToStromPad, expandToStoredPadIndex } from '../lib/mixer-input-map.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { graphicUrl } from '../lib/url-validation.js';
 import { decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
@@ -393,6 +394,16 @@ function padToIndex(mixerInput: string): number | null {
 }
 
 /**
+ * Translate a PiP config's zone `sources` (stored pad indices) to the COMPACT
+ * Strom pad indices actually wired in the flow (issue #463). In-memory and
+ * broadcast PiP state stays in stored space; this runs only at the Strom boundary.
+ */
+function remapZonesToStromPads(zones: PipZone[], map: Record<string, number> | undefined): PipZone[] {
+  if (!map) return zones;
+  return zones.map((z) => ({ ...z, sources: z.sources.map((s) => storedPadToStromPad(s, map)) }));
+}
+
+/**
  * Computes the effective HTML-source URL from a base address and forwarded
  * params (issue #268). `merge` updates/adds the given keys on the base URL's
  * current query; `replace` sets the query to exactly `params`. The resulting
@@ -461,7 +472,9 @@ async function stromTransition(
     console.warn('[controller] Strom transition skipped — no toMixerInput');
     return true;
   }
-  const toIndex = padToIndex(toMixerInput);
+  // Translate the stored mixerInput to the COMPACT Strom pad index (issue #463).
+  // Identity when this production has no compaction map.
+  const toIndex = mixerInputToStromPad(toMixerInput, doc.mixerInputMap);
   if (toIndex === null) {
     console.warn('[controller] Strom transition skipped — cannot parse index from pad:', toMixerInput);
     return true;
@@ -469,7 +482,7 @@ async function stromTransition(
   // Set Strom's PVW to the target input first, then fire the transition.
   // Strom's trigger_transition uses from_input/to_input directly — selectPreview
   // call is belt-and-suspenders so Strom's own UI also reflects the new PVW.
-  const fromIndex = fromMixerInput ? (padToIndex(fromMixerInput) ?? toIndex) : toIndex;
+  const fromIndex = fromMixerInput ? (mixerInputToStromPad(fromMixerInput, doc.mixerInputMap) ?? toIndex) : toIndex;
   const strom = await makeStromClient();
   try {
     // selectPreview is belt-and-suspenders so Strom's own UI reflects the new
@@ -1815,8 +1828,8 @@ export async function handleMessage(
         if (doc.stromFlowId && doc.mixerBlockId) {
           try {
             const strom = await makeStromClient();
-            const fromInputIndex = tally.pgm ? (padToIndex(tally.pgm) ?? 0) : 0;
-            const toInputIndex = pvwBeforePip !== null ? (padToIndex(pvwBeforePip) ?? fromInputIndex) : fromInputIndex;
+            const fromInputIndex = tally.pgm ? (mixerInputToStromPad(tally.pgm, doc.mixerInputMap) ?? 0) : 0;
+            const toInputIndex = pvwBeforePip !== null ? (mixerInputToStromPad(pvwBeforePip, doc.mixerInputMap) ?? fromInputIndex) : fromInputIndex;
             await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: curPvwPip } });
             await strom.mixer.transition(doc.stromFlowId, doc.mixerBlockId, {
               from_input: fromInputIndex,
@@ -1841,8 +1854,8 @@ export async function handleMessage(
         if (doc.stromFlowId && doc.mixerBlockId) {
           try {
             const strom = await makeStromClient();
-            const fromInputIndex = pgmBg ? (padToIndex(pgmBg) ?? 0) : 0;
-            const toInputIndex = tally.pvw ? (padToIndex(tally.pvw) ?? fromInputIndex) : fromInputIndex;
+            const fromInputIndex = pgmBg ? (mixerInputToStromPad(pgmBg, doc.mixerInputMap) ?? 0) : 0;
+            const toInputIndex = tally.pvw ? (mixerInputToStromPad(tally.pvw, doc.mixerInputMap) ?? fromInputIndex) : fromInputIndex;
             await strom.mixer.transition(doc.stromFlowId, doc.mixerBlockId, {
               from_input: fromInputIndex,
               to_input: toInputIndex,
@@ -1901,7 +1914,7 @@ export async function handleMessage(
       broadcast(productionId, { type: 'TALLY', ...buildTallyPayload(productionId, newTally, doc) });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: pgmPipByProduction.get(productionId) ?? null, pvwPip: null, pips: pipConfigsByProduction.get(productionId) ?? [] });
       if (doc.stromFlowId && doc.mixerBlockId) {
-        const inputIndex = padToIndex(msg.mixerInput);
+        const inputIndex = mixerInputToStromPad(msg.mixerInput, doc.mixerInputMap);
         if (inputIndex !== null) {
           try {
             const strom = await makeStromClient();
@@ -1947,9 +1960,11 @@ export async function handleMessage(
         const pips = setPipConfigSlot(productionId, msg.pip, { bg: msg.bg, zones: msg.zones, transforms });
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: pgmPipByProduction.get(productionId) ?? null, pvwPip: pvwPipByProduction.get(productionId) ?? null, pips });
 
+        // In-memory + broadcast PiP state stays in STORED pad space; only the
+        // Strom write translates bg + zone sources to COMPACT pads (issue #463).
         const resp = await strom.mixer.updatePipConfig(doc.stromFlowId, doc.mixerBlockId, msg.pip, {
-          bg: msg.bg,
-          zones: msg.zones,
+          bg: msg.bg === null ? null : storedPadToStromPad(msg.bg, doc.mixerInputMap),
+          zones: remapZonesToStromPads(msg.zones, doc.mixerInputMap),
           transforms,
         });
         // Sync back Strom-clamped transforms (may differ due to clamping)
@@ -2882,9 +2897,14 @@ export async function handleMessage(
       if (!doc.stromFlowId || !doc.mixerBlockId) break;
       const target = msg.target;
       const effect = msg.effect as VideoEffect;
+      // The Strom call addresses the COMPACT pad; in-memory FX state is kept in
+      // STORED pad space so FX_STATE broadcasts match the client (issue #463).
+      const stromTarget: EffectTarget = target === 'master'
+        ? 'master'
+        : { input: storedPadToStromPad(target.input, doc.mixerInputMap) };
       try {
         const strom = await makeStromClient();
-        await strom.mixer.setVideoEffect(doc.stromFlowId, doc.mixerBlockId, { target, effect });
+        await strom.mixer.setVideoEffect(doc.stromFlowId, doc.mixerBlockId, { target: stromTarget, effect });
         // Update in-memory state
         if (target === 'master') {
           masterEffectByProduction.set(productionId, effect);
@@ -3364,8 +3384,10 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             // Skip empty slots — nothing to restore.
             if (!cfg || (cfg.bg === null && cfg.zones.length === 0)) continue;
             await strom.mixer.updatePipConfig(flowId, mixerBlockId, i, {
-              bg: cfg.bg,
-              zones: cfg.zones,
+              // Persisted PiP layout is in STORED pad space — translate to COMPACT
+              // Strom pads for the re-push (issue #463).
+              bg: cfg.bg === null ? null : storedPadToStromPad(cfg.bg, connectDoc.mixerInputMap),
+              zones: remapZonesToStromPads(cfg.zones, connectDoc.mixerInputMap),
               transforms: cfg.transforms,
             }).catch((err) => console.warn('[controller] restore pipConfig error:', err));
           }
@@ -3590,7 +3612,13 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
                 fxAvailableByProduction.set(id, mixerState.fx_available);
               }
               if (Array.isArray(mixerState.input_effects)) {
-                inputEffectsByProduction.set(id, mixerState.input_effects);
+                // Strom reports input_effects indexed by COMPACT pad; store in
+                // STORED pad space so FX_STATE matches the client (issue #463).
+                inputEffectsByProduction.set(
+                  id,
+                  expandToStoredPadIndex(mixerState.input_effects, connectDoc.mixerInputMap)
+                    .map((e) => e ?? { type: 'none' }),
+                );
               }
               if (mixerState.master_effect) {
                 masterEffectByProduction.set(id, mixerState.master_effect);
