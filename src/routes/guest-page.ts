@@ -62,7 +62,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     header { padding: 16px 20px; border-bottom: 1px solid #26262e; }
     header h1 { margin: 0; font-size: 18px; font-weight: 600; }
     main { max-width: 720px; margin: 0 auto; padding: 20px; }
-    .videos { position: relative; }
+    .videos { position: relative; margin-top: 12px; }
     video {
       width: 100%; background: #000; border-radius: 12px; display: block;
       aspect-ratio: 16 / 9; object-fit: cover;
@@ -100,6 +100,11 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       letter-spacing: 0.5px;
     }
     #muted-indicator.show { display: block; }
+    #device-alert {
+      margin-top: 12px; padding: 12px 14px; border-radius: 10px;
+      background: #c92a2a; color: #fff; font-weight: 700;
+    }
+    #device-alert button { margin-top: 10px; width: 100%; background: #fff; color: #c92a2a; }
     .badge {
       display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px;
       font-weight: 700; margin-left: 8px; vertical-align: middle;
@@ -120,6 +125,10 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
   <main>
     <div id="banner">Checking your camera and microphone&hellip;</div>
     <div id="muted-indicator">You are muted</div>
+    <div id="device-alert" class="hidden" role="alert">
+      <div id="device-alert-text"></div>
+      <button id="device-retry">Reconnect</button>
+    </div>
 
     <div class="videos">
       <video id="preview" autoplay playsinline muted></video>
@@ -187,6 +196,9 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       "program": document.getElementById("mode-program")
     };
     var selfWarning = document.getElementById("self-warning");
+    var deviceAlert = document.getElementById("device-alert");
+    var deviceAlertText = document.getElementById("device-alert-text");
+    var deviceRetryBtn = document.getElementById("device-retry");
 
     // ---- State -------------------------------------------------------------
     var localStream = null;
@@ -195,6 +207,19 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     var returnPc = null;
     var muted = false;
     var live = false;
+    var left = false;
+    // The publish connection's sender for each kind ("audio", "video"), so a
+    // new device can be swapped in with replaceTrack, without renegotiating.
+    var senders = {};
+    // Counts device requests per kind, so only the newest one is used.
+    var deviceSeq = { audio: 0, video: 0 };
+    // Kinds whose track has ended (device unplugged, taken by another app) or
+    // that the browser has muted (no media coming from the device).
+    var trackEnded = {};
+    var trackMuted = {};
+    // Kinds whose last reconnect failed.
+    var reconnectFailed = {};
+    var DEVICE_NAMES = { audio: "microphone", video: "camera" };
     // The return mode the page shows, and the poll that keeps it in step with
     // the server. modeSeq counts local changes so a poll answer that started
     // before one is dropped instead of undoing it.
@@ -245,6 +270,10 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
 
     function fillDevicePickers() {
       return navigator.mediaDevices.enumerateDevices().then(function (devices) {
+        // Keep the device in use selected; rebuilding the list would
+        // otherwise show the first one.
+        var camInUse = deviceIdOf("video");
+        var micInUse = deviceIdOf("audio");
         camSel.innerHTML = "";
         micSel.innerHTML = "";
         var camN = 0, micN = 0;
@@ -252,10 +281,12 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
           if (d.kind === "videoinput") {
             var o = document.createElement("option");
             o.value = d.deviceId; o.textContent = d.label || ("Camera " + (++camN));
+            if (camInUse && d.deviceId === camInUse) o.selected = true;
             camSel.appendChild(o);
           } else if (d.kind === "audioinput") {
             var o2 = document.createElement("option");
             o2.value = d.deviceId; o2.textContent = d.label || ("Microphone " + (++micN));
+            if (micInUse && d.deviceId === micInUse) o2.selected = true;
             micSel.appendChild(o2);
           }
         });
@@ -268,10 +299,139 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         if (old) old.getTracks().forEach(function (t) { t.stop(); });
         localStream = stream;
         preview.srcObject = stream;
+        trackEnded = {};
+        trackMuted = {};
+        reconnectFailed = {};
+        stream.getTracks().forEach(watchTrack);
+        updateDeviceAlert();
         // Re-apply the current mute state to the fresh audio track.
         applyMuteToTrack();
         return fillDevicePickers();
       });
+    }
+
+    function trackOf(kind) {
+      if (!localStream) return null;
+      return localStream.getTracks().filter(function (t) { return t.kind === kind; })[0] || null;
+    }
+
+    function deviceIdOf(kind) {
+      var t = trackOf(kind);
+      var settings = t && t.getSettings ? t.getSettings() : null;
+      return settings && settings.deviceId;
+    }
+
+    // A track ends when its device goes away (unplugged, taken by another app,
+    // permission revoked) and is muted while the device sends nothing. Either
+    // way the studio stops getting that medium, so tell the guest. Stopping a
+    // track ourselves does not fire "ended".
+    function watchTrack(t) {
+      if (!t.addEventListener) return;
+      t.addEventListener("ended", function () {
+        if (trackOf(t.kind) !== t || left) return;
+        trackEnded[t.kind] = true;
+        updateDeviceAlert();
+        // The device list has likely changed (unplugged, or a new default).
+        fillDevicePickers().catch(function () {});
+      });
+      t.addEventListener("mute", function () {
+        if (trackOf(t.kind) !== t || left) return;
+        trackMuted[t.kind] = true;
+        updateDeviceAlert();
+      });
+      t.addEventListener("unmute", function () {
+        if (trackOf(t.kind) !== t) return;
+        trackMuted[t.kind] = false;
+        updateDeviceAlert();
+      });
+    }
+
+    function failingKinds() {
+      return ["video", "audio"].filter(function (k) {
+        return trackEnded[k] || trackMuted[k] || reconnectFailed[k];
+      });
+    }
+
+    function updateDeviceAlert() {
+      var kinds = left ? [] : failingKinds();
+      // While publishing, the live banner must not claim the studio gets a
+      // medium it does not.
+      if (live && Object.keys(senders).length) {
+        setBanner(kinds.length ? "You are live." : "You are live. The studio can see and hear you.", "live");
+      }
+      if (!kinds.length) { hide(deviceAlert); return; }
+      var names = kinds.map(function (k) { return DEVICE_NAMES[k]; }).join(" and ");
+      var text;
+      if (kinds.some(function (k) { return reconnectFailed[k]; })) {
+        text = "Could not reconnect your " + names + ". Check that it is plugged in and not in use by another app, or pick another one below.";
+      } else {
+        text = "Your " + names + " stopped working.";
+        if (live) {
+          var cannot = kinds.length > 1 ? "see or hear" : (kinds[0] === "audio" ? "hear" : "see");
+          text += " The studio cannot " + cannot + " you.";
+        }
+        text += " Reconnect it, or pick another one below.";
+      }
+      deviceAlertText.textContent = text;
+      deviceRetryBtn.textContent = "Reconnect " + names;
+      deviceRetryBtn.disabled = false;
+      show(deviceAlert);
+    }
+
+    // Opens the picked device of one kind and puts it in place of the current
+    // track, in the preview and, once live, in the publish connection.
+    function switchDevice(kind) {
+      var seq = ++deviceSeq[kind];
+      var sel = kind === "audio" ? micSel : camSel;
+      var exact = {};
+      exact[kind] = sel.value ? { deviceId: { exact: sel.value } } : true;
+      return navigator.mediaDevices.getUserMedia(exact).catch(function (err) {
+        // The picked device may be the one that went away: take the default.
+        if (!sel.value) throw err;
+        var any = {};
+        any[kind] = true;
+        return navigator.mediaDevices.getUserMedia(any);
+      }).then(function (stream) {
+        var fresh = stream.getTracks().filter(function (t) { return t.kind === kind; })[0];
+        if (seq !== deviceSeq[kind] || left || !localStream || !fresh) {
+          stream.getTracks().forEach(function (t) { t.stop(); });
+          return;
+        }
+        var sender = senders[kind];
+        return (sender ? sender.replaceTrack(fresh) : Promise.resolve()).then(function () {
+          if (seq !== deviceSeq[kind] || left) { fresh.stop(); return; }
+          var old = trackOf(kind);
+          var rest = localStream.getTracks().filter(function (t) { return t.kind !== kind; });
+          localStream = new MediaStream(rest.concat([fresh]));
+          preview.srcObject = localStream;
+          if (old) old.stop();
+          watchTrack(fresh);
+          applyMuteToTrack();
+          trackEnded[kind] = false;
+          trackMuted[kind] = !!fresh.muted;
+          reconnectFailed[kind] = false;
+          updateDeviceAlert();
+          return fillDevicePickers();
+        });
+      }).catch(function (err) {
+        if (seq !== deviceSeq[kind] || left) return;
+        reconnectFailed[kind] = true;
+        updateDeviceAlert();
+        throw err;
+      });
+    }
+
+    function reconnectDevices() {
+      deviceRetryBtn.disabled = true;
+      Promise.all(failingKinds().map(function (k) {
+        return switchDevice(k).catch(function () {});
+      })).then(function () { deviceRetryBtn.disabled = false; });
+    }
+
+    function onPickerChange(kind) {
+      if (left) return;
+      if (!localStream) { startPreview().catch(function () {}); return; }
+      switchDevice(kind).catch(function () {});
     }
 
     // Join can disagree with the slot check made at page load (the slot's
@@ -291,6 +451,10 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       if (localStream) localStream.getTracks().forEach(function (t) { t.stop(); });
       localStream = null;
       preview.srcObject = null;
+      trackEnded = {};
+      trackMuted = {};
+      reconnectFailed = {};
+      hide(deviceAlert);
       hide(preview);
       hide(previewHint);
     }
@@ -316,7 +480,8 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
 
     function whipPublish(url, stream) {
       var pc = new RTCPeerConnection(ICE);
-      stream.getTracks().forEach(function (t) { pc.addTrack(t, stream); });
+      senders = {};
+      stream.getTracks().forEach(function (t) { senders[t.kind] = pc.addTrack(t, stream); });
       return pc.createOffer().then(function (offer) {
         return pc.setLocalDescription(offer);
       }).then(function () {
@@ -481,13 +646,15 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         });
       }).then(function () {
         live = true;
-        hide(pickers);
+        // The pickers stay while live: picking a device swaps it in.
+        if (!joinData.whipUrl) hide(pickers);
         hide(goLiveBtn);
         if (joinData.whipUrl) show(muteBtn);
         show(leaveBtn);
         setBanner(joinData.whipUrl
           ? "You are live. The studio can see and hear you."
           : "You are connected. You hear the studio here; your camera reaches it separately.", "live");
+        updateDeviceAlert();
         startReturnMode(joinData);
         // Play the return feed(s), if any are live yet. Failure here is
         // non-fatal: the guest is still contributing even without return video.
@@ -502,6 +669,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
           show(returnHint);
         }
       }).catch(function (err) {
+        senders = {};
         goLiveBtn.disabled = false;
         setBanner(err && err.handled ? err.message : "Could not go live. Please check your connection and try again.", "error");
       });
@@ -526,6 +694,9 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
 
     // ---- Leave -------------------------------------------------------------
     function teardown() {
+      left = true;
+      senders = {};
+      hide(deviceAlert);
       stopReturnMode();
       if (publishPc) { try { publishPc.close(); } catch (e) {} publishPc = null; }
       if (returnPc) { try { returnPc.close(); } catch (e) {} returnPc = null; }
@@ -543,6 +714,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         teardown();
         hide(muteBtn);
         hide(leaveBtn);
+        hide(pickers);
         mutedIndicator.classList.remove("show");
         setBanner("You have left the broadcast. You can close this page.", "left");
       });
@@ -570,8 +742,15 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         if (modeInputs[k].checked && k !== returnMode) setReturnMode(k);
       });
     });
-    camSel.addEventListener("change", function () { startPreview().catch(function () {}); });
-    micSel.addEventListener("change", function () { startPreview().catch(function () {}); });
+    camSel.addEventListener("change", function () { onPickerChange("video"); });
+    micSel.addEventListener("change", function () { onPickerChange("audio"); });
+    deviceRetryBtn.addEventListener("click", reconnectDevices);
+    if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+      // Show a newly plugged-in device without a reload.
+      navigator.mediaDevices.addEventListener("devicechange", function () {
+        if (localStream && !left) fillDevicePickers().catch(function () {});
+      });
+    }
 
     // ---- Boot --------------------------------------------------------------
     if (!token) {
