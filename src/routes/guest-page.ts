@@ -406,7 +406,14 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
           throw err;
         }) : Promise.resolve();
         return swapped.then(function () {
-          if (seq !== deviceSeq[kind] || left) { fresh.stop(); return; }
+          if (seq !== deviceSeq[kind] || left || !localStream) {
+            fresh.stop();
+            // If a newer pick failed before this one landed, nothing else will
+            // move the sender off this stopped track: send the one in use.
+            var current = trackOf(kind);
+            if (sender && sender.track === fresh && current) sender.replaceTrack(current).catch(function () {});
+            return;
+          }
           var old = trackOf(kind);
           var rest = localStream.getTracks().filter(function (t) { return t.kind !== kind; });
           localStream = new MediaStream(rest.concat([fresh]));
@@ -728,16 +735,24 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         keepalive: true
       }).catch(function () {}).then(function () {
         teardown();
-        hide(muteBtn);
-        hide(leaveBtn);
-        hide(pickers);
-        mutedIndicator.classList.remove("show");
-        setBanner("You have left the broadcast. You can close this page.", "left");
+        showLeft();
       });
+    }
+
+    function showLeft() {
+      hide(muteBtn);
+      hide(leaveBtn);
+      hide(pickers);
+      mutedIndicator.classList.remove("show");
+      setBanner("You have left the broadcast. You can close this page.", "left");
     }
 
     window.addEventListener("pagehide", function () {
       if (!live) { teardown(); return; }
+      // The guest has left, as with Leave, including on a page restored from
+      // the back/forward cache.
+      live = false;
+      left = true;
       // Best-effort teardown on close; keepalive lets the request outlive the page.
       try {
         fetch(apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/session", {
@@ -747,6 +762,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         });
       } catch (e) {}
       teardown();
+      showLeft();
     });
 
     // ---- Wire up -----------------------------------------------------------

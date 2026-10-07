@@ -15,7 +15,8 @@
  *  - a device already silent when the preview opens raises the alert;
  *  - the pickers show on a camera join, and keep showing the device in use
  *    after the list is rebuilt;
- *  - a page hidden before going live opens the devices again on a pick;
+ *  - a page hidden before going live opens the devices again on a pick; one
+ *    hidden while live has left, like Leave;
  *  - after leaving, nothing shows the alert or opens a device.
  */
 import { describe, it, expect } from 'vitest';
@@ -449,6 +450,39 @@ describe('guest page devices', () => {
     await flush();
     expect(page.track('audio').stopped).toBe(false);
     expect(page.track('video').deviceId).toBe('cam-b');
+  });
+
+  it('puts the connection back on the device in use when a newer pick fails before an older one lands', async () => {
+    const page = await goLive({ holdReplace: true, broken: new Set(['mic-b']) });
+    const before = page.track('audio');
+    page.pick('mic', 'mic-a');
+    await flush(); // the first pick is now waiting in replaceTrack
+    page.denyNext();
+    page.pick('mic', 'mic-b');
+    await flush(); // the second pick has failed
+    page.releaseReplaces();
+    await flush();
+    page.releaseReplaces();
+    await flush();
+    expect(page.senders['audio']!.track).toBe(before);
+    expect(before.stopped).toBe(false);
+  });
+
+  it('a page hidden while live has left: a swap in flight is released and picks open nothing', async () => {
+    const page = await goLive({ holdReplace: true });
+    page.pick('mic', 'mic-b');
+    await flush(); // waiting in replaceTrack
+    page.fireWindow('pagehide');
+    page.releaseReplaces();
+    await flush();
+    expect(page.opened.filter((t) => t.deviceId === 'mic-b').every((t) => t.stopped)).toBe(true);
+    expect(page.els['device-alert']!.hidden).toBe(true);
+    expect(page.els['banner']!.textContent).toMatch(/You have left/);
+
+    const calls = page.gumCalls.length;
+    page.pick('cam', 'cam-b');
+    await flush();
+    expect(page.gumCalls).toHaveLength(calls);
   });
 
   it('after leaving, shows no alert and opens no device', async () => {
