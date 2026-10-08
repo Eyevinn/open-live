@@ -6,6 +6,7 @@ import { sweepGuestsOnProductionEnd } from '../services/guest-sweep.js';
 import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc, RecordingDoc } from '../db/types.js';
 import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
+import { stromBrowserBaseUrl } from '../lib/strom-public-url.js';
 import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js';
 import { expandToStoredPadIndex } from '../lib/mixer-input-map.js';
 import { setTally, broadcast, getSubscriberCount, getWatcherCount } from '../services/tally.service.js';
@@ -473,7 +474,7 @@ async function runActivationFlow(
             await deactivateStromFlow(stromFlowId, strom).catch(() => {});
             return;
           }
-          if (resp?.endpoint) whepEndpoint = `${config.stromUrl}${resp.endpoint}`;
+          if (resp?.endpoint) whepEndpoint = `${stromBrowserBaseUrl()}${resp.endpoint}`;
         }
 
         if (signal.aborted) {
@@ -518,7 +519,7 @@ async function runActivationFlow(
           whepOutputEntries && whepOutputEntries.length > 0
             ? whepOutputEntries.map(({ outputId, endpointId }) => ({
                 outputId,
-                url: `${config.stromUrl}/whep/${endpointId}`,
+                url: `${stromBrowserBaseUrl()}/whep/${endpointId}`,
               }))
             : undefined;
 
@@ -537,7 +538,7 @@ async function runActivationFlow(
         await updateProductionDoc(productionId, {
           status: 'active',
           whepEndpoint,
-          pgmWhepEndpoint: pgmWhepEndpointId ? `${config.stromUrl}/whep/${pgmWhepEndpointId}` : undefined,
+          pgmWhepEndpoint: pgmWhepEndpointId ? `${stromBrowserBaseUrl()}/whep/${pgmWhepEndpointId}` : undefined,
           whipEndpoints: whipEndpoints.length > 0 ? whipEndpoints : undefined,
           srtOutputUri: undefined,
           whepOutputUrls: whepOutputUrls && whepOutputUrls.length > 0 ? whepOutputUrls : undefined,
