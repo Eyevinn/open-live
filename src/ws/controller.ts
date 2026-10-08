@@ -3777,8 +3777,8 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             }));
             // Watchers get meters only while an operator's relay is running. A socket
             // that closed during the connect sync must not take a ref it never releases,
-            // and one that reactivation re-init already counted must not take a second.
-            if (!watchOnly && !socketClosed && relayHold(socket).meter !== connectDoc.stromFlowId) {
+            // and one already holding a ref (set by re-init) must not take a second.
+            if (!watchOnly && !socketClosed && relayHold(socket).meter === undefined) {
               startMeterRelay(id, connectDoc.stromFlowId, audioBlockId, connectDoc.loudnessMainBlockId);
               relayHold(socket).meter = connectDoc.stromFlowId;
             }
@@ -3884,7 +3884,7 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
         // The relay writes the registry, so a watcher does not start it.
         if (
           connectDoc.stromFlowId && !watchOnly && !socketClosed
-          && relayHold(socket).clip !== connectDoc.stromFlowId
+          && relayHold(socket).clip === undefined
         ) {
           const blockToInput = new Map<string, string>();
           for (const [mixerInput, blockId] of Object.entries(connectDoc.clipPlayerBlockIds)) {
