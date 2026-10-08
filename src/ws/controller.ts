@@ -3642,6 +3642,11 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             if (mainVolume !== undefined) {
               socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: 'main', property: 'volume', value: mainVolume }));
             }
+            // Main mute is not cached or reset by the init; Strom holds it.
+            const mainMuted = blockProps ? stromMuteState('main', blockProps.properties) : undefined;
+            if (mainMuted !== undefined) {
+              socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: 'main', property: 'mute', value: mainMuted }));
+            }
             // Restore AUX master state — prefer in-memory cache (set by this session's
             // AUX_MASTER_SET messages), fall back to Strom block properties for the first
             // connect after a server restart when the cache is empty.
