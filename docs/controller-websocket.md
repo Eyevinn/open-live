@@ -190,7 +190,7 @@ are emitted from `src/ws/controller.ts` and `src/services/meter-relay.ts`:
 
 | `type` | Fields | Emitted when |
 |---|---|---|
-| `TALLY` | `pgm: string \| null`, `pvw: string \| null`, `pgmBg: string \| null`, `transitionType?: string`, `durationMs?: number` | Tally (PGM/PVW) changes; also sent on connect |
+| `TALLY` | `pgm: string \| null`, `pvw: string \| null`, `pgmBg: string \| null`, `pgmPip: number \| null`, `pvwPip: number \| null`, `program: string[]`, `preview: string[]`, `contributions: Array<{ source: string; role: 'main' \| 'pip-bg' \| 'pip-inset' \| 'dsk' \| 'graphic' }>`, `transitionType?: string`, `durationMs?: number` | Tally (PGM/PVW) changes; also sent on connect |
 | `PIP_STATE` | `pgmPip: number \| null`, `pvwPip: number \| null`, `pips: PipConfig[]` | PiP program/preview/config changes; also sent on connect |
 | `FTB_STATE` | `active: boolean` | Fade-to-black state changes |
 | `ON_AIR` | `value: boolean` | Production goes on/off air (`GO_LIVE` / `CUT_STREAM`) |
@@ -225,10 +225,21 @@ are emitted from `src/ws/controller.ts` and `src/services/meter-relay.ts`:
 | `ERROR` | `error: string` | An inbound frame was invalid or an operation failed (sent to originating socket). Also carries each activation warning (`ProductionDoc.activationWarnings`, e.g. a recording with no sound): broadcast when the production goes active, and sent to each client that connects while it is active. Not a response to any command. |
 
 `pgmBg` is the mixer input a PiP on program is composited over. It is `null` unless
-`PIP_STATE.pgmPip` is set, so the two fields together distinguish an empty program
+`pgmPip` is set — the same PiP-slot index that `TALLY` now carries directly (and that
+`PIP_STATE.pgmPip` also reports) — so the two fields together distinguish an empty program
 (`pgmPip` null) from a PiP over a known input (both set) from a PiP over nothing
 (`pgmPip` set, `pgmBg` null). It is not tracked across the `MACRO_EXEC` cut,
 transition, and take paths, which leave it holding the value from before the macro.
+
+`pgmPip` / `pvwPip` are the PiP-slot indices currently on program / preview, with the
+same meaning as the identically-named `PIP_STATE` fields (`null` when no PiP is on that
+bus). `program` and `preview` are the sets of mixer-input pads contributing to each bus,
+and `contributions` is the richer per-source breakdown — one `{ source, role }` entry per
+contributing source, where `role` is `main` (the primary PGM/PVW input), `pip-bg` (the real
+input behind a PiP), `pip-inset` (a source inside a PiP zone), `dsk` (a visible keyer layer,
+surfaced as `dsk:<layer>`), or `graphic` (an active overlay, surfaced as `gfx:<overlayId>`).
+These contribution fields have been part of the `TALLY` payload since the automation-control
+contract landed (#209); `pgmPip` / `pvwPip` were added in #482.
 
 ### Connect-time snapshot
 
