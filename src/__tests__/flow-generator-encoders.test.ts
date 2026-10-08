@@ -118,7 +118,7 @@ describe('flow-generator — viewer/program encoder split (#413)', () => {
     const encPgmPad = `${byName(blocks, 'Enc PGM')!['id'] as string}:encoded_out`;
 
     // Recorder stays on the full-rate program encode.
-    const recorder = blocks.find((b) => b['block_definition_id'] === 'builtin.recorder')!;
+    const recorder = blocks.find((b) => b['block_definition_id'] === 'builtin.liverecorder')!;
     expect(feedFor(links, recorder['id'] as string, 'video_in_0')!['from']).toBe(encPgmPad);
 
     // The dynamic WHEP viewer output is fed from the low-bitrate viewer encode.

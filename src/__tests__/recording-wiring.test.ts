@@ -1,7 +1,7 @@
 /**
  * Tests for the MinIO config + Strom recorder wiring slice (issue #41).
  *
- *  - flow-generator emits a builtin.recorder block wired to PGM + main audio and
+ *  - flow-generator emits a builtin.liverecorder block wired to PGM + main audio and
  *    returns recorderBlockId when a 'recording' output is assigned.
  *  - the upload-from-local uploader signs a SigV4 PutObject and pushes every
  *    local Strom segment to MinIO/S3, tolerating per-segment failures.
@@ -15,7 +15,7 @@ vi.mock('../db/index.js', () => ({
   getGraphicsDb: () => ({ get: vi.fn().mockRejectedValue(new Error('not found')) }),
 }));
 
-function makeStromClient(blockIds: string[] = ['builtin.recorder', 'builtin.audioenc']) {
+function makeStromClient(blockIds: string[] = ['builtin.liverecorder', 'builtin.audioenc']) {
   const capturedFlows: Record<string, unknown>[] = [];
   return {
     blocks: {
@@ -66,7 +66,7 @@ const recordingOutput = {
 describe('flow-generator — recorder wiring (#41)', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('emits a builtin.recorder block wired to PGM + main audio and returns recorderBlockId', async () => {
+  it('emits a builtin.liverecorder block wired to PGM + main audio and returns recorderBlockId', async () => {
     const { activateStromFlow } = await import('../lib/flow-generator.js');
     const strom = makeStromClient();
     const production = makeProduction([{ sourceId: '__test1__', mixerInput: 'video_in_1' }]);
@@ -82,7 +82,7 @@ describe('flow-generator — recorder wiring (#41)', () => {
     const blocks = flow['blocks'] as Array<Record<string, unknown>>;
     const links = flow['links'] as Array<Record<string, unknown>>;
 
-    const recorder = blocks.find((b) => b['block_definition_id'] === 'builtin.recorder');
+    const recorder = blocks.find((b) => b['block_definition_id'] === 'builtin.liverecorder');
     expect(recorder).toBeDefined();
     const recId = recorder!['id'] as string;
     expect(result.recorderBlockId).toBe(recId);
@@ -119,7 +119,7 @@ describe('flow-generator — recorder wiring (#41)', () => {
 
   it('records picture only, with a warning, when Strom has no builtin.audioenc', async () => {
     const { activateStromFlow } = await import('../lib/flow-generator.js');
-    const strom = makeStromClient(['builtin.recorder']);
+    const strom = makeStromClient(['builtin.liverecorder']);
     const production = makeProduction([{ sourceId: '__test1__', mixerInput: 'video_in_1' }]);
 
     const result = await activateStromFlow(
@@ -138,6 +138,27 @@ describe('flow-generator — recorder wiring (#41)', () => {
     expect(links.find((l) => l['to'] === `${recId}:audio_in_0`)).toBeUndefined();
     expect(result.warnings).toEqual([
       expect.objectContaining({ type: 'recording-no-audio', message: expect.stringContaining('0.6.9') }),
+    ]);
+  });
+
+  it('records nothing, with a warning, when Strom has no builtin.liverecorder', async () => {
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    const strom = makeStromClient(['builtin.recorder', 'builtin.audioenc']);
+    const production = makeProduction([{ sourceId: '__test1__', mixerInput: 'video_in_1' }]);
+
+    const result = await activateStromFlow(
+      production as never,
+      strom as never,
+      'http://localhost:7000',
+      [recordingOutput] as never,
+    );
+
+    const blocks = strom.capturedFlows[0]!['blocks'] as Array<Record<string, unknown>>;
+    expect(blocks.find((b) => String(b['block_definition_id']).includes('recorder'))).toBeUndefined();
+    expect(blocks.find((b) => b['block_definition_id'] === 'builtin.audioenc')).toBeUndefined();
+    expect(result.recorderBlockId).toBeUndefined();
+    expect(result.warnings).toEqual([
+      expect.objectContaining({ type: 'recording-unavailable', message: expect.stringContaining('builtin.liverecorder') }),
     ]);
   });
 
@@ -173,7 +194,7 @@ describe('flow-generator — recorder wiring (#41)', () => {
 
     const flow = strom.capturedFlows[0]!;
     const blocks = flow['blocks'] as Array<Record<string, unknown>>;
-    const recorders = blocks.filter((b) => b['block_definition_id'] === 'builtin.recorder');
+    const recorders = blocks.filter((b) => b['block_definition_id'] === 'builtin.liverecorder');
     expect(recorders).toHaveLength(1);
   });
 
@@ -185,7 +206,7 @@ describe('flow-generator — recorder wiring (#41)', () => {
     const result = await activateStromFlow(production as never, strom as never);
     const flow = strom.capturedFlows[0]!;
     const blocks = flow['blocks'] as Array<Record<string, unknown>>;
-    expect(blocks.find((b) => b['block_definition_id'] === 'builtin.recorder')).toBeUndefined();
+    expect(blocks.find((b) => b['block_definition_id'] === 'builtin.liverecorder')).toBeUndefined();
     expect(result.recorderBlockId).toBeUndefined();
     expect(strom.blocks.list).not.toHaveBeenCalled();
   });

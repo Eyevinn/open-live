@@ -826,6 +826,7 @@ export type AudioStreamNotAppliedReason =
  */
 export type ActivationWarning =
   | { type: 'recording-no-audio'; message: string }
+  | { type: 'recording-unavailable'; message: string }
   | { type: 'input-recording-incomplete'; message: string }
   | {
       type: 'audio-stream-not-applied';
@@ -865,7 +866,7 @@ export interface ProductionDoc {
   pipConfigs?: PipConfig[];
   /** ID of the running Strom flow (set on activate, cleared on deactivate) */
   stromFlowId?: string;
-  /** ID of the builtin.recorder block — set on activate when a 'recording' output is assigned, cleared on deactivate */
+  /** ID of the builtin.liverecorder block — set on activate when a 'recording' output is assigned, cleared on deactivate */
   recorderBlockId?: string;
   /**
    * Upload target of the running recording, snapshotted at activation next to
@@ -884,7 +885,7 @@ export interface ProductionDoc {
   lastRecordingUpload?: RecordingUploadSummary;
   /** Strom media directory this activation's recorder writes into — set on activate alongside recorderBlockId, cleared on deactivate */
   recorderOutputDir?: string;
-  /** Maps mixerInput → builtin.recorder block ID per track of that input's own recording (ProductionSourceAssignment.record) — set on activate, cleared on deactivate */
+  /** Maps mixerInput → builtin.liverecorder block ID per track of that input's own recording (ProductionSourceAssignment.record) — set on activate, cleared on deactivate */
   inputRecorderBlockIds?: Record<string, { video?: string; audio?: string }>;
   /** WHEP multiview endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */
   whepEndpoint?: string;

@@ -43,13 +43,11 @@ through Strom's WHIP session bridge. It works for SRT/EFP too, at the cost of a
 software encode per input on the Strom host. `passthrough`, for SRT/EFP
 encoders with a fixed GOP, will record their encoded streams without decoding.
 
-Picture and sound go to separate recorders, and so to separate files, because
-an input can carry only one of them: a guest who joins with audio only, or a
-camera or encoder that sends no sound. A recorder with both tracks waits for
-both before it writes anything, so such an input would not be recorded at all,
-and in testing the stalled recorder also stopped another input's recorder. With
-one recorder per track, the missing track's recorder stays idle and writes no
-file.
+Picture and sound go to separate recorders (`builtin.liverecorder`), and so to
+separate files, because an input can carry only one of them: a guest who joins
+with audio only, or a camera or encoder that sends no sound. The missing
+track's recorder stays idle and writes no file. A track that stops and comes
+back continues in the same file, with a gap where it was missing.
 
 The two files line up by their start times in `recordings.json` (below).
 
@@ -58,7 +56,7 @@ stalled recorder drops frames from the recording instead of holding up the
 input's feed to the mixers.
 
 If Strom lacks `builtin.audioenc` or `builtin.videoenc`, inputs are recorded
-without that track. Without `builtin.recorder`, or without both encoders, they
+without that track. Without `builtin.liverecorder`, or without both encoders, they
 are not recorded. Each case adds an `input-recording-incomplete` activation
 warning, which the controller shows as an `ERROR` frame.
 
