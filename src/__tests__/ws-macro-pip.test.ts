@@ -239,6 +239,37 @@ describe('pgmBg with no Strom flow configured', () => {
 });
 
 // ---------------------------------------------------------------------------
+// issue #481 — TALLY must carry the PiP program/preview slot numbers so a
+// client that applies the new TALLY before the trailing PIP_STATE arrives does
+// not read stale PiP slot info. The slots mirror PIP_STATE's `pgmPip`/`pvwPip`.
+// ---------------------------------------------------------------------------
+
+describe('TALLY carries pgmPip/pvwPip (issue #481)', () => {
+  it('reflects the PiP slots in the same TALLY that reflects the PiP going to program', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([{ type: 'CUT', sourceId: 'cam3' }]));
+
+    // Select PiP 0 into preview, then take it to program.
+    await send({ type: 'SELECT_PVW_PIP', pip: 0 });
+    resetRecordings();
+    await send({ type: 'TAKE' });
+
+    // The TALLY broadcast at TAKE time must already carry the new slots
+    // (pgmPip: 0, pvwPip: null), not wait for the trailing PIP_STATE.
+    expect(tallies()[0]).toMatchObject({ pgmPip: 0, pvwPip: null });
+    // The authoritative PIP_STATE agrees, proving TALLY mirrors it.
+    expect(pipStates()[0]).toMatchObject({ pgmPip: 0, pvwPip: null });
+  });
+
+  it('carries null slots when no PiP is on program or preview', async () => {
+    mockGet.mockResolvedValue(makeProductionDoc([{ type: 'CUT', sourceId: 'cam3' }]));
+
+    await send({ type: 'SET_PVW', mixerInput: 'video_in_2' });
+
+    expect(tallies()[0]).toMatchObject({ pgmPip: null, pvwPip: null });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Macro CUT / TRANSITION over a PiP that is on program
 // ---------------------------------------------------------------------------
 
