@@ -226,8 +226,8 @@ export const config = {
   /**
    * MinIO / S3 object storage for VOD recordings (epic #5, issue #41).
    *
-   * Strom's recorder writes local files only ({media_path}/{output_dir}/{filename_prefix}_{timestamp}_%05d.{ext},
-   * backend/src/blocks/builtin/recorder.rs) — it has no native S3/MinIO sink. So open-live
+   * Strom's Live Recorder writes local files only ({media_path}/{output_dir}/{filename_prefix}_{timestamp}_%05d.{ext},
+   * backend/src/blocks/builtin/live_recorder/mod.rs) — it has no native S3/MinIO sink. So open-live
    * uploads the recorder's local segments to object storage after a production deactivates,
    * fetching them via Strom's existing media download API (`GET /api/media/file/:path`).
    *

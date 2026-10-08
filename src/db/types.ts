@@ -638,11 +638,11 @@ export interface ProductionDoc {
   pipConfigs?: PipConfig[];
   /** ID of the running Strom flow (set on activate, cleared on deactivate) */
   stromFlowId?: string;
-  /** ID of the builtin.recorder block — set on activate when a 'recording' output is assigned, cleared on deactivate */
+  /** ID of the builtin.liverecorder block — set on activate when a 'recording' output is assigned, cleared on deactivate */
   recorderBlockId?: string;
   /** Strom media directory this activation's recorder writes into — set on activate alongside recorderBlockId, cleared on deactivate */
   recorderOutputDir?: string;
-  /** Maps mixerInput → builtin.recorder block ID per track of that input's own recording (ProductionSourceAssignment.record) — set on activate, cleared on deactivate */
+  /** Maps mixerInput → builtin.liverecorder block ID per track of that input's own recording (ProductionSourceAssignment.record) — set on activate, cleared on deactivate */
   inputRecorderBlockIds?: Record<string, { video?: string; audio?: string }>;
   /** WHEP multiview endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */
   whepEndpoint?: string;
@@ -715,7 +715,7 @@ export interface ProductionDoc {
    * Problems found while going on air that did not stop activation, such as a
    * recording that will have no sound. Cleared on next activation.
    */
-  activationWarnings?: Array<{ type: 'recording-no-audio' | 'input-recording-incomplete'; message: string }>;
+  activationWarnings?: Array<{ type: 'recording-no-audio' | 'recording-unavailable' | 'input-recording-incomplete'; message: string }>;
   /** Set when the idle watchdog auto-deactivated this production; cleared on next activation */
   autoDeactivated?: boolean;
   /**

@@ -33,7 +33,7 @@ vi.mock('../ws/controller.js', () => ({
   clearFxState: vi.fn(),
 }));
 
-const ALL_BLOCKS = ['builtin.recorder', 'builtin.videoenc', 'builtin.audioenc'];
+const ALL_BLOCKS = ['builtin.liverecorder', 'builtin.videoenc', 'builtin.audioenc'];
 
 function makeStromClient(blockIds: string[] = ALL_BLOCKS) {
   const capturedFlows: Array<Record<string, unknown>> = [];
@@ -166,7 +166,7 @@ describe('flow-generator — per-input recording', () => {
       expect(result.inputRecorders).toEqual([]);
       expect(result.recordingsDir).toBeUndefined();
       expect(result.warnings).toEqual([]);
-      expect(flow.blocks.filter((b) => b['block_definition_id'] === 'builtin.recorder')).toEqual([]);
+      expect(flow.blocks.filter((b) => b['block_definition_id'] === 'builtin.liverecorder')).toEqual([]);
     },
   );
 
@@ -187,7 +187,7 @@ describe('flow-generator — per-input recording', () => {
   });
 
   it('records picture only, with a warning, when Strom has no builtin.audioenc', async () => {
-    const { result, flow } = await activate(BOTH, { blocks: ['builtin.recorder', 'builtin.videoenc'] });
+    const { result, flow } = await activate(BOTH, { blocks: ['builtin.liverecorder', 'builtin.videoenc'] });
     expect(result.inputRecorders.map((r) => Object.keys(r.blockIds))).toEqual([['video'], ['video']]);
     expect(flow.blocks.some((b) => String(b['id']).startsWith('b-inrec-aenc'))).toBe(false);
     expect(result.warnings).toEqual([
@@ -196,7 +196,7 @@ describe('flow-generator — per-input recording', () => {
   });
 
   it('records sound only, with a warning, when Strom has no builtin.videoenc', async () => {
-    const { result, flow } = await activate(BOTH, { blocks: ['builtin.recorder', 'builtin.audioenc'] });
+    const { result, flow } = await activate(BOTH, { blocks: ['builtin.liverecorder', 'builtin.audioenc'] });
     expect(result.inputRecorders.map((r) => Object.keys(r.blockIds))).toEqual([['audio'], ['audio']]);
     expect(flow.blocks.some((b) => String(b['id']).startsWith('b-inrec-venc'))).toBe(false);
     expect(result.warnings).toEqual([
@@ -204,7 +204,7 @@ describe('flow-generator — per-input recording', () => {
     ]);
   });
 
-  it('adds no input recorder, with a warning, when Strom has no builtin.recorder', async () => {
+  it('adds no input recorder, with a warning, when Strom has no builtin.liverecorder', async () => {
     const { result } = await activate(BOTH, { blocks: ['builtin.videoenc', 'builtin.audioenc'] });
     expect(result.inputRecorders).toEqual([]);
     expect(result.warnings).toEqual([

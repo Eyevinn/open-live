@@ -40,7 +40,7 @@ export type InputTrack = 'video' | 'audio';
 
 export interface InputRecorder {
   mixerInput: string;
-  /** builtin.recorder block ID per recorded track */
+  /** builtin.liverecorder block ID per recorded track */
   blockIds: Partial<Record<InputTrack, string>>;
   outputDir: string;
   recordMode: 'transcode';
@@ -56,9 +56,9 @@ export interface InputTap {
 }
 
 /**
- * Adds transcoding recorders for one input: one per track, so an input that
- * only ever sends one (an audio-only guest, a camera with no sound) still
- * records it. A recorder with two tracks waits for both and records nothing.
+ * Adds transcoding recorders for one input: one per track, so each track has
+ * a file of its own and an input that only ever sends one (an audio-only
+ * guest, a camera with no sound) still records it.
  *
  * Each branch starts with a leaky queue: it gives the encoder its own thread,
  * so encoding never runs in the input's streaming thread, and if the recorder
@@ -111,7 +111,7 @@ export function addTranscodingInputRecorder(
     flow.blocks.push({ id: encId, ...encoder, name: `Record ${mixerInput} ${track} encoder`, position: { x: position.x + 200, y } });
     flow.blocks.push({
       id: recorderId,
-      block_definition_id: 'builtin.recorder',
+      block_definition_id: 'builtin.liverecorder',
       name: `Record ${mixerInput} ${track}`,
       properties: { output_dir: outputDir, filename_prefix: inputRecordingFilePrefix(opts.productionId, mixerInput, track), ...trackCounts },
       position: { x: position.x + 400, y },

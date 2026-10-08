@@ -31,7 +31,7 @@ export interface ActivationResult {
   whepOutputEntries?: Array<{ outputId: string; endpointId: string }>;
   pgmWhepEndpointId?: string;
   /**
-   * ID of the builtin.recorder block wired into the flow — set only when a
+   * ID of the builtin.liverecorder block wired into the flow — set only when a
    * 'recording' output is assigned. The block records local segments in Strom;
    * open-live uploads them to MinIO after deactivate (see recording-uploader.ts).
    */
@@ -87,7 +87,10 @@ export interface ActivationResult {
   mixerInputMap: Record<string, number>;
 }
 
-export type ActivationWarning = { type: 'recording-no-audio' | 'input-recording-incomplete'; message: string };
+export type ActivationWarning = {
+  type: 'recording-no-audio' | 'recording-unavailable' | 'input-recording-incomplete';
+  message: string;
+};
 
 export interface ActivationInputRecorder extends InputRecorder {
   sourceId: string;
@@ -1072,17 +1075,26 @@ export async function activateStromFlow(
       const idSlug = outputDoc._id.replace(/[^a-z0-9]/gi, '').slice(-8) || 'out';
       const blockId = `b-out-${idSlug}-${endpointSuffix}`;
       if (outputDoc.outputType === 'recording') {
-        // VOD recording: emit a single builtin.recorder block that writes local
+        // VOD recording: emit a single builtin.liverecorder block that writes local
         // segments in Strom. open-live uploads them to MinIO after deactivate
         // (recording-uploader.ts). Only one recorder is wired per production —
         // extra 'recording' assignments are ignored so we never fan-out writes.
         if (recorderBlockId) continue;
+        // Strom refuses to start a flow that names a block it lacks, so a Strom
+        // without Live Recorder goes on air unrecorded instead of not at all.
+        if (!(await hasBlock('builtin.liverecorder'))) {
+          warnings.push({
+            type: 'recording-unavailable',
+            message: `Recording "${outputDoc.name}" is off: this Strom has no builtin.liverecorder block.`,
+          });
+          continue;
+        }
         // Recorder writes {media_path}/{output_dir}/{filename_prefix}_{timestamp}_%05d.{ext}
-        // (Strom recorder.rs).
+        // (Strom live_recorder/mod.rs).
         const outputDir = recordingsDir;
         flow.blocks.push({
           id: blockId,
-          block_definition_id: 'builtin.recorder',
+          block_definition_id: 'builtin.liverecorder',
           name: outputDoc.name,
           properties: {
             output_dir: outputDir,
@@ -1219,7 +1231,7 @@ export async function activateStromFlow(
   });
   if (transcodeTaps.length > 0) {
     const [recorder, video, audio] = await Promise.all(
-      ['builtin.recorder', 'builtin.videoenc', 'builtin.audioenc'].map((id) => hasBlock(id)),
+      ['builtin.liverecorder', 'builtin.videoenc', 'builtin.audioenc'].map((id) => hasBlock(id)),
     );
     const support = { video: recorder && video, audio: recorder && audio };
     if (!support.video && !support.audio) {
@@ -1227,7 +1239,7 @@ export async function activateStromFlow(
         type: 'input-recording-incomplete',
         message: recorder
           ? 'Inputs are not recorded: this Strom has neither builtin.videoenc nor builtin.audioenc.'
-          : 'Inputs are not recorded: this Strom has no builtin.recorder block.',
+          : 'Inputs are not recorded: this Strom has no builtin.liverecorder block.',
       });
     } else {
       if (!support.audio) {
