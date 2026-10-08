@@ -1018,6 +1018,8 @@ function buildTallyPayload(
   pgm: string | null;
   pvw: string | null;
   pgmBg: string | null;
+  pgmPip: number | null;
+  pvwPip: number | null;
   program: string[];
   preview: string[];
   contributions: Array<{ source: string; role: string }>;
@@ -1042,7 +1044,7 @@ function buildTallyPayload(
     activeGraphics,
   );
 
-  return { pgm: tally.pgm, pvw: tally.pvw, pgmBg, program, preview, contributions };
+  return { pgm: tally.pgm, pvw: tally.pvw, pgmBg, pgmPip, pvwPip, program, preview, contributions };
 }
 
 
