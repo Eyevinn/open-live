@@ -77,7 +77,7 @@ afterAll(() => {
   stromServer.close();
 });
 
-const { handleMessage, clearPipState } = await import('../ws/controller.js');
+const { handleMessage, clearPipState, setPipConfigSlot } = await import('../ws/controller.js');
 const { setTally, getTally } = await import('../services/tally.service.js');
 
 const PROD = 'prod-cut-same-1';
@@ -124,15 +124,17 @@ function pipStates() {
   return broadcasts.filter((m) => m.type === 'PIP_STATE');
 }
 
-function degenerateTakes() {
-  return transitions().filter((r) => {
-    const b = r.body as { from_input?: number; to_input?: number };
-    return b.from_input === b.to_input;
-  });
+/** Mixer calls in order: `preview <source>` or `transition`. */
+function mixerCalls() {
+  return stromRequests
+    .filter((r) => r.path.endsWith('/preview') || r.path === TRANSITION)
+    .map((r) => (r.path === TRANSITION ? 'transition' : `preview ${JSON.stringify((r.body as { source: unknown }).source)}`));
 }
 
 beforeEach(() => {
   clearPipState(PROD);
+  // PiP 0 is composited over input 1.
+  setPipConfigSlot(PROD, 0, { bg: 1, zones: [], transforms: {} });
   setTally(PROD, { pgm: 'video_in_0', pvw: 'video_in_1' });
   broadcasts.length = 0;
   stromRequests.length = 0;
@@ -193,11 +195,12 @@ describe('TRANSITION to the input already on program', () => {
 // CUT / TRANSITION to the source *behind an on-air PiP* (issues #342, #353)
 //
 // With a PiP on PGM the tally.pgm is null and the real on-air source is the
-// tracked background behind the PiP. Cutting to that same background input must
+// PiP's configured background. Cutting to that same background input must
 // take the PiP off program (the background stays on PGM, PVW clears, the PiP
 // moves to PVW) — #347 mis-classified it as "already on program" and dropped the
-// command silently, leaving the Studio tally split (#353). The command must
-// still never fire a degenerate from_input === to_input take (#342).
+// command silently, leaving the Studio tally split (#353). Strom only removes
+// the PiP from the picture when it takes, so the background is previewed and
+// taken.
 // PiP-on-PGM state is arranged through real inbound messages (SELECT_PVW_PIP +
 // TAKE), exactly like ws-macro-pip.test.ts, so the same state machine runs.
 // ---------------------------------------------------------------------------
@@ -206,8 +209,8 @@ describe('CUT/TRANSITION to the input behind an on-air PiP (#342, #353)', () => 
   /** Put PiP 0 on PGM over background video_in_1; return with recordings cleared. */
   async function pipOnProgramOverInput1() {
     // pgm=video_in_0, pvw=video_in_1 from beforeEach. Selecting the PiP in PVW
-    // then taking it puts PiP 0 on PGM with video_in_1 (the pre-PiP PVW) as the
-    // background, and tally.pgm null.
+    // then taking it puts PiP 0 on PGM over its configured background
+    // video_in_1, and tally.pgm null.
     await send({ type: 'SELECT_PVW_PIP', pip: 0 });
     await send({ type: 'TAKE' });
     // Sanity: the background the take recorded is video_in_1.
@@ -216,7 +219,7 @@ describe('CUT/TRANSITION to the input behind an on-air PiP (#342, #353)', () => 
     stromRequests.length = 0;
   }
 
-  it('CUT to the background takes the PiP off program without a degenerate take (#353)', async () => {
+  it('CUT to the background takes the PiP off program (#353)', async () => {
     await pipOnProgramOverInput1();
 
     await send({ type: 'CUT', mixerInput: 'video_in_1' });
@@ -225,8 +228,10 @@ describe('CUT/TRANSITION to the input behind an on-air PiP (#342, #353)', () => 
     expect(tallies().at(-1)).toMatchObject({ pgm: 'video_in_1', pvw: null });
     expect(pipStates().at(-1)).toMatchObject({ pgmPip: null, pvwPip: 0 });
     expect(getTally(PROD)).toEqual({ pgm: 'video_in_1', pvw: null });
-    // Never a degenerate from_input === to_input take (#342).
-    expect(degenerateTakes()).toHaveLength(0);
+    // Strom swaps its buses on a take, so this puts the background on PGM and
+    // the PiP on PVW.
+    expect(mixerCalls()).toEqual(['preview {"input":1}', 'transition']);
+    expect(transitions()[0]?.body).toMatchObject({ transition_type: 'cut' });
   });
 
   it('CUT to the background still acks the command', async () => {
@@ -240,7 +245,7 @@ describe('CUT/TRANSITION to the input behind an on-air PiP (#342, #353)', () => 
     expect(acks.at(-1)).toMatchObject({ cmdId: 'c-pip', phase: 'executed' });
   });
 
-  it('TRANSITION to the background takes the PiP off program without a degenerate take (#353)', async () => {
+  it('TRANSITION to the background takes the PiP off program (#353)', async () => {
     await pipOnProgramOverInput1();
 
     await send({ type: 'TRANSITION', mixerInput: 'video_in_1', transitionType: 'fade', durationMs: 500 });
@@ -248,7 +253,8 @@ describe('CUT/TRANSITION to the input behind an on-air PiP (#342, #353)', () => 
     expect(tallies().at(-1)).toMatchObject({ pgm: 'video_in_1', pvw: null });
     expect(pipStates().at(-1)).toMatchObject({ pgmPip: null, pvwPip: 0 });
     expect(getTally(PROD)).toEqual({ pgm: 'video_in_1', pvw: null });
-    expect(degenerateTakes()).toHaveLength(0);
+    expect(mixerCalls()).toEqual(['preview {"input":1}', 'transition']);
+    expect(transitions()[0]?.body).toMatchObject({ transition_type: 'fade', duration_ms: 500 });
   });
 
   it('CUT to a DIFFERENT real input while a PiP is on PGM is unaffected', async () => {
