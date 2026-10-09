@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { getStromToken } from '../lib/strom-token.js';
 import { assertSameStromOrigin } from '../lib/url-validation.js';
+import { toInternalStromUrl } from '../lib/strom-public-url.js';
 import { config } from '../config.js';
 
 /** Validates a proxy target URL is on the configured Strom host (prevents SSRF + token exfiltration). */
@@ -14,6 +15,9 @@ function validateProxyTarget(targetUrl: string): void {
  * The browser cannot reach Strom directly: OSC-hosted Strom is behind auth
  * (SAT token) and does not allow CORS from localhost. This proxy adds the
  * token and forwards the request server-side.
+ *
+ * `target` may be on `STROM_URL` or `STROM_PUBLIC_URL` (the base of the WHEP
+ * URLs stored for the studio); the latter is mapped to `STROM_URL` first.
  *
  * POST /api/v1/whep-proxy?target={encodeURIComponent(stromWhepUrl)}
  *   Body: raw SDP offer (text/plain or application/sdp)
@@ -40,7 +44,7 @@ const whepProxyRoutes: FastifyPluginAsync = async (fastify) => {
 
     let targetUrl: string
     try {
-      targetUrl = decodeURIComponent(target)
+      targetUrl = toInternalStromUrl(decodeURIComponent(target))
       validateProxyTarget(targetUrl)
     } catch (err) {
       return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid target URL' })
@@ -90,7 +94,7 @@ const whepProxyRoutes: FastifyPluginAsync = async (fastify) => {
 
     let targetUrl: string
     try {
-      targetUrl = decodeURIComponent(target)
+      targetUrl = toInternalStromUrl(decodeURIComponent(target))
       validateProxyTarget(targetUrl)
     } catch (err) {
       return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid target URL' })

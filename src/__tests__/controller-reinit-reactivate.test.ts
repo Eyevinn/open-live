@@ -52,6 +52,8 @@ vi.mock('ws', () => {
 let numChannels = 2;
 // Properties the init PATCH refuses, with the current value Strom reports for each.
 let patchRejected: Record<string, { reason: string; current: unknown }> = {};
+// The new flow's main mute, returned with every write; undefined omits it.
+let stromMainMute: boolean | undefined = false;
 const propertyPatches: Array<Record<string, unknown>> = [];
 const stromServer: Server = createServer((req, res) => {
   const chunks: Buffer[] = [];
@@ -66,7 +68,7 @@ const stromServer: Server = createServer((req, res) => {
     if (req.method === 'PATCH' && url.endsWith('/properties')) {
       const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {};
       propertyPatches.push(body.properties ?? {});
-      const properties: Record<string, unknown> = { ...(body.properties ?? {}) };
+      const properties: Record<string, unknown> = { ...(stromMainMute === undefined ? {} : { main_mute: stromMainMute }), ...(body.properties ?? {}) };
       const rejected: Record<string, string> = {};
       for (const [key, { reason, current }] of Object.entries(patchRejected)) {
         properties[key] = current;
@@ -99,6 +101,7 @@ function activeDoc(): Record<string, unknown> {
 beforeEach(() => {
   propertyPatches.length = 0;
   patchRejected = {};
+  stromMainMute = false;
   clearAudioState(PROD); // simulate deactivate having wiped the registries
   productionDocs.clear();
   productionDocs.set(PROD, activeDoc());
@@ -141,6 +144,26 @@ describe('reinitConnectedControllers', () => {
       expect(audio).toContainEqual(expect.objectContaining({ elementId: 'ch2', property: 'mute', value: false }));
       expect(audio).not.toContainEqual(expect.objectContaining({ elementId: 'ch2', property: 'volume' }));
       expect(audio).toContainEqual(expect.objectContaining({ elementId: 'ch1', property: 'volume', value: 1.0 }));
+    } finally {
+      unsubscribe(PROD, sock as never);
+    }
+  });
+
+  it('tells a socket that stayed open the new flow\'s main mute, without writing it', async () => {
+    const sock = makeSocket();
+    subscribe(PROD, sock as never);
+    try {
+      await reinitConnectedControllers(PROD);
+
+      expect(propertyPatches[0]).not.toHaveProperty('main_mute');
+      expect(sock.sent).toContainEqual(expect.objectContaining({ type: 'AUDIO_STATE', elementId: 'main', property: 'mute', value: false }));
+
+      sock.sent.length = 0;
+      clearAudioState(PROD);
+      stromMainMute = undefined;
+      await reinitConnectedControllers(PROD);
+      // Strom did not say: nothing is reported.
+      expect(sock.sent).not.toContainEqual(expect.objectContaining({ elementId: 'main', property: 'mute' }));
     } finally {
       unsubscribe(PROD, sock as never);
     }

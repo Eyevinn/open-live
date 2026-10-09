@@ -87,7 +87,7 @@ const MIXER_BLOCK = 'b-video-mixer-0';
 
 const writes: Array<{ method: string; url: string }> = [];
 // ch1 starts off program at half level; ch2 is routed to main. Writes merge in.
-const INITIAL_AUDIO_PROPS = { ch1_fader: 0.5, ch2_fader: 1.0, main_fader: 1.0, ch1_to_main: false, ch2_to_main: true };
+const INITIAL_AUDIO_PROPS = { ch1_fader: 0.5, ch2_fader: 1.0, main_fader: 1.0, main_mute: true, ch1_to_main: false, ch2_to_main: true };
 let audioProps: Record<string, unknown> = { ...INITIAL_AUDIO_PROPS };
 // Set to hold back the next flow fetch, leaving a connect mid-sync until released.
 let holdNextFlowGet = false;
@@ -246,6 +246,7 @@ describe('watch-only controller connection', () => {
     const muteOf = (ch: string) => watcher.messages.find((m) => m.type === 'AUDIO_STATE' && m.elementId === ch && m.property === 'mute');
     expect(muteOf('ch1')).toMatchObject({ value: true });
     expect(muteOf('ch2')).toMatchObject({ value: false });
+    expect(muteOf('main')).toMatchObject({ value: true });
 
     // A second watcher still does not init.
     const watcher2 = await connect(id, '?mode=watch');
@@ -253,6 +254,10 @@ describe('watch-only controller connection', () => {
 
     const operator = await connect(id);
     expect(audioInitWrites()).toHaveLength(1);
+    // The init leaves main muted, and the operator is told so.
+    expect(audioProps.main_mute).toBe(true);
+    const operatorMainMute = operator.messages.find((m) => m.type === 'AUDIO_STATE' && m.elementId === 'main' && m.property === 'mute');
+    expect(operatorMainMute).toMatchObject({ value: true });
 
     watcher.ws.close();
     watcher2.ws.close();
@@ -518,6 +523,7 @@ describe('watch-only controller connection', () => {
     await waitFor(() => latest('ch1', 'mute') === false);
     expect({ mute: latest('ch1', 'mute'), volume: latest('ch1', 'volume') }).toEqual({ mute: false, volume: 1.0 });
     expect(latest('main', 'volume')).toBe(1.0);
+    expect(latest('main', 'mute')).toBe(true);
 
     watcher.ws.close();
     operator.ws.close();
