@@ -1,4 +1,4 @@
-import { config } from './config.js';
+import { config, objectStorageMissingVars } from './config.js';
 import { startIdleWatchdog } from './services/idle-watchdog.js';
 import { startPortReservation, stopPortReservation } from './services/port-reservation.js';
 import { connectDb } from './db/index.js';
@@ -74,6 +74,17 @@ async function main() {
       'Storing HTML-source header credentials or SRT passphrases will fail closed ' +
       'with a 503 (credentials are never stored in plaintext). Set HTML_AUTH_KEY ' +
       '(or SRT_PASSPHRASE_KEY) to a 32-byte base64/hex key to enable credential storage.'
+    );
+  }
+
+  // A partial MinIO config is treated as no object storage: recordings stay on
+  // Strom and are never uploaded. Warn so a typo'd or forgotten var is visible.
+  const missingStorageVars = objectStorageMissingVars();
+  if (missingStorageVars.length > 0) {
+    console.warn(
+      `[recording] Object storage is partially configured (missing ${missingStorageVars.join(', ')}). ` +
+      'Recordings will stay on Strom and will not be uploaded. Set all of MINIO_ENDPOINT, ' +
+      'MINIO_ACCESS_KEY, MINIO_SECRET_KEY and MINIO_BUCKET to upload, or unset them all.'
     );
   }
 

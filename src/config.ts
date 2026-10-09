@@ -265,8 +265,8 @@ export const config = {
    * uploads the recorder's local segments to object storage after a production deactivates,
    * fetching them via Strom's existing media download API (`GET /api/media/file/:path`).
    *
-   * When these vars are unset the `recording` output type is rejected at assignment time
-   * (400 — recording disabled), mirroring how STROM_URL / API_KEY degrade cleanly.
+   * Object storage is optional: recording itself needs only Strom. When these vars are
+   * unset, recordings stay on Strom's media path and deactivate skips the upload.
    * `MINIO_ENDPOINT` falls back to `S3_ENDPOINT` for S3-compatible naming. Empty or
    * whitespace-only values count as unset (see `optionalEnv`).
    */
@@ -384,15 +384,32 @@ export function isGuestCallingEnabled(): boolean {
 }
 
 /**
- * True when all required MinIO vars are present, i.e. VOD recording is enabled.
- * The `recording` output type is only accepted, and the recorder block only
- * wired into the flow, when this returns true (spec: config-gated feature).
+ * True when all required MinIO vars are present, i.e. recordings are uploaded to
+ * object storage on deactivate and the VOD listing/playback endpoints are served.
+ * Recording itself does not depend on this: without object storage, Strom's
+ * recorder still writes segments to its media path and they stay there.
  */
-export function isRecordingEnabled(): boolean {
+export function isObjectStorageConfigured(): boolean {
   return Boolean(
     config.minioEndpoint &&
       config.minioAccessKey &&
       config.minioSecretKey &&
       config.minioBucket,
   );
+}
+
+/**
+ * Names of the required MinIO vars that are unset. Empty when object storage is
+ * fully configured or not configured at all (no var set) — a non-empty result
+ * means a partial config, which silently disables upload, so startup warns.
+ */
+export function objectStorageMissingVars(): string[] {
+  const vars: Array<[string, string | undefined]> = [
+    ['MINIO_ENDPOINT', config.minioEndpoint],
+    ['MINIO_ACCESS_KEY', config.minioAccessKey],
+    ['MINIO_SECRET_KEY', config.minioSecretKey],
+    ['MINIO_BUCKET', config.minioBucket],
+  ];
+  const missing = vars.filter(([, v]) => !v).map(([name]) => name);
+  return missing.length === vars.length ? [] : missing;
 }
