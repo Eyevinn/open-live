@@ -303,13 +303,14 @@ async function refreshRegisteredRecording(
   bucket: string,
   sizeBytes: number,
   endedAt: string,
+  updatedAt: string,
   log: FastifyBaseLogger,
 ): Promise<void> {
   try {
     const db = getRecordingsDb();
     const existing = await db.get(recordingDocId(bucket, key));
     if (existing.sizeBytes === sizeBytes) return;
-    await db.insert({ ...existing, sizeBytes, endedAt, updatedAt: endedAt });
+    await db.insert({ ...existing, sizeBytes, endedAt, updatedAt });
   } catch (err) {
     log.error({ err, key }, 'RecordingDoc refresh failed — object uploaded again but its listing is stale');
   }
@@ -1118,7 +1119,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
                 // Already registered: by a concurrent deactivate, or by an earlier
                 // one that saw the file before it was complete.
                 if (isConflict(persistErr)) {
-                  await refreshRegisteredRecording(seg.key, target.bucket, seg.sizeBytes, finalizedAt, log);
+                  await refreshRegisteredRecording(seg.key, target.bucket, seg.sizeBytes, seg.modifiedAt ?? finalizedAt, finalizedAt, log);
                   continue;
                 }
                 log.error({ persistErr, productionId: doc._id, key: seg.key }, 'RecordingDoc persist failed — object uploaded but unlisted');
