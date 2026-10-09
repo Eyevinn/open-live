@@ -83,7 +83,8 @@ function runPage(script: string, feeds: Feed[], opts: { failFast?: boolean; retu
   const pcs: FakePc[] = [];
   const requests: Request[] = [];
   const server = { mode: opts.returnMode ?? 'program-minus' };
-  let interval: (() => void) | null = null;
+  const intervals = new Map<number, () => void>();
+  let nextInterval = 1;
   const windowListeners: Record<string, Array<() => void>> = {};
 
   class RTCPeerConnection {
@@ -168,8 +169,8 @@ function runPage(script: string, feeds: Feed[], opts: { failFast?: boolean; retu
     AbortController,
     setTimeout,
     clearTimeout,
-    setInterval: (fn: () => void) => { interval = fn; return 1; },
-    clearInterval: () => { interval = null; },
+    setInterval: (fn: () => void) => { intervals.set(nextInterval, fn); return nextInterval++; },
+    clearInterval: (id: number) => { intervals.delete(id); },
   };
   vm.runInNewContext(script, context);
   return {
@@ -177,8 +178,8 @@ function runPage(script: string, feeds: Feed[], opts: { failFast?: boolean; retu
     pcs,
     requests,
     server,
-    /** Runs one return-mode poll tick, if polling. */
-    tick: () => interval?.(),
+    /** Runs one tick of every active poll (return mode, on-air). */
+    tick: () => [...intervals.values()].forEach((fn) => fn()),
     fireWindow: (type: string) => (windowListeners[type] ?? []).forEach((fn) => fn()),
     pick: (mode: string) => {
       const input = el(`mode-${mode}`);
@@ -226,6 +227,19 @@ describe('guest page return feeds', () => {
     expect(els['return-audio'].muted).toBe(false);
     expect(els['return'].srcObject).toEqual({ id: 'stream-1' });
     expect(els['return-audio'].srcObject).toEqual({ id: 'stream-2' });
+  });
+
+  it('picks the feeds by id, whatever order the join lists them in', async () => {
+    const { els, pcs, requests } = runPage(await pageScript(), [FAST, PICTURE]);
+    await flush();
+    els['golive'].fire('click');
+    await flush();
+    const posts = requests.filter((r) => r.method === 'POST' && r.url.endsWith('/whep')).map((r) => r.url);
+    expect(posts).toEqual([PICTURE.url, FAST.url]);
+    expect(pcs[1].kinds).toEqual(['video', 'audio']);
+    expect(pcs[2].kinds).toEqual(['audio']);
+    expect(els['return'].muted).toBe(true);
+    expect(els['return-audio'].muted).toBe(false);
   });
 
   it("plays the picture's audio and mutes the fast feed when the guest joins in program", async () => {
