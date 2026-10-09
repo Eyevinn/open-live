@@ -6,6 +6,8 @@ import { broadcast } from './tally.service.js';
 interface RelayEntry {
   stop: () => void;
   refCount: number;
+  /** Identifies this relay instance; a force-stop and restart gets a new one. */
+  generation: number;
   flowId: string;
   meterPrefix: string;
   loudnessBlockId?: string | null;
@@ -16,8 +18,13 @@ const relays = new Map<string, RelayEntry>();
 // so an entry only goes stale, never wrong; the next deactivate overwrites it.
 const retiredFlows = new Map<string, string>();
 const RECONNECT_DELAY_MS = 5000;
+let nextGeneration = 1;
 
-export function startMeterRelay(productionId: string, flowId: string, mixerBlockId: string, loudnessBlockId?: string | null): void {
+/**
+ * Take one ref on the production's meter relay, creating it if needed. Returns
+ * the relay's generation; pass it to `stopMeterRelay` to release that ref.
+ */
+export function startMeterRelay(productionId: string, flowId: string, mixerBlockId: string, loudnessBlockId?: string | null): number {
   const meterPrefix = `${mixerBlockId}:meter:`;
   const existing = relays.get(productionId);
   if (existing) {
@@ -30,7 +37,7 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
       existing.meterPrefix = meterPrefix;
       existing.loudnessBlockId = loudnessBlockId;
     }
-    return;
+    return existing.generation;
   }
 
   let stopped = false;
@@ -104,6 +111,7 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
 
   const entry: RelayEntry = {
     refCount: 1,
+    generation: nextGeneration++,
     flowId,
     meterPrefix,
     loudnessBlockId,
@@ -116,6 +124,7 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
 
   connect();
   relays.set(productionId, entry);
+  return entry.generation;
 }
 
 /**
@@ -126,13 +135,14 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
  * Per-socket `startMeterRelay` calls there would either miss re-creating a
  * force-stopped relay (losing meters for an operator that stayed open) or
  * double-count the mid-teardown socket (an orphaned ref that never reaches
- * zero). Since every operator socket backs exactly one ref (connect takes one,
- * close releases one), this rebinds any existing relay onto the new flow and
- * sets its refCount to the operator-socket count so the later per-socket stops
- * land it back on zero. No-op when `holderCount <= 0`.
+ * zero). Since every controller socket, watch-only included, backs exactly one
+ * ref (connect takes one, close releases one), this rebinds any existing relay
+ * onto the new flow and sets its refCount to the socket count so the later
+ * per-socket stops land it back on zero. Returns the relay's generation, or
+ * undefined (a no-op) when `holderCount <= 0`.
  */
-export function reconcileMeterRelay(productionId: string, flowId: string, mixerBlockId: string, loudnessBlockId: string | null | undefined, holderCount: number): void {
-  if (holderCount <= 0) return;
+export function reconcileMeterRelay(productionId: string, flowId: string, mixerBlockId: string, loudnessBlockId: string | null | undefined, holderCount: number): number | undefined {
+  if (holderCount <= 0) return undefined;
   const meterPrefix = `${mixerBlockId}:meter:`;
   const existing = relays.get(productionId);
   if (existing) {
@@ -143,11 +153,12 @@ export function reconcileMeterRelay(productionId: string, flowId: string, mixerB
     existing.meterPrefix = meterPrefix;
     existing.loudnessBlockId = loudnessBlockId;
     existing.refCount = holderCount;
-    return;
+    return existing.generation;
   }
-  startMeterRelay(productionId, flowId, mixerBlockId, loudnessBlockId);
+  const generation = startMeterRelay(productionId, flowId, mixerBlockId, loudnessBlockId);
   const created = relays.get(productionId);
   if (created) created.refCount = holderCount;
+  return generation;
 }
 
 /** Current ref count for a production's meter relay (0 when none). Diagnostic. */
@@ -155,9 +166,15 @@ export function getMeterRelayRefCount(productionId: string): number {
   return relays.get(productionId)?.refCount ?? 0;
 }
 
-export function stopMeterRelay(productionId: string): void {
+/**
+ * Release one ref. With `generation`, release only if the relay is still that
+ * instance: a ref taken on a relay that was since force-stopped is already gone,
+ * and releasing it would take a ref another socket owns.
+ */
+export function stopMeterRelay(productionId: string, generation?: number): void {
   const entry = relays.get(productionId);
   if (!entry) return;
+  if (generation !== undefined && entry.generation !== generation) return;
   entry.refCount--;
   if (entry.refCount <= 0) {
     entry.stop();
