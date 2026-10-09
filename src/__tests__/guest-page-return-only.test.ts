@@ -162,7 +162,7 @@ async function loadPage(inv: { id: string; token: string }, options: { slotCheck
   const script = /<script>([\s\S]*?)<\/script>/.exec(html)![1];
   const hiddenAtStart = new Set(['onair-badge', 'return', 'return-hint', 'rejoin', 'mute', 'leave', 'return-mode', 'self-warning', 'device-alert']);
   const els: Record<string, FakeElement> = {};
-  for (const id of ['banner', 'muted-indicator', 'onair-badge', 'preview', 'preview-hint', 'return',
+  for (const id of ['banner', 'muted-indicator', 'onair-badge', 'preview', 'preview-hint', 'return', 'return-audio',
     'return-hint', 'cam', 'mic', 'pickers', 'golive', 'rejoin', 'mute', 'leave', 'return-mode', 'mode-program-minus',
     'mode-program', 'self-warning', 'device-alert', 'device-alert-text', 'device-retry']) {
     els[id] = new FakeElement(hiddenAtStart.has(id));
