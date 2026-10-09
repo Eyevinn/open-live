@@ -6,6 +6,7 @@ import { cleanLegacyFixtures } from './db/seed.js';
 import { ensureGuestSigningKey } from './lib/guest-signing-key.js';
 import { ensureCredentialEncryptionKey } from './lib/credential-encryption-key.js';
 import { ensureRtmpCredentialKey } from './lib/rtmp-credential-key.js';
+import { migrateAudioChannelOrder } from './services/migrate-audio-channel-order.js';
 import { buildServer } from './server.js';
 import { reconcileProductionStatuses } from './services/reconcile.js';
 
@@ -138,6 +139,16 @@ async function main() {
       );
     }
     await cleanLegacyFixtures();
+    // One-time migration (issue #487): the audio channel sort changed to numeric
+    // pad order, which renumbers channels for productions with a guest or 10+
+    // sources. Remap persisted per-channel `ch{N}_aux{M}_pre` settings BEFORE any
+    // flow is (re)built so operator pre/post choices follow their source. Runs at
+    // most once per instance; best-effort — a failure retries on next start.
+    try {
+      await migrateAudioChannelOrder(app.log);
+    } catch (err: any) {
+      app.log.error('[migrate:audio-channel-order] Migration errored — will retry next start (reason: %s)', err?.statusCode ?? err?.message ?? 'unknown');
+    }
     await reconcileProductionStatuses(app.log);
   } catch (err: any) {
     app.log.error('[db] Failed to connect to CouchDB — continuing without database (status: %s)', err?.statusCode ?? err?.message ?? 'unknown');
