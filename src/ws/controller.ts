@@ -1180,6 +1180,9 @@ export async function reinitConnectedControllers(productionId: string): Promise<
         initProps['main_fader'] = 1.0;
         levelCache.set('main', 1.0);
         channelLevelsByProduction.set(productionId, levelCache);
+        // The init leaves main mute alone, but this is a new flow: a socket that
+        // stayed open still shows the old flow's main mute.
+        let mainMuted: boolean | undefined;
         // Mirror the first-connect guard (#396): a channel Strom refused to route
         // to main is reported muted rather than falsely told live.
         const seedMutes = (rejected: Record<string, unknown>, current: Record<string, unknown>) => {
@@ -1187,6 +1190,7 @@ export async function reinitConnectedControllers(productionId: string): Promise<
             const toMainKey = `ch${i}_to_main`;
             if (Object.hasOwn(rejected, toMainKey) || current[toMainKey] === false) muted.add(`ch${i}`);
           }
+          mainMuted = stromMuteState('main', current);
         };
         const applied = await strom.flows.updateBlockProperties(flowId, audioBlockId, { properties: initProps })
           .then((res) => { seedMutes(res.rejected ?? {}, res.properties ?? {}); return true; })
@@ -1206,6 +1210,9 @@ export async function reinitConnectedControllers(productionId: string): Promise<
         // that stayed open across reactivation drops its stale mixer view.
         // Skipped when the write failed outright: Strom still holds the old values.
         if (applied) broadcastAudioReset(productionId, numChannels, muted);
+        if (applied && mainMuted !== undefined) {
+          broadcast(productionId, { type: 'AUDIO_STATE', elementId: 'main', property: 'mute', value: mainMuted });
+        }
         broadcast(productionId, { type: 'GRP_STATE_RESET' });
       }
 
@@ -3641,6 +3648,11 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             const mainVolume = cachedMain ?? (typeof stromMain === 'number' ? stromMain : undefined);
             if (mainVolume !== undefined) {
               socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: 'main', property: 'volume', value: mainVolume }));
+            }
+            // Main mute is not cached or reset by the init; Strom holds it.
+            const mainMuted = blockProps ? stromMuteState('main', blockProps.properties) : undefined;
+            if (mainMuted !== undefined) {
+              socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: 'main', property: 'mute', value: mainMuted }));
             }
             // Restore AUX master state — prefer in-memory cache (set by this session's
             // AUX_MASTER_SET messages), fall back to Strom block properties for the first
