@@ -53,6 +53,12 @@ export interface UploadedSegment {
    * uploaded segment can be deleted from Strom afterward (issue #366).
    */
   stromPath: string;
+  /**
+   * When the recording session that wrote the segment began (ISO 8601), read
+   * from the timestamp Strom puts in the file name. Undefined when the name
+   * carries none.
+   */
+  startedAt?: string;
 }
 
 export interface UploadResult {
@@ -335,6 +341,27 @@ async function downloadFromStrom(
   return Buffer.from(await res.arrayBuffer());
 }
 
+/**
+ * Start of the recording session that wrote a segment, read from its file name.
+ *
+ * Strom's recorder names segments `{filename_prefix}_{YYYYmmdd_HHMMSS}_%05d.{ext}`
+ * (backend/src/blocks/builtin/recorder.rs), stamping the time the recorder
+ * block was built, so every segment of one session carries the same stamp.
+ * Strom formats it in the host's local time zone and the name records no
+ * offset; it is read as UTC, the zone Strom's container image runs in.
+ * Returns undefined when the name has no valid stamp.
+ */
+export function recordingStartFromFileName(name: string): string | undefined {
+  const m = /_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})_\d+\.[^.]+$/.exec(name);
+  if (!m) return undefined;
+  const [, y, mo, d, h, mi, sec] = m.map(Number);
+  const date = new Date(Date.UTC(y, mo - 1, d, h, mi, sec));
+  // Reject out-of-range fields (e.g. month 13) that Date.UTC would roll over.
+  if (date.getUTCMonth() !== mo - 1 || date.getUTCDate() !== d || date.getUTCHours() !== h
+    || date.getUTCMinutes() !== mi || date.getUTCSeconds() !== sec) return undefined;
+  return date.toISOString();
+}
+
 export interface UploadRecordingsArgs {
   strom: StromClient;
   /** Base URL of the Strom instance (for the raw media download). */
@@ -386,7 +413,13 @@ export async function uploadRecordings(args: UploadRecordingsArgs): Promise<Uplo
       const bytes = await downloadFromStrom(stromUrl, stromToken, entry.path);
       const key = `${prefix}${productionId}/${entry.name}`;
       await putObject(target, key, bytes, contentTypeForFile(entry.name));
-      result.uploaded.push({ key, sizeBytes: bytes.length, stromPath: entry.path });
+      const startedAt = recordingStartFromFileName(entry.name);
+      result.uploaded.push({
+        key,
+        sizeBytes: bytes.length,
+        stromPath: entry.path,
+        ...(startedAt ? { startedAt } : {}),
+      });
     } catch (err) {
       result.failed.push({
         file: entry.path,

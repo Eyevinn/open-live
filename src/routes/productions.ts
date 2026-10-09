@@ -1053,7 +1053,10 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
                   bucket: target.bucket,
                   key: seg.key,
                   sizeBytes: seg.sizeBytes,
-                  startedAt: doc.updatedAt,
+                  // The sweep also uploads segments earlier sessions left on
+                  // Strom, so take the start from each segment's own name;
+                  // doc.updatedAt is this activation's start.
+                  startedAt: seg.startedAt ?? doc.updatedAt,
                   endedAt: finalizedAt,
                   createdAt: finalizedAt,
                   updatedAt: finalizedAt,
