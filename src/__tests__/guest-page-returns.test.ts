@@ -228,6 +228,19 @@ describe('guest page return feeds', () => {
     expect(els['return-audio'].srcObject).toEqual({ id: 'stream-2' });
   });
 
+  it('picks the feeds by id, whatever order the join lists them in', async () => {
+    const { els, pcs, requests } = runPage(await pageScript(), [FAST, PICTURE]);
+    await flush();
+    els['golive'].fire('click');
+    await flush();
+    const posts = requests.filter((r) => r.method === 'POST' && r.url.endsWith('/whep')).map((r) => r.url);
+    expect(posts).toEqual([PICTURE.url, FAST.url]);
+    expect(pcs[1].kinds).toEqual(['video', 'audio']);
+    expect(pcs[2].kinds).toEqual(['audio']);
+    expect(els['return'].muted).toBe(true);
+    expect(els['return-audio'].muted).toBe(false);
+  });
+
   it("plays the picture's audio and mutes the fast feed when the guest joins in program", async () => {
     const { els, pcs } = runPage(await pageScript(), [PICTURE, FAST], { returnMode: 'program' });
     await flush();
