@@ -515,6 +515,27 @@ export interface RtmpCredentialKeyDoc {
   createdAt: string;        // ISO 8601
 }
 
+// --------------- One-time data migration marker ---------------
+
+/**
+ * Marker for a completed one-time, instance-wide data migration. Each migration
+ * has a fixed id (e.g. `audio-channel-order-v2`); the presence of its doc means
+ * the migration has already run on this instance, so a later restart skips it.
+ * Kept as a singleton-per-migration doc (mirroring the stored-key docs) rather
+ * than a per-production flag so productions created AFTER the migration — which
+ * are already in the new shape — are never re-migrated and corrupted.
+ */
+export interface MigrationStateDoc {
+  _id: string;              // fixed per migration, e.g. "migration:audio-channel-order-v2"
+  _rev?: string;
+  type: 'migration-state';
+  /** Stable migration identifier (same as the `_id` suffix). */
+  migration: string;
+  /** How many documents the migration actually changed (diagnostics only). */
+  migratedCount: number;
+  completedAt: string;      // ISO 8601
+}
+
 // --------------- Production config types ---------------
 
 export interface ProductionConfigDoc {
@@ -629,6 +650,17 @@ export interface ProductionDoc {
   srtOutputUri?: string;
   /** Template property values chosen at production creation, keyed by property id */
   values?: Record<string, string | number | boolean>;
+  /**
+   * Per-production stamp for the issue #487 audio-channel-order migration. Set in
+   * the SAME write that renumbers this doc's `ch{N}_aux{M}_pre` keys, so a
+   * partial-failure retry of the one-time migration skips already-migrated docs
+   * and never double-applies the (bijective) channel remap — which would corrupt
+   * operator pre/post routing. Absent on docs the migration has not touched (and
+   * on productions created after the migration, which are already numbered
+   * correctly and are never scanned, being created after the instance marker).
+   * See `services/migrate-audio-channel-order.ts`.
+   */
+  audioChannelOrderV2?: boolean;
   /** Scheduled on-air start time — ISO 8601 UTC string (e.g. "2026-05-01T18:30:00.000Z") */
   airTime?: string;
   pipeline: Pipeline;
