@@ -15,6 +15,7 @@ import { persistClipCue, clearPersistedClipCue } from '../services/clip-cue-stor
 import { startClipRelay, stopClipRelay, reconcileClipRelay } from '../services/clip-relay.js';
 import { CONTRACT_VERSION, computeTallyContributions } from '../services/automation-contract.js';
 import { startMeterRelay, stopMeterRelay, reconcileMeterRelay } from '../services/meter-relay.js';
+import { guestInputBlocks, guestHealthSnapshot } from '../services/guest-health.js';
 import { StromClient, StromClientError, StromPropertiesRejectedError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms, type VideoEffect, type EffectTarget, type SetVideoEffectRequest } from '../lib/strom.js';
 import { mixerInputToStromPad, storedPadToStromPad, expandToStoredPadIndex } from '../lib/mixer-input-map.js';
 import { getStromToken } from '../lib/strom-token.js';
@@ -1152,6 +1153,10 @@ export async function reinitConnectedControllers(productionId: string): Promise<
     const strom = await makeStromClient();
     const { flow } = await strom.flows.get(flowId);
     const blocks = flow.blocks ?? [];
+    // A socket that stayed open across reactivation may still show a guest
+    // failure from the old flow; the new flow's health replaces it.
+    const guestBlocks = guestInputBlocks(doc);
+    for (const message of guestHealthSnapshot(guestBlocks, flow.block_health)) broadcast(productionId, message);
     const audioBlockId = doc.audioMixerBlockId ?? blocks.find((b) => b.block_definition_id === 'builtin.mixer')?.id;
     if (audioBlockId) {
       const mixerBlock = blocks.find((b) => b.id === audioBlockId);
@@ -1226,7 +1231,7 @@ export async function reinitConnectedControllers(productionId: string): Promise<
       // (issue #434). Every operator socket then releases exactly one ref on
       // close, landing the relay back at zero.
       const meterOperators = getOperatorSockets(productionId);
-      reconcileMeterRelay(productionId, flowId, audioBlockId, doc.loudnessMainBlockId, meterOperators.length);
+      reconcileMeterRelay(productionId, flowId, audioBlockId, doc.loudnessMainBlockId, meterOperators.length, guestBlocks);
       for (const ws of meterOperators) relayHold(ws).meter = flowId;
     }
   } catch (err) {
@@ -3560,6 +3565,12 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
           const strom = await makeStromClient();
           const { flow } = await strom.flows.get(connectDoc.stromFlowId);
           const blocks = flow.blocks ?? [];
+          // Current guest-seat health, so a reconnecting studio sees a failure
+          // that is still going on. Live changes come through the meter relay.
+          const guestBlocks = guestInputBlocks(connectDoc);
+          for (const message of guestHealthSnapshot(guestBlocks, flow.block_health)) {
+            socket.send(JSON.stringify({ ...message, seq: nextSeq(id), ts: new Date().toISOString() }));
+          }
           // Prefer the persisted audioMixerBlockId; fall back to scanning live flow blocks
           const audioBlockId = connectDoc.audioMixerBlockId ?? blocks.find((b) => b.block_definition_id === 'builtin.mixer')?.id;
           const mixerBlock = audioBlockId ? blocks.find((b) => b.id === audioBlockId) : undefined;
@@ -3793,7 +3804,7 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             // that closed during the connect sync must not take a ref it never releases,
             // and one already holding a ref (set by re-init) must not take a second.
             if (!watchOnly && !socketClosed && relayHold(socket).meter === undefined) {
-              startMeterRelay(id, connectDoc.stromFlowId, audioBlockId, connectDoc.loudnessMainBlockId);
+              startMeterRelay(id, connectDoc.stromFlowId, audioBlockId, connectDoc.loudnessMainBlockId, guestBlocks);
               relayHold(socket).meter = connectDoc.stromFlowId;
             }
           }

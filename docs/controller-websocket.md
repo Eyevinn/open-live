@@ -221,6 +221,7 @@ are emitted from `src/ws/controller.ts` and `src/services/meter-relay.ts`:
 | `IDLE_WARNING_CLEARED` | `productionId: string` | A pending idle warning was cancelled because activity reset the idle timer (a subscriber joined or a `KEEP_ALIVE` was received). |
 | `RETURN_STATE` | `mixerInput: string`, `mode: 'program' \| 'program-minus'` | A per-guest return feed's mix-minus mode changed on `mixerInput` (crew via `PUT .../returns/{mixerInput}/mode`, the `RETURN_SET` WS command, or the guest via `PUT /api/v1/guests/{inviteId}/session/return`). `program-minus` closes that guest's own send; `program` opens it (epic #208, issue #300). Also emitted once per configured return during the connect-time snapshot. |
 | `GUEST_STATE` | `guestId: string`, `mixerInput: string`, `state: 'invited' \| 'joined' \| 'previewing' \| 'on-air' \| 'left' \| 'error'`, `label?`, `intercomLine?` | A guest's lifecycle state changed (epic #208, issue #301). Broadcast on the persisted join/leave/kick transitions and emitted once per live guest in the connect-time snapshot. `previewing`/`on-air` are **derived** from the live vision-mixer contribution set (#209); a guest composited only as a PiP *inset* reads `joined` until the PiP-inset tally gap #209 raises is closed. |
+| `GUEST_HEALTH` | `mixerInput: string`, `blockId: string`, `status: 'ok' \| 'failed'`, `detail?: string`, `causes?: object[]` | Strom's block health scan (Eyevinn/strom#786) reported a guest seat's input block (`b-input-<pad>-<suffix>`) stopped passing data (`failed`) or resumed (`ok`), while the pipeline stays PLAYING. `mixerInput` is the guest seat. `detail` is Strom's human-readable text, sent only while failed. `causes` is Strom's list of structured causes (e.g. `{ kind: 'whip_medium', slot, medium, fault }`), passed through unchanged while failed when Strom sends them. Strom re-sends a failed event when `causes` changes, so a seat can get consecutive `failed` messages. Relayed through the meter relay, so live changes reach clients only while an operator socket is connected; the relay re-reads `block_health` each time its Strom socket opens, so a change during a reconnect is not lost. Also emitted once per guest seat in the connect-time snapshot and after reactivation, from the flow's `block_health` (a seat Strom does not list reads `ok`). |
 | `ERROR` | `error: string` | An inbound frame was invalid or an operation failed (sent to originating socket) |
 
 `pgmBg` is the mixer input a PiP on program is composited over. It is `null` unless
@@ -250,8 +251,9 @@ state to the new socket before any further broadcasts: `TALLY`, `OVL_STATE` (if 
 `SOURCE_OFFSET_STATE` / `SOURCE_AUDIO_OFFSET_STATE`, `AFV_RAMP_STATE`, `FX_STATE`,
 `HTML_SOURCE_STATE` (per HTML source with forwarded params), `CLIP_STATE` (one per
 clip source — a `mixerInput` present in `clipPlayerBlockIds`), `GUEST_STATE` (one per
-live guest session, `left` excluded) and `RETURN_STATE` (one per configured return
-feed — epic #208, issue #301).
+live guest session, `left` excluded), `RETURN_STATE` (one per configured return
+feed — epic #208, issue #301) and `GUEST_HEALTH` (one per guest seat, when Strom
+answered the flow fetch).
 This lets a freshly-connected client rebuild the full control state without sending
 any inbound messages. See the connect handler in `src/ws/controller.ts` for the exact
 ordering.
