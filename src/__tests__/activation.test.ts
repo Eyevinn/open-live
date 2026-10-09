@@ -36,6 +36,8 @@ vi.mock('../ws/controller.js', () => ({
   clearPipState: vi.fn(),
   clearFxState: vi.fn(),
   clearClipStateForProduction: vi.fn(),
+  // A successful activation re-inits controllers that stayed connected.
+  reinitConnectedControllers: vi.fn(),
 }));
 
 // ---------------------------------------------------------------------------
@@ -134,6 +136,8 @@ function makeActivationResult(flowId: string, mixerBlockId: string) {
     returnBuses: [],
     returnWhepEntries: [],
     mixerInputMap: {},
+    fastWhepEntries: [] as Array<{ mixerInput: string; endpointId: string }>,
+    fastFeedRouter: undefined as undefined | { flowId: string; blockId: string },
   };
 }
 
@@ -369,6 +373,59 @@ describe('activate → deactivate → activate → deactivate abort-controller r
 
     expect(currentDoc.status).toBe('inactive');
     expect(currentDoc.status).not.toBe('active');
+  });
+});
+
+describe('activation — fast return feeds (returnFeed.lowLatency)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockFind.mockResolvedValue({ docs: [] });
+  });
+
+  /** Activates against a stateful doc store and returns the doc once it is active. */
+  async function activate(startDoc: Record<string, unknown>, result: ReturnType<typeof makeActivationResult>) {
+    let currentDoc: Record<string, unknown> = startDoc;
+    mockGet.mockImplementation(async () => ({ ...currentDoc }));
+    mockInsert.mockImplementation(async (d: Record<string, unknown>) => {
+      currentDoc = { ...d };
+      return { rev: `rev-${Date.now()}`, ok: true, id: d._id as string };
+    });
+    mockActivateStromFlow.mockResolvedValue(result);
+    mockStromFlowsGet.mockResolvedValue({ flow: { id: result.flowId, running: true, blocks: [] } });
+    mockStromMixerMultiviewEndpoint.mockResolvedValue({ endpoint: `/whep/${result.flowId}/mixer` });
+
+    const app = await buildServer();
+    const res = await app.inject({ method: 'POST', url: '/api/v1/productions/prod-test-1/activate' });
+    expect(res.statusCode).toBe(200);
+    for (let i = 0; i < 50 && currentDoc.status !== 'active'; i++) await new Promise((r) => setTimeout(r, 0));
+    expect(currentDoc.status).toBe('active');
+    return currentDoc;
+  }
+
+  it('stores the fast feed URLs and the router', async () => {
+    const router = { flowId: 'flow-conv', blockId: 'b-fast-router-x' };
+    const doc = await activate(makeProductionDoc(), {
+      ...makeActivationResult('flow-1', 'mixer-1'),
+      fastWhepEntries: [{ mixerInput: 'video_in_1', endpointId: 'whep-fast-1-x' }],
+      fastFeedRouter: router,
+    });
+    expect(doc.fastWhepUrls).toEqual([
+      { mixerInput: 'video_in_1', url: 'http://localhost:7000/whep/whep-fast-1-x', endpointId: 'whep-fast-1-x' },
+    ]);
+    expect(doc.fastFeedRouter).toEqual(router);
+  });
+
+  it('drops an earlier run\'s fast feed when this run has none', async () => {
+    // An idle-watchdog or reconcile stop leaves these on the doc.
+    const doc = await activate(
+      makeProductionDoc({
+        fastWhepUrls: [{ mixerInput: 'video_in_1', url: 'http://localhost:7000/whep/whep-fast-1-x', endpointId: 'whep-fast-1-x' }],
+        fastFeedRouter: { flowId: 'flow-conv-old', blockId: 'b' },
+      }),
+      makeActivationResult('flow-2', 'mixer-2'),
+    );
+    expect(doc.fastWhepUrls).toBeUndefined();
+    expect(doc.fastFeedRouter).toBeUndefined();
   });
 });
 

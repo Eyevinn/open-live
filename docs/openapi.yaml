@@ -557,8 +557,8 @@ components:
           description: >-
             Present when this assignment is a guest slot (issue #381): a per-guest
             mix-minus return built into the flow as a return bus at activation.
-            Absent for an ordinary source assignment. v1 supports the synced
-            (picture-switch) return only (`lowLatency: false`).
+            Absent for an ordinary source assignment. `lowLatency: true` also builds
+            an audio-only fast feed of the same mix-minus, ahead of the picture.
           required: [synced]
           properties:
             synced:
@@ -567,7 +567,6 @@ components:
               default: program-minus
             lowLatency:
               type: boolean
-              enum: [false]
               default: false
 
     ProductionGraphicAssignment:
@@ -832,8 +831,8 @@ components:
           enum: [program, program-minus, low-latency-minus]
           description: >-
             `program` opens the guest's own send; `program-minus` (default) closes it
-            for mix-minus. `low-latency-minus` is a client-side feed choice not built in
-            v1 and returns 400.
+            for mix-minus. `low-latency-minus` is a client-side feed choice (play the
+            `fast` feed) and returns 400.
 
     ReturnModeResult:
       type: object
@@ -881,9 +880,11 @@ components:
         feeds:
           type: array
           description: >-
-            Per-guest return feeds. In v1 this carries the `picture` feed (program
-            video over WHEP with a single mix-minus audio track) when the production
-            is active and a return aux bus exists for the guest's input; otherwise empty.
+            Per-guest return feeds, present while the production is active: the
+            `picture` feed (program video over WHEP with a single mix-minus audio
+            track) when a return aux bus exists for the guest's input, and the
+            audio-only `fast` feed (`video: false`) when the input's return has
+            `lowLatency: true` and its conversation flow started.
           items:
             type: object
             required: [id, url, video]
@@ -1770,7 +1771,6 @@ paths:
                       default: program-minus
                     lowLatency:
                       type: boolean
-                      enum: [false]
                       default: false
       responses:
         '200':
@@ -2842,7 +2842,8 @@ paths:
         Switches the guest's return feed between `program` and `program-minus`
         (mix-minus). Needs the invite's live session, and changes the session's
         mixerInput, so a guest who has left cannot change the return of whoever
-        holds the slot now. `low-latency-minus` is not built in v1 and returns 400.
+        holds the slot now. `low-latency-minus` is a client-side feed choice (play
+        the `fast` feed) and returns 400.
       operationId: guestSetReturnMode
       tags: [Guests]
       security:
@@ -3030,6 +3031,84 @@ paths:
     delete:
       summary: Tear down the return picture WHEP session
       operationId: stopReturnPictureWhep
+      tags: [Returns]
+      responses:
+        '204':
+          description: Session torn down (idempotent)
+
+  /api/v1/productions/{id}/returns/{mixerInput}/fast/whep:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Establish the fast (low-latency, audio-only) return WHEP session
+      description: >-
+        Same as the picture feed route, for the fast feed: proxies a WHEP offer to
+        the Strom endpoint derived SERVER-SIDE from the production's persisted
+        `fastWhepUrls`. Guest tokens are scoped the same way, with the session bound
+        separately from the picture feed's.
+      operationId: startReturnFastWhep
+      tags: [Returns]
+      requestBody:
+        required: true
+        content:
+          application/sdp:
+            schema:
+              type: string
+      responses:
+        '201':
+          description: WHEP answer SDP
+          content:
+            application/sdp:
+              schema:
+                type: string
+        '404':
+          description: Production not found, or no fast feed on this input
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Production inactive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Upstream Strom unreachable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/productions/{id}/returns/{mixerInput}/fast/whep/{sessionId}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: sessionId
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      summary: Tear down the fast return WHEP session
+      operationId: stopReturnFastWhep
       tags: [Returns]
       responses:
         '204':

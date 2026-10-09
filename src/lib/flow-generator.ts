@@ -12,6 +12,15 @@ import { VIRTUAL_SOURCES, assignAudioChannels } from './audio-channels.js';
 import { assignReturnBuses, returnSendMatrix } from './return-feeds.js';
 import { assignPortsToFlow, unassignPortsFromFlow } from '../services/port-reservation.js';
 import { listenerPortRequest } from '../services/listener-ports.js';
+import {
+  conversationFlowDescription,
+  conversationFlowOwner,
+  FAST_ROUTER_MAX_STREAMS,
+  planFastReturns,
+  removeOrphanConversationFlows,
+  type FastFeedRouter,
+  type FastReturnPlan,
+} from './fast-returns.js';
 
 /**
  * Generates a Strom flow from a template + source assignments,
@@ -70,6 +79,14 @@ export interface ActivationResult {
    * productions. Returned so the activation route can persist it on the doc.
    */
   mixerInputMap: Record<string, number>;
+  /**
+   * Audio-only fast return endpoints (`returnFeed.lowLatency`), keyed by the
+   * guest's mixerInput. Empty when no guest asked for one or the conversation
+   * flow could not start.
+   */
+  fastWhepEntries: Array<{ mixerInput: string; endpointId: string }>;
+  /** The running fast-feed router, when the conversation flow started. */
+  fastFeedRouter?: FastFeedRouter;
 }
 
 /** `builtin.mixer`'s own `min_upstream_latency` default (strom `types/src/mixer.rs`). */
@@ -229,6 +246,12 @@ export async function activateStromFlow(
     if (typeof v === 'number' && Number.isFinite(v)) return Math.max(0, Math.round(v));
     if (typeof v === 'string') { const n = parseInt(v, 10); return isNaN(n) ? 100 : Math.max(0, n); }
     return 100;
+  })();
+  const fastReturnLatencyMs = (() => {
+    const v = production.values?.fast_return_latency_ms;
+    if (typeof v === 'number' && Number.isFinite(v)) return Math.max(0, Math.round(v));
+    if (typeof v === 'string' && v !== '') { const n = parseInt(v, 10); return isNaN(n) ? undefined : Math.max(0, n); }
+    return undefined;
   })();
   const clockType = typeof production.values?.clock === 'string' && production.values.clock !== '' ? production.values.clock : undefined;
 
@@ -1142,6 +1165,46 @@ export async function activateStromFlow(
     }
   }
 
+  // Fast return feeds (`returnFeed.lowLatency`): tap every audio channel's
+  // direct out into a bridge here; the mix-minus and its WHEP outputs run in a
+  // separate conversation flow, created once this flow has started.
+  let fastPlan: FastReturnPlan | null = null;
+  const fastRequests = returnBuses
+    .filter((rb) => rb.assignment.returnFeed?.lowLatency === true)
+    .map((rb) => {
+      const padMatch = /video_in_(\d+)$/.exec(rb.assignment.mixerInput);
+      return { mixerInput: rb.assignment.mixerInput, padIndex: padMatch ? parseInt(padMatch[1]!, 10) : 0, ownChannel: rb.ownChannel };
+    });
+  if (audioMixerBlock && audioMixerBlockId && fastRequests.length > 0) {
+    const inputPad = new RegExp(`^${audioMixerBlockId}:input_(\\d+)$`);
+    const linkedInputs: boolean[] = [];
+    for (const link of flow.links as Array<Record<string, unknown>>) {
+      const m = inputPad.exec((link['to'] as string | undefined) ?? '');
+      if (m) linkedInputs[parseInt(m[1]!, 10) - 1] = true;
+    }
+    const numChannels = linkedInputs.length;
+    const dense = numChannels > 0 && Array.from(linkedInputs).every((linked) => linked === true);
+    if (!dense) {
+      console.warn('[flow-generator] Fast return feeds skipped: an audio channel has no source link');
+    } else if (numChannels > FAST_ROUTER_MAX_STREAMS) {
+      // Every fast feed's guest is one of these channels, so the outputs fit too.
+      console.warn(
+        `[flow-generator] Fast return feeds skipped: ${numChannels} audio channels, ` +
+        `but the router takes at most ${FAST_ROUTER_MAX_STREAMS}`,
+      );
+    } else {
+      fastPlan = planFastReturns(endpointSuffix, audioMixerBlockId, numChannels, fastRequests, fastReturnLatencyMs);
+      if (fastPlan) {
+        // Construction-time: each channel gets a `direct_out_N` pad (Eyevinn/strom#930).
+        const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
+        props['direct_outs'] = true;
+        audioMixerBlock['properties'] = props;
+        flow.blocks.push(...fastPlan.programBlocks);
+        flow.links.push(...fastPlan.programLinks);
+      }
+    }
+  }
+
   // Compute encoder block positions — shared by loudness block and group drain placement.
   const encBlocks = flow.blocks.filter(
     (b) => (b as Record<string, unknown>)['block_definition_id'] === 'builtin.videoenc',
@@ -1248,6 +1311,10 @@ export async function activateStromFlow(
     throw err;
   }
 
+  const fastFeedRouter = fastPlan
+    ? await startConversationFlow(strom, flowId, `${flowName}-conv`, fastPlan, clockType)
+    : undefined;
+
   return {
     flowId,
     mixerBlockId,
@@ -1268,17 +1335,78 @@ export async function activateStromFlow(
     })),
     returnWhepEntries,
     mixerInputMap,
+    fastWhepEntries: fastFeedRouter ? fastPlan!.entries : [],
+    ...(fastFeedRouter && { fastFeedRouter }),
   };
 }
 
 /**
- * Stops and deletes the Strom flow associated with a production.
- * Silently ignores errors (flow may already be gone).
+ * Creates and starts the conversation flow that carries the fast return feeds,
+ * and returns where its router runs. A failure here costs only the fast feeds:
+ * the program flow keeps running and the picture feeds still work. (A Strom
+ * without the audio bridge blocks or the mixer's direct outs fails the program
+ * flow itself, since the bridge outputs and their links are part of it.)
+ */
+async function startConversationFlow(
+  strom: StromClient,
+  programFlowId: string,
+  name: string,
+  plan: FastReturnPlan,
+  clockType: string | undefined,
+): Promise<FastFeedRouter | undefined> {
+  // A conversation flow left behind by a failed teardown holds the same bridge
+  // channels and endpoint ids this one is about to claim.
+  try {
+    await removeOrphanConversationFlows(strom, (await strom.flows.list()).flows);
+  } catch {
+    // Strom did not list its flows; a leftover flow, if any, fails the start below.
+  }
+  let flowId: string | undefined;
+  try {
+    const created = await strom.flows.create({
+      id: randomUUID(),
+      name,
+      properties: {
+        description: conversationFlowDescription(programFlowId),
+        ephemeral: true,
+        ...(clockType ? { clock_type: clockType } : {}),
+      },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      elements: plan.conversation.elements as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      blocks: plan.conversation.blocks as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      links: plan.conversation.links as any,
+    });
+    flowId = created.flow.id;
+    await strom.flows.start(flowId);
+    return { flowId, blockId: plan.routerBlockId };
+  } catch (err) {
+    console.warn('[flow-generator] Conversation flow failed to start; fast return feeds unavailable:', err);
+    if (flowId) await strom.flows.delete(flowId).catch(() => undefined);
+    return undefined;
+  }
+}
+
+/**
+ * Stops and deletes the Strom flow associated with a production, and its
+ * conversation flow if it has one. Silently ignores errors (flow may already be gone).
  */
 export async function deactivateStromFlow(
   stromFlowId: string,
   strom: StromClient,
 ): Promise<void> {
+  try {
+    const { flows } = await strom.flows.list();
+    for (const f of flows) {
+      const description = (f.properties as { description?: string } | undefined)?.description;
+      if (conversationFlowOwner(description) !== stromFlowId) continue;
+      await strom.flows.stop(f.id).catch(() => undefined);
+      await strom.flows.delete(f.id).catch(() => undefined);
+    }
+  } catch {
+    // ignore — Strom unreachable or no list; the program flow teardown below still runs
+  }
   try {
     await strom.flows.stop(stromFlowId);
   } catch {
