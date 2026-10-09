@@ -20,6 +20,8 @@ const sourceDocs: Record<string, Record<string, unknown>> = {
 let productions: Array<Record<string, unknown>> = [];
 const inserted: Array<Record<string, unknown>> = [];
 let migrationMarker: Record<string, unknown> | null = null;
+// _ids whose production insert should reject (simulates a mid-pass write failure).
+const rejectInsertIds = new Set<string>();
 
 vi.mock('../db/index.js', () => ({
   isDbConnected: () => true,
@@ -31,7 +33,16 @@ vi.mock('../db/index.js', () => ({
   }),
   getDb: () => ({
     find: () => Promise.resolve({ docs: productions }),
-    insert: (doc: Record<string, unknown>) => { inserted.push(doc); return Promise.resolve({ ok: true }); },
+    insert: (doc: Record<string, unknown>) => {
+      if (rejectInsertIds.has(doc._id as string)) {
+        return Promise.reject(Object.assign(new Error('insert failed'), { statusCode: 500 }));
+      }
+      inserted.push(doc);
+      // Write back so a re-run observes the persisted per-doc stamp (as CouchDB would).
+      const i = productions.findIndex((p) => p._id === doc._id);
+      if (i >= 0) productions[i] = doc; else productions.push(doc);
+      return Promise.resolve({ ok: true });
+    },
   }),
   getMigrationStateDb: () => ({
     get: () =>
@@ -55,6 +66,7 @@ beforeEach(() => {
   productions = [];
   inserted.length = 0;
   migrationMarker = null;
+  rejectInsertIds.clear();
   vi.clearAllMocks();
 });
 
@@ -167,5 +179,44 @@ describe('migrateAudioChannelOrder', () => {
     await migrateAudioChannelOrder(log);
 
     expect(inserted).toHaveLength(0);
+  });
+
+  it('does not re-remap an already-migrated production when a partial-failure pass retries', async () => {
+    const guestSources = [
+      { sourceId: 'cam-a', mixerInput: 'video_in_0' },
+      { sourceId: 'cam-b', mixerInput: 'video_in_1' },
+      { sourceId: 'cam-c', mixerInput: 'video_in_2' },
+      { sourceId: 'cam-d', mixerInput: 'video_in_3' },
+      { sourceId: 'cam-guest', mixerInput: 'video_in_15' },
+    ];
+    // Both productions need the same remap {3:5,4:3,5:4}; ch3_aux1_pre moves to ch5.
+    productions = [
+      makeProduction('prod-a', guestSources, { ch3_aux1_pre: 'A3' }),
+      makeProduction('prod-b', guestSources, { ch3_aux1_pre: 'B3' }),
+    ];
+
+    // First pass: prod-a migrates, then prod-b's write fails mid-loop.
+    rejectInsertIds.add('prod-b');
+    await migrateAudioChannelOrder(log);
+
+    expect(inserted).toHaveLength(1);
+    expect(inserted[0]).toMatchObject({ _id: 'prod-a', audioChannelOrderV2: true });
+    expect((inserted[0] as { values: Record<string, unknown> }).values).toEqual({ ch5_aux1_pre: 'A3' });
+    expect(migrationMarker).toBeNull(); // instance marker unwritten after a failed write
+
+    // Retry: prod-a is now stamped, so it must be skipped (NOT remapped a second
+    // time, which would move ch5 -> ch4); only prod-b is re-processed.
+    rejectInsertIds.clear();
+    await migrateAudioChannelOrder(log);
+
+    const prodAInserts = inserted.filter((d) => d._id === 'prod-a');
+    expect(prodAInserts).toHaveLength(1); // prod-a written exactly once, across both passes
+    expect((prodAInserts[0] as { values: Record<string, unknown> }).values).toEqual({ ch5_aux1_pre: 'A3' });
+
+    const prodBInserts = inserted.filter((d) => d._id === 'prod-b');
+    expect(prodBInserts).toHaveLength(1);
+    expect((prodBInserts[0] as { values: Record<string, unknown> }).values).toEqual({ ch5_aux1_pre: 'B3' });
+
+    expect(migrationMarker).toMatchObject({ migratedCount: 1 }); // only prod-b migrated on the retry pass
   });
 });
