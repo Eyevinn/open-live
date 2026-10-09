@@ -698,24 +698,22 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     // invite token stops authorizing return routes once the session is gone.
     function closeWhep(pc, resource) {
       if (pc) { try { pc.close(); } catch (e) {} }
-      if (!resource) return Promise.resolve();
-      return fetch(new URL(resource, apiBase).toString(), {
-        method: "DELETE",
-        headers: { "Authorization": "Bearer " + token },
-        keepalive: true
-      }).catch(function () {});
+      if (!resource) return;
+      try {
+        fetch(new URL(resource, apiBase).toString(), {
+          method: "DELETE",
+          headers: { "Authorization": "Bearer " + token },
+          keepalive: true
+        }).catch(function () {});
+      } catch (e) {}
     }
 
-    // Closes the return feeds and resolves once their DELETEs are answered.
     function closeReturns() {
-      var done = Promise.all([
-        closeWhep(returnPc, returnResource),
-        closeWhep(fastPc, fastResource)
-      ]);
+      closeWhep(returnPc, returnResource);
+      closeWhep(fastPc, fastResource);
       returnPc = returnResource = fastPc = fastResource = null;
       returnVideo.srcObject = null;
       returnAudio.srcObject = null;
-      return done;
     }
 
     // ---- Return mode -------------------------------------------------------
@@ -934,17 +932,25 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       localStream = null;
     }
 
-    function leave() {
-      leaveBtn.disabled = true;
-      live = false;
-      left = true;
-      closeReturns().then(function () {
+    // Ends the guest session. Never throws, so Leave and pagehide always finish.
+    function endSession() {
+      try {
         return fetch(apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/session", {
           method: "DELETE",
           headers: { "Authorization": "Bearer " + token },
           keepalive: true
-        });
-      }).catch(function () {}).then(function () {
+        }).catch(function () {});
+      } catch (e) {
+        return Promise.resolve();
+      }
+    }
+
+    function leave() {
+      leaveBtn.disabled = true;
+      live = false;
+      left = true;
+      closeReturns();
+      endSession().then(function () {
         teardown();
         showLeft();
       });
@@ -968,13 +974,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       // Best-effort teardown on close; keepalive lets the requests outlive the
       // page. The return feeds' DELETEs are queued first (see closeWhep).
       closeReturns();
-      try {
-        fetch(apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/session", {
-          method: "DELETE",
-          headers: { "Authorization": "Bearer " + token },
-          keepalive: true
-        });
-      } catch (e) {}
+      endSession();
       teardown();
       showLeft();
     });

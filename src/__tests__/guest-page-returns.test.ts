@@ -8,9 +8,14 @@
  *  - in `program` the guest hears the picture's audio, since the fast feed is
  *    always mix-minus, and a mode change, the guest's or the crew's, moves the
  *    audio between the two feeds;
- *  - on leave, both return sessions are deleted before the guest session.
+ *  - on leave and on page close, both return sessions are deleted before the
+ *    guest session;
+ *  - a return DELETE that never answers, or that fails at once, does not delay
+ *    or stop the guest session's DELETE;
+ *  - a page close after a Leave sends no second guest session DELETE, unless
+ *    a late join made the page live again.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import vm from 'node:vm';
 import Fastify from 'fastify';
 import guestPageRoutes from '../routes/guest-page.js';
@@ -70,7 +75,7 @@ const MODES = [
   { key: 'low-latency-minus', label: 'Conversation (low latency)', synced: false, excludesMixerInput: 'in1', delivery: { kind: 'feed', feed: 'fast' } },
 ];
 
-function runPage(script: string, feeds: Feed[], opts: { failFast?: boolean; returnMode?: string } = {}) {
+function runPage(script: string, feeds: Feed[], opts: { failFast?: boolean; returnMode?: string; hangReturnDelete?: boolean; hook?: (method: string, url: string) => Promise<never> | undefined; joinGate?: (n: number) => Promise<void> | undefined } = {}) {
   const els: Record<string, FakeElement> = {};
   const el = (id: string) => (els[id] ??= new FakeElement());
   for (const id of ['return', 'return-hint', 'return-mode', 'self-warning', 'mute', 'leave']) el(id).classList.add('hidden');
@@ -79,6 +84,7 @@ function runPage(script: string, feeds: Feed[], opts: { failFast?: boolean; retu
   const requests: Request[] = [];
   const server = { mode: opts.returnMode ?? 'program-minus' };
   let interval: (() => void) | null = null;
+  const windowListeners: Record<string, Array<() => void>> = {};
 
   class RTCPeerConnection {
     state: FakePc = { kinds: [], closed: false };
@@ -100,19 +106,24 @@ function runPage(script: string, feeds: Feed[], opts: { failFast?: boolean; retu
     close() { this.state.closed = true; }
   }
 
+  let joins = 0;
   const fetch = (url: string, init: { method?: string; body?: string } = {}) => {
     const method = init.method ?? 'GET';
     requests.push({ method, url });
+    opts.hook?.(method, url);
     const headers = (loc: string | null) => ({ get: (h: string) => (h === 'Location' ? loc : null) });
     if (url.endsWith('/join')) {
-      return Promise.resolve({
+      const gate = opts.joinGate?.(++joins);
+      const joinResponse = () => ({
         ok: true, status: 200, headers: headers(null),
         json: () => Promise.resolve({
           whipUrl: 'https://live.example.com/whip', feeds, modes: MODES,
           defaultMode: 'program-minus', returnMode: server.mode,
         }),
       });
+      return gate ? gate.then(joinResponse) : Promise.resolve(joinResponse());
     }
+    if (method === 'DELETE' && url.includes('/whep/') && opts.hangReturnDelete) return new Promise(() => {});
     if (url === RETURN_URL) {
       if (method === 'PUT') server.mode = JSON.parse(init.body ?? '{}').mode;
       return Promise.resolve({
@@ -146,7 +157,10 @@ function runPage(script: string, feeds: Feed[], opts: { failFast?: boolean; retu
         enumerateDevices: () => Promise.resolve([]),
       },
     },
-    window: { RTCPeerConnection, addEventListener() {} },
+    window: {
+      RTCPeerConnection,
+      addEventListener: (type: string, fn: () => void) => { (windowListeners[type] ??= []).push(fn); },
+    },
     RTCPeerConnection,
     fetch,
     URL,
@@ -165,6 +179,7 @@ function runPage(script: string, feeds: Feed[], opts: { failFast?: boolean; retu
     server,
     /** Runs one return-mode poll tick, if polling. */
     tick: () => interval?.(),
+    fireWindow: (type: string) => (windowListeners[type] ?? []).forEach((fn) => fn()),
     pick: (mode: string) => {
       const input = el(`mode-${mode}`);
       input.checked = true;
@@ -177,6 +192,13 @@ const flush = () => new Promise((r) => setTimeout(r, 10));
 
 const PICTURE: Feed = { id: 'picture', url: 'https://live.example.com/api/v1/guests/inv-1/returns/picture/whep', video: true };
 const FAST: Feed = { id: 'fast', url: 'https://live.example.com/api/v1/guests/inv-1/returns/fast/whep', video: false };
+
+const sessionDeletes = (requests: Request[]) =>
+  requests.filter((r) => r.method === 'DELETE' && r.url.endsWith('/session')).length;
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe('guest page return feeds', () => {
   it('plays the picture feed with its own audio when there is no fast feed', async () => {
@@ -265,5 +287,99 @@ describe('guest page return feeds', () => {
     ]);
     expect(pcs[1].closed).toBe(true);
     expect(pcs[2].closed).toBe(true);
+  });
+  it('deletes both return sessions before the guest session when the page closes', async () => {
+    const { els, pcs, requests, fireWindow } = runPage(await pageScript(), [PICTURE, FAST]);
+    await flush();
+    els['golive'].fire('click');
+    await flush();
+    fireWindow('pagehide');
+    const deletes = requests.filter((r) => r.method === 'DELETE').map((r) => r.url);
+    expect(deletes).toEqual([
+      'https://live.example.com/api/v1/guests/inv-1/returns/picture/whep/s-picture',
+      'https://live.example.com/api/v1/guests/inv-1/returns/fast/whep/s-fast',
+      'https://live.example.com/api/v1/guests/inv-1/session',
+    ]);
+    expect(pcs[1].closed).toBe(true);
+    expect(pcs[2].closed).toBe(true);
+  });
+
+  it('ends the guest session at once on Leave while a return DELETE is unanswered', async () => {
+    vi.useFakeTimers();
+    const { els, requests } = runPage(await pageScript(), [PICTURE], { hangReturnDelete: true });
+    await vi.advanceTimersByTimeAsync(10);
+    els['golive'].fire('click');
+    await vi.advanceTimersByTimeAsync(10);
+    els['leave'].fire('click');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionDeletes(requests)).toBe(1);
+    expect(els['banner'].textContent).toMatch(/You have left/);
+  });
+
+  it('sends no second guest session DELETE when the page closes after a Leave', async () => {
+    vi.useFakeTimers();
+    const { els, requests, fireWindow } = runPage(await pageScript(), [PICTURE]);
+    await vi.advanceTimersByTimeAsync(10);
+    els['golive'].fire('click');
+    await vi.advanceTimersByTimeAsync(10);
+    els['leave'].fire('click');
+    await vi.advanceTimersByTimeAsync(10);
+    fireWindow('pagehide');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionDeletes(requests)).toBe(1);
+  });
+
+  it('ends the session a late join created when the page closes after a Leave pressed during a Rejoin', async () => {
+    vi.useFakeTimers();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const { els, requests, fireWindow } = runPage(await pageScript(), [PICTURE], { joinGate: (n) => (n === 2 ? gate : undefined) });
+    await vi.advanceTimersByTimeAsync(10);
+    els['golive'].fire('click');
+    await vi.advanceTimersByTimeAsync(10);
+    els['rejoin'].fire('click');
+    await vi.advanceTimersByTimeAsync(10);
+    els['leave'].fire('click');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionDeletes(requests)).toBe(1);
+    // The join is answered after the Leave, and the page claims to be live again.
+    release();
+    await vi.advanceTimersByTimeAsync(50);
+    fireWindow('pagehide');
+    expect(sessionDeletes(requests)).toBe(2);
+  });
+
+  it('still ends the session on Leave and on page close when a return DELETE fails at once', async () => {
+    const hook = (method: string, url: string) => {
+      if (method === 'DELETE' && url.includes('/whep/')) throw new TypeError('fetch failed');
+      return undefined;
+    };
+    for (const how of ['leave', 'pagehide']) {
+      vi.useFakeTimers();
+      const { els, requests, fireWindow } = runPage(await pageScript(), [PICTURE], { hook });
+      await vi.advanceTimersByTimeAsync(10);
+      els['golive'].fire('click');
+      await vi.advanceTimersByTimeAsync(10);
+      if (how === 'leave') els['leave'].fire('click');
+      else fireWindow('pagehide');
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionDeletes(requests)).toBe(1);
+      vi.useRealTimers();
+    }
+  });
+
+  it('shows the guest as left when the guest session DELETE fails at once', async () => {
+    vi.useFakeTimers();
+    const hook = (method: string, url: string) => {
+      if (method === 'DELETE' && url.endsWith('/session')) throw new TypeError('fetch failed');
+      return undefined;
+    };
+    const { els } = runPage(await pageScript(), [PICTURE], { hook });
+    await vi.advanceTimersByTimeAsync(10);
+    els['golive'].fire('click');
+    await vi.advanceTimersByTimeAsync(10);
+    els['leave'].fire('click');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(els['banner'].textContent).toMatch(/You have left/);
   });
 });
