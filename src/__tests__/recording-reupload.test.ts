@@ -231,7 +231,9 @@ describe('deactivate — each recording is uploaded and registered once', () => 
     expect(res.statusCode).toBe(200);
     expect(putKeys).toEqual([keyOf(ACT1), keyOf(ACT2)]);
     expect(registered().filter((r) => r.key === keyOf(ACT1))).toHaveLength(1);
-    expect(registered().find((r) => r.key === keyOf(ACT1))!.sizeBytes).toBe(9);
+    const act1 = registered().find((r) => r.key === keyOf(ACT1))!;
+    expect(act1.sizeBytes).toBe(9);
+    expect(act1.endedAt).toBe('2026-09-27T10:01:00.000Z');
     expect(mediaFiles).toEqual([LEGACY]);
   });
 
