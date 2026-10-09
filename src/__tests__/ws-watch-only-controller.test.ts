@@ -81,6 +81,7 @@ vi.mock('../services/clip-relay.js', () => ({
 }));
 
 const FLOW = 'flow-watch-only';
+const FLOW_B = 'flow-watch-only-b';
 const AUDIO_BLOCK = 'b-audio-mixer-0';
 const MIXER_BLOCK = 'b-video-mixer-0';
 
@@ -103,10 +104,11 @@ const stromServer: Server = createServer((req, res) => {
     res.setHeader('content-type', 'application/json');
     const url = req.url ?? '';
     if (req.method !== 'GET') writes.push({ method: req.method ?? '', url });
-    if (req.method === 'GET' && url === `/api/flows/${FLOW}`) {
+    const flowGet = req.method === 'GET' ? [FLOW, FLOW_B].find((f) => url === `/api/flows/${f}`) : undefined;
+    if (flowGet) {
       const send = () => res.end(JSON.stringify({
         flow: {
-          id: FLOW,
+          id: flowGet,
           blocks: [{ id: AUDIO_BLOCK, block_definition_id: 'builtin.mixer', properties: { num_channels: 2 } }],
         },
       }));
@@ -456,6 +458,55 @@ describe('watch-only controller connection', () => {
 
     operator.ws.close();
     await waitFor(() => relayRefs(id).meter === 0 && relayRefs(id).clip === 0);
+  });
+
+  it('an operator mid-connect when reactivation re-init runs takes one relay ref, not two', async () => {
+    const id = 'prod-watch-reinit-mid-connect';
+    productionDocs.set(id, makeProductionDoc(id, { clipPlayerBlockIds: { clip1: 'b-clip-0' } }));
+    await startApp();
+
+    holdNextFlowGet = true;
+    const operator = open(id);
+    const snapshotEnd = new Promise<void>((resolve) => operator.on('message', (data) => {
+      if ((JSON.parse(data.toString()) as { type?: string }).type === 'SNAPSHOT_END') resolve();
+    }));
+    await waitFor(() => releaseFlowGet !== null);
+    clearAudioState(id); // deactivate
+    await reinitConnectedControllers(id);
+    expect(relayRefs(id)).toEqual({ meter: 1, clip: 1 });
+    releaseFlowGet!();
+    releaseFlowGet = null;
+    await snapshotEnd;
+    expect(relayRefs(id)).toEqual({ meter: 1, clip: 1 });
+
+    operator.close();
+    await waitFor(() => getSubscriberCount(id) === 0);
+    expect(relayRefs(id)).toEqual({ meter: 0, clip: 0 });
+  });
+
+  it('an operator mid-connect on a flow that is replaced before its relay starts takes one relay ref, not two', async () => {
+    const id = 'prod-watch-reinit-stale-flow';
+    productionDocs.set(id, makeProductionDoc(id, { clipPlayerBlockIds: { clip1: 'b-clip-0' } }));
+    await startApp();
+
+    holdNextFlowGet = true;
+    const operator = open(id);
+    const snapshotEnd = new Promise<void>((resolve) => operator.on('message', (data) => {
+      if ((JSON.parse(data.toString()) as { type?: string }).type === 'SNAPSHOT_END') resolve();
+    }));
+    await waitFor(() => releaseFlowGet !== null);
+    clearAudioState(id); // deactivate
+    productionDocs.set(id, makeProductionDoc(id, { stromFlowId: FLOW_B, clipPlayerBlockIds: { clip1: 'b-clip-0' } }));
+    await reinitConnectedControllers(id);
+    expect(relayRefs(id)).toEqual({ meter: 1, clip: 1 });
+    releaseFlowGet!();
+    releaseFlowGet = null;
+    await snapshotEnd;
+    expect(relayRefs(id)).toEqual({ meter: 1, clip: 1 });
+
+    operator.close();
+    await waitFor(() => getSubscriberCount(id) === 0);
+    expect(relayRefs(id)).toEqual({ meter: 0, clip: 0 });
   });
 
   it('tells a watcher that connected first about the operator connect\'s audio reset', async () => {
