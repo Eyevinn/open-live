@@ -43,7 +43,7 @@ function pushRawFrame(json: string): void {
   handler(Buffer.from(json));
 }
 
-const { startMeterRelay, stopMeterRelay, forceStopMeterRelay } = await import('../services/meter-relay.js');
+const { startMeterRelay, stopMeterRelay, forceStopMeterRelay, getMeterRelayRefCount } = await import('../services/meter-relay.js');
 
 const PROD = 'prod-meter-01';
 
@@ -145,5 +145,30 @@ describe('deactivate→reactivate rebind (issue #416)', () => {
     await startAndFlush('flow-A', 'mixer-A');
     pushRawFrame(JSON.stringify({ type: 'MeterData', data: { flow_id: 'flow-A', element_id: 'mixer-A:meter:main', rms: -20, peak: -10 } }));
     expect(meters().at(-1)).toMatchObject({ elementId: 'main' });
+  });
+});
+
+describe('generation-scoped release', () => {
+  it('a stop with the generation of a force-stopped relay leaves the new relay alone', () => {
+    const old = startMeterRelay(PROD, 'flow-A', 'mixer-A');
+    forceStopMeterRelay(PROD, 'flow-A');
+    const current = startMeterRelay(PROD, 'flow-B', 'mixer-B');
+    expect(current).not.toBe(old);
+
+    stopMeterRelay(PROD, old);
+    expect(getMeterRelayRefCount(PROD)).toBe(1);
+    stopMeterRelay(PROD, current);
+    expect(getMeterRelayRefCount(PROD)).toBe(0);
+  });
+
+  it('rebinding a relay off the torn-down flow keeps its generation', () => {
+    forceStopMeterRelay(PROD, 'flow-A');
+    const midTeardown = startMeterRelay(PROD, 'flow-A', 'mixer-A');
+    const afterReactivate = startMeterRelay(PROD, 'flow-B', 'mixer-B');
+    expect(afterReactivate).toBe(midTeardown);
+
+    stopMeterRelay(PROD, midTeardown);
+    stopMeterRelay(PROD, afterReactivate);
+    expect(getMeterRelayRefCount(PROD)).toBe(0);
   });
 });

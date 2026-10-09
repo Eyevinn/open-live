@@ -48,8 +48,9 @@ connection:
 - does not count in `GET /api/v1/productions/{id}/controllers` `count` (it is reported
   in `watchers`) or in the list endpoint's `subscriberCount`, and does not reset the idle
   timer, so watchers alone do not keep a production alive;
-- does not start the meter or clip relays. `METER_DATA`, `LOUDNESS_DATA` and relayed
-  `CLIP_STATE` updates arrive only while an operator connection is open.
+- starts the meter relay, so `METER_DATA` and `LOUDNESS_DATA` arrive with only watchers
+  connected; subscribing to Strom's meters writes nothing. It does not start the clip relay,
+  so relayed `CLIP_STATE` updates arrive only while an operator connection is open.
 
 Before any operator has connected, the snapshot's `AUDIO_STATE` mute values come from
 Strom's `chN_to_main` routing rather than the server's mute registry. When the first

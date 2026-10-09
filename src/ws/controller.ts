@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { getDb, getSourcesDb, getGuestSessionsDb, getGuestInvitesDb } from '../db/index.js';
 import { updateProductionDoc } from '../routes/productions.js';
 import type { ProductionDoc, ClipState, SourceDoc, GuestSessionState } from '../db/types.js';
-import { getTally, setTally, subscribe, unsubscribe, broadcast, nextSeq, currentSeq, getOperatorSockets, beginSnapshot, endSnapshot } from '../services/tally.service.js';
+import { getTally, setTally, subscribe, unsubscribe, broadcast, nextSeq, currentSeq, getOperatorSockets, getSockets, beginSnapshot, endSnapshot } from '../services/tally.service.js';
 import {
   cueClip, playClip, stopClip, pauseClip, seekClip,
   resolveClipSource, resolveClipTarget,
@@ -1095,13 +1095,15 @@ function broadcastAudioReset(productionId: string, numChannels: number, muted: S
 }
 
 /**
- * The flow whose meter/clip relay each operator socket holds one ref on. A
- * socket releases on close only what it holds, and reinit takes refs on behalf
- * of sockets that stayed open across a reactivation.
+ * The relay refs each socket holds: `meter` is the meter relay's generation,
+ * `clip` the flow of the clip relay (watch-only sockets hold meter refs only).
+ * A socket releases on close only what it holds, and reinit takes refs on
+ * behalf of sockets that stayed open across a reactivation.
  */
-const relayHolds = new WeakMap<WebSocket, { meter?: string; clip?: string }>();
+type RelayHold = { meter?: number; clip?: string };
+const relayHolds = new WeakMap<WebSocket, RelayHold>();
 
-function relayHold(ws: WebSocket): { meter?: string; clip?: string } {
+function relayHold(ws: WebSocket): RelayHold {
   let hold = relayHolds.get(ws);
   if (!hold) {
     hold = {};
@@ -1124,16 +1126,17 @@ function relayHold(ws: WebSocket): { meter?: string; clip?: string } {
  * run first-connect init and reset every channel to fader 1.0 / unmuted / to
  * main, clobbering any change made since reactivation.
  *
- * Fixing it here: when at least one controller is connected, initialise the new
- * flow's audio ONCE (so a later fresh connect inherits rather than re-inits) and
- * restart both relays bound to the new flow, taking one ref per connected
- * operator socket that does not already hold one on this flow, so each relay is
- * torn down only when the last of those sockets closes. Watch-only sockets
- * neither trigger init nor hold relay refs. A no-op when no operator is
+ * Fixing it here: when at least one operator is connected, initialise the new
+ * flow's audio ONCE (so a later fresh connect inherits rather than re-inits).
+ * Restart the meter relay for every connected socket and the clip relay for
+ * every operator socket, taking one ref per socket that does not already hold
+ * one on this flow, so each relay is torn down only when the last of those
+ * sockets closes. Watch-only sockets never trigger init. A no-op when nobody is
  * connected — the next connect runs the normal path.
  */
 export async function reinitConnectedControllers(productionId: string): Promise<void> {
-  if (getOperatorSockets(productionId).length === 0) return;
+  if (getSockets(productionId).length === 0) return;
+  const hasOperator = getOperatorSockets(productionId).length > 0;
 
   let doc: ProductionDoc;
   try {
@@ -1146,7 +1149,7 @@ export async function reinitConnectedControllers(productionId: string): Promise<
 
   // Mark the new flow as current so a subsequent fresh connect does not treat it
   // as a pipeline change and wipe the state we are about to initialise.
-  activeFlowIdByProduction.set(productionId, flowId);
+  if (hasOperator) activeFlowIdByProduction.set(productionId, flowId);
 
   try {
     const strom = await makeStromClient();
@@ -1159,12 +1162,12 @@ export async function reinitConnectedControllers(productionId: string): Promise<
       const numChannels = typeof rawNumCh === 'number' ? rawNumCh
         : typeof rawNumCh === 'string' ? parseInt(rawNumCh, 10)
         : 0;
-      numAudioChannelsByProduction.set(productionId, numChannels);
+      if (hasOperator) numAudioChannelsByProduction.set(productionId, numChannels);
 
       // Initialise ONCE. If clearAudioState already ran (deactivate) the registry
       // is cold; if some fresh connect raced ahead and initialised the new flow,
       // leave its state untouched.
-      const isFirstInit = !afvChannelsByProduction.has(productionId);
+      const isFirstInit = hasOperator && !afvChannelsByProduction.has(productionId);
       if (isFirstInit) {
         afvChannelsByProduction.set(productionId, new Set());
         const muted = new Set<string>();
@@ -1219,15 +1222,15 @@ export async function reinitConnectedControllers(productionId: string): Promise<
       // Restart the meter relay against the NEW flow. Deactivate force-stopped
       // (and forgot) the relay while leaving each socket's per-socket hold in
       // place, and a connect mid-teardown may have re-created it on the retired
-      // flow. Reconcile to one ref per operator socket on the new flow rather
-      // than taking a per-socket ref: the latter both fails to re-create a
-      // force-stopped relay for an operator that stayed open AND double-counts
-      // the mid-teardown socket, orphaning a ref that never reaches zero
-      // (issue #434). Every operator socket then releases exactly one ref on
-      // close, landing the relay back at zero.
-      const meterOperators = getOperatorSockets(productionId);
-      reconcileMeterRelay(productionId, flowId, audioBlockId, doc.loudnessMainBlockId, meterOperators.length);
-      for (const ws of meterOperators) relayHold(ws).meter = flowId;
+      // flow. Reconcile to one ref per socket on the new flow, watchers included,
+      // rather than taking a per-socket ref: the latter both fails to re-create a
+      // force-stopped relay for a socket that stayed open AND double-counts the
+      // mid-teardown socket, orphaning a ref that never reaches zero (issue
+      // #434). Every socket then releases exactly one ref on close, landing the
+      // relay back at zero.
+      const meterSockets = getSockets(productionId);
+      const meterGeneration = reconcileMeterRelay(productionId, flowId, audioBlockId, doc.loudnessMainBlockId, meterSockets.length);
+      for (const ws of meterSockets) relayHold(ws).meter = meterGeneration;
     }
   } catch (err) {
     console.warn('[controller] reinit audio/meter error:', err);
@@ -3385,7 +3388,8 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
         unsubscribe(id, socket);
         // Relays are ref-counted, so only release what this socket holds.
         const hold = relayHolds.get(socket);
-        if (hold?.meter) stopMeterRelay(id);
+        // A meter hold on a relay that was force-stopped since releases nothing.
+        if (hold?.meter !== undefined) stopMeterRelay(id, hold.meter);
         if (hold?.clip) stopClipRelay(id);
         // Audio state registries are kept in memory so other connected clients
         // and future reconnects inherit the current AFV/mute configuration.
@@ -3789,12 +3793,12 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               inputEffects: inputEffectsByProduction.get(id) ?? [],
               masterEffect: masterEffectByProduction.get(id) ?? { type: 'none' },
             }));
-            // Watchers get meters only while an operator's relay is running. A socket
-            // that closed during the connect sync must not take a ref it never releases,
-            // and one already holding a ref (set by re-init) must not take a second.
-            if (!watchOnly && !socketClosed && relayHold(socket).meter === undefined) {
-              startMeterRelay(id, connectDoc.stromFlowId, audioBlockId, connectDoc.loudnessMainBlockId);
-              relayHold(socket).meter = connectDoc.stromFlowId;
+            // Watchers hold a meter ref too: subscribing to Strom's meters writes
+            // nothing. A socket that closed during the connect sync must not take
+            // a ref it never releases, and one already holding a ref (set by
+            // re-init) must not take a second.
+            if (!socketClosed && relayHold(socket).meter === undefined) {
+              relayHold(socket).meter = startMeterRelay(id, connectDoc.stromFlowId, audioBlockId, connectDoc.loudnessMainBlockId);
             }
           }
         } catch (err) {
