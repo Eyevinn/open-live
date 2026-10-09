@@ -328,7 +328,7 @@ components:
       description: >-
         A recorded VOD asset archived to MinIO/S3 (epic #5, issue #42). One asset
         is persisted per uploaded object when a production with a `recording`
-        output deactivates. `playbackUrl` is a time-boxed presigned GET URL
+        output, or with an input recorded (a source assignment's `record`), deactivates (docs/recording-inputs.md). `playbackUrl` is a time-boxed presigned GET URL
         (TTL = RECORDING_PRESIGN_TTL_S) so a private bucket's recordings can be
         played without exposing storage credentials; it is omitted when a
         presigned URL cannot be produced (e.g. bucket reconfigured).
@@ -341,6 +341,15 @@ components:
         outputId:
           type: string
           description: The 'recording' output that produced this asset, when known.
+        mixerInput:
+          type: string
+          description: >-
+            The input this asset records (per-input recording). Absent for the
+            program recording.
+        track:
+          type: string
+          enum: [video, audio]
+          description: Which of that input's tracks this asset holds; each is recorded to its own file.
         bucket:
           type: string
         key:
@@ -569,6 +578,14 @@ components:
               type: boolean
               enum: [false]
               default: false
+        record:
+          type: string
+          enum: ['off', transcode, passthrough]
+          default: 'off'
+          description: >-
+            Whether this input is recorded on its own, beside the program
+            recording (docs/recording-inputs.md). Absent means off.
+            `passthrough` is not built yet.
 
     ProductionGraphicAssignment:
       type: object
@@ -1772,6 +1789,14 @@ paths:
                       type: boolean
                       enum: [false]
                       default: false
+                record:
+                  type: string
+                  enum: ['off', transcode]
+                  default: 'off'
+                  description: >-
+                    Records this input on its own, beside the program recording
+                    (docs/recording-inputs.md). `passthrough` is answered with 400
+                    until it is built.
       responses:
         '200':
           description: Assignment created

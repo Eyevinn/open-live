@@ -1,7 +1,7 @@
 /**
  * Deactivate teardown must not be held hostage by the VOD upload sweep (#465).
  *
- * When object storage rejects our credentials, `uploadRecordings` short-circuits
+ * When object storage rejects our credentials, `uploadProductionRecordings` short-circuits
  * (it returns `abortedOnAuthError` rather than grinding through — and re-failing —
  * every segment). This test pins the route contract around that: the deactivate
  * handler logs the abort, then still runs the Strom flow teardown and the guest
@@ -42,10 +42,10 @@ vi.mock('../lib/strom-token.js', () => ({
   getStromToken: vi.fn().mockResolvedValue('test-token'),
 }));
 
-// Avoid a real StromClient (and the recorder.splitNow network call).
+// Avoid a real StromClient (and the flows.stop network call).
 vi.mock('../lib/strom.js', () => ({
   StromClient: class {
-    recorder = { splitNow: vi.fn().mockResolvedValue(undefined) };
+    flows = { stop: vi.fn().mockResolvedValue(undefined) };
   },
   StromClientError: class extends Error {},
 }));
@@ -68,7 +68,7 @@ vi.mock('../lib/recording-uploader.js', () => ({
     secretKey: 'secret',
     bucket: 'vod',
   }),
-  uploadRecordings: (...args: unknown[]) => mockUploadRecordings(...args),
+  uploadProductionRecordings: (...args: unknown[]) => mockUploadRecordings(...args),
 }));
 
 const mockSweepGuests = vi.fn();

@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import type { ProductionDoc, SourceDoc, GraphicDoc, OutputDoc, ClipReference } from '../db/types.js';
+import type { ProductionDoc, SourceDoc, GraphicDoc, OutputDoc, ClipReference, StreamType } from '../db/types.js';
 import { getSourcesDb, getGraphicsDb } from '../db/index.js';
 import { deserializeClipReference } from './clip-reference.js';
 import { StromClient } from './strom.js';
@@ -10,8 +10,10 @@ import { composeRtmpUrl } from './rtmp.js';
 import { safeFlowProjection } from './log-redact.js';
 import { VIRTUAL_SOURCES, assignAudioChannels } from './audio-channels.js';
 import { assignReturnBuses, returnSendMatrix } from './return-feeds.js';
+import { addTranscodingInputRecorder, type InputRecorder, type InputRecordMode, type InputTap } from './input-recording.js';
 import { assignPortsToFlow, unassignPortsFromFlow } from '../services/port-reservation.js';
 import { listenerPortRequest } from '../services/listener-ports.js';
+import { activationRecordingsDirName, productionRecordingsDir } from './recording-uploader.js';
 
 /**
  * Generates a Strom flow from a template + source assignments,
@@ -29,7 +31,7 @@ export interface ActivationResult {
   whepOutputEntries?: Array<{ outputId: string; endpointId: string }>;
   pgmWhepEndpointId?: string;
   /**
-   * ID of the builtin.recorder block wired into the flow — set only when a
+   * ID of the builtin.liverecorder block wired into the flow — set only when a
    * 'recording' output is assigned. The block records local segments in Strom;
    * open-live uploads them to MinIO after deactivate (see recording-uploader.ts).
    */
@@ -39,6 +41,19 @@ export interface ActivationResult {
    * post-deactivate to locate the recorded segments via Strom's media API.
    */
   recorderOutputDir?: string;
+  /**
+   * Problems that did not stop the production from going on air but that the
+   * operator needs to know about (e.g. a recording with no sound).
+   */
+  warnings: ActivationWarning[];
+  /**
+   * Strom media directory of this activation's recordings — the program
+   * recorder writes into it and each input recorder into a subdirectory. Set
+   * when any recorder is wired.
+   */
+  recordingsDir?: string;
+  /** One per recorded input (`ProductionSourceAssignment.record`), in mixerInput order. */
+  inputRecorders: ActivationInputRecorder[];
   /** WHEP endpoint ID for the mixer's monitor_out (headphone/monitor bus) — undefined if no audio mixer */
   monitorWhepEndpointId?: string;
   /** Maps mixerInput (e.g. 'video_in_1') → time_offset block ID — so the WS layer can apply live offset changes */
@@ -70,6 +85,38 @@ export interface ActivationResult {
    * productions. Returned so the activation route can persist it on the doc.
    */
   mixerInputMap: Record<string, number>;
+}
+
+export type ActivationWarning = {
+  type: 'recording-no-audio' | 'recording-unavailable' | 'input-recording-incomplete';
+  message: string;
+};
+
+export interface ActivationInputRecorder extends InputRecorder {
+  sourceId: string;
+  sourceName: string;
+  streamType: StreamType;
+}
+
+/**
+ * Whether Strom has a block, memoised per activation so it lists blocks once.
+ * If the list can't be read, assume it does: the flow create/start that
+ * follows reports an unreachable Strom better than a guess here would.
+ */
+function stromBlockCheck(strom: StromClient): (blockId: string) => Promise<boolean> {
+  let ids: Promise<Set<string> | null> | undefined;
+  return async (blockId) => {
+    ids ??= (async () => {
+      try {
+        const { blocks } = await strom.blocks.list();
+        return new Set(blocks.map((b) => b.id));
+      } catch {
+        return null;
+      }
+    })();
+    const known = await ids;
+    return !known || known.has(blockId);
+  };
 }
 
 /** `builtin.mixer`'s own `min_upstream_latency` default (strom `types/src/mixer.rs`). */
@@ -646,6 +693,9 @@ export async function activateStromFlow(
   // Maps mixerInput → builtin.media_player block ID for 'clip' sources — returned so the
   // clip cue/play control surface (#277/#278) can target the player block by mixer input.
   const clipPlayerBlockIds: Record<string, string> = {};
+  // Inputs whose assignment asks for a recording, with the decoded pads a
+  // recorder can tap; only arriving feeds have them.
+  const inputTaps: Array<InputTap & { source: SourceDoc; sourceId: string; mode: InputRecordMode }> = [];
 
   for (const assignment of sortedAssignments) {
     const padMatch = /video_in_(\d+)$/.exec(assignment.mixerInput);
@@ -664,6 +714,11 @@ export async function activateStromFlow(
 
     const yPos = ROW_START + stromPad * ROW_H;
     const inputId = `b-input-${padIndex}-${endpointSuffix}`;
+    const tapInput = (videoPad: string, audioPad: string) => {
+      const mode = assignment.record ?? 'off';
+      if (mode === 'off') return;
+      inputTaps.push({ mixerInput: assignment.mixerInput, padIndex, videoPad, audioPad, source, sourceId: assignment.sourceId, mode });
+    };
 
     // Insert a time_offset block between this source and the vision mixer.
     // Starts at 0 ms; operators adjust it live via SOURCE_OFFSET_SET WS messages.
@@ -849,6 +904,7 @@ export async function activateStromFlow(
       });
       sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetIdWhip;
       flow.links.push({ from: `${inputId}:audio_out`, to: `${audioOffsetIdWhip}:in` });
+      tapInput(`${inputId}:video_out`, `${inputId}:audio_out`);
       flow.links.push({ from: `${audioOffsetIdWhip}:out`, to: `${mixerBlockId}:audio_in_${stromPad}` });
       if (audioMixerBlock && audioMixerBlockId) {
         flow.links.push({ from: `${audioOffsetIdWhip}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
@@ -890,6 +946,7 @@ export async function activateStromFlow(
       });
       sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetId;
       flow.links.push({ from: `${inputId}:audio_out_0`, to: `${audioOffsetId}:in` });
+      tapInput(`${inputId}:video_out`, `${inputId}:audio_out_0`);
       flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${stromPad}` });
       if (audioMixerBlock && audioMixerBlockId) {
         flow.links.push({ from: `${audioOffsetId}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
@@ -1004,6 +1061,11 @@ export async function activateStromFlow(
   const whepOutputEntries: Array<{ outputId: string; endpointId: string }> = [];
   let recorderBlockId: string | undefined;
   let recorderOutputDir: string | undefined;
+  const warnings: ActivationWarning[] = [];
+  const hasBlock = stromBlockCheck(strom);
+  // Each activation records into its own directory, named by its start time, so
+  // deactivate can tell which activation recorded each file.
+  const recordingsDir = `${productionRecordingsDir(production._id)}/${activationRecordingsDirName()}`;
   let outputBlockIndex = 0;
   if (outputDocs && outputDocs.length > 0) {
     for (const outputDoc of outputDocs) {
@@ -1013,27 +1075,57 @@ export async function activateStromFlow(
       const idSlug = outputDoc._id.replace(/[^a-z0-9]/gi, '').slice(-8) || 'out';
       const blockId = `b-out-${idSlug}-${endpointSuffix}`;
       if (outputDoc.outputType === 'recording') {
-        // VOD recording: emit a single builtin.recorder block that writes local
+        // VOD recording: emit a single builtin.liverecorder block that writes local
         // segments in Strom. open-live uploads them to MinIO after deactivate
         // (recording-uploader.ts). Only one recorder is wired per production —
         // extra 'recording' assignments are ignored so we never fan-out writes.
         if (recorderBlockId) continue;
-        // Per-production output directory: recorder writes
-        // {media_path}/{output_dir}/{prefix}_%05d.{ext} (Strom recorder.rs). We key
-        // it by production id so segments are trivially locatable + uploadable.
-        const outputDir = `recordings/${production._id}`;
+        // Strom refuses to start a flow that names a block it lacks, so a Strom
+        // without Live Recorder goes on air unrecorded instead of not at all.
+        if (!(await hasBlock('builtin.liverecorder'))) {
+          warnings.push({
+            type: 'recording-unavailable',
+            message: `Recording "${outputDoc.name}" is off: this Strom has no builtin.liverecorder block.`,
+          });
+          continue;
+        }
+        // Recorder writes {media_path}/{output_dir}/{filename_prefix}_{timestamp}_%05d.{ext}
+        // (Strom live_recorder/mod.rs).
+        const outputDir = recordingsDir;
         flow.blocks.push({
           id: blockId,
-          block_definition_id: 'builtin.recorder',
+          block_definition_id: 'builtin.liverecorder',
           name: outputDoc.name,
           properties: {
             output_dir: outputDir,
-            prefix: production._id,
+            filename_prefix: production._id,
           },
           position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
         });
-        if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
-        if (mainAudioSource) flow.links.push({ from: mainAudioSource, to: `${blockId}:audio_in_0` });
+        if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in_0` });
+        // The recorder refuses raw audio (Strom refusal.rs), and main_out is raw,
+        // so audio needs builtin.audioenc. Strom older than 0.6.9 lacks it and
+        // refuses to start the whole flow if it is referenced; record picture
+        // only rather than keep the production off air.
+        if (mainAudioSource && !(await hasBlock('builtin.audioenc'))) {
+          warnings.push({
+            type: 'recording-no-audio',
+            message:
+              `Recording "${outputDoc.name}" has no sound: this Strom has no builtin.audioenc block. ` +
+              'Upgrade Strom to 0.6.9 or later to record audio.',
+          });
+        } else if (mainAudioSource) {
+          const audioEncId = `b-rec-aenc-${idSlug}-${endpointSuffix}`;
+          flow.blocks.push({
+            id: audioEncId,
+            block_definition_id: 'builtin.audioenc',
+            name: `${outputDoc.name} Audio`,
+            properties: { codec: 'aac' },
+            position: { x: COL_OUTPUT - 200, y: ROW_START + outputBlockIndex * ROW_H },
+          });
+          flow.links.push({ from: mainAudioSource, to: `${audioEncId}:audio_in` });
+          flow.links.push({ from: `${audioEncId}:encoded_out`, to: `${blockId}:audio_in_0` });
+        }
         recorderBlockId = blockId;
         recorderOutputDir = outputDir;
         outputBlockIndex++;
@@ -1112,6 +1204,71 @@ export async function activateStromFlow(
         outputBlockIndex++;
         if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
         if (mainAudioSource) flow.links.push({ from: mainAudioSource, to: `${blockId}:audio_in_0` });
+      }
+    }
+  }
+
+  // Per-input recording (`ProductionSourceAssignment.record`): recorders for
+  // each opted-in arriving feed, beside the program recording
+  // (src/lib/input-recording.ts).
+  const inputRecorders: ActivationInputRecorder[] = [];
+  const tapped = new Set(inputTaps.map((t) => t.mixerInput));
+  for (const { mixerInput, record } of sortedAssignments) {
+    if (record && record !== 'off' && !tapped.has(mixerInput)) {
+      warnings.push({
+        type: 'input-recording-incomplete',
+        message: `${mixerInput} is not recorded: only WHIP, SRT and EFP inputs can be recorded on their own.`,
+      });
+    }
+  }
+  const transcodeTaps = inputTaps.filter((tap) => {
+    if (tap.mode === 'transcode') return true;
+    warnings.push({
+      type: 'input-recording-incomplete',
+      message: `${tap.mixerInput} is not recorded: ${tap.mode} recording is not supported yet.`,
+    });
+    return false;
+  });
+  if (transcodeTaps.length > 0) {
+    const [recorder, video, audio] = await Promise.all(
+      ['builtin.liverecorder', 'builtin.videoenc', 'builtin.audioenc'].map((id) => hasBlock(id)),
+    );
+    const support = { video: recorder && video, audio: recorder && audio };
+    if (!support.video && !support.audio) {
+      warnings.push({
+        type: 'input-recording-incomplete',
+        message: recorder
+          ? 'Inputs are not recorded: this Strom has neither builtin.videoenc nor builtin.audioenc.'
+          : 'Inputs are not recorded: this Strom has no builtin.liverecorder block.',
+      });
+    } else {
+      if (!support.audio) {
+        warnings.push({
+          type: 'input-recording-incomplete',
+          message: 'Inputs are recorded without sound: this Strom has no builtin.audioenc block. ' +
+            'Upgrade Strom to 0.6.9 or later to record audio.',
+        });
+      }
+      if (!support.video) {
+        warnings.push({
+          type: 'input-recording-incomplete',
+          message: 'Inputs are recorded without picture: this Strom has no builtin.videoenc block.',
+        });
+      }
+      for (const tap of transcodeTaps) {
+        const recorder = addTranscodingInputRecorder(flow, tap, {
+          productionId: production._id,
+          activationDir: recordingsDir,
+          idSuffix: endpointSuffix,
+          support,
+          position: { x: COL_ELEM - 900, y: ROW_START + (mixerInputMap[tap.mixerInput] ?? tap.padIndex) * ROW_H },
+        });
+        inputRecorders.push({
+          ...recorder,
+          sourceId: tap.sourceId,
+          sourceName: tap.source.name,
+          streamType: tap.source.streamType,
+        });
       }
     }
   }
@@ -1257,6 +1414,9 @@ export async function activateStromFlow(
     pgmWhepEndpointId,
     recorderBlockId,
     recorderOutputDir,
+    warnings,
+    ...((recorderBlockId || inputRecorders.length > 0) && { recordingsDir }),
+    inputRecorders,
     sourceOffsetBlockIds,
     sourceAudioOffsetBlockIds,
     clipPlayerBlockIds,
