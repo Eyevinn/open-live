@@ -98,14 +98,12 @@ const mockMediaDeleteDirectory = vi.fn(async (dir: string) => {
   if (mediaFiles.some((f) => f.startsWith(`${dir}/`))) throw new Error('Directory not empty');
   return { success: true };
 });
-const mockSplitNow = vi.fn().mockResolvedValue({});
 const mockFlowsGet = vi.fn();
 
 vi.mock('../lib/strom.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/strom.js')>();
   class MockStromClient {
     flows = { list: vi.fn(), get: mockFlowsGet, start: vi.fn(), stop: vi.fn(), delete: vi.fn() };
-    recorder = { splitNow: mockSplitNow };
     media = { list: mockMediaList, deleteFile: mockMediaDeleteFile, deleteDirectory: mockMediaDeleteDirectory };
   }
   return { ...actual, StromClient: MockStromClient };
@@ -244,7 +242,6 @@ describe('deactivate — each recording is uploaded and registered once', () => 
     const res = await deactivate();
 
     expect(res.statusCode).toBe(200);
-    expect(mockSplitNow).not.toHaveBeenCalled();
     expect(putKeys).toEqual([keyOf(ACT1)]);
   });
 

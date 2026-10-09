@@ -16,7 +16,7 @@ import { forceStopClipRelay } from '../services/clip-relay.js';
 import { config, isRecordingEnabled } from '../config.js';
 import { minioTargetFromConfig, uploadProductionRecordings } from '../lib/recording-uploader.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
-import { bindRecordingIndex, closeRecordingIndex, currentRecordingIndex, openRecordingIndex, waitForNextFiles, type RecordingIndexHandle } from '../services/recording-index.js';
+import { bindRecordingIndex, closeRecordingIndex, currentRecordingIndex, openRecordingIndex, type RecordingIndexHandle } from '../services/recording-index.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type OutputStatusEntry } from '../lib/production-health.js';
 
@@ -27,9 +27,6 @@ import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type O
 const FLOW_POLL_INTERVAL_MS = 500;
 const FLOW_POLL_TIMEOUT_MS = 30_000;
 const MAX_DB_WRITE_RETRIES = 3;
-// How long deactivate waits for a split to open each recorder's next file.
-// A split lands on the next keyframe; a passthrough input keeps its sender's GOP.
-const SPLIT_TIMEOUT_MS = 10_000;
 
 // ---------------------------------------------------------------------------
 // AbortController map — keyed by production ID, allows deactivate to cancel
@@ -1082,37 +1079,26 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       const stromToken = await getStromToken(config.stromToken).catch((err) => { log.error({ errMsg: err instanceof Error ? err.message : String(err) }, "SAT exchange failed — proceeding without auth"); return undefined; });
       const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
 
-      // VOD recording (issue #41): when a recorder block is active, finalise
-      // the current segment (recorder.splitNow), stop the flow, then upload
-      // Strom's local recordings to MinIO — Strom's recorder has no native S3 sink, so
-      // open-live pulls the segments and pushes them to object storage.
+      // VOD recording (issue #41): when a recorder block is active, stop the
+      // flow, then upload Strom's local recordings to MinIO — Strom's recorder
+      // has no native S3 sink, so open-live pulls the segments and pushes them
+      // to object storage.
       // Every activation's directory is swept, skipping objects already
       // registered, so a session whose upload failed (or that ended without
       // this route, e.g. the idle watchdog) is uploaded here instead of lost.
       // Best-effort: a failed upload must not block deactivation/teardown.
-      const inputRecorderBlockIds = Object.values(doc.inputRecorderBlockIds ?? {}).flatMap((ids) => Object.values(ids));
       if (isRecordingEnabled()) {
         const target = minioTargetFromConfig();
         if (target) {
           try {
-            const flowId = doc.stromFlowId;
-            const recorderIds = [doc.recorderBlockId, ...inputRecorderBlockIds].filter((id): id is string => !!id);
-            // A split lands on the recorder's next keyframe, after splitNow
-            // returns. Stopping before then would leave the file it closes
-            // unfinalised: Strom's stop does not end the recording, so the
-            // file keeps its last periodic moov and loses up to ~2 s.
-            const split = recordingIndex && waitForNextFiles(recordingIndex, recorderIds, SPLIT_TIMEOUT_MS);
-            await Promise.all(recorderIds.map((id) => strom.recorder.splitNow(flowId, id).catch(() => undefined)));
-            await split;
-            // Stop at once, so the files the split opened hold milliseconds,
-            // not however long the upload takes.
+            // Stopping the flow finishes each recorder's open file before the
+            // request returns, so the sweep below never reads one mid-write.
             try {
-              await strom.flows.stop(flowId);
+              await strom.flows.stop(doc.stromFlowId);
             } catch {
               // deactivateStromFlow below stops it again
             }
-            // Final sidecar write, listing the files the split opened, before
-            // the sweep below uploads it.
+            // Final sidecar write, before the sweep below uploads it.
             if (recordingIndex) await closeRecordingIndex(recordingIndex);
             const uploadRes = await uploadProductionRecordings({
               strom,

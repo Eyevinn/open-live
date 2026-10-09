@@ -42,10 +42,10 @@ vi.mock('../lib/strom-token.js', () => ({
   getStromToken: vi.fn().mockResolvedValue('test-token'),
 }));
 
-// Avoid a real StromClient (and the recorder.splitNow network call).
+// Avoid a real StromClient (and the flows.stop network call).
 vi.mock('../lib/strom.js', () => ({
   StromClient: class {
-    recorder = { splitNow: vi.fn().mockResolvedValue(undefined) };
+    flows = { stop: vi.fn().mockResolvedValue(undefined) };
   },
   StromClientError: class extends Error {},
 }));
