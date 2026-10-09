@@ -42,7 +42,7 @@ vi.mock('../lib/strom.js', async (importOriginal) => {
   return { ...actual, StromClient: MockStromClient };
 });
 
-import { bindRecordingIndex, closeRecordingIndex, currentRecordingIndex, openRecordingIndex, waitForNextFiles, type RecordingIndexHandle } from '../services/recording-index.js';
+import { bindRecordingIndex, closeRecordingIndex, currentRecordingIndex, openRecordingIndex, type RecordingIndexHandle } from '../services/recording-index.js';
 
 const DIR = 'recordings/prod-1/20261001T100000Z-11111111-1111-4111-8111-111111111111';
 const ACTIVATED = Date.parse('2026-10-01T10:00:00.000Z');
@@ -216,65 +216,5 @@ describe('recording index', () => {
     expect(currentRecordingIndex('prod-1')).toBe(handle);
     await closeRecordingIndex(handle);
     expect(currentRecordingIndex('prod-1')).toBeUndefined();
-  });
-});
-
-describe('waitForNextFiles', () => {
-  const settled = (p: Promise<void>) => {
-    let done = false;
-    void p.then(() => { done = true; });
-    return () => done;
-  };
-  const flush = () => new Promise((r) => setTimeout(r, 0));
-
-  async function recording() {
-    const handle = await openRecordingIndex('prod-1');
-    bind(handle);
-    emit(fileEvent('b-rec', `${DIR}/p_00000.mp4`));
-    emit(fileEvent('b-inrec-v-1', `${DIR}/video_in_1/v_00000.mp4`));
-    return handle;
-  }
-
-  it('resolves once each recorder that has a file opens another', async () => {
-    const handle = await recording();
-    const done = settled(waitForNextFiles(handle, ['b-rec', 'b-inrec-v-1'], 60_000));
-    emit(fileEvent('b-rec', `${DIR}/p_00001.mp4`));
-    await flush();
-    expect(done()).toBe(false);
-    emit(fileEvent('b-inrec-v-1', `${DIR}/video_in_1/v_00001.mp4`));
-    await flush();
-    expect(done()).toBe(true);
-  });
-
-  it('does not wait for a recorder that has not opened a file', async () => {
-    const handle = await recording();
-    const done = settled(waitForNextFiles(handle, ['b-rec', 'b-inrec-a-1'], 60_000));
-    emit(fileEvent('b-rec', `${DIR}/p_00001.mp4`));
-    await flush();
-    expect(done()).toBe(true);
-  });
-
-  it('resolves after the timeout when a recorder opens nothing', async () => {
-    const handle = await recording();
-    const done = settled(waitForNextFiles(handle, ['b-rec'], 20));
-    await flush();
-    expect(done()).toBe(false);
-    await new Promise((r) => setTimeout(r, 40));
-    expect(done()).toBe(true);
-  });
-
-  it('resolves when the index closes', async () => {
-    const handle = await recording();
-    const done = settled(waitForNextFiles(handle, ['b-rec'], 60_000));
-    await closeRecordingIndex(handle);
-    await flush();
-    expect(done()).toBe(true);
-  });
-
-  it('resolves at once for an index that is not bound', async () => {
-    const handle = await openRecordingIndex('prod-1');
-    const done = settled(waitForNextFiles(handle, ['b-rec'], 60_000));
-    await flush();
-    expect(done()).toBe(true);
   });
 });

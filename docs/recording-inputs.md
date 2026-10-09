@@ -137,10 +137,6 @@ last update once it has left.
 Not listed: a file opened while Open Live was not connected to Strom's event
 stream.
 
-The final split at deactivate leaves each recorder a last file of a few
-milliseconds, listed like any other. Strom's stop does not finalise it, so it
-may hold one frame or no media at all; skip a file you cannot read.
-
 ## For tools that read these recordings
 
 A separate writer (a TAMS store, for one) can pick the recordings up from the

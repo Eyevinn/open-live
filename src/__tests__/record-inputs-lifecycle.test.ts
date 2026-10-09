@@ -1,9 +1,9 @@
 /**
  * Per-input recorders (ProductionSourceAssignment.record) through the production lifecycle.
- * Activate saves their ids and binds the recording index. Deactivate splits
- * every recorder, waits for the split files, stops the flow, uploads input
- * files and registers them with their mixerInput, and copies the activation's
- * sidecar to object storage without registering it as a recording.
+ * Activate saves their ids and binds the recording index. Deactivate stops the
+ * flow, uploads input files and registers them with their mixerInput, and
+ * copies the activation's sidecar to object storage without registering it as
+ * a recording.
  *
  * CouchDB, Strom and object storage are mocked.
  */
@@ -109,7 +109,6 @@ const mockMediaDeleteDirectory = vi.fn(async (dir: string) => {
   deletedDirs.push(dir);
   return { success: true };
 });
-const mockSplitNow = vi.fn().mockResolvedValue({});
 const mockFlowsGet = vi.fn();
 const mockFlowsStop = vi.fn();
 const mockMediaUpload = vi.fn().mockResolvedValue({});
@@ -119,7 +118,6 @@ vi.mock('../lib/strom.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/strom.js')>();
   class MockStromClient {
     flows = { list: vi.fn(), get: mockFlowsGet, start: vi.fn(), stop: mockFlowsStop, delete: vi.fn() };
-    recorder = { splitNow: mockSplitNow };
     media = { list: mockMediaList, deleteFile: mockMediaDeleteFile, deleteDirectory: mockMediaDeleteDirectory, upload: mockMediaUpload };
     connectWebSocket(onEvent: (event: unknown) => void, _onClose?: () => void, onOpen?: () => void) {
       emit = onEvent;
@@ -202,11 +200,17 @@ afterEach(async () => {
 });
 
 describe('deactivate — per-input recordings', () => {
-  it('splits the program and every input recorder before uploading', async () => {
+  it('stops the flow before uploading', async () => {
+    let uploadedAtStop = -1;
+    mockFlowsStop.mockImplementationOnce(async () => {
+      uploadedAtStop = puts.size;
+      return {};
+    });
     await deactivate();
-    expect(mockSplitNow.mock.calls.map((c) => c[1]).sort()).toEqual(['b-inrec-a-1', 'b-inrec-a-2', 'b-inrec-v-1', 'b-out-rec']);
-    expect(mockSplitNow.mock.calls.every((c) => c[0] === 'flow-1')).toBe(true);
-    expect(mockDeactivateStromFlow).toHaveBeenCalledOnce();
+    expect(mockFlowsStop).toHaveBeenCalledWith('flow-1');
+    expect(uploadedAtStop).toBe(0);
+    expect(puts.size).toBeGreaterThan(0);
+    expect(mockFlowsStop.mock.invocationCallOrder[0]).toBeLessThan(mockDeactivateStromFlow.mock.invocationCallOrder[0]!);
   });
 
   describe('with the activation\'s recording index open', () => {
@@ -222,7 +226,6 @@ describe('deactivate — per-input recordings', () => {
       return [body.program, ...Object.values(body.inputs).flatMap((i) => Object.values(i.tracks))].flatMap((r) => r.files);
     };
     const recorders = ['b-out-rec', 'b-inrec-v-1', 'b-inrec-a-1', 'b-inrec-a-2'];
-    const splitOpened: string[] = [];
 
     beforeEach(async () => {
       const handle = await openRecordingIndex('prod-iso-1');
@@ -235,40 +238,12 @@ describe('deactivate — per-input recordings', () => {
         ],
       });
       for (const id of recorders) emit(fileEvent(id, 0));
-      // A split opens the recorder's next file a moment after the request returns.
-      splitOpened.length = 0;
-      mockSplitNow.mockImplementation(async (_flowId: string, blockId: string) => {
-        setTimeout(() => {
-          splitOpened.push(blockId);
-          emit(fileEvent(blockId, 1));
-        }, 5);
-      });
     });
 
-    afterEach(() => {
-      mockSplitNow.mockReset().mockResolvedValue({});
-    });
-
-    it('stops the flow once every split has opened its next file, before uploading', async () => {
-      let openedAtStop: string[] = [];
-      let uploadedAtStop = -1;
-      mockFlowsStop.mockImplementationOnce(async () => {
-        openedAtStop = [...splitOpened];
-        uploadedAtStop = puts.size;
-        return {};
-      });
-      await deactivate();
-      expect(mockFlowsStop).toHaveBeenCalledWith('flow-1');
-      expect(openedAtStop.sort()).toEqual([...recorders].sort());
-      expect(uploadedAtStop).toBe(0);
-      expect(puts.size).toBeGreaterThan(0);
-      expect(mockFlowsStop.mock.invocationCallOrder[0]).toBeLessThan(mockDeactivateStromFlow.mock.invocationCallOrder[0]!);
-    });
-
-    it('lists the files the final split opened, with their startMs, in the sidecar it uploads', async () => {
+    it('lists each recorder\'s files, with their startMs, in the sidecar it uploads', async () => {
       await deactivate();
       const files = sidecarFiles();
-      for (const id of recorders) expect(files).toContainEqual({ path: `${ACT_DIR}/${id}_00001.mp4`, openedAtMs: expect.any(Number), startMs: 1_001 });
+      for (const id of recorders) expect(files).toContainEqual({ path: `${ACT_DIR}/${id}_00000.mp4`, openedAtMs: expect.any(Number), startMs: 1_000 });
       expect(mockCloseIndex.mock.invocationCallOrder[0]).toBeGreaterThan(mockFlowsStop.mock.invocationCallOrder[0]!);
       expect(puts.get(`prod-iso-1/${ACT_NAME}/recordings.json`)).toBe('application/json');
     });
@@ -355,14 +330,12 @@ describe('deactivate — per-input recordings', () => {
     mediaFiles = [INPUT_1, SIDECAR];
     production = activeProduction({ recorderBlockId: undefined, recorderOutputDir: undefined, outputAssignments: [] });
     await deactivate();
-    expect(mockSplitNow.mock.calls.map((c) => c[1]).sort()).toEqual(['b-inrec-a-1', 'b-inrec-a-2', 'b-inrec-v-1']);
     expect([...recordings.values()].map((d) => d['mixerInput'])).toEqual(['video_in_1']);
   });
 
-  it('keeps everything on Strom, without splitting, when object storage is not configured', async () => {
+  it('keeps everything on Strom when object storage is not configured', async () => {
     Object.assign(config, { minioEndpoint: undefined, minioAccessKey: undefined, minioSecretKey: undefined, minioBucket: undefined });
     await deactivate();
-    expect(mockSplitNow).not.toHaveBeenCalled();
     expect(puts.size).toBe(0);
     expect(mediaFiles).toHaveLength(5);
     expect(production['inputRecorderBlockIds']).toBeUndefined();
