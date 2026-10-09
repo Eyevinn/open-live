@@ -153,6 +153,23 @@ export interface Flow {
   elements?: FlowElement[]
   blocks?: BlockInstance[]
   links?: FlowLink[]
+  /** Per-block runtime health (Eyevinn/strom#786). Present only while the pipeline runs. */
+  block_health?: BlockHealthReport[]
+}
+
+/**
+ * One block's health from Strom's block health scan (Eyevinn/strom#786): the
+ * `BlockHealthChanged` event payload, and an entry of `Flow.block_health`.
+ * `failed` means the block's element chain stopped passing data while the
+ * pipeline stayed PLAYING. `causes` is Strom's optional list of structured
+ * causes (e.g. which WHIP seat lost which medium); absent when ok or when Strom
+ * has none. Its items are Strom's, so they are typed loosely and passed through.
+ */
+export interface BlockHealthReport {
+  block_id: string
+  status: 'ok' | 'failed'
+  detail?: string | null
+  causes?: unknown
 }
 
 export interface FlowResponse {
@@ -719,6 +736,9 @@ export type FlowEvent =
   // that emits it is not yet merged, so field names follow the issue, not a
   // verified `events.rs` variant.
   | { type: 'PipelineError'; data: { flow_id?: string; source: string; error: string } }
+  // Emitted by Strom's block health scan only when a block's status changes
+  // (Eyevinn/strom#786). Same `{ type, data }` envelope.
+  | { type: 'BlockHealthChanged'; data: BlockHealthReport & { flow_id: string } }
   | { type: 'ping' }
 
 // ---------------------------------------------------------------------------
@@ -1165,9 +1185,10 @@ export class StromClient {
 
   /**
    * Opens a WebSocket connection to /api/ws and calls `onEvent` for each
-   * flow event. Returns a cleanup function that closes the socket.
+   * flow event, and `onOpen` once the socket is subscribed. Returns a cleanup
+   * function that closes the socket.
    */
-  connectWebSocket(onEvent: (event: FlowEvent) => void, onClose?: () => void): () => void {
+  connectWebSocket(onEvent: (event: FlowEvent) => void, onClose?: () => void, onOpen?: () => void): () => void {
     const wsUrl = this.baseUrl.replace(/^http/, 'ws') + '/api/ws'
     const headers: Record<string, string> = {}
     if (this.token) headers['Authorization'] = `Bearer ${this.token}`
@@ -1175,6 +1196,10 @@ export class StromClient {
 
     ws.on('error', (err) => {
       console.error('[strom-ws] Connection error:', err.message)
+    })
+
+    ws.on('open', () => {
+      onOpen?.()
     })
 
     ws.on('close', (_code, _reason) => {
