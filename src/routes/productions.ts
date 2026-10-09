@@ -282,14 +282,36 @@ function recordingDocId(bucket: string, key: string): string {
   return `recording-${createHash('sha256').update(`${bucket}/${key}`).digest('hex').slice(0, 32)}`;
 }
 
-/** Whether an object has already been uploaded and registered as a RecordingDoc. */
-async function isRecordingRegistered(bucket: string, key: string): Promise<boolean> {
+/**
+ * Whether an object has already been uploaded and registered as a RecordingDoc.
+ * A file that has since changed size was still being written when it was
+ * registered, so the object holds a truncated copy and the file is uploaded again.
+ */
+async function isRecordingRegistered(bucket: string, key: string, sizeBytes: number | undefined): Promise<boolean> {
   try {
-    await getRecordingsDb().get(recordingDocId(bucket, key));
-    return true;
+    const doc = await getRecordingsDb().get(recordingDocId(bucket, key));
+    return sizeBytes === undefined || doc.sizeBytes === sizeBytes;
   } catch (err) {
     if (typeof err === 'object' && err !== null && (err as { statusCode?: unknown }).statusCode === 404) return false;
     throw err;
+  }
+}
+
+/** Updates the size and end time of a registered RecordingDoc after its object was uploaded again. */
+async function refreshRegisteredRecording(
+  key: string,
+  bucket: string,
+  sizeBytes: number,
+  endedAt: string,
+  log: FastifyBaseLogger,
+): Promise<void> {
+  try {
+    const db = getRecordingsDb();
+    const existing = await db.get(recordingDocId(bucket, key));
+    if (existing.sizeBytes === sizeBytes) return;
+    await db.insert({ ...existing, sizeBytes, endedAt, updatedAt: endedAt });
+  } catch (err) {
+    log.error({ err, key }, 'RecordingDoc refresh failed — object uploaded again but its listing is stale');
   }
 }
 
@@ -1049,7 +1071,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
               // A recorder activated before per-activation directories wrote
               // straight into the production's directory.
               includeSharedDir: Boolean(doc.recorderBlockId && !doc.recorderOutputDir),
-              isUploaded: (key) => isRecordingRegistered(target.bucket, key),
+              isUploaded: (key, sizeBytes) => isRecordingRegistered(target.bucket, key, sizeBytes),
               // Guard (issue #366): re-check the production doc immediately
               // before uploadProductionRecordings' delete-after-upload pass.
               // Nothing else in this handler writes to the production doc
@@ -1093,8 +1115,12 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
                 };
                 await getRecordingsDb().insert(recDoc);
               } catch (persistErr) {
-                // A concurrent deactivate registered it first.
-                if (isConflict(persistErr)) continue;
+                // Already registered: by a concurrent deactivate, or by an earlier
+                // one that saw the file before it was complete.
+                if (isConflict(persistErr)) {
+                  await refreshRegisteredRecording(seg.key, target.bucket, seg.sizeBytes, finalizedAt, log);
+                  continue;
+                }
                 log.error({ persistErr, productionId: doc._id, key: seg.key }, 'RecordingDoc persist failed — object uploaded but unlisted');
               }
             }

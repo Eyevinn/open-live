@@ -18,8 +18,10 @@ const recordings = new Map<string, Doc>();
 const notFound = () => Object.assign(new Error('missing'), { statusCode: 404 });
 
 const mockRecordingInsert = vi.fn(async (doc: Doc) => {
-  if (recordings.has(doc._id)) throw Object.assign(new Error('Document update conflict.'), { statusCode: 409 });
-  recordings.set(doc._id, doc);
+  // As in CouchDB, replacing a document needs its current revision.
+  if (recordings.has(doc._id) && !doc['_rev']) throw Object.assign(new Error('Document update conflict.'), { statusCode: 409 });
+  const { _rev, ...stored } = doc;
+  recordings.set(doc._id, stored);
   return { ok: true };
 });
 
@@ -38,7 +40,7 @@ vi.mock('../db/index.js', () => ({
     get: vi.fn(async (id: string) => {
       const doc = recordings.get(id);
       if (!doc) throw notFound();
-      return doc;
+      return { ...doc, _rev: '1-a' };
     }),
     insert: mockRecordingInsert,
     find: vi.fn().mockResolvedValue({ docs: [] }),
@@ -76,6 +78,8 @@ const ACT2 = `${ACT2_DIR}/prod-rec-1_20260927_110000_00000.mp4`;
 const keyOf = (path: string) => `prod-rec-1/${path.split('/').pop()}`;
 
 let mediaFiles: string[];
+// Sizes Strom reports for its files; unlisted files report none.
+const stromSizes = new Map<string, number>();
 const mockMediaList = vi.fn(async (dir: string) => {
   const { StromClientError } = await import('../lib/strom.js');
   const entries = new Map<string, { name: string; path: string; is_directory: boolean; modified: number }>();
@@ -84,7 +88,9 @@ const mockMediaList = vi.fn(async (dir: string) => {
     const [name, ...rest] = file.slice(dir.length + 1).split('/');
     // Last written a minute after the activation's hour.
     const modified = Date.parse(`2026-09-27T${name!.includes('_10') ? '10' : '11'}:01:00Z`) / 1000;
-    entries.set(name!, { name: name!, path: `${dir}/${name}`, is_directory: rest.length > 0, modified });
+    const path = `${dir}/${name}`;
+    const size = stromSizes.get(path);
+    entries.set(name!, { name: name!, path, is_directory: rest.length > 0, modified, ...(size !== undefined && { size }) });
   }
   if (entries.size === 0) throw new StromClientError(404, 'Directory not found');
   return { entries: [...entries.values()] };
@@ -140,14 +146,15 @@ function activeProduction(overrides: Record<string, unknown> = {}): Doc {
 }
 
 /** Registers a file as a previous deactivate would have. */
-async function preRegister(path: string) {
+async function preRegister(path: string, sizeBytes?: number) {
   const { createHash } = await import('crypto');
   const key = keyOf(path);
   const id = `recording-${createHash('sha256').update(`vod/${key}`).digest('hex').slice(0, 32)}`;
-  recordings.set(id, { _id: id, key });
+  recordings.set(id, { _id: id, key, ...(sizeBytes !== undefined && { sizeBytes }) });
 }
 
-const registered = () => [...recordings.values()] as unknown as Array<{ key: string; startedAt?: string; endedAt?: string }>;
+const registered = () =>
+  [...recordings.values()] as unknown as Array<{ key: string; sizeBytes?: number; startedAt?: string; endedAt?: string }>;
 
 const savedConfig = {
   minioEndpoint: config.minioEndpoint,
@@ -162,6 +169,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   putKeys.length = 0;
   recordings.clear();
+  stromSizes.clear();
   productionWrites.length = 0;
   mediaFiles = [LEGACY, ACT1, ACT2];
   production = activeProduction();
@@ -202,6 +210,29 @@ describe('deactivate — each recording is uploaded and registered once', () => 
     expect(registered().map((r) => r.key)).toEqual([keyOf(ACT1), keyOf(ACT2)]);
     expect(production['recorderOutputDir']).toBeUndefined();
     expect(production['recorderBlockId']).toBeUndefined();
+  });
+
+  it('skips a registered file whose size on Strom matches the registered size', async () => {
+    stromSizes.set(ACT1, 9);
+    await preRegister(ACT1, 9);
+
+    await deactivate();
+
+    expect(putKeys).toEqual([keyOf(ACT2)]);
+  });
+
+  it('uploads a registered file again when Strom now holds more of it, and updates its listing', async () => {
+    // Registered while the recorder was still writing it: the object is truncated.
+    stromSizes.set(ACT1, 9);
+    await preRegister(ACT1, 4);
+
+    const res = await deactivate();
+
+    expect(res.statusCode).toBe(200);
+    expect(putKeys).toEqual([keyOf(ACT1), keyOf(ACT2)]);
+    expect(registered().filter((r) => r.key === keyOf(ACT1))).toHaveLength(1);
+    expect(registered().find((r) => r.key === keyOf(ACT1))!.sizeBytes).toBe(9);
+    expect(mediaFiles).toEqual([LEGACY]);
   });
 
   it('picks up an earlier activation whose upload failed, dated by that activation', async () => {

@@ -422,8 +422,11 @@ export interface UploadProductionRecordingsArgs extends Omit<UploadRecordingsArg
    * activated before per-activation directories wrote them.
    */
   includeSharedDir: boolean;
-  /** Whether an object key has already been uploaded and registered; those files are skipped. */
-  isUploaded: (key: string) => Promise<boolean>;
+  /**
+   * Whether an object key has already been uploaded and registered with this
+   * file size (undefined when Strom does not report one); those files are skipped.
+   */
+  isUploaded: (key: string, sizeBytes: number | undefined) => Promise<boolean>;
 }
 
 /**
@@ -483,7 +486,7 @@ async function uploadFiles(
   args: Omit<UploadRecordingsArgs, 'outputDir'>,
   files: MediaEntry[],
   activationStartedAt: string | undefined,
-  isUploaded: (key: string) => Promise<boolean>,
+  isUploaded: (key: string, sizeBytes: number | undefined) => Promise<boolean>,
   result: UploadResult,
 ): Promise<string[]> {
   const { stromUrl, stromToken, productionId, target } = args;
@@ -491,7 +494,7 @@ async function uploadFiles(
   for (const entry of files) {
     try {
       const key = recordingObjectKey(productionId, entry.name);
-      if (await isUploaded(key)) {
+      if (await isUploaded(key, entry.size)) {
         done.push(entry.path);
         continue;
       }
