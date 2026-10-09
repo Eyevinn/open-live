@@ -21,6 +21,7 @@ import Fastify from 'fastify';
 const SOURCES: Record<string, Record<string, unknown>> = {
   'cam-srt': { _id: 'cam-srt', name: 'Camera SRT', streamType: 'srt', address: 'srt://10.0.0.1:9000?mode=caller' },
   'cam-efp': { _id: 'cam-efp', name: 'Camera EFP', streamType: 'efp', address: 'srt://10.0.0.2:9000?mode=caller' },
+  'cam-guest': { _id: 'cam-guest', name: 'Guest', streamType: 'srt', address: 'srt://10.0.0.3:9000?mode=caller' },
 };
 
 const mockProductionGet = vi.fn();
@@ -215,6 +216,37 @@ describe('audio channel numbering with test pattern sources', () => {
       [`ch${channelByMixerInput['video_in_4']}_to_main`]: false,
     });
   });
+  // Issue #487: audio channel order must follow the NUMERIC picture order, not a
+  // lexical sort of mixerInput. A guest is allocated from the top of the range
+  // down (e.g. video_in_15), and large productions reach 10+ sources — both of
+  // which a `localeCompare` sort reordered wrongly ("video_in_15"/"video_in_10"
+  // sort before "video_in_2").
+  it('orders a guest on video_in_15 after the lower pads (numeric picture order)', async () => {
+    const { channelByMixerInput } = await generate([
+      { sourceId: '__test1__', mixerInput: 'video_in_0' },
+      { sourceId: '__test2__', mixerInput: 'video_in_1' },
+      { sourceId: 'cam-srt', mixerInput: 'video_in_2' },
+      { sourceId: 'cam-efp', mixerInput: 'video_in_3' },
+      { sourceId: 'cam-guest', mixerInput: 'video_in_15' },
+    ]);
+    // Picture order: HTML/test1(0), test2(1), SRT(2), EFP(3), Guest(15) → ch 1..5.
+    // The guest is the LAST channel, not channel 3 (the old lexical bug).
+    expect(channelByMixerInput).toEqual({
+      video_in_0: 1, video_in_1: 2, video_in_2: 3, video_in_3: 4, video_in_15: 5,
+    });
+  });
+
+  it('orders 10+ sources numerically (video_in_10/11 after video_in_2, not before)', async () => {
+    const sources = Array.from({ length: 12 }, (_, pad) => ({
+      sourceId: pad % 2 === 0 ? '__test1__' : '__test2__',
+      mixerInput: `video_in_${pad}`,
+    }));
+    const { channelByMixerInput } = await generate(sources);
+    const expected: Record<string, number> = {};
+    for (let pad = 0; pad < 12; pad++) expected[`video_in_${pad}`] = pad + 1;
+    expect(channelByMixerInput).toEqual(expected);
+  });
+
   it('CUT broadcasts the AFV channel switches as AUDIO_STATE mute (#452)', async () => {
     const { audioMixerId, channelByMixerInput } = await generate(MIXED);
     setTally(PROD, { pgm: 'video_in_4', pvw: 'video_in_2' });

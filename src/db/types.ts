@@ -515,6 +515,27 @@ export interface RtmpCredentialKeyDoc {
   createdAt: string;        // ISO 8601
 }
 
+// --------------- One-time data migration marker ---------------
+
+/**
+ * Marker for a completed one-time, instance-wide data migration. Each migration
+ * has a fixed id (e.g. `audio-channel-order-v2`); the presence of its doc means
+ * the migration has already run on this instance, so a later restart skips it.
+ * Kept as a singleton-per-migration doc (mirroring the stored-key docs) rather
+ * than a per-production flag so productions created AFTER the migration — which
+ * are already in the new shape — are never re-migrated and corrupted.
+ */
+export interface MigrationStateDoc {
+  _id: string;              // fixed per migration, e.g. "migration:audio-channel-order-v2"
+  _rev?: string;
+  type: 'migration-state';
+  /** Stable migration identifier (same as the `_id` suffix). */
+  migration: string;
+  /** How many documents the migration actually changed (diagnostics only). */
+  migratedCount: number;
+  completedAt: string;      // ISO 8601
+}
+
 // --------------- Production config types ---------------
 
 export interface ProductionConfigDoc {
