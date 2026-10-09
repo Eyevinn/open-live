@@ -342,7 +342,11 @@ export function emitProductionStatus(
 async function runActivationFlow(
   productionId: string,
   signal: AbortSignal,
-  log: { error: (obj: unknown, msg: string) => void; info: (obj: unknown, msg: string) => void },
+  log: {
+    error: (obj: unknown, msg: string) => void;
+    warn: (obj: unknown, msg: string) => void;
+    info: (obj: unknown, msg: string) => void;
+  },
   publicBaseUrl: string,
 ): Promise<void> {
   let stromFlowId: string | undefined;
@@ -421,7 +425,9 @@ async function runActivationFlow(
       ...(Object.keys(activation.clipPlayerBlockIds).length > 0 && { clipPlayerBlockIds: activation.clipPlayerBlockIds }),
       ...(activation.returnBuses.length > 0 && { returnBuses: activation.returnBuses }),
       ...(Object.keys(activation.mixerInputMap).length > 0 && { mixerInputMap: activation.mixerInputMap }),
+      ...(activation.warnings.length > 0 && { activationWarnings: activation.warnings }),
     });
+    for (const w of activation.warnings) log.warn({ productionId, warning: w.type }, w.message);
 
     // Step 3: Poll until flow reaches 'playing' or we time out
     const deadline = Date.now() + FLOW_POLL_TIMEOUT_MS;
@@ -579,6 +585,11 @@ async function runActivationFlow(
           stromFlowId,
           outputAssignments: doc.outputAssignments,
         });
+        // Studio shows ERROR frames as a toast. Controllers that connect later get
+        // the same frame from the connect-time snapshot in ws/controller.ts.
+        if (!signal.aborted) {
+          for (const w of activation.warnings) broadcast(productionId, { type: 'ERROR', error: w.message });
+        }
         log.info({ productionId, stromFlowId, whepEndpoint, initialTally, audioMixerBlockId }, 'Production activated — flow playing');
 
         // Controllers that stayed connected across a deactivate→reactivate are
@@ -628,6 +639,7 @@ async function runActivationFlow(
       whepEndpoint: undefined,
       pgmWhepEndpoint: undefined,
       whipEndpoints: undefined,
+      activationWarnings: undefined,
     }).catch((resetErr) => {
       log.error({ resetErr, productionId }, 'Failed to reset production to inactive after activation failure');
     });
@@ -928,6 +940,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         ...doc,
         status: 'activating',
         deletionWarnings: undefined,
+        activationWarnings: undefined,
         autoDeactivated: undefined,
         endedReason: undefined,
         updatedAt: new Date().toISOString(),

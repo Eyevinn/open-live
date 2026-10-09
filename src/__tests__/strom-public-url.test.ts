@@ -103,6 +103,7 @@ async function activate(): Promise<Record<string, unknown>> {
     returnBuses: [],
     returnWhepEntries: [{ mixerInput: 'video_in_1', endpointId: 'ret-ep' }],
     mixerInputMap: {},
+    warnings: [],
   });
 
   const app = await buildServer();

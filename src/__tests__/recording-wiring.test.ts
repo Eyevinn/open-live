@@ -15,9 +15,12 @@ vi.mock('../db/index.js', () => ({
   getGraphicsDb: () => ({ get: vi.fn().mockRejectedValue(new Error('not found')) }),
 }));
 
-function makeStromClient() {
+function makeStromClient(blockIds: string[] = ['builtin.recorder', 'builtin.audioenc']) {
   const capturedFlows: Record<string, unknown>[] = [];
   return {
+    blocks: {
+      list: vi.fn().mockResolvedValue({ blocks: blockIds.map((id) => ({ id })) }),
+    },
     flows: {
       create: vi.fn().mockImplementation((flow: Record<string, unknown>) => {
         capturedFlows.push(flow);
@@ -87,6 +90,7 @@ describe('flow-generator — recorder wiring (#41)', () => {
     const outputDir = (recorder!['properties'] as Record<string, unknown>)['output_dir'] as string;
     expect(outputDir).toMatch(/^recordings\/prod-rec-1\/\d{8}T\d{6}Z-[0-9a-f-]{36}$/);
     expect(result.recorderOutputDir).toBe(outputDir);
+    expect((recorder!['properties'] as Record<string, unknown>)['filename_prefix']).toBe('prod-rec-1');
 
     // A second activation of the same production writes somewhere else
     const again = await activateStromFlow(
@@ -97,11 +101,62 @@ describe('flow-generator — recorder wiring (#41)', () => {
     );
     expect(again.recorderOutputDir).not.toBe(outputDir);
 
-    // Recorder receives the PGM video feed and the main audio bus
-    const videoIn = links.find((l) => l['to'] === `${recId}:video_in`);
+    // Recorder receives the PGM video feed and the main audio bus, AAC-encoded
+    // because the recorder refuses raw audio
+    const videoIn = links.find((l) => l['to'] === `${recId}:video_in_0`);
     const audioIn = links.find((l) => l['to'] === `${recId}:audio_in_0`);
     expect(videoIn).toBeDefined();
     expect(audioIn).toBeDefined();
+    const [encId, encPad] = (audioIn!['from'] as string).split(':');
+    expect(encPad).toBe('encoded_out');
+    const enc = blocks.find((b) => b['id'] === encId);
+    expect(enc?.['block_definition_id']).toBe('builtin.audioenc');
+    expect((enc!['properties'] as Record<string, unknown>)['codec']).toBe('aac');
+    const encIn = links.find((l) => l['to'] === `${encId}:audio_in`);
+    expect(encIn?.['from']).toMatch(/:main_out$/);
+    expect(result.warnings).toEqual([]);
+  });
+
+  it('records picture only, with a warning, when Strom has no builtin.audioenc', async () => {
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    const strom = makeStromClient(['builtin.recorder']);
+    const production = makeProduction([{ sourceId: '__test1__', mixerInput: 'video_in_1' }]);
+
+    const result = await activateStromFlow(
+      production as never,
+      strom as never,
+      'http://localhost:7000',
+      [recordingOutput] as never,
+    );
+
+    const flow = strom.capturedFlows[0]!;
+    const blocks = flow['blocks'] as Array<Record<string, unknown>>;
+    const links = flow['links'] as Array<Record<string, unknown>>;
+    expect(blocks.find((b) => b['block_definition_id'] === 'builtin.audioenc')).toBeUndefined();
+    const recId = result.recorderBlockId!;
+    expect(links.find((l) => l['to'] === `${recId}:video_in_0`)).toBeDefined();
+    expect(links.find((l) => l['to'] === `${recId}:audio_in_0`)).toBeUndefined();
+    expect(result.warnings).toEqual([
+      expect.objectContaining({ type: 'recording-no-audio', message: expect.stringContaining('0.6.9') }),
+    ]);
+  });
+
+  it('keeps the audio encoder when the block list cannot be read', async () => {
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    const strom = makeStromClient();
+    strom.blocks.list.mockRejectedValue(new Error('Strom API error 503'));
+    const production = makeProduction([{ sourceId: '__test1__', mixerInput: 'video_in_1' }]);
+
+    const result = await activateStromFlow(
+      production as never,
+      strom as never,
+      'http://localhost:7000',
+      [recordingOutput] as never,
+    );
+
+    const blocks = strom.capturedFlows[0]!['blocks'] as Array<Record<string, unknown>>;
+    expect(blocks.find((b) => b['block_definition_id'] === 'builtin.audioenc')).toBeDefined();
+    expect(result.warnings).toEqual([]);
   });
 
   it('wires at most one recorder block even if two recording outputs are assigned', async () => {
@@ -132,6 +187,7 @@ describe('flow-generator — recorder wiring (#41)', () => {
     const blocks = flow['blocks'] as Array<Record<string, unknown>>;
     expect(blocks.find((b) => b['block_definition_id'] === 'builtin.recorder')).toBeUndefined();
     expect(result.recorderBlockId).toBeUndefined();
+    expect(strom.blocks.list).not.toHaveBeenCalled();
   });
 });
 
