@@ -117,6 +117,7 @@ function seedActiveProduction(id = 'prod-1'): ProductionDoc {
     status: 'active',
     stromFlowId: 'flow-1',
     mixerBlockId: 'b-mixer',
+    audioMixerBlockId: 'b-audio-mixer',
     mixerInputMap: { video_in_14: 0, video_in_15: 1 },
     sources: [
       { sourceId: 'Whip', mixerInput: 'video_in_14', returnFeed: { synced: 'program-minus', lowLatency: false } },
@@ -184,11 +185,19 @@ async function mkInvite(mixerInput: string, label?: string, prodId = 'prod-1') {
   return res.json() as { id: string; token: string };
 }
 
+// The join route is rate-limited to 10/min per IP (keyed on req.ip). The suite
+// makes more than 10 join calls in the same minute, so each call is injected from
+// its own synthetic remote address to give it an independent bucket — the tests
+// exercise behaviour, not the rate limiter (which has its own coverage).
+let joinIpCounter = 0;
 function join(invite: { id: string; token: string }) {
+  joinIpCounter += 1;
+  const remoteAddress = `10.0.${Math.floor(joinIpCounter / 256)}.${joinIpCounter % 256}`;
   return app.inject({
     method: 'POST',
     url: `/api/v1/guests/${invite.id}/join`,
     headers: { authorization: `Bearer ${invite.token}` },
+    remoteAddress,
   });
 }
 
@@ -325,6 +334,274 @@ describe('guest slot live multiview label (#466)', () => {
   it('does not PATCH a label when the production has no live flow (set at flow build instead)', async () => {
     // Inactive production: no stromFlowId / mixerBlockId, so there is nothing
     // live to label — the Guest N label is written at the next flow build.
+    const doc = seedActiveProduction();
+    productionsStore.set('prod-1', {
+      ...doc,
+      status: 'inactive',
+      stromFlowId: undefined,
+      mixerBlockId: undefined,
+    } as unknown as ProductionDoc);
+    const captured: PatchCall[] = [];
+    stubStromFetch(captured);
+    try {
+      const invite = await mkInvite('video_in_15', 'Anna, Helsinki');
+      expect((await join(invite)).statusCode).toBe(200);
+      expect(captured.length).toBe(0);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe('guest slot audio strip label reset on teardown (#494)', () => {
+  // The audio mixer numbers channels ascending by pad (loadAudioChannels, #487):
+  // video_in_14 → ch1, video_in_15 → ch2. The guest tile numbers DESCENDING, so
+  // video_in_15 is Guest 1 — its audio strip is ch2_label, and the reset must put
+  // "Guest 1" (the same text as the tile) back onto ch2_label of the audio block.
+  function chLabelOf(captured: PatchCall[], ch: number): unknown {
+    const patch = captured.find(
+      (c) => c.blockId === 'b-audio-mixer' && `ch${ch}_label` in c.properties,
+    );
+    return patch?.properties[`ch${ch}_label`];
+  }
+
+  it('resets the audio strip to "Guest N" when the guest leaves', async () => {
+    seedActiveProduction();
+    const captured: PatchCall[] = [];
+    stubStromFetch(captured);
+    try {
+      const invite = await mkInvite('video_in_15', 'Anna, Helsinki');
+      expect((await join(invite)).statusCode).toBe(200);
+      captured.length = 0; // ignore the join-time patches
+
+      const leave = await app.inject({
+        method: 'DELETE',
+        url: `/api/v1/guests/${invite.id}/session`,
+        headers: { authorization: `Bearer ${invite.token}` },
+      });
+      expect(leave.statusCode).toBe(204);
+      // video_in_15 is Guest 1, wired to audio channel 1 (ch2_label).
+      expect(chLabelOf(captured, 2)).toBe('Guest 1');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('resets the audio strip to "Guest N" when the operator kicks the guest', async () => {
+    seedActiveProduction();
+    const captured: PatchCall[] = [];
+    stubStromFetch(captured);
+    try {
+      const invite = await mkInvite('video_in_15', 'Anna, Helsinki');
+      const guestId = (await join(invite).then((r) => r.json())).guestId as string;
+      captured.length = 0;
+
+      const kick = await app.inject({
+        method: 'DELETE',
+        url: `/api/v1/productions/prod-1/guests/${guestId}`,
+        headers: AUTH,
+      });
+      expect(kick.statusCode).toBe(204);
+      expect(chLabelOf(captured, 2)).toBe('Guest 1');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('resets the audio strip to "Guest N" when the invite is revoked', async () => {
+    seedActiveProduction();
+    const captured: PatchCall[] = [];
+    stubStromFetch(captured);
+    try {
+      const invite = await mkInvite('video_in_15', 'Anna, Helsinki');
+      expect((await join(invite)).statusCode).toBe(200);
+      captured.length = 0;
+
+      const revoke = await app.inject({
+        method: 'DELETE',
+        url: `/api/v1/productions/prod-1/guests/invites/${invite.id}`,
+        headers: AUTH,
+      });
+      expect(revoke.statusCode).toBe(204);
+      expect(chLabelOf(captured, 2)).toBe('Guest 1');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('does not fail the leave when an older Strom rejects the live ch label property', async () => {
+    seedActiveProduction();
+    const captured: PatchCall[] = [];
+    // Strom answers 200 but lists ch2_label under `rejected` (unknown property on
+    // a Strom without the live channel label) → the client throws, which the
+    // audio-strip helper must swallow so the leave still succeeds.
+    stubStromFetch(captured, { ch2_label: 'unknown property: ch2_label' });
+    const warnSpy = vi.spyOn(app.log, 'warn');
+    try {
+      const invite = await mkInvite('video_in_15', 'Anna, Helsinki');
+      expect((await join(invite)).statusCode).toBe(200);
+      captured.length = 0;
+
+      const leave = await app.inject({
+        method: 'DELETE',
+        url: `/api/v1/guests/${invite.id}/session`,
+        headers: { authorization: `Bearer ${invite.token}` },
+      });
+      // The leave is unaffected by the rejected cosmetic audio-strip label.
+      expect(leave.statusCode).toBe(204);
+      expect(
+        captured.some((c) => c.blockId === 'b-audio-mixer' && 'ch2_label' in c.properties),
+      ).toBe(true);
+      expect(
+        warnSpy.mock.calls.some(
+          (c) => typeof c[1] === 'string' && (c[1] as string).includes('guest slot audio strip label'),
+        ),
+      ).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('does not PATCH the audio strip when the production has no live flow', async () => {
+    const doc = seedActiveProduction();
+    productionsStore.set('prod-1', {
+      ...doc,
+      status: 'inactive',
+      stromFlowId: undefined,
+      mixerBlockId: undefined,
+      audioMixerBlockId: undefined,
+    } as unknown as ProductionDoc);
+    const captured: PatchCall[] = [];
+    stubStromFetch(captured);
+    try {
+      const invite = await mkInvite('video_in_15', 'Anna, Helsinki');
+      expect((await join(invite)).statusCode).toBe(200);
+      expect(captured.length).toBe(0);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe('guest slot picture black-out on teardown (#493)', () => {
+  function alphaOf(captured: PatchCall[], pad: number): unknown {
+    const patch = captured.find((c) => `input_${pad}_alpha` in c.properties);
+    return patch?.properties[`input_${pad}_alpha`];
+  }
+
+  it('restores the slot picture to opaque (alpha 1) when a guest joins a live flow', async () => {
+    seedActiveProduction();
+    const captured: PatchCall[] = [];
+    stubStromFetch(captured);
+    try {
+      // video_in_15 is Guest 1, wired to compact pad 1.
+      const invite = await mkInvite('video_in_15', 'Anna, Helsinki');
+      expect((await join(invite)).statusCode).toBe(200);
+      expect(alphaOf(captured, 1)).toBe(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('blacks the slot (alpha 0) when the guest leaves', async () => {
+    seedActiveProduction();
+    const captured: PatchCall[] = [];
+    stubStromFetch(captured);
+    try {
+      const invite = await mkInvite('video_in_15', 'Anna, Helsinki');
+      expect((await join(invite)).statusCode).toBe(200);
+      captured.length = 0; // ignore the join-time restore
+
+      const leave = await app.inject({
+        method: 'DELETE',
+        url: `/api/v1/guests/${invite.id}/session`,
+        headers: { authorization: `Bearer ${invite.token}` },
+      });
+      expect(leave.statusCode).toBe(204);
+      expect(alphaOf(captured, 1)).toBe(0);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('blacks the slot (alpha 0) when the operator kicks the guest', async () => {
+    seedActiveProduction();
+    const captured: PatchCall[] = [];
+    stubStromFetch(captured);
+    try {
+      const invite = await mkInvite('video_in_15', 'Anna, Helsinki');
+      const guestId = (await join(invite).then((r) => r.json())).guestId as string;
+      captured.length = 0;
+
+      const kick = await app.inject({
+        method: 'DELETE',
+        url: `/api/v1/productions/prod-1/guests/${guestId}`,
+        headers: AUTH,
+      });
+      expect(kick.statusCode).toBe(204);
+      expect(alphaOf(captured, 1)).toBe(0);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('blacks the slot (alpha 0) when the invite is revoked', async () => {
+    seedActiveProduction();
+    const captured: PatchCall[] = [];
+    stubStromFetch(captured);
+    try {
+      const invite = await mkInvite('video_in_15', 'Anna, Helsinki');
+      expect((await join(invite)).statusCode).toBe(200);
+      captured.length = 0;
+
+      const revoke = await app.inject({
+        method: 'DELETE',
+        url: `/api/v1/productions/prod-1/guests/invites/${invite.id}`,
+        headers: AUTH,
+      });
+      expect(revoke.statusCode).toBe(204);
+      expect(alphaOf(captured, 1)).toBe(0);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('does not fail the leave when an older Strom rejects the live alpha property', async () => {
+    seedActiveProduction();
+    const captured: PatchCall[] = [];
+    // Strom answers 200 but lists input_1_alpha under `rejected` (unknown
+    // property on a Strom without the live per-input alpha) → the client throws,
+    // which clearGuestSlotPicture must swallow so the leave still succeeds.
+    stubStromFetch(captured, { input_1_alpha: 'unknown property: input_1_alpha' });
+    const warnSpy = vi.spyOn(app.log, 'warn');
+    try {
+      const invite = await mkInvite('video_in_15', 'Anna, Helsinki');
+      expect((await join(invite)).statusCode).toBe(200);
+      captured.length = 0;
+
+      const leave = await app.inject({
+        method: 'DELETE',
+        url: `/api/v1/guests/${invite.id}/session`,
+        headers: { authorization: `Bearer ${invite.token}` },
+      });
+      // The leave is unaffected by the rejected cosmetic picture clear.
+      expect(leave.statusCode).toBe(204);
+      expect(captured.some((c) => 'input_1_alpha' in c.properties)).toBe(true);
+      expect(
+        warnSpy.mock.calls.some(
+          (c) => typeof c[1] === 'string' && (c[1] as string).includes('guest slot picture'),
+        ),
+      ).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('does not PATCH alpha when the production has no live flow', async () => {
+    // Inactive production: no stromFlowId / mixerBlockId, so there is no live
+    // vision mixer to black — the flow is (re)built fresh when it next activates.
     const doc = seedActiveProduction();
     productionsStore.set('prod-1', {
       ...doc,
