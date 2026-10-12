@@ -1,5 +1,5 @@
 /**
- * Live multiview tile labelling for guest slots (issue #466).
+ * Live vision-mixer control for guest slots (issues #466, #493).
  *
  * A guest slot's vision-mixer tile is labelled `Guest N` at flow-build time
  * (issues #458/#460, `flow-generator.ts`) because the invite name is only known
@@ -8,6 +8,16 @@
  * `PATCH /api/flows/{flow_id}/blocks/{block_id}/properties`, so once a guest
  * joins we can push their invite name onto the tile with no flow restart, and
  * reset it to `Guest N` when they leave / the invite is revoked.
+ *
+ * The same live-property channel also drives the slot's PICTURE (issue #493).
+ * When a guest's WHIP publisher drops on leave/kick/revoke, the whip_input block
+ * keeps its last decoded frame, so the vision mixer carries on compositing the
+ * guest's frozen last frame onto PGM and the multiview. The vision mixer exposes
+ * a live per-input alpha (`input_{N}_alpha`, 0.0–1.0 — strom-block-config.md), so
+ * at teardown we push that input's alpha to 0 (black the slot) and restore it to
+ * 1 when a new guest takes the slot. Same best-effort contract as the label: a
+ * Strom that does not know the property rejects it and the slot simply keeps its
+ * frame — the leave/kick/revoke/join is never failed.
  *
  * Numbering MUST match the controller and the flow generator exactly: guest
  * slots (source assignments carrying a `returnFeed`) numbered by trailing pad
@@ -67,12 +77,48 @@ export function guestSlotDefaultLabel(
 }
 
 /**
+ * Shared best-effort PATCH of one of a guest slot's live vision-mixer input
+ * properties (label, alpha, …). Resolves the live flow/mixer block and the
+ * COMPACT Strom pad (issue #463) for the stored `mixerInput`, lets `build`
+ * produce the `properties` map keyed by that pad, and writes it. Never throws:
+ *   - no-op when the production has no live flow / mixer block (not activated —
+ *     the build-time flow generator covers that case);
+ *   - no-op when the mixer input does not resolve to a Strom pad;
+ *   - no-op when `build` returns null (nothing meaningful to write);
+ *   - any rejected property (older Strom unaware of the live property) or
+ *     transport error is logged at `warn` with `logMessage` and swallowed so the
+ *     caller's join/leave/kick/revoke is never failed.
+ */
+async function patchGuestSlotMixerInput(
+  production: ProductionDoc,
+  mixerInput: string,
+  build: (pad: number) => Record<string, unknown> | null,
+  log: FastifyBaseLogger,
+  logMessage: string,
+): Promise<void> {
+  const flowId = production.stromFlowId;
+  const blockId = production.mixerBlockId;
+  if (!flowId || !blockId) return;
+
+  const pad = mixerInputToStromPad(mixerInput, production.mixerInputMap);
+  if (pad === null) return;
+
+  const properties = build(pad);
+  if (!properties) return;
+
+  try {
+    const token = await getStromToken(config.stromToken);
+    const strom = new StromClient({ baseUrl: config.stromUrl, token });
+    await strom.flows.updateBlockProperties(flowId, blockId, { properties });
+  } catch (err) {
+    log.warn({ err, flowId, blockId, properties, mixerInput }, logMessage);
+  }
+}
+
+/**
  * Best-effort live update of a guest slot's multiview tile label on the vision
- * mixer. No-op (never throws) when:
- *   - the production has no live flow / mixer block (not activated — the label
- *     is then set at the next flow build);
- *   - the mixer input does not resolve to a Strom pad;
- *   - `label` is empty/null (nothing meaningful to show).
+ * mixer. No-op (never throws) when the production has no live flow / mixer block,
+ * the mixer input does not resolve to a Strom pad, or `label` is empty/null.
  *
  * On a Strom that rejects the (older-Strom-unknown) `input_{N}_label` live
  * property, or on any transport error, the failure is logged at `warn` and
@@ -84,33 +130,60 @@ export async function applyGuestSlotMixerLabel(
   label: string | null | undefined,
   log: FastifyBaseLogger,
 ): Promise<void> {
-  const flowId = production.stromFlowId;
-  const blockId = production.mixerBlockId;
-  // Nothing live to label — the build-time label (flow-generator) covers the
-  // not-yet-active case.
-  if (!flowId || !blockId) return;
-
   const text = label?.trim();
-  if (!text) return;
-
-  const pad = mixerInputToStromPad(mixerInput, production.mixerInputMap);
-  if (pad === null) return;
-
-  const property = `input_${pad}_label`;
-  try {
-    const token = await getStromToken(config.stromToken);
-    const strom = new StromClient({ baseUrl: config.stromUrl, token });
-    await strom.flows.updateBlockProperties(flowId, blockId, {
-      properties: { [property]: text },
-    });
-  } catch (err) {
+  await patchGuestSlotMixerInput(
+    production,
+    mixerInput,
+    (pad) => (text ? { [`input_${pad}_label`]: text } : null),
+    log,
     // Older Strom (pre strom#1014/PR#1014) does not know the live
     // `input_{N}_label` property and rejects it (StromPropertiesRejectedError),
     // or Strom is briefly unreachable. Either way the tile keeps its `Guest N`
     // build-time label — do NOT fail the guest join/leave over a cosmetic label.
-    log.warn(
-      { err, flowId, blockId, property, mixerInput },
-      'guest slot label — Strom rejected the live input label; tile keeps its build-time label',
-    );
-  }
+    'guest slot label — Strom rejected the live input label; tile keeps its build-time label',
+  );
+}
+
+/**
+ * Best-effort black-out of a released guest slot's picture (issue #493). A WHIP
+ * publisher that drops leaves the whip_input block holding its last decoded
+ * frame, which the vision mixer keeps compositing onto PGM and the multiview, so
+ * on leave/kick/revoke we set the slot input's live alpha to 0 — the frozen frame
+ * goes black instead of staying on air. No-op / never throws under the same
+ * conditions as the label write; a Strom that does not know `input_{N}_alpha`
+ * rejects it and the slot simply keeps its frame — the teardown is never failed.
+ */
+export async function clearGuestSlotPicture(
+  production: ProductionDoc,
+  mixerInput: string,
+  log: FastifyBaseLogger,
+): Promise<void> {
+  await patchGuestSlotMixerInput(
+    production,
+    mixerInput,
+    (pad) => ({ [`input_${pad}_alpha`]: 0 }),
+    log,
+    'guest slot picture — Strom rejected the live input alpha; the slot may keep its last frame',
+  );
+}
+
+/**
+ * Best-effort restore of a guest slot's picture to fully opaque (issue #493) when
+ * a new guest takes the slot. `clearGuestSlotPicture` leaves the slot input's
+ * alpha at 0 after the previous guest left, so without this a rejoining / next
+ * guest on the same live flow would be invisible. No-op / never throws under the
+ * same conditions as the label write.
+ */
+export async function restoreGuestSlotPicture(
+  production: ProductionDoc,
+  mixerInput: string,
+  log: FastifyBaseLogger,
+): Promise<void> {
+  await patchGuestSlotMixerInput(
+    production,
+    mixerInput,
+    (pad) => ({ [`input_${pad}_alpha`]: 1 }),
+    log,
+    'guest slot picture — Strom rejected the live input alpha; the slot may start black',
+  );
 }

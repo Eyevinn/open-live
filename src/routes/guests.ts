@@ -25,7 +25,12 @@ import { applyReturnMode } from '../ws/controller.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { assertSameStromOrigin } from '../lib/url-validation.js';
 import { slotTakesWhip } from '../lib/guest-scope.js';
-import { applyGuestSlotMixerLabel, guestSlotDefaultLabel } from '../lib/guest-slot-label.js';
+import {
+  applyGuestSlotMixerLabel,
+  guestSlotDefaultLabel,
+  clearGuestSlotPicture,
+  restoreGuestSlotPicture,
+} from '../lib/guest-slot-label.js';
 import {
   isIntercomEnabled,
   provisionGuestLine,
@@ -243,15 +248,17 @@ async function teardownGuestWhip(
 }
 
 /**
- * Reset a guest slot's multiview tile back to its `Guest N` label (issue #466)
- * — used when a guest leaves, is kicked, or their invite is revoked. Loads the
- * production fresh (the live flow/mixer ids and the `mixerInputMap` live there)
- * and pushes the label to Strom best-effort. Never throws: a failure must not
- * block the leave/kick/revoke that frees the slot (same contract as
- * `teardownGuestWhip`). No-op when the production is gone or the slot is not a
- * declared guest slot.
+ * Reset a guest slot on teardown — used when a guest leaves, is kicked, or their
+ * invite is revoked. Loads the production fresh (the live flow/mixer ids and the
+ * `mixerInputMap` live there) and best-effort:
+ *   - resets the multiview tile back to its `Guest N` label (issue #466);
+ *   - blacks the slot's picture so the dropped guest's last decoded frame no
+ *     longer stays frozen on PGM / the multiview (issue #493).
+ * Never throws: a failure must not block the leave/kick/revoke that frees the
+ * slot (same contract as `teardownGuestWhip`). No-op when the production is gone
+ * or the slot is not a declared guest slot.
  */
-async function resetGuestSlotLabel(
+async function resetGuestSlot(
   productionId: string,
   mixerInput: string | undefined,
   log: FastifyBaseLogger,
@@ -269,6 +276,7 @@ async function resetGuestSlotLabel(
     guestSlotDefaultLabel(production, mixerInput),
     log,
   );
+  await clearGuestSlotPicture(production, mixerInput, log);
 }
 
 const guestsRoutes: FastifyPluginAsync = async (fastify) => {
@@ -404,10 +412,11 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         fastify.log.warn({ err }, 'DELETE guests/invites — DB delete failed');
         return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
       }
-      // Reset the slot's multiview tile back to `Guest N` (issue #466): a revoked
-      // invite's guest should no longer be named on air. Best-effort — the invite
-      // is already revoked and the DELETE must not fail over a cosmetic label.
-      await resetGuestSlotLabel(doc.productionId, doc.mixerInput, fastify.log);
+      // Reset the slot's multiview tile back to `Guest N` (issue #466) and black
+      // its picture (issue #493): a revoked invite's guest should no longer be
+      // named on air, nor leave a frozen last frame. Best-effort — the invite is
+      // already revoked and the DELETE must not fail over a cosmetic label/picture.
+      await resetGuestSlot(doc.productionId, doc.mixerInput, fastify.log);
       return reply.status(204).send();
     },
   );
@@ -665,6 +674,11 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         invite.label ?? guestSlotDefaultLabel(production, mixerInput),
         fastify.log,
       );
+      // Restore the slot's picture to fully opaque (issue #493): a previous guest
+      // leaving this slot blacked it (input alpha 0), so without this a rejoining
+      // or next guest on the same live flow would stay invisible. Best-effort —
+      // never fails the join; a Strom without the live alpha property just no-ops.
+      await restoreGuestSlotPicture(production, mixerInput, fastify.log);
 
       // 6. Build the response. whipUrl and the return-picture feed URL point at
       //    the guest-scoped aliases under `/api/v1/guests/:inviteId/...` (issue
@@ -747,9 +761,10 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
           // not the endpoint). teardownGuestWhip never throws, so it needs no
           // guard of its own.
           await teardownGuestWhip(leftSession, fastify.log);
-          // Reset the multiview tile back to `Guest N` now the guest is gone
-          // (issue #466). Best-effort — never fails the leave.
-          await resetGuestSlotLabel(leftSession.productionId, leftSession.mixerInput, fastify.log);
+          // Reset the multiview tile back to `Guest N` (issue #466) and black the
+          // slot's picture so the guest's last frame no longer stays frozen on
+          // PGM / the multiview (issue #493). Best-effort — never fails the leave.
+          await resetGuestSlot(leftSession.productionId, leftSession.mixerInput, fastify.log);
         }
       } catch (err) {
         fastify.log.warn({ err }, 'DELETE guests/:id/session — DB write failed');
@@ -877,9 +892,10 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
       // #467). teardownGuestWhip never throws. `session` carries the stored
       // whipSessionUrl (leftSession is just the same doc marked `left`).
       await teardownGuestWhip(session, fastify.log);
-      // Reset the multiview tile back to `Guest N` now the guest is gone (issue
-      // #466). Best-effort — never fails the kick.
-      await resetGuestSlotLabel(session.productionId, session.mixerInput, fastify.log);
+      // Reset the multiview tile back to `Guest N` (issue #466) and black the
+      // slot's picture so the kicked guest's last frame no longer stays frozen on
+      // PGM / the multiview (issue #493). Best-effort — never fails the kick.
+      await resetGuestSlot(session.productionId, session.mixerInput, fastify.log);
 
       return reply.status(204).send();
     },

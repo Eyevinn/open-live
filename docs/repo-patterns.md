@@ -309,3 +309,29 @@ Any new server-side WHIP teardown must target the stored session resource, re-ch
 lingering session. `whipSessionUrl` is internal: it is destructured out of `sessionToApi` so it
 never reaches operator clients, and it is absent on return-only slots / before the first publish
 (teardown no-ops then) and stale after a reconnect until the next offer overwrites it.
+
+## Ending a guest's WHIP session does NOT clear the slot picture — black it, and restore it on join
+
+Tearing down a guest's WHIP session (previous section, #467) stops the *publisher*, but the
+`whip_input` block holds its **last decoded frame**, so the vision mixer keeps compositing the
+dropped guest's frozen frame onto PGM and the multiview (#493). There is no `whip_input` "go
+black" property (the block exposes only `endpoint_id`), so the clear is done one level down, on
+the vision mixer: `input_{N}_alpha` is a LIVE per-input property (0.0–1.0, strom-block-config.md)
+set via the same `updateBlockProperties` channel as the live `input_{N}_label` (#466). On
+leave/kick/revoke `clearGuestSlotPicture` (`src/lib/guest-slot-label.ts`) pushes that slot input's
+alpha to **0** (best-effort, never throws — same contract as the label reset; an older Strom that
+rejects the property just keeps the frame). The alpha targets the **COMPACT** pad
+(`mixerInputToStromPad`, #463), exactly like the label.
+
+Non-obvious invariant: alpha 0 is sticky on a live flow, so the **join path must restore it to 1**
+(`restoreGuestSlotPicture`) — otherwise the next guest (or a rejoin) on the same slot of the same
+live flow is composited at alpha 0 and stays **invisible**. The two live writes are coupled at the
+route helper `resetGuestSlot` (label reset + picture black on teardown) and in the join handler
+(label set + picture restore); keep both halves together when adding a new teardown/join path.
+Numeric *block* properties go out as plain JSON (`input_N_alpha: 0` serialises to `0`), which Strom
+accepts — the float-coercion `"value":N→N.0` hack in `StromClient.request()` only rewrites the
+`value` key of element/pad writes, not the `properties` map (the existing `ch{N}_fader = 1.0`
+block-property writes rely on the same). Known gap: this blacks the composited/PGM output for
+certain; whether Strom also dims the raw multiview tile for a 0-alpha input is a Strom-internal
+detail not verifiable from this repo — if a frozen *multiview* tile persists, that is a Strom-side
+follow-up, not a backend bug.
