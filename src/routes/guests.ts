@@ -669,12 +669,11 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
       //     slot's tile (falling back to `Guest N` when the invite has no label).
       //     Best-effort: on an older Strom the property is rejected and the tile
       //     keeps `Guest N` — the join has already succeeded and must not fail.
-      await applyGuestSlotMixerLabel(
-        production,
-        mixerInput,
-        invite.label ?? guestSlotDefaultLabel(production, mixerInput),
-        fastify.log,
-      );
+      const joinedLabel = invite.label ?? guestSlotDefaultLabel(production, mixerInput);
+      await applyGuestSlotMixerLabel(production, mixerInput, joinedLabel, fastify.log);
+      // Same name on the slot's audio strip (issue #497); reset to `Guest N` on
+      // leave/kick/revoke. Best-effort like the tile label above.
+      await applyGuestSlotAudioStripLabel(production, mixerInput, joinedLabel, fastify.log);
       // Restore the slot's picture to fully opaque (issue #493): a previous guest
       // leaving this slot blacked it (input alpha 0), so without this a rejoining
       // or next guest on the same live flow would stay invisible. Best-effort —
