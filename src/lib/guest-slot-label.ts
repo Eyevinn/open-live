@@ -39,6 +39,7 @@ import { config } from '../config.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { StromClient } from './strom.js';
 import { mixerInputToStromPad } from './mixer-input-map.js';
+import { loadAudioChannels } from './audio-channels.js';
 import type { ProductionDoc } from '../db/types.js';
 
 /** Trailing pad index of a `video_in_N` mixer-input name (0 when absent). */
@@ -142,6 +143,69 @@ export async function applyGuestSlotMixerLabel(
     // build-time label — do NOT fail the guest join/leave over a cosmetic label.
     'guest slot label — Strom rejected the live input label; tile keeps its build-time label',
   );
+}
+
+/**
+ * Best-effort live update of a guest slot's AUDIO mixer strip label — the
+ * `ch{N}_label` property on the audio `builtin.mixer` block (issues #464, #494).
+ *
+ * The flow generator writes the audio strip the SAME `Guest N` text as the
+ * multiview tile at build time, so the picture and the audio desk agree. The
+ * tile label is a live property (#466) and is reset to `Guest N` on
+ * leave/kick/revoke, but the audio strip was left untouched, so after a guest
+ * left the strip kept the departed guest's name and no longer matched the tile
+ * (issue #494). This resets (or updates) the strip to the supplied text so the
+ * two stay in sync.
+ *
+ * Addressing differs from the video tile: the audio channel is numbered by the
+ * audio mixer's own ordering (`loadAudioChannels`, ascending by pad — issue
+ * #487), NOT the compact video pad, and the property lives on
+ * `audioMixerBlockId`, not the video mixer block. Never throws, under the same
+ * contract as `applyGuestSlotMixerLabel`:
+ *   - no-op when the production has no live flow / audio mixer block;
+ *   - no-op when `label` is empty/null, or the mixer input does not resolve to
+ *     an audio channel on this production;
+ *   - any rejected property (older Strom unaware of the live `ch{N}_label`
+ *     property), transport error, or sources-DB lookup failure is logged at
+ *     `warn` and swallowed so the caller's join/leave/kick/revoke is never
+ *     failed.
+ */
+export async function applyGuestSlotAudioStripLabel(
+  production: ProductionDoc,
+  mixerInput: string,
+  label: string | null | undefined,
+  log: FastifyBaseLogger,
+): Promise<void> {
+  const text = label?.trim();
+  if (!text) return;
+
+  const flowId = production.stromFlowId;
+  const audioBlockId = production.audioMixerBlockId;
+  if (!flowId || !audioBlockId) return;
+
+  try {
+    // The audio strip index comes from the audio mixer's own channel ordering
+    // (ascending by pad), which differs from the guest tile number — resolve it
+    // from the SAME source-assignment ordering the flow generator wired.
+    const channels = await loadAudioChannels(production.sources ?? []);
+    const match = channels.find((c) => c.assignment.mixerInput === mixerInput);
+    if (match === undefined) return;
+
+    const token = await getStromToken(config.stromToken);
+    const strom = new StromClient({ baseUrl: config.stromUrl, token });
+    await strom.flows.updateBlockProperties(flowId, audioBlockId, {
+      properties: { [`ch${match.channel + 1}_label`]: text },
+    });
+  } catch (err) {
+    log.warn(
+      { err, flowId, audioBlockId, mixerInput },
+      // Older Strom does not know the live `ch{N}_label` property and rejects it
+      // (StromPropertiesRejectedError), Strom is briefly unreachable, or the
+      // sources DB is down — either way the strip keeps its current name. Do NOT
+      // fail the guest join/leave over a cosmetic audio-strip label.
+      'guest slot audio strip label — Strom rejected the live channel label (or channel lookup failed); the strip keeps its current name',
+    );
+  }
 }
 
 /**
