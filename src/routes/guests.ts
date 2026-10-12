@@ -27,6 +27,7 @@ import { assertSameStromOrigin } from '../lib/url-validation.js';
 import { slotTakesWhip } from '../lib/guest-scope.js';
 import {
   applyGuestSlotMixerLabel,
+  applyGuestSlotAudioStripLabel,
   guestSlotDefaultLabel,
   clearGuestSlotPicture,
   restoreGuestSlotPicture,
@@ -252,6 +253,9 @@ async function teardownGuestWhip(
  * invite is revoked. Loads the production fresh (the live flow/mixer ids and the
  * `mixerInputMap` live there) and best-effort:
  *   - resets the multiview tile back to its `Guest N` label (issue #466);
+ *   - resets the audio mixer strip name back to the same `Guest N` label so the
+ *     audio desk no longer carries the departed guest's stale name and matches
+ *     the tile again (issue #494);
  *   - blacks the slot's picture so the dropped guest's last decoded frame no
  *     longer stays frozen on PGM / the multiview (issue #493).
  * Never throws: a failure must not block the leave/kick/revoke that frees the
@@ -270,12 +274,9 @@ async function resetGuestSlot(
   } catch {
     return;
   }
-  await applyGuestSlotMixerLabel(
-    production,
-    mixerInput,
-    guestSlotDefaultLabel(production, mixerInput),
-    log,
-  );
+  const defaultLabel = guestSlotDefaultLabel(production, mixerInput);
+  await applyGuestSlotMixerLabel(production, mixerInput, defaultLabel, log);
+  await applyGuestSlotAudioStripLabel(production, mixerInput, defaultLabel, log);
   await clearGuestSlotPicture(production, mixerInput, log);
 }
 
