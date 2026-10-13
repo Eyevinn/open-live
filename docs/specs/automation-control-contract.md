@@ -228,6 +228,7 @@ No new env vars required for the contract itself; reuses `API_KEY` (`src/config.
    spec question.
 5. **ACK scope:** two-phase ACK on all commands, or only on the switching/clip commands where
    automations most need execution confirmation (to bound event volume)?
+   *Closed for clip commands:* `CLIP_*` with a `cmdId` now get `accepted` then `executed` / NACK (#499).
 6. **Seq durability:** is a restart-resetting `seq` acceptable (relying on the snapshot for
    resync), or must `seq` survive restarts?
 
