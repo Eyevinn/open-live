@@ -197,6 +197,10 @@ function send(msg: Record<string, unknown>) {
 function clipStates() {
   return broadcasts.filter((m) => m.type === 'CLIP_STATE');
 }
+function sentFrames() {
+  return (ws.send as unknown as ReturnType<typeof vi.fn>).mock.calls
+    .map((c: unknown[]) => JSON.parse(c[0] as string) as Record<string, unknown>);
+}
 function errorFrames() {
   return (ws.send as unknown as ReturnType<typeof vi.fn>).mock.calls
     .map((c: unknown[]) => JSON.parse(c[0] as string) as Record<string, unknown>)
@@ -302,6 +306,60 @@ describe('CLIP_CUE / PLAY / PAUSE / STOP transitions', () => {
     await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
     expect(errorFrames().length).toBeGreaterThan(0);
     expect(playerReqs('playlist')).toHaveLength(0);
+  });
+});
+
+describe('CLIP_* ACK / NACK with cmdId (issue #499)', () => {
+  function ackFrames(cmdId: string) {
+    return sentFrames().filter((m) => (m.type === 'ACK' || m.type === 'NACK') && m.cmdId === cmdId);
+  }
+
+  it('cue, play, pause, seek, stop each yield accepted then executed in order', async () => {
+    const steps: Array<[Record<string, unknown>, Record<string, unknown>]> = [
+      [{ type: 'CLIP_CUE', mixerInput: 'video_in_0' }, { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 }],
+      [{ type: 'CLIP_PLAY', mixerInput: 'video_in_0' }, { state: 'playing', position_ns: 20_000_000, duration_ns: 12_000_000_000 }],
+      [{ type: 'CLIP_PAUSE', mixerInput: 'video_in_0' }, { state: 'paused', position_ns: 500_000_000, duration_ns: 12_000_000_000 }],
+      [{ type: 'CLIP_SEEK', mixerInput: 'video_in_0', positionMs: 5000 }, { state: 'paused', position_ns: 5_000_000_000, duration_ns: 12_000_000_000 }],
+      [{ type: 'CLIP_STOP', mixerInput: 'video_in_0' }, { state: 'stopped', position_ns: 0 }],
+    ];
+    let i = 0;
+    for (const [msg, state] of steps) {
+      const cmdId = `clip-${i++}`;
+      playerState = state;
+      await send({ ...msg, cmdId });
+      const frames = ackFrames(cmdId);
+      expect(frames.map((f) => [f.type, f.phase])).toEqual([['ACK', 'accepted'], ['ACK', 'executed']]);
+      expect(frames.every((f) => typeof f.seq === 'number' && typeof f.ts === 'string')).toBe(true);
+    }
+    expect(errorFrames()).toHaveLength(0);
+  });
+
+  it('CLIP_PLAY with nothing cued yields NACK, no executed and no ERROR; CLIP_STATE error still broadcast', async () => {
+    await send({ type: 'CLIP_PLAY', mixerInput: 'video_in_0', cmdId: 'p1' });
+    const frames = ackFrames('p1');
+    expect(frames.map((f) => f.type === 'ACK' ? f.phase : 'NACK')).toEqual(['accepted', 'NACK']);
+    expect(typeof frames[1].error).toBe('string');
+    expect(errorFrames()).toHaveLength(0);
+    expect(clipStates().at(-1)).toMatchObject({ state: 'error' });
+  });
+
+  it('a Strom error on cue yields NACK', async () => {
+    clipUrlStatus = 404; // preflight failure -> cue rejected
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0', cmdId: 'c1' });
+    const frames = ackFrames('c1');
+    expect(frames.map((f) => f.type === 'ACK' ? f.phase : 'NACK')).toEqual(['accepted', 'NACK']);
+    expect(errorFrames()).toHaveLength(0);
+    expect(clipStates().at(-1)).toMatchObject({ state: 'error' });
+  });
+
+  it('without cmdId a failure still sends ERROR and success sends no ACK/NACK', async () => {
+    await send({ type: 'CLIP_PLAY', mixerInput: 'video_in_0' });
+    expect(errorFrames().length).toBe(1);
+    expect(sentFrames().some((m) => m.type === 'ACK' || m.type === 'NACK')).toBe(false);
+    (ws.send as unknown as ReturnType<typeof vi.fn>).mockClear();
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+    expect(sentFrames().some((m) => m.type === 'ACK' || m.type === 'NACK' || m.type === 'ERROR')).toBe(false);
   });
 });
 
