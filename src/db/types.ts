@@ -727,6 +727,35 @@ export interface ProductionDoc {
    * status value. Cleared on next activation.
    */
   endedReason?: EndedReason;
+  /**
+   * Shared-GPU usage accrual (issue #500, `docs/specs/shared-gpu-usage-metering.md`,
+   * ADR-005). Both fields are additive, optional and defaulted-absent — existing
+   * docs read as "never accrued", so there is no migration.
+   *
+   * `activatedAt` is the **recorded start** of the current GPU allocation: the
+   * ISO 8601 UTC time the production's Strom flow reached `playing`. It is set in
+   * the SAME write that sets `status: 'active'` (`routes/productions.ts`) and
+   * cleared on every stop path (deactivate, idle auto-deactivate, activation
+   * failure, reconcile losing the flow). A production found still live after a
+   * restart keeps its `activatedAt`, so accrual resumes from the recorded start,
+   * not from zero.
+   *
+   * These are INTERNAL accrual state: they are projected only via
+   * `/api/v1/usage/gpu` and `/metrics`, and are stripped from the production
+   * GET/list/PATCH responses (`toProductionView`) so they never bloat or confuse
+   * existing clients (repo-patterns.md §"toApi() spreads the whole doc").
+   */
+  activatedAt?: string;
+  /**
+   * Closed, settled GPU-second buckets for this production, keyed by UTC hour
+   * `"YYYY-MM-DDTHH:00:00Z"`. Append-only and immutable once written: the settle
+   * sweep writes a key exactly once, when its hour has fully elapsed (and every
+   * stop path settles the final partial hour). The current partial hour of a
+   * live production is NEVER stored here — it is derived on read from
+   * `activatedAt` — so there are no read-modify-write races on a live counter.
+   * Pruned to `GPU_USAGE_RETENTION_HOURS` on settle. See {@link activatedAt}.
+   */
+  gpuHours?: Record<string, number>;
   createdAt: string;
   updatedAt: string;
 }
