@@ -11,6 +11,7 @@ import { encryptHtmlAuthValue } from '../lib/html-auth-crypto.js';
 import { getPortReservation } from '../services/port-reservation.js';
 import { clashesAfterWrite, listenerPortRequest, resolveListenerAddress, usedListenerPorts } from '../services/listener-ports.js';
 import { getWhipIngestState } from '../services/whip-ingest-state.js';
+import { getAllClipStates } from '../services/clip-state.service.js';
 
 /**
  * Token-header name allowlist for a Design-B auth header (issue #314,
@@ -217,6 +218,26 @@ async function isSourceInActiveProduction(sourceId: string): Promise<string | nu
   return (active.docs[0] as unknown as Pick<ProductionDoc, 'name'>).name;
 }
 
+/**
+ * Name of an active production in which the clip source is currently `playing`
+ * in some slot (per the in-memory clip-state registry, which tracks the loaded
+ * source id as `clipId`), or null. Editing a clip source's address is allowed
+ * while it is merely assigned/cued (takes effect at the next Cue) but not while
+ * it is on air.
+ */
+async function clipSourcePlayingIn(sourceId: string): Promise<string | null> {
+  // A clip may be cued into ANY slot of an active production, not only the one
+  // it is assigned to, so scan every active production's tracked clip states.
+  const active = await getDb().findTrusted({
+    selector: { type: 'production', status: { $in: ['active', 'activating'] } },
+    fields: ['_id', 'name'],
+  });
+  for (const p of active.docs as unknown as Array<Pick<ProductionDoc, '_id' | 'name'>>) {
+    if (getAllClipStates(p._id).some((c) => c.state === 'playing' && c.clipId === sourceId)) return p.name;
+  }
+  return null;
+}
+
 async function gatewayExists(gatewayId: string): Promise<boolean> {
   try {
     await getGatewaysDb().get(gatewayId);
@@ -286,11 +307,18 @@ function maskAuth(auth: HtmlSourceAuth, authHeaderValueEnc: string | undefined):
 
 const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
   // List all sources
-  fastify.get('/api/v1/sources', async (_req, reply) => {
+  fastify.get<{ Querystring: { streamType?: string } }>('/api/v1/sources', async (req, reply) => {
     const db = getSourcesDb();
+    // Optional ?streamType= filter (e.g. `clip` so a UI can list available clips).
+    const streamTypeParsed = z.enum(['srt', 'efp', 'whip', 'html', 'clip']).optional().safeParse(req.query?.streamType);
+    if (!streamTypeParsed.success) {
+      return reply.status(400).send({ error: 'Invalid streamType filter', statusCode: 400 });
+    }
     let result: Awaited<ReturnType<typeof db.find>>;
     try {
-      result = await db.find({ selector: { type: 'source' } });
+      result = await db.find({
+        selector: { type: 'source', ...(streamTypeParsed.data ? { streamType: streamTypeParsed.data } : {}) },
+      });
     } catch (err) {
       fastify.log.warn({ err }, 'GET /api/v1/sources — DB query failed');
       return reply.status(503).send({ error: 'Database unavailable' });
@@ -440,6 +468,15 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
         const activeName = await isSourceInActiveProduction(doc._id);
         if (activeName !== null) {
           return reply.status(409).send({ error: `Source auth cannot be changed while in use by active production "${activeName}"`, statusCode: 409 });
+        }
+      }
+      // A clip source may be re-addressed while assigned/cued in an active
+      // production (the change takes effect at the next Cue), but not while it
+      // is currently playing in a slot.
+      if (doc.streamType === 'clip' && body.address !== undefined) {
+        const playingIn = await clipSourcePlayingIn(doc._id);
+        if (playingIn !== null) {
+          return reply.status(409).send({ error: `Clip source is playing in active production "${playingIn}"; stop it before changing its address`, statusCode: 409 });
         }
       }
       // Encrypt the passphrase in an updated address before persisting. When the

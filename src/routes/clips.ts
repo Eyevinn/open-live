@@ -28,6 +28,8 @@ import {
   stopClip,
   getClipState,
   resolveClipSource,
+  resolveCueSource,
+  assertSlotNotPlaying,
   ClipNotFoundError,
   ClipNotActivatedError,
   ClipNotCuedError,
@@ -82,8 +84,10 @@ const clipsRoutes: FastifyPluginAsync = async (fastify) => {
       const body = CueBody.parse(req.body ?? {});
       const doc = await loadProduction(req.params.id);
       try {
-        const source = await resolveClipSource(doc, mixerInput, loadSource);
+        const source = await resolveCueSource(doc, mixerInput, body.clipId, loadSource);
         const strom = await makeStromClient();
+        // On-air guard: cueing a chosen clip into a playing slot is refused (409).
+        if (body.clipId !== undefined) await assertSlotNotPlaying(strom, doc, mixerInput);
         const state = await cueClip(strom, doc, source, mixerInput, body.clipId);
         setClipStateEntry(doc._id, state);
         // Persist the cue point so it survives deactivate/reactivate and server
