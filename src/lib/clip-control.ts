@@ -162,7 +162,10 @@ export function resolveClipFile(source: SourceDoc): string {
     case 'url':
       return ref.url;
     case 's3': {
-      const target = minioTargetFromConfig();
+      // Presign against the bucket stored on the reference (issue #505); the
+      // endpoint/credentials come from config. Falls back to MINIO_BUCKET only
+      // when the reference carries no bucket.
+      const target = minioTargetFromConfig(ref.bucket);
       if (!target) {
         throw new ClipNotFoundError('Object storage is not configured — cannot resolve s3 clip reference');
       }
@@ -219,7 +222,10 @@ function sleep(ms: number): Promise<void> {
 const PREFLIGHT_MAX_REDIRECTS = 3;
 const PREFLIGHT_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
-async function preflightClipUrl(url: string, timeoutMs: number): Promise<void> {
+async function preflightClipUrl(url: string, timeoutMs: number, objectLabel?: string): Promise<void> {
+  // For s3 references, name the bucket and key in failures (issue #505) so the
+  // operator can tell which object could not be read.
+  const suffix = objectLabel ? ` (${objectLabel})` : '';
   let current = url;
   for (let hop = 0; ; hop++) {
     let res: Response;
@@ -232,7 +238,7 @@ async function preflightClipUrl(url: string, timeoutMs: number): Promise<void> {
       });
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      throw new ClipMediaError(`Clip URL could not be reached: ${reason}`);
+      throw new ClipMediaError(`Clip URL could not be reached: ${reason}${suffix}`);
     }
     // Don't stream the body: a Range-ignoring origin would otherwise start
     // pulling the whole file just to satisfy a reachability check.
@@ -264,7 +270,7 @@ async function preflightClipUrl(url: string, timeoutMs: number): Promise<void> {
     }
 
     if (!res.ok) {
-      throw new ClipMediaError(`Clip URL returned HTTP ${res.status}`);
+      throw new ClipMediaError(`Clip URL returned HTTP ${res.status}${suffix}`);
     }
     return;
   }
@@ -359,7 +365,9 @@ export async function cueClip(
 ): Promise<ClipState> {
   const { flowId, blockId } = resolveClipTarget(doc, mixerInput);
   const file = resolveClipFile(source);
-  await preflightClipUrl(file, config.clipPreflightTimeoutMs);
+  const ref = deserializeClipReference(source.address);
+  const objectLabel = ref.type === 's3' ? `bucket "${ref.bucket || config.minioBucket}", key "${ref.key}"` : undefined;
+  await preflightClipUrl(file, config.clipPreflightTimeoutMs, objectLabel);
   await strom.player.setPlaylist(flowId, blockId, { files: [file] });
   await strom.player.goto(flowId, blockId, { index: 0 });
   // Park at frame 0: Strom's stop = pause + seek 0 (issue #350).
