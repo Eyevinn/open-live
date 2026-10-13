@@ -493,7 +493,46 @@ describe('clip URL preflight — s3 references (issue #351)', () => {
     await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
 
     expect(errorFrames().length).toBeGreaterThan(0);
-    expect(clipStates().at(-1)).toMatchObject({ state: 'error', error: 'Clip URL returned HTTP 404' });
+    expect(clipStates().at(-1)).toMatchObject({ state: 'error', error: 'Clip URL returned HTTP 404 (bucket "clips", key "story/a.mp4")' });
+    expect(playerReqs('playlist')).toHaveLength(0);
+  });
+});
+
+// Issue #505: an s3 clip source's own bucket must be used, not MINIO_BUCKET.
+describe('s3 clip references honour their own bucket (issue #505)', () => {
+  const addr = (bucket: string) => JSON.stringify({ type: 's3', bucket, key: 'story/a.mp4' });
+
+  it('presigns a bucket different from MINIO_BUCKET', async () => {
+    sourceDocs.set('src-clip', makeSourceDoc({ address: addr('other-bucket') }));
+    playerState = { state: 'paused', duration_ns: 9_000_000_000, position_ns: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+
+    expect(errorFrames()).toHaveLength(0);
+    const file = (playerReqs('playlist')[0].body as { files: string[] }).files[0];
+    expect(file).toContain(`https://${S3_HOST}/other-bucket/story/a.mp4?`);
+    expect(file).not.toContain('/clips/');
+    expect(file).toContain('test-access-key%2F');
+    expect(preflightProbes.some((p) => p.url.startsWith(`https://${S3_HOST}/other-bucket/`))).toBe(true);
+  });
+
+  it('still uses MINIO_BUCKET-equal buckets exactly as before', async () => {
+    sourceDocs.set('src-clip', makeSourceDoc({ address: addr('clips') }));
+    playerState = { state: 'paused', duration_ns: 9_000_000_000, position_ns: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+
+    expect(errorFrames()).toHaveLength(0);
+    expect((playerReqs('playlist')[0].body as { files: string[] }).files[0]).toContain(`https://${S3_HOST}/clips/story/a.mp4?`);
+  });
+
+  it('names both bucket and key when the object cannot be read', async () => {
+    sourceDocs.set('src-clip', makeSourceDoc({ address: addr('other-bucket') }));
+    s3Status = 403;
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+
+    expect(clipStates().at(-1)).toMatchObject({
+      state: 'error',
+      error: 'Clip URL returned HTTP 403 (bucket "other-bucket", key "story/a.mp4")',
+    });
     expect(playerReqs('playlist')).toHaveLength(0);
   });
 });
