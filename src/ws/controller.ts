@@ -3223,6 +3223,8 @@ export async function handleMessage(
         }
         setClipStateEntry(productionId, state);
         broadcast(productionId, { type: 'CLIP_STATE', ...state });
+        // Acknowledge only after CLIP_STATE is recorded + broadcast (issue #499).
+        if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
       } catch (err) {
         // Typed clip errors carry a human-readable message; Strom transport
         // errors are surfaced via stromErrorMessage (502/503-style text).
@@ -3241,7 +3243,8 @@ export async function handleMessage(
         const errorState: ClipState = { mixerInput, state: 'error', error: errText };
         setClipStateEntry(productionId, errorState);
         broadcast(productionId, { type: 'CLIP_STATE', ...errorState });
-        ws.send(JSON.stringify({ type: 'ERROR', error: errText }));
+        if (cmdId) sendNack(ws, productionId, cmdId, errText);
+        else ws.send(JSON.stringify({ type: 'ERROR', error: errText }));
       }
       break;
     }
