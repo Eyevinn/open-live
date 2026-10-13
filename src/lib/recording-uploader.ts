@@ -116,13 +116,18 @@ function detectS3AuthError(status: number, body: string): string | null {
 /**
  * Builds a MinioTarget from the service config, or returns null when recording
  * is not fully configured. Callers must treat null as "recording disabled".
+ *
+ * `bucketOverride` (non-empty) replaces the configured MINIO_BUCKET while the
+ * endpoint/credentials still come from config — used by s3 clip references,
+ * which carry their own bucket. With an override, MINIO_BUCKET need not be set.
  */
-export function minioTargetFromConfig(): MinioTarget | null {
+export function minioTargetFromConfig(bucketOverride?: string): MinioTarget | null {
+  const bucket = bucketOverride || config.minioBucket;
   if (
     !config.minioEndpoint ||
     !config.minioAccessKey ||
     !config.minioSecretKey ||
-    !config.minioBucket
+    !bucket
   ) {
     return null;
   }
@@ -142,7 +147,7 @@ export function minioTargetFromConfig(): MinioTarget | null {
     region: config.minioRegion,
     accessKey: config.minioAccessKey,
     secretKey: config.minioSecretKey,
-    bucket: config.minioBucket,
+    bucket,
   };
 }
 
