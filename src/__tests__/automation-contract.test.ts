@@ -56,7 +56,7 @@ vi.mock('../lib/strom-token.js', () => ({
 }));
 
 vi.mock('../lib/strom.js', () => ({
-  StromClient: vi.fn().mockImplementation(() => ({
+  StromClient: vi.fn().mockImplementation(function () { return {
     mixer: {
       transition: vi.fn().mockResolvedValue({}),
       selectPreview: vi.fn().mockResolvedValue({}),
@@ -68,9 +68,20 @@ vi.mock('../lib/strom.js', () => ({
       get: vi.fn().mockResolvedValue({ flow: { blocks: [] } }),
       updateBlockProperties: vi.fn().mockResolvedValue({}),
     },
-  })),
+  }; }),
   StromClientError: class extends Error {},
 }));
+
+// Clip transport: stub only stopClip so CLIP_* success can be driven without Strom.
+vi.mock('../lib/clip-control.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../lib/clip-control.js')>();
+  return {
+    ...actual,
+    stopClip: vi.fn().mockImplementation(async (_s: unknown, _d: unknown, mixerInput: string) => ({
+      mixerInput, state: 'stopped', positionMs: 0,
+    })),
+  };
+});
 
 vi.mock('../services/idle-watchdog.js', () => ({
   notifySubscriberJoin: vi.fn(),
@@ -260,6 +271,41 @@ describe('Command acknowledgement — ACK / NACK (contract §2)', () => {
 
     const ackMsgs = ws.all().filter((m) => m.type === 'ACK' || m.type === 'NACK');
     expect(ackMsgs).toHaveLength(0);
+
+    unsubscribe(PROD, ws as unknown as WebSocket);
+  });
+
+  it('acknowledges a CLIP_* command with ACK(accepted) then ACK(executed) when cmdId is present (#499)', async () => {
+    mockGet.mockResolvedValue(makeDoc());
+    const ws = new FakeWs();
+    subscribe(PROD, ws as unknown as WebSocket);
+
+    await handleMessage(
+      PROD, ws as unknown as WebSocket,
+      JSON.stringify({ type: 'CLIP_STOP', mixerInput: 'video_in_0', cmdId: 'clip-cmd-1' }),
+      {},
+    );
+
+    const acks = ws.all().filter((m) => m.type === 'ACK') as Array<{ cmdId: string; phase: string; seq: number; ts: string }>;
+    expect(acks.map((a) => a.phase)).toEqual(['accepted', 'executed']);
+    expect(acks.every((a) => a.cmdId === 'clip-cmd-1' && typeof a.seq === 'number' && typeof a.ts === 'string')).toBe(true);
+    expect(ws.all().some((m) => m.type === 'NACK' || m.type === 'ERROR')).toBe(false);
+
+    unsubscribe(PROD, ws as unknown as WebSocket);
+  });
+
+  it('sends no ACK/NACK for a CLIP_* command without cmdId (#499)', async () => {
+    mockGet.mockResolvedValue(makeDoc());
+    const ws = new FakeWs();
+    subscribe(PROD, ws as unknown as WebSocket);
+
+    await handleMessage(
+      PROD, ws as unknown as WebSocket,
+      JSON.stringify({ type: 'CLIP_STOP', mixerInput: 'video_in_0' }),
+      {},
+    );
+
+    expect(ws.all().filter((m) => m.type === 'ACK' || m.type === 'NACK')).toHaveLength(0);
 
     unsubscribe(PROD, ws as unknown as WebSocket);
   });
