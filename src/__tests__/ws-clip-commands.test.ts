@@ -346,6 +346,19 @@ describe('CLIP_CUE by clip source (OL-19)', () => {
     expect(clipStates()).toHaveLength(0);
   });
 
+  it('NACKs a plain cue (no clipId) while playing and leaves the tracked state intact (#504 pt 3)', async () => {
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+    playerState = { state: 'playing', duration_ns: 12_000_000_000, position_ns: 1_000_000_000 };
+    await send({ type: 'CLIP_PLAY', mixerInput: 'video_in_0' });
+    stromRequests.length = 0;
+    broadcasts.length = 0;
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0', cmdId: 'c-guard-plain' });
+    expect(sentFrames().find((m) => m.type === 'NACK' && m.cmdId === 'c-guard-plain')).toBeDefined();
+    expect(playerReqs('playlist')).toHaveLength(0);
+    expect(clipStates()).toHaveLength(0);
+  });
+
   it('without clipId loads the assigned source (unchanged)', async () => {
     playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
     await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });

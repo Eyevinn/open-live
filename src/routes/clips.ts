@@ -86,8 +86,12 @@ const clipsRoutes: FastifyPluginAsync = async (fastify) => {
       try {
         const source = await resolveCueSource(doc, mixerInput, body.clipId, loadSource);
         const strom = await makeStromClient();
-        // On-air guard: cueing a chosen clip into a playing slot is refused (409).
-        if (body.clipId !== undefined) await assertSlotNotPlaying(strom, doc, mixerInput);
+        // On-air guard: cueing into a playing slot is refused (409), regardless
+        // of whether a clipId was supplied (#504 acceptance point 3). A plain
+        // Cue resolving the slot's default must be rejected too — the operator
+        // stops first. The restore path (reconnect re-cue) runs on a cold
+        // registry and stays unguarded.
+        await assertSlotNotPlaying(strom, doc, mixerInput);
         const state = await cueClip(strom, doc, source, mixerInput, body.clipId);
         setClipStateEntry(doc._id, state);
         // Persist the cue point so it survives deactivate/reactivate and server

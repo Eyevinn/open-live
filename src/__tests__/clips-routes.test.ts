@@ -254,6 +254,13 @@ describe('POST /clips/:mixerInput/cue', () => {
     expect(playerReqs('playlist')).toHaveLength(0);
   });
 
+  it('409s a plain cue (no clipId) while the slot player is playing (on-air guard, #504 pt 3)', async () => {
+    playerState = { state: 'playing', duration_ns: 12_000_000_000, position_ns: 1_000_000_000 };
+    const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: {} });
+    expect(res.statusCode).toBe(409);
+    expect(playerReqs('playlist')).toHaveLength(0);
+  });
+
   it('without clipId still loads the assigned source (unchanged path, no state probe)', async () => {
     sourceStore.set('src-clip-b', makeSource({ _id: 'src-clip-b', address: JSON.stringify({ type: 'url', url: CLIP_URL_B }) }));
     playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };

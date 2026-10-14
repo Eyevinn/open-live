@@ -149,9 +149,16 @@ clip is chosen at Cue time.
   persisted `clipCues[mixerInput].clipId` is what reactivate/reconnect restore re-cues. The
   production's source assignment stays the slot's default; if the persisted source has been
   deleted (or is no longer a clip source) restore falls back to the assigned default.
-- **On-air guard (safe default).** A Cue carrying `clipId` is rejected while the slot's player is
-  `playing` (409 REST / `NACK` or `ERROR` WS; the tracked `CLIP_STATE` is left untouched). The
-  operator must Stop first. A Cue without `clipId` keeps its previous behaviour.
+- **On-air guard (safe default).** Any Cue — with or without `clipId` — is rejected while the
+  slot's player is `playing` (409 REST / `NACK` or `ERROR` WS; the tracked `CLIP_STATE` is left
+  untouched). The operator must Stop first. This covers both an explicit cue-by-`clipId` and a
+  plain Cue that resolves the slot's assigned default (#504 acceptance point 3). The restore path
+  (reconnect re-cue of a persisted cue) runs on a cold registry and is intentionally unguarded.
+- **Probe/cue race (TOCTOU).** The guard's `assertSlotNotPlaying` check (a `player.getState` probe)
+  and the subsequent `cueClip` are not atomic: a Play arriving in the window between the probe and
+  the cue can still slip a Cue through against a now-playing slot. This is accepted as a safe
+  default for now — the guard catches the overwhelmingly common operator-error case, and the race
+  window is narrow; a stricter atomic check (e.g. a slot lock) is deferred.
 - **Editing a clip source while in use.** `PATCH /api/v1/sources/:id` on a `clip` source may change
   `address` while the source is assigned or cued in an active production; the change takes effect
   at the **next Cue** (the player keeps what it already loaded). It is rejected with 409 only while
@@ -212,7 +219,7 @@ Strom's `player.getState`; they do not presume the reference carried an inline l
 | 400  | invalid body/param (zod) |
 | 401  | missing/invalid `API_KEY` bearer (when configured) |
 | 404  | production or clip source not found |
-| 409  | production not activated / no clip cued on `play` / Cue-by-`clipId` while the slot is playing |
+| 409  | production not activated / no clip cued on `play` / any Cue while the slot is playing |
 | 502/503 | Strom unreachable (mirrors `stromErrorMessage` handling in controller) |
 
 ## Data Model

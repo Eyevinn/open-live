@@ -3175,8 +3175,13 @@ export async function handleMessage(
         switch (msg.type) {
           case 'CLIP_CUE': {
             const source = await resolveCueSource(doc, mixerInput, msg.clipId, (sid) => getSourcesDb().get(sid) as Promise<SourceDoc>);
-            // On-air guard: cueing a chosen clip into a playing slot is refused.
-            if (msg.clipId !== undefined) await assertSlotNotPlaying(strom, doc, mixerInput);
+            // On-air guard: cueing into a playing slot is refused (NACK),
+            // regardless of whether a clipId was supplied (#504 acceptance
+            // point 3). A plain Cue resolving the slot's default must be
+            // rejected too; the tracked CLIP_STATE stays intact (see the
+            // ClipSlotPlayingError branch below). The restore path (reconnect
+            // re-cue) runs on a cold registry and stays unguarded.
+            await assertSlotNotPlaying(strom, doc, mixerInput);
             // A new cue supersedes any in-flight completion poll.
             stopClipPoll(productionId, mixerInput);
             state = await cueClip(strom, doc, source, mixerInput, msg.clipId);
