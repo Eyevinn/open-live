@@ -20,8 +20,11 @@ process.env['GPU_CLASS'] = 'shared';
 const mockFindTrusted = vi.fn();
 const mockIsDbConnected = vi.fn().mockReturnValue(true);
 
+const mockLedgerFindTrusted = vi.fn(async () => ({ docs: [] }));
+
 vi.mock('../db/index.js', () => ({
   getDb: () => ({ findTrusted: mockFindTrusted, get: vi.fn(), insert: vi.fn() }),
+  getGpuUsageLedgerDb: () => ({ findTrusted: mockLedgerFindTrusted, get: vi.fn(), insert: vi.fn() }),
   isDbConnected: () => mockIsDbConnected(),
 }));
 
@@ -34,6 +37,7 @@ const {
   buildGpuUsageResponse,
   buildPrometheusMetrics,
   GPU_USAGE_STANDARD,
+  GpuUsageStoreUnavailableError,
 } = await import('../services/gpu-usage.js');
 
 const log = { warn() {}, info() {}, error() {} } as never;
@@ -162,5 +166,44 @@ describe('GET /metrics text builder', () => {
     // 3600 (persisted 12:00) + 1800 (live partial 13:00) = 5400.
     expect(text).toContain('osc_gpu_seconds_total{tenant="unattributed",resource="production-prod-a",gpu_pool="fra-1",gpu_class="shared"} 5400');
     expect(text).toContain('osc_gpu_active{tenant="unattributed",gpu_pool="fra-1"} 1');
+  });
+});
+
+describe('full-set scan is not capped at Mango\'s 25-doc default (#503 FIX 2)', () => {
+  it('bookmark-pages the whole production set and bills every doc', async () => {
+    mockIsDbConnected.mockReturnValue(true);
+    mockLedgerFindTrusted.mockResolvedValue({ docs: [] });
+    const closedHour = '2026-10-13T11:00:00Z';
+    const makeDoc = (i: number) => ({ _id: `prod-${i}`, type: 'production', status: 'ended', gpuHours: { [closedHour]: 60 } });
+    // Two pages: a full 200-doc page (with a bookmark) then a short 30-doc page.
+    // 230 > 25, so the old unbounded find() would have dropped 205 of them.
+    const page1 = Array.from({ length: 200 }, (_, i) => makeDoc(i));
+    const page2 = Array.from({ length: 30 }, (_, i) => makeDoc(200 + i));
+    mockFindTrusted.mockReset();
+    mockFindTrusted
+      .mockResolvedValueOnce({ docs: page1, bookmark: 'bm-1' })
+      .mockResolvedValueOnce({ docs: page2, bookmark: 'bm-2' });
+
+    const res = await buildGpuUsageResponse({}, log, ms('2026-10-13T13:00:00Z'));
+
+    // Every one of the 230 productions is billed for its closed hour.
+    expect(res.hours).toHaveLength(230);
+    // Pagination actually ran (two pages), each query carried an explicit limit
+    // well above Mango's 25-doc cap, and the second page followed the bookmark.
+    expect(mockFindTrusted).toHaveBeenCalledTimes(2);
+    for (const call of mockFindTrusted.mock.calls) {
+      expect((call[0] as { limit?: number }).limit).toBeGreaterThan(25);
+    }
+    expect((mockFindTrusted.mock.calls[1]![0] as { bookmark?: string }).bookmark).toBe('bm-1');
+  });
+});
+
+describe('JSON endpoint distinguishes db-down from zero (#503 FIX 3)', () => {
+  it('throws GpuUsageStoreUnavailableError (→ 503) when metering is on but the DB is down', async () => {
+    mockIsDbConnected.mockReturnValue(false);
+    await expect(buildGpuUsageResponse({}, log, ms('2026-10-13T13:00:00Z'))).rejects.toBeInstanceOf(
+      GpuUsageStoreUnavailableError,
+    );
+    mockIsDbConnected.mockReturnValue(true);
   });
 });

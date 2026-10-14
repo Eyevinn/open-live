@@ -19,7 +19,7 @@ import { minioTargetFromConfig, uploadRecordings } from '../lib/recording-upload
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type OutputStatusEntry } from '../lib/production-health.js';
-import { settleOnStop } from '../services/gpu-usage.js';
+import { settleOnStop, preserveGpuUsageOnDelete } from '../services/gpu-usage.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -868,6 +868,14 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
         await deactivateStromFlow(doc.stromFlowId, strom).catch(() => undefined);
       }
+
+      // Preserve shared-GPU usage BEFORE destroying the doc (issue #500). A
+      // production deleted right after a show is a normal, billable path, but
+      // `gpuHours` lives only on this doc — so settle its final partial hour and
+      // copy the buckets into a ledger record that survives the delete, keeping
+      // `/api/v1/usage/gpu` + `/metrics` reporting them within the retention
+      // window. Best-effort (never throws); a no-op when metering is off.
+      await preserveGpuUsageOnDelete(doc, fastify.log);
 
       await getDb().destroy(doc._id, doc._rev!);
       return reply.status(204).send();

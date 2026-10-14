@@ -18,11 +18,70 @@
  */
 
 import type { FastifyBaseLogger } from 'fastify';
+import type Nano from 'nano';
 import { config, isGpuMeteringEnabled } from '../config.js';
-import { getDb, isDbConnected } from '../db/index.js';
-import type { ProductionDoc } from '../db/types.js';
+import { getDb, getGpuUsageLedgerDb, isDbConnected } from '../db/index.js';
+import type { ProductionDoc, GpuUsageLedgerDoc } from '../db/types.js';
 
 const HOUR_MS = 3_600_000;
+
+/**
+ * Page size for the full-table usage scans. CouchDB Mango silently caps an
+ * unbounded `find()`/`findTrusted()` at 25 docs (so an instance with >25
+ * production or ledger docs would under-bill), so every usage scan pages through
+ * with this explicit limit until a short page ends the set — the same bookmark
+ * pagination `migrate-audio-channel-order.ts` uses. 200 matches the explicit
+ * `limit` the activation conflict check already sets.
+ */
+const USAGE_SCAN_PAGE_LIMIT = 200;
+
+/**
+ * Bookmark-paginate a trusted (literal-selector, no request data — #257) Mango
+ * scan to the FULL result set, past the 25-doc Mango cap. Mirrors the paging loop
+ * in `migrate-audio-channel-order.ts`: a page shorter than the limit ends the scan.
+ */
+async function findAllTrusted<T>(
+  scope: { findTrusted: (query: Nano.MangoQuery) => Promise<Nano.MangoResponse<T>> },
+  selector: Nano.MangoQuery['selector'],
+  fields?: string[],
+): Promise<T[]> {
+  const out: T[] = [];
+  let bookmark: string | undefined;
+  for (;;) {
+    const page = await scope.findTrusted({
+      selector,
+      limit: USAGE_SCAN_PAGE_LIMIT,
+      ...(fields ? { fields } : {}),
+      ...(bookmark ? { bookmark } : {}),
+    });
+    const docs = Array.isArray(page?.docs) ? page.docs : [];
+    out.push(...docs);
+    bookmark = page?.bookmark;
+    if (docs.length < USAGE_SCAN_PAGE_LIMIT) break;
+  }
+  return out;
+}
+
+/**
+ * Thrown by {@link buildGpuUsageResponse} when metering is ENABLED but the
+ * backing store is unreachable. The JSON usage endpoint maps it to `503`
+ * (`docs/standards/osc-gpu-usage-v1.md` §2) so a transient DB outage is
+ * distinguishable from genuine zero usage — a `200 { hours: [] }` would silently
+ * under-report. Metering-disabled instances still report zero (`200 hours:[]`):
+ * they never read the store, so there is nothing to be unavailable.
+ */
+export class GpuUsageStoreUnavailableError extends Error {
+  readonly statusCode = 503;
+  constructor() {
+    super('GPU usage backing store is unavailable');
+    this.name = 'GpuUsageStoreUnavailableError';
+  }
+}
+
+/** Deterministic ledger id for a production, so delete is an idempotent upsert. */
+function ledgerId(productionId: string): string {
+  return `gpu-ledger-${productionId}`;
+}
 
 /** Schema id emitted in the `standard` field of the JSON usage response. */
 export const GPU_USAGE_STANDARD = 'osc-gpu-usage/v1';
@@ -113,6 +172,64 @@ export function settleOnStop(
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
+/**
+ * Preserve a production's shared-GPU usage BEFORE its doc is destroyed
+ * (`DELETE /api/v1/productions/:id`, issue #500). Deleting a production right
+ * after a show is a normal path and those hours must stay billable, but
+ * `gpuHours` lives only on the production doc — so this settles the final partial
+ * hour (for a still-live production) or keeps the already-settled buckets (for a
+ * stopped one), then upserts them into a `gpu-usage-ledger` record that OUTLIVES
+ * the production. The usage read path folds the ledger back in under the same
+ * `production-<id>` resource, so `/api/v1/usage/gpu` and `/metrics` keep
+ * reporting the buckets within the retention window.
+ *
+ * Best-effort and self-contained (upsert-on-409, retention-pruned): metering off
+ * or nothing accrued writes no ledger, and a failed write is logged, never
+ * thrown — teardown must not be blocked by a ledger write, matching the
+ * Strom/recording teardown contract in the DELETE handler.
+ */
+export async function preserveGpuUsageOnDelete(
+  doc: Pick<ProductionDoc, '_id' | 'status' | 'activatedAt' | 'gpuHours'>,
+  log: FastifyBaseLogger,
+  nowMs: number = Date.now(),
+): Promise<void> {
+  if (!isGpuMeteringEnabled()) return;
+  // A live production (status 'active' with activatedAt) settles its final
+  // partial hour; a stopped one has no activatedAt, so settleOnStop is undefined
+  // and we keep its already-settled closed buckets. Prune expired ones either way.
+  const settled = settleOnStop(doc, nowMs) ?? pruneExpiredHours(doc.gpuHours ?? {}, nowMs);
+  if (Object.keys(settled).length === 0) return;
+
+  const id = ledgerId(doc._id);
+  const nowIso = new Date(nowMs).toISOString();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const ledgerDb = getGpuUsageLedgerDb();
+      let prior: GpuUsageLedgerDoc | undefined;
+      try {
+        prior = await ledgerDb.get(id);
+      } catch {
+        // No prior ledger (first delete) — create a fresh one.
+      }
+      const ledger: GpuUsageLedgerDoc = {
+        _id: id,
+        ...(prior?._rev ? { _rev: prior._rev } : {}),
+        type: 'gpu-usage-ledger',
+        productionId: doc._id,
+        gpuHours: settled,
+        createdAt: prior?.createdAt ?? nowIso,
+        updatedAt: nowIso,
+      };
+      await ledgerDb.insert(ledger);
+      return;
+    } catch (err) {
+      if (isConflict(err) && attempt < 2) continue;
+      log.warn({ err, productionId: doc._id }, '[gpu-usage] failed to preserve usage ledger on delete');
+      return;
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Settle sweep — periodic persistence of fully-elapsed hours for live productions
 // ---------------------------------------------------------------------------
@@ -171,14 +288,16 @@ async function settleOneProduction(productionId: string, nowMs: number, log: Fas
  */
 export async function settleActiveProductions(log: FastifyBaseLogger, nowMs: number = Date.now()): Promise<void> {
   if (!isGpuMeteringEnabled() || !isDbConnected()) return;
-  let result: Awaited<ReturnType<ReturnType<typeof getDb>['findTrusted']>>;
+  let docs: { _id: string }[];
   try {
-    result = await getDb().findTrusted({ selector: { type: 'production', status: 'active' }, fields: ['_id'] });
+    // Page the FULL active set — an unbounded findTrusted() is capped at 25 docs
+    // by Mango, which would leave the 26th+ live production's hours un-settled
+    // (under-billing). Only `_id` is needed; settleOneProduction re-reads each.
+    docs = await findAllTrusted<{ _id: string }>(getDb(), { type: 'production', status: 'active' }, ['_id']);
   } catch (err) {
     log.warn({ err }, '[gpu-usage] settle sweep query failed');
     return;
   }
-  const docs = Array.isArray(result?.docs) ? (result.docs as { _id: string }[]) : [];
   for (const doc of docs) {
     await settleOneProduction(doc._id, nowMs, log);
   }
@@ -270,8 +389,9 @@ function hoursForProduction(doc: ProductionDoc, nowMs: number, includeCurrentPar
 
 async function loadProductions(log: FastifyBaseLogger): Promise<ProductionDoc[]> {
   try {
-    const result = await getDb().findTrusted({ selector: { type: 'production' } });
-    return Array.isArray(result?.docs) ? (result.docs as ProductionDoc[]) : [];
+    // Page the FULL set — an unbounded findTrusted() is Mango-capped at 25 docs,
+    // which would silently drop the 26th+ production from every usage read.
+    return await findAllTrusted<ProductionDoc>(getDb(), { type: 'production' });
   } catch (err) {
     log.warn({ err }, '[gpu-usage] production query failed');
     return [];
@@ -279,10 +399,50 @@ async function loadProductions(log: FastifyBaseLogger): Promise<ProductionDoc[]>
 }
 
 /**
+ * Load the surviving usage ledgers written by {@link preserveGpuUsageOnDelete}
+ * for deleted productions (issue #500). Paged for the same reason as the
+ * production scan; a query failure degrades to "no ledgers" rather than dropping
+ * the whole usage read.
+ */
+async function loadUsageLedgers(log: FastifyBaseLogger): Promise<GpuUsageLedgerDoc[]> {
+  try {
+    return await findAllTrusted<GpuUsageLedgerDoc>(getGpuUsageLedgerDb(), { type: 'gpu-usage-ledger' });
+  } catch (err) {
+    log.warn({ err }, '[gpu-usage] usage ledger query failed');
+    return [];
+  }
+}
+
+/**
+ * Merge an hour→seconds map into a resource's accumulated buckets. Used to fold
+ * a deleted production's surviving ledger onto the same `production-<id>`
+ * resource as the (now-absent) production, so the read reports one resource, not
+ * two. The brief window where a ledger and its not-yet-destroyed production
+ * coexist carries identical buckets, so last-write-wins per hour is correct (not
+ * additive — that would double-count).
+ */
+function mergeResourceHours(
+  byResource: Map<string, Record<string, number>>,
+  resource: string,
+  hours: Record<string, number>,
+): void {
+  if (Object.keys(hours).length === 0) return;
+  const existing = byResource.get(resource);
+  byResource.set(resource, existing ? { ...existing, ...hours } : hours);
+}
+
+/**
  * Build the `osc-gpu-usage/v1` JSON response: closed UTC-hour buckets per
- * (hour × production). `sinceMs`, when set, keeps only buckets strictly after
- * the cursor. Returns an empty `hours` array when metering is disabled or the DB
- * is unavailable (so a self-hosted / BYO instance reports zero shared-GPU time).
+ * (hour × resource), across both live/stopped productions AND the surviving
+ * ledgers of deleted ones (issue #500). `sinceMs`, when set, keeps only buckets
+ * strictly after the cursor.
+ *
+ * Returns an empty `hours` array when metering is DISABLED (a self-hosted / BYO
+ * instance reports zero shared-GPU time — it never reads the store). When
+ * metering is enabled but the backing store is unreachable it throws
+ * {@link GpuUsageStoreUnavailableError} so the endpoint answers `503`
+ * (osc-gpu-usage-v1 §2), never a `200 { hours: [] }` that would hide a transient
+ * outage behind genuine-zero semantics.
  */
 export async function buildGpuUsageResponse(
   opts: { sinceMs?: number },
@@ -297,8 +457,11 @@ export async function buildGpuUsageResponse(
     generatedAt: isoSeconds(nowMs),
     settledThrough: isoHour(nowMs),
   };
-  if (!isGpuMeteringEnabled() || !isDbConnected()) {
+  if (!isGpuMeteringEnabled()) {
     return { ...base, hours: [] };
+  }
+  if (!isDbConnected()) {
+    throw new GpuUsageStoreUnavailableError();
   }
 
   const pool = config.gpuPool!;
@@ -306,9 +469,18 @@ export async function buildGpuUsageResponse(
   const tenantId = tenantLabel();
   const hours: GpuHourBucket[] = [];
 
+  // Fold live/stopped productions and the surviving ledgers of deleted ones onto
+  // their shared `production-<id>` resource, so a deletion never drops hours.
+  const byResource = new Map<string, Record<string, number>>();
   for (const doc of await loadProductions(log)) {
-    const resource = resourceId(doc._id);
-    for (const [hour, seconds] of Object.entries(hoursForProduction(doc, nowMs, false))) {
+    mergeResourceHours(byResource, resourceId(doc._id), hoursForProduction(doc, nowMs, false));
+  }
+  for (const ledger of await loadUsageLedgers(log)) {
+    mergeResourceHours(byResource, resourceId(ledger.productionId), pruneExpiredHours(ledger.gpuHours ?? {}, nowMs));
+  }
+
+  for (const [resource, hoursMap] of byResource) {
+    for (const [hour, seconds] of Object.entries(hoursMap)) {
       const hourMs = Date.parse(hour);
       if (!Number.isFinite(hourMs)) continue;
       // Only closed (immutable) hours, and only after the optional cursor.
@@ -343,17 +515,27 @@ export async function buildPrometheusMetrics(log: FastifyBaseLogger, nowMs: numb
     const tenant = escapeLabel(tenantLabel());
     let activeCount = 0;
 
+    // Counter is cumulative allocation seconds per resource, including the
+    // current partial hour and the surviving ledgers of deleted productions
+    // (so a delete does not reset the monotonic counter). Billing never reads it
+    // (JSON buckets do). The gauge counts only live productions — a ledger is a
+    // deleted production and never contributes to "running right now".
+    const byResource = new Map<string, Record<string, number>>();
     for (const doc of await loadProductions(log)) {
       if (doc.status === 'active' && doc.activatedAt && Number.isFinite(Date.parse(doc.activatedAt))) {
         activeCount++;
       }
-      // Counter is cumulative allocation seconds for the resource, including the
-      // current partial hour. Billing never reads it (JSON buckets do).
-      const total = Object.values(hoursForProduction(doc, nowMs, true)).reduce((sum, s) => sum + s, 0);
+      mergeResourceHours(byResource, resourceId(doc._id), hoursForProduction(doc, nowMs, true));
+    }
+    for (const ledger of await loadUsageLedgers(log)) {
+      mergeResourceHours(byResource, resourceId(ledger.productionId), pruneExpiredHours(ledger.gpuHours ?? {}, nowMs));
+    }
+
+    for (const [resource, hoursMap] of byResource) {
+      const total = Object.values(hoursMap).reduce((sum, s) => sum + s, 0);
       if (total > 0) {
-        const resource = escapeLabel(resourceId(doc._id));
         counterSamples.push(
-          `osc_gpu_seconds_total{tenant="${tenant}",resource="${resource}",gpu_pool="${pool}",gpu_class="${cls}"} ${total}`,
+          `osc_gpu_seconds_total{tenant="${tenant}",resource="${escapeLabel(resource)}",gpu_pool="${pool}",gpu_class="${cls}"} ${total}`,
         );
       }
     }

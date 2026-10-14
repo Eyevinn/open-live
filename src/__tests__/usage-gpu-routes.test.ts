@@ -19,9 +19,11 @@ process.env['GPU_POOL'] = 'fra-1';
 process.env['GPU_CLASS'] = 'shared';
 
 const mockFindTrusted = vi.fn();
+const mockIsDbConnected = vi.fn().mockReturnValue(true);
 
 vi.mock('../db/index.js', () => ({
   getDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn(), findTrusted: mockFindTrusted }),
+  getGpuUsageLedgerDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn(), findTrusted: vi.fn(async () => ({ docs: [] })), destroy: vi.fn() }),
   getSourcesDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn(), destroy: vi.fn() }),
   getOutputsDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn(), destroy: vi.fn() }),
   getGraphicsDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn(), destroy: vi.fn() }),
@@ -32,7 +34,7 @@ vi.mock('../db/index.js', () => ({
   getGuestSessionsDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn(), destroy: vi.fn() }),
   connectDb: vi.fn().mockResolvedValue(undefined),
   isDbReady: vi.fn().mockResolvedValue(true),
-  isDbConnected: vi.fn().mockReturnValue(true),
+  isDbConnected: () => mockIsDbConnected(),
 }));
 
 vi.mock('../ws/controller.js', () => ({
@@ -102,5 +104,19 @@ describe('GET /api/v1/usage/gpu (#500)', () => {
   it('400s a malformed since cursor', async () => {
     const res = await app.inject({ method: 'GET', url: '/api/v1/usage/gpu?since=not-a-date', headers: AUTH });
     expect(res.statusCode).toBe(400);
+  });
+
+  it('503s when the backing store is unreachable (osc-gpu-usage-v1 §2, #503 FIX 3)', async () => {
+    // Metering is on (GPU_POOL set) but the DB is unreachable: the endpoint must
+    // return 503, NOT a 200 with hours:[] that would hide a transient outage
+    // behind genuine-zero semantics. (The server-wide DB-down onRequest guard
+    // 503s /api/v1 first; buildGpuUsageResponse's own throw keeps the service and
+    // the published standard in agreement and covers the handle-drops-mid-request
+    // race — see the unit test in gpu-usage.test.ts.)
+    mockIsDbConnected.mockReturnValue(false);
+    const res = await app.inject({ method: 'GET', url: '/api/v1/usage/gpu', headers: AUTH });
+    mockIsDbConnected.mockReturnValue(true);
+    expect(res.statusCode).toBe(503);
+    expect(typeof res.json().error).toBe('string');
   });
 });

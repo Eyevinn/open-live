@@ -23,6 +23,7 @@ const mockFindTrusted = vi.fn(async () => ({
 
 vi.mock('../db/index.js', () => ({
   getDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn(), findTrusted: mockFindTrusted }),
+  getGpuUsageLedgerDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn(), findTrusted: vi.fn(async () => ({ docs: [] })), destroy: vi.fn() }),
   getSourcesDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn(), destroy: vi.fn() }),
   getOutputsDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn(), destroy: vi.fn() }),
   getGraphicsDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn(), destroy: vi.fn() }),

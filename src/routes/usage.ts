@@ -16,7 +16,7 @@
  */
 
 import type { FastifyPluginAsync } from 'fastify';
-import { buildGpuUsageResponse, buildPrometheusMetrics } from '../services/gpu-usage.js';
+import { buildGpuUsageResponse, buildPrometheusMetrics, GpuUsageStoreUnavailableError } from '../services/gpu-usage.js';
 
 const usageRoutes: FastifyPluginAsync = async (fastify) => {
   // Closed UTC-hour GPU-second buckets per production (schema osc-gpu-usage/v1).
@@ -33,8 +33,18 @@ const usageRoutes: FastifyPluginAsync = async (fastify) => {
       }
       sinceMs = parsed;
     }
-    const body = await buildGpuUsageResponse({ sinceMs }, fastify.log);
-    return reply.send(body);
+    try {
+      const body = await buildGpuUsageResponse({ sinceMs }, fastify.log);
+      return reply.send(body);
+    } catch (err) {
+      // Backing store unreachable (osc-gpu-usage-v1 §2): 503, so the platform
+      // poller can tell a transient outage from genuine zero usage rather than
+      // booking an empty hours array as "no GPU time this hour".
+      if (err instanceof GpuUsageStoreUnavailableError) {
+        return reply.status(503).send({ error: err.message, statusCode: 503 });
+      }
+      throw err;
+    }
   });
 
   // Prometheus text exposition. text/plain; version=0.0.4 is the 0.0.4 format.
