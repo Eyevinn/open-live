@@ -1,5 +1,6 @@
 import { config } from './config.js';
 import { startIdleWatchdog } from './services/idle-watchdog.js';
+import { startGpuUsageSweep, stopGpuUsageSweep } from './services/gpu-usage.js';
 import { startPortReservation, stopPortReservation } from './services/port-reservation.js';
 import { connectDb } from './db/index.js';
 import { cleanLegacyFixtures } from './db/seed.js';
@@ -144,6 +145,12 @@ async function main() {
   }
 
   startIdleWatchdog(app.log);
+  // Shared-GPU usage settle sweep (issue #500). No-op unless GPU_POOL is set, so
+  // self-hosted / BYO-Strom deployments are unchanged. Reconcile has already run
+  // above, so a production found still live after a restart has kept its
+  // activatedAt and the first sweep accrues the hours elapsed across the downtime
+  // from the recorded start, not from zero.
+  startGpuUsageSweep(app.log);
   startPortReservation(app.log);
   await app.listen({ port: config.port, host: '0.0.0.0' });
 
@@ -153,6 +160,7 @@ async function main() {
     app.log.info({ signal }, 'Shutting down');
     setTimeout(() => process.exit(1), 5000).unref();
     void (async () => {
+      stopGpuUsageSweep();
       await stopPortReservation(app.log);
       await app.close();
       process.exit(0);
