@@ -22,6 +22,7 @@ import { broadcast } from './tally.service.js';
 import { activationAbortControllers, updateProductionDoc, emitProductionStatus } from '../routes/productions.js';
 import { sweepGuestsOnProductionEnd } from './guest-sweep.js';
 import { stoppedStatus } from '../lib/production-health.js';
+import { settleOnStop } from './gpu-usage.js';
 import type { ProductionDoc } from '../db/types.js';
 
 // Idle deadline is config-driven (issue #290, env IDLE_TIMEOUT_SEC, default 300s
@@ -266,10 +267,15 @@ export async function deactivateProduction(productionId: string, log: FastifyBas
   // becomes `ended` (it broadcast and then stopped); one still `activating`
   // becomes `inactive` (it never reached a live broadcast).
   const nextStatus = stoppedStatus(doc.status);
+  // Settle shared-GPU usage up to now (final partial hour included) and clear the
+  // accrual start, same obligation as the explicit deactivate path (issue #500).
+  const settledGpuHours = settleOnStop(doc);
   await updateProductionDoc(doc._id, {
     status: nextStatus,
     endedReason: nextStatus === 'ended' ? 'idle' : undefined,
     autoDeactivated: true,
+    activatedAt: undefined,
+    ...(settledGpuHours ? { gpuHours: settledGpuHours } : {}),
     stromFlowId: undefined,
     mixerBlockId: undefined,
     audioMixerBlockId: undefined,
