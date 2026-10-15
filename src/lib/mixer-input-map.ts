@@ -26,6 +26,31 @@ export function storedPadIndex(mixerInput: string): number | null {
 }
 
 /**
+ * The 1-indexed stored Studio slot number displayed for a mixer input
+ * (ADR-007). Studio shows mixer-input pads 1-indexed, so stored `video_in_5` is
+ * "Input 6". This is the operator-facing slot number the guest was placed in —
+ * independent of the #463-compacted Strom pad the tile physically renders at.
+ * Returns `null` when the input is not a `video_in_N` pad.
+ */
+export function guestSlotStudioInputNumber(mixerInput: string): number | null {
+  const stored = storedPadIndex(mixerInput);
+  return stored === null ? null : stored + 1;
+}
+
+/**
+ * Append the stored Studio slot number to a guest-tile overlay label
+ * (ADR-007 Option C — guest tiles only), e.g. `Guest 1` → `Guest 1 · In 6`,
+ * `Ada` → `Ada · In 6`. The physical pad badge keeps the #463-compacted number;
+ * this suffix carries the operator's Studio slot number into the overlay text so
+ * the label matches the slot the operator set, without touching the compaction.
+ * Returns `label` unchanged when the input is not a `video_in_N` pad.
+ */
+export function withGuestSlotStudioInputSuffix(label: string, mixerInput: string): string {
+  const n = guestSlotStudioInputNumber(mixerInput);
+  return n === null ? label : `${label} · In ${n}`;
+}
+
+/**
  * Forward: the compact Strom pad index for a stored `mixerInput` name. Falls back
  * to the stored numeric index when the input is not in the map.
  */

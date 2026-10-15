@@ -10,6 +10,7 @@ import { composeRtmpUrl } from './rtmp.js';
 import { safeFlowProjection } from './log-redact.js';
 import { VIRTUAL_SOURCES, assignAudioChannels } from './audio-channels.js';
 import { assignReturnBuses, returnSendMatrix } from './return-feeds.js';
+import { withGuestSlotStudioInputSuffix } from './mixer-input-map.js';
 import { assignPortsToFlow, unassignPortsFromFlow } from '../services/port-reservation.js';
 import { listenerPortRequest } from '../services/listener-ports.js';
 
@@ -546,7 +547,14 @@ export async function activateStromFlow(
         ? guestSlotNumber.get(assignment.mixerInput)
         : undefined;
       if (guestNum !== undefined) {
-        props[`input_${padIndex}_label`] = `Guest ${guestNum}`;
+        // ADR-007 Option C (guest tiles only): carry the operator's stored Studio
+        // slot number into the overlay label (e.g. "Guest 1 · In 6") so it matches
+        // the slot the guest was placed in, while the physical pad stays the
+        // #463-compacted index. Sources (the `src.name` branch) are unchanged.
+        props[`input_${padIndex}_label`] = withGuestSlotStudioInputSuffix(
+          `Guest ${guestNum}`,
+          assignment.mixerInput,
+        );
       } else if (src?.name) {
         props[`input_${padIndex}_label`] = src.name;
       }
