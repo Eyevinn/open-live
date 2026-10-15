@@ -101,7 +101,7 @@ New CouchDB doc type `recording`, stored in a dedicated DB (mirroring `getOutput
 
 ```ts
 export interface RecordingDoc {
-  _id: string;            // "recording-<uuid>"
+  _id: string;            // "recording-<hash of bucket/key>"
   _rev?: string;
   type: 'recording';
   productionId: string;   // references ProductionDoc._id
