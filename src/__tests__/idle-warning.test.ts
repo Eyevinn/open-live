@@ -16,6 +16,8 @@ import type { FastifyBaseLogger } from 'fastify';
 // on the first tick where remaining <= 10s (i.e. once idle >= 20s).
 vi.mock('../config.js', () => ({
   config: { idleTimeoutSec: 30, idleWarningLeadSec: 10, stromUrl: 'http://localhost:9999', stromToken: undefined },
+  // GPU metering off (no GPU_POOL): the stop path's settleOnStop is a no-op here.
+  isGpuMeteringEnabled: () => false,
 }));
 
 // Controllable subscriber count + a broadcast spy — the only tally.service

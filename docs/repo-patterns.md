@@ -16,6 +16,35 @@ body contains the ciphertext field name or the plaintext value (see
 `src/__tests__/outputs-rtmp.test.ts`). The same caution applies to `SourceDoc`
 (`authHeaderValueEnc` is kept off the `...rest` path deliberately — issue #314).
 
+## A top-level route (e.g. `/metrics`) is NOT guarded by keeping it out of `AUTH_EXEMPT_PATHS`
+
+The shared-key `onRequest` gate in `src/server.ts` only *guards* paths that start
+with `/api/v1`, `/ws/`, `/documentation` **or `/metrics`** — every other path hits
+the `return;` and is served **without auth**, exempt list or not. So for a
+top-level route, keeping it out of `AUTH_EXEMPT_PATHS` is **necessary but not
+sufficient**: it must also be added to that guarded-prefix check, or it answers
+anonymously even when `API_KEY` is set. `GET /metrics` (issue #500, shared-GPU
+usage) is the current example — it exposes per-tenant GPU usage, so it is both
+absent from `AUTH_EXEMPT_PATHS` *and* listed in the prefix check, and a test
+asserts `GET /metrics` with no token returns `401`
+(`src/__tests__/metrics-route.test.ts`). A route under `/api/v1` (e.g.
+`/api/v1/usage/gpu`) is guarded automatically — just do not add it to the exempt
+set. When adding any new top-level path, extend the prefix check in the same
+commit and cover the no-token path with a 401 test.
+
+## Internal `ProductionDoc` accrual fields must be stripped from production responses
+
+`activatedAt` and `gpuHours` (issue #500, shared-GPU metering) are internal
+accrual state on `ProductionDoc`. `gpuHours` can hold up to
+`GPU_USAGE_RETENTION_HOURS` keys (90 days ≈ 2160), so echoing the raw doc on the
+production GET/list/PATCH responses would bloat and confuse existing clients — the
+same `...doc` over-spread hazard as the `toApi()` section below. They are surfaced
+**only** via `GET /api/v1/usage/gpu` and `GET /metrics`. The productions routes
+pass every returned doc through `toProductionView()` (`src/routes/productions.ts`),
+which destructures both fields out. Any new production response (or any new
+internal-only `ProductionDoc` field) must go through the same projection; never
+`reply.send(doc)` the raw production doc.
+
 ## `new URL()` on non-special schemes (rtmp/rtmps/srt) and IPv6 brackets
 
 The WHATWG `URL` parser **does** parse the authority of non-special schemes when they use `//`
