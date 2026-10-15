@@ -515,6 +515,39 @@ export interface RtmpCredentialKeyDoc {
   createdAt: string;        // ISO 8601
 }
 
+// --------------- Shared-GPU usage ledger (issue #500) ---------------
+
+/**
+ * A surviving snapshot of a deleted production's settled shared-GPU buckets
+ * (issue #500).
+ *
+ * `gpuHours` normally lives ONLY on the owning `ProductionDoc`, so destroying a
+ * production — a normal path, e.g. deleting it right after a show — would
+ * permanently lose every retained closed-hour bucket AND the final partial hour,
+ * making those billable hours unrecoverable. Before the production doc is
+ * destroyed (`DELETE /api/v1/productions/:id`), its final partial hour is settled
+ * (`settleOnStop`) and the resulting buckets are copied here as a ledger record
+ * that OUTLIVES the production. The usage read path folds these records back in,
+ * keyed by the SAME `production-<id>` resource, so `/api/v1/usage/gpu` and
+ * `/metrics` keep reporting them until their buckets age past
+ * `GPU_USAGE_RETENTION_HOURS` (pruned on read exactly like `ProductionDoc.gpuHours`).
+ *
+ * Kept under a deterministic id (`gpu-ledger-<productionId>`) so a re-delete (or a
+ * delete after a settle wrote more buckets) upserts the same record rather than
+ * duplicating it.
+ */
+export interface GpuUsageLedgerDoc {
+  _id: string;              // "gpu-ledger-<productionId>"
+  _rev?: string;
+  type: 'gpu-usage-ledger';
+  /** The deleted production's id — the usage read reuses its stable resource id. */
+  productionId: string;
+  /** Settled closed + final-partial UTC-hour buckets inherited from the production. */
+  gpuHours: Record<string, number>;
+  createdAt: string;        // ISO 8601
+  updatedAt: string;        // ISO 8601
+}
+
 // --------------- One-time data migration marker ---------------
 
 /**
@@ -727,6 +760,35 @@ export interface ProductionDoc {
    * status value. Cleared on next activation.
    */
   endedReason?: EndedReason;
+  /**
+   * Shared-GPU usage accrual (issue #500, `docs/specs/shared-gpu-usage-metering.md`,
+   * ADR-005). Both fields are additive, optional and defaulted-absent — existing
+   * docs read as "never accrued", so there is no migration.
+   *
+   * `activatedAt` is the **recorded start** of the current GPU allocation: the
+   * ISO 8601 UTC time the production's Strom flow reached `playing`. It is set in
+   * the SAME write that sets `status: 'active'` (`routes/productions.ts`) and
+   * cleared on every stop path (deactivate, idle auto-deactivate, activation
+   * failure, reconcile losing the flow). A production found still live after a
+   * restart keeps its `activatedAt`, so accrual resumes from the recorded start,
+   * not from zero.
+   *
+   * These are INTERNAL accrual state: they are projected only via
+   * `/api/v1/usage/gpu` and `/metrics`, and are stripped from the production
+   * GET/list/PATCH responses (`toProductionView`) so they never bloat or confuse
+   * existing clients (repo-patterns.md §"toApi() spreads the whole doc").
+   */
+  activatedAt?: string;
+  /**
+   * Closed, settled GPU-second buckets for this production, keyed by UTC hour
+   * `"YYYY-MM-DDTHH:00:00Z"`. Append-only and immutable once written: the settle
+   * sweep writes a key exactly once, when its hour has fully elapsed (and every
+   * stop path settles the final partial hour). The current partial hour of a
+   * live production is NEVER stored here — it is derived on read from
+   * `activatedAt` — so there are no read-modify-write races on a live counter.
+   * Pruned to `GPU_USAGE_RETENTION_HOURS` on settle. See {@link activatedAt}.
+   */
+  gpuHours?: Record<string, number>;
   createdAt: string;
   updatedAt: string;
 }
