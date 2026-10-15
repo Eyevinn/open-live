@@ -69,7 +69,20 @@ export async function reconcileProductionStatuses(
 
     if (liveFlowId && (doc.status !== 'active' || doc.stromFlowId !== liveFlowId)) {
       try {
-        await db.insert({ ...doc, stromFlowId: liveFlowId, status: 'active', updatedAt: new Date().toISOString() } as ProductionDoc);
+        // Shared-GPU accrual (issue #500): the flow is still live after a restart,
+        // so PRESERVE the recorded start — the settle sweep then accrues the hours
+        // that elapsed across the downtime from here, resuming from the recorded
+        // start, not from zero. If the doc predates this field (was active before
+        // the upgrade), stamp `now` so accrual begins from the restart rather than
+        // never. A doc already `active` with the same flow id is not rewritten
+        // here at all, so its `activatedAt` is untouched.
+        await db.insert({
+          ...doc,
+          stromFlowId: liveFlowId,
+          status: 'active',
+          activatedAt: doc.activatedAt ?? new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        } as ProductionDoc);
         log.info({ productionId: doc._id, stromFlowId: liveFlowId }, '[reconcile] Restored production to active');
       } catch (err) {
         log.error({ err, productionId: doc._id }, '[reconcile] Failed to restore production to active');
@@ -83,10 +96,16 @@ export async function reconcileProductionStatuses(
       // Revoke guest invites and end live guest sessions (issue #414); best-effort.
       await sweepGuestsOnProductionEnd(doc._id, log);
       try {
+        // Shared-GPU accrual (issue #500): the flow is gone, so stop accruing —
+        // clear the recorded start. The exact death time is unobservable from
+        // open-live (ADR-005 OQ-1), so we do NOT invent partial hours for the
+        // downtime here; the settle sweep already persisted the closed hours it
+        // observed while the process was up, and those immutable buckets remain.
         await db.insert({
           ...doc,
           status: nextStatus,
           ...(nextStatus === 'ended' ? { endedReason: 'flow-lost' as const } : {}),
+          activatedAt: undefined,
           stromFlowId: undefined,
           updatedAt: new Date().toISOString(),
         } as ProductionDoc);

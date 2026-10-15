@@ -37,6 +37,7 @@ import clipsRoutes from './routes/clips.js';
 import guestsRoutes from './routes/guests.js';
 import guestPageRoutes from './routes/guest-page.js';
 import returnsRoutes from './routes/returns.js';
+import usageRoutes from './routes/usage.js';
 import controllerWs from './ws/controller.js';
 import gatewayHeartbeatWs from './ws/gateway-heartbeat.js';
 
@@ -397,10 +398,18 @@ export async function buildServer() {
       // /api/v1 and would otherwise expose the full API blueprint — route
       // signatures, schemas, and the bearer-auth config — unauthenticated even
       // when API_KEY is set.
+      //
+      // /metrics (issue #500) is a TOP-LEVEL path (the Prometheus convention),
+      // so it must be listed explicitly here too: keeping it out of
+      // AUTH_EXEMPT_PATHS is necessary but NOT sufficient — without this prefix
+      // it would fall through the return below and be served anonymously,
+      // leaking per-tenant GPU usage. It carries no guest-token exemption; the
+      // shared key is the only credential it accepts.
       if (
         !req.url.startsWith('/api/v1') &&
         !req.url.startsWith('/ws/') &&
-        !req.url.startsWith('/documentation')
+        !req.url.startsWith('/documentation') &&
+        !req.url.startsWith('/metrics')
       ) {
         return;
       }
@@ -523,6 +532,7 @@ export async function buildServer() {
   await fastify.register(guestsRoutes);
   await fastify.register(guestPageRoutes);
   await fastify.register(returnsRoutes);
+  await fastify.register(usageRoutes);
   await fastify.register(controllerWs);
   await fastify.register(gatewayHeartbeatWs);
 

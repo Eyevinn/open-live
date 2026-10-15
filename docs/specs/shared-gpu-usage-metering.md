@@ -144,6 +144,14 @@ Field contract:
 **Errors:** `400` (malformed `since`), `401` (missing/invalid bearer), `503` (CouchDB unreachable and
 no in-memory buckets available — mirrors how recording degrades, `src/config.ts:269`). No `404`.
 
+A usage query that fails while the database is connected (production or ledger scan) also answers
+`503`; it is never masked as an empty `200`. A legitimately empty result is still `200` with
+`hours: []`.
+
+**Delete-time ledger write (v1):** when a production is deleted its buckets are preserved in a usage
+ledger (`preserveGpuUsageOnDelete`). That ledger write is best-effort for v1: a failed write is logged
+and does not fail the delete.
+
 **Self-hosted / BYO Strom:** when metering is not enabled (no `GPU_POOL`, or `STROM_AUTH_MODE=direct`
 self-hosted — §5), the endpoint returns `200` with `hours: []` and `basis: "allocation"`. It never
 reports non-zero shared-GPU time for an instance that is not on the managed shared GPU (issue AC:

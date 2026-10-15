@@ -12,6 +12,8 @@ import type { FastifyBaseLogger } from 'fastify';
 
 vi.mock('../config.js', () => ({
   config: { idleTimeoutSec: 30, idleWarningLeadSec: 10, stromUrl: 'http://localhost:9999', stromToken: undefined },
+  // GPU metering off (no GPU_POOL): the stop path's settleOnStop is a no-op here.
+  isGpuMeteringEnabled: () => false,
 }));
 
 const broadcasts: Array<Record<string, unknown>> = [];

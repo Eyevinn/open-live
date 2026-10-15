@@ -369,6 +369,44 @@ export const config = {
    * and redacted in `src/lib/log-redact.ts`. Consumed by a later sub-issue.
    */
   intercomManagerToken: process.env['INTERCOM_MANAGER_TOKEN'] ?? undefined,
+  // --- Shared-GPU usage metering (issue #500, docs/specs/shared-gpu-usage-metering.md, ADR-005) ---
+  /**
+   * Shared-GPU pool label (e.g. `fra-1`) surfaced as the `gpu_pool` label /
+   * `gpuPool` field. **Metering is enabled iff this is set**: the platform
+   * provisions managed shared-GPU instances with `GPU_POOL` (+ `GPU_CLASS`) and
+   * leaves it unset everywhere else, so self-hosted / BYO-Strom deployments
+   * report zero shared-GPU time (`/api/v1/usage/gpu` → `hours: []`, `/metrics`
+   * emits no `osc_gpu_*` samples). There is no existing field that marks an
+   * instance as "on the shared GPU", so this explicit opt-in gates all accrual.
+   */
+  gpuPool: optionalEnv('GPU_POOL'),
+  /**
+   * `gpu_class` label value (default `shared`). Only the shared class is metered
+   * to tokens; a `dedicated` value can be emitted for dashboards without
+   * implying billing.
+   */
+  gpuClass: optionalEnv('GPU_CLASS') ?? 'shared',
+  /**
+   * Settle-sweep cadence in ms (default 5 min). The sweep writes each fully
+   * elapsed UTC hour's GPU-seconds into the owning production's append-only
+   * `gpuHours` buckets. A lower value bounds the worst-case partial hour lost on
+   * a hard crash between sweeps; a higher value reduces CouchDB writes.
+   */
+  gpuSettleIntervalMs: parsePositiveIntEnv('GPU_SETTLE_INTERVAL_MS', 300_000, MAX_TIMER_MS),
+  /**
+   * How long (hours, default 2160 = 90 days) closed `gpuHours` buckets are
+   * retained and returned by `/api/v1/usage/gpu`. Old buckets are pruned on
+   * settle. Must exceed the platform's re-poll + dead-letter window.
+   */
+  gpuUsageRetentionHours: parsePositiveIntEnv('GPU_USAGE_RETENTION_HOURS', 2160),
+  /**
+   * Optional OSC workspace id. When the platform injects one, it is emitted as
+   * the `tenantId` / `tenant` label. Unset (the expected case today — open-live
+   * has no tenant id of its own) → `"unattributed"`, and the platform poller
+   * resolves instance→tenant on its side. A bucket is NEVER dropped for lack of
+   * a tenant.
+   */
+  oscWorkspaceId: optionalEnv('OSC_WORKSPACE_ID'),
 } as const;
 
 /**
@@ -381,6 +419,18 @@ export const config = {
  */
 export function isGuestCallingEnabled(): boolean {
   return isGuestSigningKeyAvailable();
+}
+
+/**
+ * True when shared-GPU usage metering is enabled — i.e. `GPU_POOL` is set
+ * (issue #500). When false (every self-hosted / BYO-Strom deployment, and any
+ * managed instance the platform has not opted in), no GPU-seconds accrue,
+ * `/api/v1/usage/gpu` returns `hours: []`, and `/metrics` emits no `osc_gpu_*`
+ * samples. This is the single gate for all accrual, so a non-shared-GPU
+ * instance reports exactly zero.
+ */
+export function isGpuMeteringEnabled(): boolean {
+  return Boolean(config.gpuPool);
 }
 
 /**
