@@ -19,6 +19,7 @@ import { minioTargetFromConfig, uploadRecordings } from '../lib/recording-upload
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type OutputStatusEntry } from '../lib/production-health.js';
+import { settleOnStop, preserveGpuUsageOnDelete } from '../services/gpu-usage.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -160,6 +161,20 @@ export async function updateProductionDoc(
   }
 }
 
+/**
+ * Project a production doc for an API response, stripping the internal
+ * shared-GPU accrual state (`activatedAt`, `gpuHours`, issue #500). Those fields
+ * are surfaced ONLY via `/api/v1/usage/gpu` + `/metrics`; leaking them through
+ * the production GET/list/PATCH responses would bloat payloads (up to
+ * `GPU_USAGE_RETENTION_HOURS` bucket keys) and confuse existing clients — the
+ * same `...doc` over-spread hazard called out in repo-patterns.md §"toApi()
+ * spreads the whole doc". Callers add their own derived fields after.
+ */
+export function toProductionView<T extends ProductionDoc>(doc: T): Omit<T, 'activatedAt' | 'gpuHours'> {
+  const { activatedAt: _activatedAt, gpuHours: _gpuHours, ...rest } = doc;
+  return rest;
+}
+
 export interface DeactivateResult {
   id: string;
   name: string;
@@ -182,10 +197,16 @@ function deactivatedDoc(
   stopped?: Pick<ProductionDoc, 'status' | 'endedReason'>,
 ): ProductionDoc {
   const status = stopped?.status ?? stoppedStatus(doc.status);
+  // Settle shared-GPU usage up to now (including the final partial hour) and
+  // clear the accrual start before the flow fields are wiped (issue #500). The
+  // settle is a no-op when metering is off or the production never accrued.
+  const settledGpuHours = settleOnStop(doc);
   return {
     ...doc,
     status,
     endedReason: stopped ? stopped.endedReason : status === 'ended' ? 'deactivated' : undefined,
+    activatedAt: undefined,
+    ...(settledGpuHours ? { gpuHours: settledGpuHours } : {}),
     stromFlowId: undefined,
     mixerBlockId: undefined,
     audioMixerBlockId: undefined,
@@ -531,6 +552,11 @@ async function runActivationFlow(
 
         await updateProductionDoc(productionId, {
           status: 'active',
+          // Shared-GPU accrual start (issue #500): the flow has reached 'playing',
+          // so record when the GPU slot allocation began, in the SAME write that
+          // sets status 'active'. Cleared on every stop path. A restart that finds
+          // the flow still live preserves this, so accrual resumes from here.
+          activatedAt: new Date().toISOString(),
           whepEndpoint,
           pgmWhepEndpoint: pgmWhepEndpointId ? `${stromBrowserBaseUrl()}/whep/${pgmWhepEndpointId}` : undefined,
           whipEndpoints: whipEndpoints.length > 0 ? whipEndpoints : undefined,
@@ -594,9 +620,18 @@ async function runActivationFlow(
       await deactivateStromFlow(stromFlowId, strom).catch(() => undefined);
     }
 
+    // Settle any shared-GPU time accrued if the flow was briefly 'playing'
+    // before the activation failed (issue #500), then clear the accrual start.
+    // Re-read so the freshest activatedAt/gpuHours are settled; a no-op when the
+    // flow never reached 'playing' (activatedAt was never set) or metering is off.
+    const stopDoc = await getDb().get(productionId).catch(() => undefined);
+    const settledGpuHours = stopDoc ? settleOnStop(stopDoc) : undefined;
+
     // Reset production to inactive, clearing all flow-related fields
     await updateProductionDoc(productionId, {
       status: 'inactive',
+      activatedAt: undefined,
+      ...(settledGpuHours ? { gpuHours: settledGpuHours } : {}),
       stromFlowId: undefined,
       mixerBlockId: undefined,
       whepEndpoint: undefined,
@@ -738,11 +773,11 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.status(503).send({ error: 'Database unavailable' });
     }
     const docs = (Array.isArray(result?.docs) ? (result.docs as ProductionDoc[]) : []).map((doc) => {
-      if (doc.status !== 'active') return doc;
+      if (doc.status !== 'active') return toProductionView(doc);
       const subscriberCount = getSubscriberCount(doc._id);
       const idleSinceAt = getIdleSince(doc._id);
       const idleExpiresAt = idleSinceAt !== undefined ? getIdleExpiresAt(idleSinceAt) : undefined;
-      return { ...doc, subscriberCount, ...(idleExpiresAt !== undefined ? { idleExpiresAt } : {}) };
+      return { ...toProductionView(doc), subscriberCount, ...(idleExpiresAt !== undefined ? { idleExpiresAt } : {}) };
     });
     return reply.send(docs);
   });
@@ -777,7 +812,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
     }
     if (doc.status !== 'active' || !doc.stromFlowId || !doc.mixerBlockId) {
-      return reply.send(doc);
+      return reply.send(toProductionView(doc));
     }
     try {
       const stromToken = await getStromToken(config.stromToken);
@@ -789,10 +824,10 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       // pass-through when no compaction map is present (older flows, or a
       // contiguous-from-0 production).
       const inputResolutions = expandToStoredPadIndex(mixerState.input_resolutions, doc.mixerInputMap);
-      return reply.send({ ...doc, inputResolutions });
+      return reply.send({ ...toProductionView(doc), inputResolutions });
     } catch (err) {
       fastify.log.warn({ err }, 'GET /api/v1/productions/:id — failed to fetch input_resolutions from Strom');
-      return reply.send(doc);
+      return reply.send(toProductionView(doc));
     }
   });
 
@@ -809,7 +844,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         updatedAt: new Date().toISOString(),
       };
       const response = await getDb().insert(updated);
-      return reply.send({ ...updated, _rev: response.rev });
+      return reply.send({ ...toProductionView(updated), _rev: response.rev });
     } catch {
       return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
     }
@@ -833,6 +868,14 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
         await deactivateStromFlow(doc.stromFlowId, strom).catch(() => undefined);
       }
+
+      // Preserve shared-GPU usage BEFORE destroying the doc (issue #500). A
+      // production deleted right after a show is a normal, billable path, but
+      // `gpuHours` lives only on this doc — so settle its final partial hour and
+      // copy the buckets into a ledger record that survives the delete, keeping
+      // `/api/v1/usage/gpu` + `/metrics` reporting them within the retention
+      // window. Best-effort (never throws); a no-op when metering is off.
+      await preserveGpuUsageOnDelete(doc, fastify.log);
 
       await getDb().destroy(doc._id, doc._rev!);
       return reply.status(204).send();
