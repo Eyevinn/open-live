@@ -106,10 +106,10 @@ control surface downstream never sees the reference type.
 
 ```
 POST /api/v1/productions/:id/clips/:mixerInput/cue
-  body: { clipId?: string }        # cue a specific clip into the ready state
+  body: { clipId?: string }        # clipId = clip SOURCE id to load (see "Change clips" below)
   200 → ClipState
-  404 → { error: 'Production not found' } | { error: 'Clip source not found' }
-  409 → { error: 'Production is not activated' }
+  404 → { error: 'Production not found' } | { error: 'Clip source not found' }  # incl. clipId unknown / not a clip source
+  409 → { error: 'Production is not activated' } | { error: 'Clip slot is playing; ...' }
 
 POST /api/v1/productions/:id/clips/:mixerInput/play
   body: { }                        # play the currently cued clip
@@ -134,6 +134,36 @@ interface ClipState {
   error?: string;
 }
 ```
+
+### Change clips during a live production (OL-19, issue #504)
+
+A clip slot (`video_in_N` + its media-player block, created at activation) is a **player**; the
+clip is chosen at Cue time.
+
+- **Cue by source.** `clipId` on REST cue / `CLIP_CUE` is a clip *source* id. The server loads that
+  source (must exist and be `streamType: 'clip'`, else 404 / `ERROR`+`NACK`), resolves its
+  reference and cues it into the slot's existing player through the normal
+  `setPlaylist` + `goto` + park path. Without `clipId` the source assigned to the mixer input is
+  loaded exactly as before. Adding a *new* slot to a running production is out of scope.
+- **State follows the loaded clip.** `ClipState.clipId` is the source actually loaded, and the
+  persisted `clipCues[mixerInput].clipId` is what reactivate/reconnect restore re-cues. The
+  production's source assignment stays the slot's default; if the persisted source has been
+  deleted (or is no longer a clip source) restore falls back to the assigned default.
+- **On-air guard (safe default).** Any Cue — with or without `clipId` — is rejected while the
+  slot's player is `playing` (409 REST / `NACK` or `ERROR` WS; the tracked `CLIP_STATE` is left
+  untouched). The operator must Stop first. This covers both an explicit cue-by-`clipId` and a
+  plain Cue that resolves the slot's assigned default (#504 acceptance point 3). The restore path
+  (reconnect re-cue of a persisted cue) runs on a cold registry and is intentionally unguarded.
+- **Probe/cue race (TOCTOU).** The guard's `assertSlotNotPlaying` check (a `player.getState` probe)
+  and the subsequent `cueClip` are not atomic: a Play arriving in the window between the probe and
+  the cue can still slip a Cue through against a now-playing slot. This is accepted as a safe
+  default for now — the guard catches the overwhelmingly common operator-error case, and the race
+  window is narrow; a stricter atomic check (e.g. a slot lock) is deferred.
+- **Editing a clip source while in use.** `PATCH /api/v1/sources/:id` on a `clip` source may change
+  `address` while the source is assigned or cued in an active production; the change takes effect
+  at the **next Cue** (the player keeps what it already loaded). It is rejected with 409 only while
+  that source is currently `playing` in a slot (as tracked in the in-memory clip-state registry).
+- **Listing clips.** `GET /api/v1/sources?streamType=clip` returns the available clip sources.
 
 ### WebSocket — commands and events
 
@@ -189,7 +219,7 @@ Strom's `player.getState`; they do not presume the reference carried an inline l
 | 400  | invalid body/param (zod) |
 | 401  | missing/invalid `API_KEY` bearer (when configured) |
 | 404  | production or clip source not found |
-| 409  | production not activated / no clip cued on `play` |
+| 409  | production not activated / no clip cued on `play` / any Cue while the slot is playing |
 | 502/503 | Strom unreachable (mirrors `stromErrorMessage` handling in controller) |
 
 ## Data Model

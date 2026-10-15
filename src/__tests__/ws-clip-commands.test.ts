@@ -104,6 +104,7 @@ afterAll(() => stromServer.close());
 // real fetch untouched.
 // ---------------------------------------------------------------------------
 const CLIP_URL = 'https://media.example.com/story-a.mp4';
+const CLIP_URL_B = 'https://media.example.com/story-b.mp4';
 // s3-reference presigned URLs resolve against this host (see MINIO_* env below).
 const S3_HOST = 's3.example.test';
 // A public-looking URL whose preflight answers a 302 (Location = redirectLocation),
@@ -129,7 +130,7 @@ vi.spyOn(globalThis, 'fetch').mockImplementation(((input: RequestInfo | URL, ini
   if (url === REDIRECT_URL && redirectLocation) {
     return Promise.resolve(new Response(null, { status: 302, headers: { location: redirectLocation } }));
   }
-  if (url === CLIP_URL) return Promise.resolve(new Response(null, { status: clipUrlStatus }));
+  if (url === CLIP_URL || url === CLIP_URL_B) return Promise.resolve(new Response(null, { status: clipUrlStatus }));
   if (host === S3_HOST) return Promise.resolve(new Response(null, { status: s3Status }));
   return realFetch(input as never, init);
 }) as typeof fetch);
@@ -306,6 +307,63 @@ describe('CLIP_CUE / PLAY / PAUSE / STOP transitions', () => {
     await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
     expect(errorFrames().length).toBeGreaterThan(0);
     expect(playerReqs('playlist')).toHaveLength(0);
+  });
+});
+
+describe('CLIP_CUE by clip source (OL-19)', () => {
+  const CLIP_B = CLIP_URL_B;
+  beforeEach(() => {
+    sourceDocs.set('src-clip-b', makeSourceDoc({ _id: 'src-clip-b', address: JSON.stringify({ type: 'url', url: CLIP_B }) }));
+  });
+
+  it('loads the source named by clipId and persists it', async () => {
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0', clipId: 'src-clip-b' });
+    expect(errorFrames()).toHaveLength(0);
+    expect(playerReqs('playlist')[0].body).toEqual({ files: [CLIP_B] });
+    expect(clipStates().at(-1)).toMatchObject({ state: 'cued', clipId: 'src-clip-b' });
+    expect(updateProductionDoc).toHaveBeenCalledWith(PROD, expect.objectContaining({ clipCues: expect.objectContaining({ video_in_0: expect.objectContaining({ clipId: 'src-clip-b' }) }) }));
+  });
+
+  it('ERRORs on an unknown source and a non-clip source', async () => {
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0', clipId: 'nope' });
+    sourceDocs.set('src-srt', makeSourceDoc({ _id: 'src-srt', streamType: 'srt', address: 'srt://1.2.3.4:9000' }));
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0', clipId: 'src-srt' });
+    expect(errorFrames()).toHaveLength(2);
+    expect(playerReqs('playlist')).toHaveLength(0);
+  });
+
+  it('NACKs a cue-by-clipId while playing and leaves the tracked state intact', async () => {
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+    playerState = { state: 'playing', duration_ns: 12_000_000_000, position_ns: 1_000_000_000 };
+    await send({ type: 'CLIP_PLAY', mixerInput: 'video_in_0' });
+    stromRequests.length = 0;
+    broadcasts.length = 0;
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0', clipId: 'src-clip-b', cmdId: 'c-guard' });
+    expect(sentFrames().find((m) => m.type === 'NACK' && m.cmdId === 'c-guard')).toBeDefined();
+    expect(playerReqs('playlist')).toHaveLength(0);
+    expect(clipStates()).toHaveLength(0);
+  });
+
+  it('NACKs a plain cue (no clipId) while playing and leaves the tracked state intact (#504 pt 3)', async () => {
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+    playerState = { state: 'playing', duration_ns: 12_000_000_000, position_ns: 1_000_000_000 };
+    await send({ type: 'CLIP_PLAY', mixerInput: 'video_in_0' });
+    stromRequests.length = 0;
+    broadcasts.length = 0;
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0', cmdId: 'c-guard-plain' });
+    expect(sentFrames().find((m) => m.type === 'NACK' && m.cmdId === 'c-guard-plain')).toBeDefined();
+    expect(playerReqs('playlist')).toHaveLength(0);
+    expect(clipStates()).toHaveLength(0);
+  });
+
+  it('without clipId loads the assigned source (unchanged)', async () => {
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
+    await send({ type: 'CLIP_CUE', mixerInput: 'video_in_0' });
+    expect(playerReqs('playlist')[0].body).toEqual({ files: [CLIP_URL] });
+    expect(clipStates().at(-1)).toMatchObject({ clipId: 'src-clip' });
   });
 });
 
