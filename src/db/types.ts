@@ -170,6 +170,11 @@ export interface SourceDoc {
   /** SRT receiver buffer latency in ms. Only applies to srt/efp stream types. Default 125. */
   latency?: number;
   /**
+   * 0-based audio elementary-stream index an SRT/EFP input uses (ADR-006).
+   * Additive, no migration: absent => 0. Only valid for srt/efp stream types.
+   */
+  audioStreamIndex?: number;
+  /**
    * Authenticated-HTML-source auth material (issue #314). Present only for
    * `streamType: 'html'`. Additive and defaulted-absent — every existing source
    * stays valid unchanged. See {@link HtmlSourceAuth}.
