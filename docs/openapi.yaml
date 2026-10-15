@@ -1060,6 +1060,16 @@ paths:
       summary: List sources
       operationId: listSources
       tags: [Sources]
+      parameters:
+        - name: streamType
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [srt, efp, whip, html, clip]
+          description: >-
+            Only return sources of this stream type. `streamType=clip` lists the
+            available clips a controller can Cue into a clip slot (OL-19).
       responses:
         '200':
           description: Array of sources
@@ -1101,7 +1111,9 @@ paths:
         '409':
           description: >-
             Hostless SRT listener port is already held by another source or output, or no
-            port is free in the range for a port-0 assignment request
+            port is free in the range for a port-0 assignment request; or the source is a
+            `clip` source currently `playing` in a slot of an active production and the patch
+            changes its `address` (stop the clip first)
           content:
             application/json:
               schema:
@@ -1135,6 +1147,11 @@ paths:
           description: Not found
     patch:
       summary: Update source
+      description: >-
+        A `clip` source's `address` may be changed while the source is assigned or cued in
+        an active production; the change takes effect at the NEXT Cue of that source (the
+        player keeps what it already loaded). The patch is rejected with 409 only while the
+        clip is currently `playing` in some slot (OL-19).
       operationId: updateSource
       tags: [Sources]
       requestBody:
@@ -1825,7 +1842,16 @@ paths:
         Preflight-checks the clip's resolved URL for reachability, loads it into the
         media-player block, seeks to index 0 (Strom
         `player.setPlaylist({files:[clip]}) + player.goto({index:0})`), then waits for
-        Strom to confirm a loaded duration before reporting `cued`. A non-2xx/unreachable
+        Strom to confirm a loaded duration before reporting `cued`.
+
+        `clipId` selects WHICH clip to load (OL-19): it is a clip SOURCE id (see
+        `GET /api/v1/sources?streamType=clip`). The slot is a player; the clip is chosen
+        at Cue time. The source must exist and be `streamType: clip` (else 404). Without
+        `clipId` the source assigned to `mixerInput` is loaded (unchanged). The returned
+        `ClipState.clipId` and the persisted cue (used to restore on reactivate/reconnect)
+        follow the loaded source; the production's source assignment stays the slot's
+        default. On-air guard: a Cue carrying `clipId` is refused with 409 while the slot's
+        player is `playing` — Stop first. A non-2xx/unreachable
         URL or a duration that never arrives fails the cue with a 502 rather than
         reporting `cued` for media that cannot play (issue #351).
       operationId: cueClip
@@ -1841,6 +1867,9 @@ paths:
                   type: string
                   minLength: 1
                   maxLength: 256
+                  description: >-
+                    Id of the clip source (`streamType: clip`) to load into this slot.
+                    Omit to load the source assigned to the mixer input.
       responses:
         '200':
           description: Clip cued
@@ -1853,9 +1882,9 @@ paths:
         '401':
           description: Missing/invalid API key (when configured)
         '404':
-          description: Production or clip source not found
+          description: Production not found, or `clipId` names no source / a non-clip source
         '409':
-          description: Production is not activated
+          description: Production is not activated, or `clipId` given while the slot is playing
         '502':
           description: >-
             Strom returned an error, or the clip's media could not be reached/loaded
