@@ -120,11 +120,12 @@ afterAll(() => stromServer.close());
 // the real fetch untouched.
 // ---------------------------------------------------------------------------
 const CLIP_URL = 'https://media.example.com/story-a.mp4';
+const CLIP_URL_B = 'https://media.example.com/story-b.mp4';
 const realFetch = globalThis.fetch;
 let clipUrlStatus = 200;
 vi.spyOn(globalThis, 'fetch').mockImplementation(((input: RequestInfo | URL, init?: RequestInit) => {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-  if (url === CLIP_URL) return Promise.resolve(new Response(null, { status: clipUrlStatus }));
+  if (url === CLIP_URL || url === CLIP_URL_B) return Promise.resolve(new Response(null, { status: clipUrlStatus }));
   return realFetch(input as never, init);
 }) as typeof fetch);
 afterAll(() => { globalThis.fetch = realFetch; });
@@ -220,11 +221,54 @@ describe('POST /clips/:mixerInput/cue', () => {
     expect(playerReqs('goto')[0].body).toEqual({ index: 0 });
   });
 
-  it('accepts an explicit clipId in the body', async () => {
+  it('cues the clip source named by clipId into the slot (OL-19)', async () => {
+    sourceStore.set('src-clip-b', makeSource({ _id: 'src-clip-b', name: 'Story B', address: JSON.stringify({ type: 'url', url: CLIP_URL_B }) }));
     playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
-    const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: { clipId: 'story-42' } });
+    const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: { clipId: 'src-clip-b' } });
     expect(res.statusCode).toBe(200);
-    expect(res.json().clipId).toBe('story-42');
+    expect(res.json()).toMatchObject({ state: 'cued', clipId: 'src-clip-b' });
+    expect(playerReqs('playlist')[0].body).toEqual({ files: [CLIP_URL_B] });
+    // Persisted cue follows the loaded clip; the assignment stays the default.
+    expect(productionStore.get(PROD)?.clipCues?.['video_in_0']?.clipId).toBe('src-clip-b');
+    expect(productionStore.get(PROD)?.sources?.[0]?.sourceId).toBe('src-clip');
+  });
+
+  it('404s a clipId naming an unknown source', async () => {
+    const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: { clipId: 'story-42' } });
+    expect(res.statusCode).toBe(404);
+    expect(playerReqs('playlist')).toHaveLength(0);
+  });
+
+  it('404s a clipId naming a non-clip source', async () => {
+    sourceStore.set('src-srt', makeSource({ _id: 'src-srt', streamType: 'srt', address: 'srt://1.2.3.4:9000' }));
+    const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: { clipId: 'src-srt' } });
+    expect(res.statusCode).toBe(404);
+    expect(playerReqs('playlist')).toHaveLength(0);
+  });
+
+  it('409s a cue-by-clipId while the slot player is playing (on-air guard)', async () => {
+    sourceStore.set('src-clip-b', makeSource({ _id: 'src-clip-b', address: JSON.stringify({ type: 'url', url: CLIP_URL_B }) }));
+    playerState = { state: 'playing', duration_ns: 12_000_000_000, position_ns: 1_000_000_000 };
+    const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: { clipId: 'src-clip-b' } });
+    expect(res.statusCode).toBe(409);
+    expect(playerReqs('playlist')).toHaveLength(0);
+  });
+
+  it('409s a plain cue (no clipId) while the slot player is playing (on-air guard, #504 pt 3)', async () => {
+    playerState = { state: 'playing', duration_ns: 12_000_000_000, position_ns: 1_000_000_000 };
+    const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: {} });
+    expect(res.statusCode).toBe(409);
+    expect(playerReqs('playlist')).toHaveLength(0);
+  });
+
+  it('without clipId still loads the assigned source (unchanged path, no state probe)', async () => {
+    sourceStore.set('src-clip-b', makeSource({ _id: 'src-clip-b', address: JSON.stringify({ type: 'url', url: CLIP_URL_B }) }));
+    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
+    const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: {} });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().clipId).toBe('src-clip');
+    expect(playerReqs('playlist')[0].body).toEqual({ files: [CLIP_URL] });
+    expect(productionStore.get(PROD)?.clipCues?.['video_in_0']?.clipId).toBe('src-clip');
   });
 
   it('404s an unknown production', async () => {
@@ -304,13 +348,6 @@ describe('POST /clips/:mixerInput/cue persists the cue point (issue #336)', () =
     expect(persisted?.clipCues).toMatchObject({
       video_in_0: { clipId: 'src-clip', durationMs: 12000 },
     });
-  });
-
-  it('persists the explicit clipId given in the body', async () => {
-    playerState = { state: 'paused', duration_ns: 12_000_000_000, position_ns: 0 };
-    const res = await app.inject({ method: 'POST', url: `/api/v1/productions/${PROD}/clips/video_in_0/cue`, headers: AUTH, payload: { clipId: 'story-42' } });
-    expect(res.statusCode).toBe(200);
-    expect(productionStore.get(PROD)?.clipCues?.['video_in_0']?.clipId).toBe('story-42');
   });
 
   it('drops the persisted cue on stop, leaving nothing to restore', async () => {
