@@ -7,7 +7,7 @@ import type { ProductionDoc, ClipState, SourceDoc, GuestSessionState } from '../
 import { getTally, setTally, subscribe, unsubscribe, broadcast, nextSeq, currentSeq, getOperatorSockets, beginSnapshot, endSnapshot } from '../services/tally.service.js';
 import {
   cueClip, playClip, stopClip, pauseClip, seekClip,
-  resolveClipSource, resolveClipTarget,
+  resolveClipSource, resolveCueSource, resolvePersistedCueSource, assertSlotNotPlaying, ClipSlotPlayingError, resolveClipTarget,
   ClipNotFoundError, ClipNotActivatedError, ClipNotCuedError, ClipMediaError,
 } from '../lib/clip-control.js';
 import { getClipStateEntry, getAllClipStates, setClipStateEntry, clearClipState } from '../services/clip-state.service.js';
@@ -3174,7 +3174,14 @@ export async function handleMessage(
         let state: ClipState;
         switch (msg.type) {
           case 'CLIP_CUE': {
-            const source = await resolveClipSource(doc, mixerInput, (sid) => getSourcesDb().get(sid) as Promise<SourceDoc>);
+            const source = await resolveCueSource(doc, mixerInput, msg.clipId, (sid) => getSourcesDb().get(sid) as Promise<SourceDoc>);
+            // On-air guard: cueing into a playing slot is refused (NACK),
+            // regardless of whether a clipId was supplied (#504 acceptance
+            // point 3). A plain Cue resolving the slot's default must be
+            // rejected too; the tracked CLIP_STATE stays intact (see the
+            // ClipSlotPlayingError branch below). The restore path (reconnect
+            // re-cue) runs on a cold registry and stays unguarded.
+            await assertSlotNotPlaying(strom, doc, mixerInput);
             // A new cue supersedes any in-flight completion poll.
             stopClipPoll(productionId, mixerInput);
             state = await cueClip(strom, doc, source, mixerInput, msg.clipId);
@@ -3233,6 +3240,7 @@ export async function handleMessage(
           err instanceof ClipNotFoundError ||
           err instanceof ClipNotActivatedError ||
           err instanceof ClipNotCuedError ||
+          err instanceof ClipSlotPlayingError ||
           err instanceof ClipMediaError
         ) {
           errText = err.message;
@@ -3240,9 +3248,13 @@ export async function handleMessage(
           errText = `Clip: ${stromErrorMessage(err)}`;
         }
         // Also record + broadcast the error transition so subscribers converge.
-        const errorState: ClipState = { mixerInput, state: 'error', error: errText };
-        setClipStateEntry(productionId, errorState);
-        broadcast(productionId, { type: 'CLIP_STATE', ...errorState });
+        // Exception: the on-air guard rejects BEFORE touching the player, so the
+        // playing clip's tracked state must stay intact (NACK/ERROR only).
+        if (!(err instanceof ClipSlotPlayingError)) {
+          const errorState: ClipState = { mixerInput, state: 'error', error: errText };
+          setClipStateEntry(productionId, errorState);
+          broadcast(productionId, { type: 'CLIP_STATE', ...errorState });
+        }
         if (cmdId) sendNack(ws, productionId, cmdId, errText);
         else ws.send(JSON.stringify({ type: 'ERROR', error: errText }));
       }
@@ -3853,17 +3865,19 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
           if (persistedCue && !watchOnly) {
             try {
               if (!clipStrom) clipStrom = await makeStromClient();
-              const source = await resolveClipSource(connectDoc, mixerInput, (sid) => getSourcesDb().get(sid) as Promise<SourceDoc>);
+              // Re-cue the persisted source (falls back to the assigned default
+              // if it was deleted); state/persistence follow the loaded clip.
+              const source = await resolvePersistedCueSource(connectDoc, mixerInput, persistedCue.clipId, (sid) => getSourcesDb().get(sid) as Promise<SourceDoc>);
               // Re-cue Strom (setPlaylist + goto) so the player is actually ready
               // at the cue point, then seek to a non-zero cue position if any.
-              await cueClip(clipStrom, connectDoc, source, mixerInput, persistedCue.clipId);
+              await cueClip(clipStrom, connectDoc, source, mixerInput, source._id);
               if (persistedCue.positionMs && persistedCue.positionMs > 0) {
                 await clipStrom.player.seek(connectDoc.stromFlowId!, resolveClipTarget(connectDoc, mixerInput).blockId, { position_ns: persistedCue.positionMs * 1e6 });
               }
               const state: ClipState = {
                 mixerInput,
                 state: 'cued',
-                clipId: persistedCue.clipId,
+                clipId: source._id,
                 ...(persistedCue.positionMs !== undefined ? { positionMs: persistedCue.positionMs } : {}),
                 ...(persistedCue.durationMs !== undefined ? { durationMs: persistedCue.durationMs } : {}),
               };
