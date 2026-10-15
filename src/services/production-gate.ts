@@ -28,7 +28,15 @@ import { config, isGpuMeteringEnabled } from '../config.js';
 /** Fixed money-manager endpoint (never caller-supplied, anti-SSRF). */
 export const TOKEN_COUNT_URL = 'https://money.svc.prod.osaas.io/mytokencount';
 
-const LOOKUP_TIMEOUT_MS = 5000;
+/**
+ * Ceiling for the balance lookup on the start path. A timeout fails open, so it
+ * only costs latency. Measurement (2026-10-15, last 6 h): platform ingress access
+ * log on prod-se (Elastx Loki, {namespace="osaas", app="ingress-nginx"}) for
+ * money.svc.prod.osaas.io GET /mytokencount: 25 successful requests, request_time
+ * p50 0.14 s, max 0.505 s (small sample, the endpoint is called rarely). 2000 ms is
+ * about four times the observed maximum. Approved by birme on open-live#523.
+ */
+export const LOOKUP_TIMEOUT_MS = 2000;
 
 /** Customer-facing refusal text. Hours wording only, no credit-unit word. */
 export const OUT_OF_HOURS_MESSAGE =

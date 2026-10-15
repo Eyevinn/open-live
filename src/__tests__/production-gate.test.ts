@@ -87,6 +87,20 @@ describe('checkProductionStartAllowed (#523)', () => {
     expect(gate.getProductionGateCounters()).toEqual({ lookupErrors: 1, refusals: 0 });
   });
 
+  it('uses a 2000 ms lookup timeout and fails open when the lookup times out', async () => {
+    const gate = await loadGate({ gpuPool: 'fra-1', pat: 'pat-1' });
+    expect(gate.LOOKUP_TIMEOUT_MS).toBe(2000);
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout');
+    fetchMock.mockRejectedValue(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+
+    const decision = await gate.checkProductionStartAllowed(log);
+
+    expect(timeoutSpy).toHaveBeenCalledWith(2000);
+    expect(decision).toEqual({ allowed: true });
+    expect(gate.getProductionGateCounters()).toEqual({ lookupErrors: 1, refusals: 0 });
+    timeoutSpy.mockRestore();
+  });
+
   it('fails open when no OSC access token is configured', async () => {
     const gate = await loadGate({ gpuPool: 'fra-1' });
 
