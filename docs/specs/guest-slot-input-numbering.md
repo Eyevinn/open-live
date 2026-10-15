@@ -1,14 +1,14 @@
 # Spec: Guest-slot live-multiview input numbering & label
 
-**Status**: Draft — Phase 1 (architect), per `epic-workflow.md`
+**Status**: Draft — Phase 1 (architect), per `epic-workflow.md`; product question resolved 2026-10-15 (Option C, guest tiles only — see ADR-007)
 **Issue**: Eyevinn/open-live#512 (`Refs #512`)
 **Services**: `open-live` (backend flow generator + controller WS), `open-live-studio` (multiview rendering)
 **Related**: #458 (multiviewer "In 5"/"In 6"), #460, #463 (empty-tile compaction), #464/#494 (audio strip labels), #466/#493 (live label/picture), #479
 
-> This is a cross-service item and carries a **product decision that this team is NOT positioned to
-> make unilaterally** (see [Open product question](#open-product-question-requires-svensson00)). The
-> architect proposes a decided fix for the clearly-wrong label behaviour and lays out — but does not
-> resolve — the numbering decision, which is flagged for **@svensson00** (PM decision authority).
+> This is a cross-service item that carried a product decision reserved for the PM. That decision is now
+> **resolved by @svensson00 (PM decision authority) on 2026-10-15 — Option C, for guest tiles only** (see
+> [Resolved product question](#resolved-product-question--option-c-guest-tiles-only) and ADR-007). The
+> architect's decided fix for the clearly-wrong label behaviour is independent and ships first.
 
 ---
 
@@ -115,28 +115,35 @@ own return-feed naming — it simply closes the one fallback that still exposes 
 
 ---
 
-## Open product question (requires @svensson00)
+## Resolved product question — Option C (guest tiles only)
 
 > **Should the live multiviewer show the stored Studio slot number (Input 6), or the #463-compacted pad
 > number (input 3)?**
+>
+> **RESOLVED by @svensson00 (PM decision authority) on 2026-10-15 — Option C, for guest tiles only.**
 
-This is the core question and the team is **not** positioned to decide it unilaterally — it trades a
-user-facing number against a GPU-multiview cost and reverses/relaxes a shipped behaviour (#463).
-@svensson00 to decide. Options and consequences:
+The decision is recorded in **ADR-007**
+(`docs/decisions/ADR-007-guest-slot-live-multiview-numbering.md`, Status **Accepted**):
 
-| Option | What changes | Positive | Negative / cost |
-|--------|--------------|----------|-----------------|
-| **A. Keep compaction (status quo)** | Nothing; live multiview keeps showing the compacted number (`input 3`). | No empty tiles; mixer sized to exactly what the production uses; preserves #436 "guest picture always reaches the mixer" invariant and #463's benefit. | The multiview number stays out of sync with the Studio slot number the operator set — the reported confusion is *not* fixed (only the label is). |
-| **B. Show the stored slot number** | Size the mixer by the highest stored pad (revert #463's compaction) **or** carry the stored pad number into the overlay so the displayed number matches Studio. | Live multiview number matches Studio ("Input 6" everywhere); eliminates the reported confusion entirely. | Reverting compaction reintroduces empty tiles and a larger GPU multiview (the exact problem #463 solved); the carry-the-number variant decouples the displayed number from the physical pad and needs a new Strom overlay convention. |
-| **C. Keep compaction, surface the slot number in the label** | Physical pad stays compacted; the overlay label carries both, e.g. `Guest 1 · In 6`. | Keeps #463's GPU benefit *and* shows the operator's slot number; smallest physical change. | New label convention; longer overlay text; two numbers on screen (`input 3` pad badge + `In 6` in label) could itself read as inconsistent. |
+- The **#463 compaction is kept unchanged** — no empty tiles was the point of that change, so the live
+  Strom mixer stays sized to exactly the compacted `0..N-1` range and `mixerInputMap` is untouched.
+- For **guest tiles only**, the stored **Studio slot number** is surfaced in the tile label — e.g.
+  `Guest 1 · In 6`, or the invite name in place of `Guest 1` once the guest has joined. The physical pad
+  badge stays the compacted number; the `In 6` suffix carries the operator's slot number into the label.
+- **Sources (non-guest tiles) are unchanged** — they already number identically in Studio and the
+  multiview, so only guest tiles need the slot-number suffix.
 
-Dependency note: the **decided label fix is independent** of this decision and can ship first. This
-question only governs the *number*.
+Options as considered (C chosen, A/B not chosen):
 
-If @svensson00 selects **B** or **C**, that is a significant cross-service design choice (it changes the
-live Strom mixer sizing and/or the overlay label convention and spans both services) and is recorded as
-**ADR-007** (`docs/decisions/ADR-007-guest-slot-live-multiview-numbering.md`, Status **Proposed /
-pending @svensson00**). Option **A** needs no ADR beyond marking ADR-007 Rejected.
+| Option | What changes | Positive | Negative / cost | Decision |
+|--------|--------------|----------|-----------------|----------|
+| **A. Keep compaction (status quo)** | Nothing; live multiview keeps showing the compacted number (`input 3`). | No empty tiles; mixer sized to exactly what the production uses; preserves #436 "guest picture always reaches the mixer" invariant and #463's benefit. | The multiview number stays out of sync with the Studio slot number the operator set — the reported confusion is *not* fixed (only the label is). | **Not chosen** |
+| **B. Show the stored slot number** | Size the mixer by the highest stored pad (revert #463's compaction) **or** carry the stored pad number into the overlay so the displayed number matches Studio. | Live multiview number matches Studio ("Input 6" everywhere); eliminates the reported confusion entirely. | Reverting compaction reintroduces empty tiles and a larger GPU multiview (the exact problem #463 solved) — "no empty tiles was the point of #463"; the carry-the-number variant decouples the displayed number from the physical pad and needs a new Strom overlay convention. | **Not chosen** |
+| **C. Keep compaction, surface the slot number in the guest-tile label** | Physical pad stays compacted; the guest-tile overlay label carries both, e.g. `Guest 1 · In 6` (or invite name + `In 6`). Sources unchanged. | Keeps #463's GPU benefit *and* shows the operator's slot number; smallest physical change; no change to sources. | New guest-tile label convention; longer overlay text; two numbers on screen (compact pad badge + `In 6` in label). | **Chosen** |
+
+Dependency note: the **decided label fix is independent** of this decision and **ships first** (per the
+PM: "The label fix can ship first, as you suggest"). This slot-number-in-label work follows it and
+governs only the guest-tile *number*.
 
 ---
 
@@ -182,10 +189,10 @@ sequenceDiagram
 5. Live/beta: reproduce the #512 scenario on `openlivedev` beta (guest slot at `video_in_5`, guest joins);
    confirm the live multiview overlay reads `Guest N`/invite, never `Whip`.
 
-**Number decision (after @svensson00):** add tests for whichever option is chosen — Option A: assert the
-compacted number is shown (status quo, no new test beyond #4); Option B: assert mixer sizing / displayed
-number equals the stored slot number; Option C: assert the overlay label carries both `Guest N` and the
-stored slot number.
+**Number decision (resolved — Option C, guest tiles only):** add a test asserting a guest-tile overlay
+label carries **both** the `Guest N` / invite name **and** the stored Studio slot number (e.g.
+`Guest 1 · In 6`), while the physical pad stays the compacted number (#463 unchanged) and non-guest
+source tiles get no slot-number suffix.
 
 ---
 
@@ -206,9 +213,9 @@ could emit a non-`Guest N` overlay and produce the symptom with no current-code 
 
 ## Open questions
 
-1. **[@svensson00]** Stored slot number vs compacted pad number in the live multiview — see
-   [above](#open-product-question-requires-svensson00). Blocks the number change; does **not** block the
-   label fix.
+1. ~~**[@svensson00]** Stored slot number vs compacted pad number in the live multiview.~~ **Resolved
+   2026-10-15 — Option C (guest tiles only)**; see [Resolved product question](#resolved-product-question--option-c-guest-tiles-only)
+   and ADR-007. Did not block the label fix, which ships first.
 2. Does the raw-`Whip` symptom reproduce on the Strom WHEP overlay (`PgmPreview`/`PanePage`) on a
    *current* build, or only in the Studio tile fallback? Resolve via the ops pre-check + a current-build
    repro before scoping any backend label change (none is expected).

@@ -1,7 +1,7 @@
 # ADR-007: Guest-slot live-multiview input numbering (stored slot number vs #463-compacted pad)
 
 **Date**: 2026-10-15
-**Status**: Proposed — pending decision by **@svensson00** (PM decision authority)
+**Status**: Accepted — Option C (guest tiles only), decided by **@svensson00** (PM decision authority) on 2026-10-15
 
 ## Context
 
@@ -24,12 +24,20 @@ a shipped behaviour (#463). The agent team is not positioned to decide this unil
 
 ## Decision
 
-**Pending @svensson00.** No decision is recorded yet. One of:
+**Option C, for guest tiles only** — decided by @svensson00 on 2026-10-15 (on #517).
 
-- **A. Keep the #463 compaction** — the live multiview keeps showing the compacted pad number.
-- **B. Show the stored Studio slot number** — size the mixer by the highest stored pad (revert #463) or
-  carry the stored number into the overlay.
-- **C. Keep compaction, surface the stored slot number in the overlay label** (e.g. `Guest 1 · In 6`).
+- The **#463 empty-tile compaction is kept unchanged.** No empty tiles was the point of that change, so
+  the live Strom vision mixer stays sized to exactly the compacted `0..N-1` range and `mixerInputMap` is
+  unchanged.
+- For **guest tiles only**, the stored **Studio slot number** is surfaced in the tile label — e.g.
+  `Guest 1 · In 6`, or the invite name in place of `Guest 1` once the guest has joined (e.g. `Ada · In 6`).
+  `In 6` is the 1-indexed stored Studio slot number the operator set, carried into the overlay label text;
+  the physical pad badge stays the compacted number.
+- **Sources (non-guest tiles) are unchanged.** Sources already number identically in Studio and the
+  multiview, so no label suffix is added to them — only guest tiles diverge and so only guest tiles need it.
+- The **label fix** (a guest tile must always resolve to `Guest N` / invite name and must **never** leak
+  the raw virtual-source id `Whip` or generic name `WHIP Input`) is **independent of this decision and
+  ships first**, as proposed in the spec. This slot-number-in-label work follows it.
 
 ## Consequences
 
@@ -53,6 +61,21 @@ a shipped behaviour (#463). The agent team is not positioned to decide this unil
 
 ## Alternatives Considered
 
-See options A/B/C above; this ADR exists precisely to carry the three until @svensson00 selects one.
-On selection: set Status **Accepted** with the chosen option, or **Rejected** if Option A (status quo)
-is chosen (no code change) — and update `docs/specs/guest-slot-input-numbering.md` accordingly.
+- **A. Keep the #463 compaction, show only the compacted pad number — NOT chosen.** The live multiview
+  number stays out of sync with the Studio slot number the operator set, so the reported confusion is
+  left unresolved (only the label would be fixed).
+- **B. Show the stored Studio slot number as the pad number — NOT chosen.** Sizing the mixer by the
+  highest stored pad reintroduces empty tiles and a larger GPU multiview — "no empty tiles was the point
+  of #463" (@svensson00), so reverting or relaxing the compaction was explicitly rejected. The
+  carry-the-number variant would also need a new Strom overlay convention decoupling the displayed
+  number from the physical pad.
+- **C. Keep compaction, surface the stored slot number in the guest-tile label — CHOSEN** (guest tiles
+  only; e.g. `Guest 1 · In 6`). Keeps #463's GPU-multiview benefit and the #436 "guest picture always
+  reaches the mixer" invariant *and* shows the operator's slot number, with the smallest physical change
+  and no change to sources.
+
+Decided by @svensson00 on 2026-10-15 (recorded on #517): "Option C, for guest tiles only. Keep the #463
+compaction: no empty tiles was the point of that change. Sources are already numbered the same in Studio
+and the multiview, so only guest tiles need it." The spec
+(`docs/specs/guest-slot-input-numbering.md`) is updated to mark the open product question Resolved —
+Option C.
