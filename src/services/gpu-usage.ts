@@ -64,7 +64,7 @@ async function findAllTrusted<T>(
 
 /**
  * Thrown by {@link buildGpuUsageResponse} when metering is ENABLED but the
- * backing store is unreachable. The JSON usage endpoint maps it to `503`
+ * backing store is unreachable OR a usage query fails while connected. The JSON usage endpoint maps it to `503`
  * (`docs/standards/osc-gpu-usage-v1.md` §2) so a transient DB outage is
  * distinguishable from genuine zero usage — a `200 { hours: [] }` would silently
  * under-report. Metering-disabled instances still report zero (`200 hours:[]`):
@@ -394,22 +394,24 @@ async function loadProductions(log: FastifyBaseLogger): Promise<ProductionDoc[]>
     return await findAllTrusted<ProductionDoc>(getDb(), { type: 'production' });
   } catch (err) {
     log.warn({ err }, '[gpu-usage] production query failed');
-    return [];
+    // DB connected but the query failed: surface as 503, never an empty list
+    // that would answer 200 with missing hours.
+    throw new GpuUsageStoreUnavailableError();
   }
 }
 
 /**
  * Load the surviving usage ledgers written by {@link preserveGpuUsageOnDelete}
  * for deleted productions (issue #500). Paged for the same reason as the
- * production scan; a query failure degrades to "no ledgers" rather than dropping
- * the whole usage read.
+ * production scan; a query failure throws {@link GpuUsageStoreUnavailableError}
+ * (→ 503) rather than silently dropping deleted productions' hours.
  */
 async function loadUsageLedgers(log: FastifyBaseLogger): Promise<GpuUsageLedgerDoc[]> {
   try {
     return await findAllTrusted<GpuUsageLedgerDoc>(getGpuUsageLedgerDb(), { type: 'gpu-usage-ledger' });
   } catch (err) {
     log.warn({ err }, '[gpu-usage] usage ledger query failed');
-    return [];
+    throw new GpuUsageStoreUnavailableError();
   }
 }
 
@@ -514,7 +516,7 @@ export async function buildPrometheusMetrics(log: FastifyBaseLogger, nowMs: numb
     const cls = escapeLabel(config.gpuClass);
     const tenant = escapeLabel(tenantLabel());
     let activeCount = 0;
-
+    try {
     // Counter is cumulative allocation seconds per resource, including the
     // current partial hour and the surviving ledgers of deleted productions
     // (so a delete does not reset the monotonic counter). Billing never reads it
@@ -541,6 +543,13 @@ export async function buildPrometheusMetrics(log: FastifyBaseLogger, nowMs: numb
     }
     // The gauge is always emitted when metering is on (0 when nothing runs).
     gaugeSamples.push(`osc_gpu_active{tenant="${tenant}",gpu_pool="${pool}"} ${activeCount}`);
+    } catch (err) {
+      // A failed usage query (DB connected) now throws from the loaders; /metrics
+      // degrades to headers only, like db-down, rather than a partial scrape.
+      if (!(err instanceof GpuUsageStoreUnavailableError)) throw err;
+      counterSamples.length = 0;
+      gaugeSamples.length = 0;
+    }
   }
 
   const lines = [

@@ -119,4 +119,22 @@ describe('GET /api/v1/usage/gpu (#500)', () => {
     expect(res.statusCode).toBe(503);
     expect(typeof res.json().error).toBe('string');
   });
+
+  it('503s when a usage query fails while the DB is connected (#503 review)', async () => {
+    mockIsDbConnected.mockReturnValue(true);
+    mockFindTrusted.mockReset();
+    mockFindTrusted.mockRejectedValue(new Error('query boom'));
+    const res = await app.inject({ method: 'GET', url: '/api/v1/usage/gpu', headers: AUTH });
+    expect(res.statusCode).toBe(503);
+    expect(typeof res.json().error).toBe('string');
+  });
+
+  it('still 200s with zero hours on an empty-but-successful query (#503 review)', async () => {
+    mockIsDbConnected.mockReturnValue(true);
+    mockFindTrusted.mockReset();
+    mockFindTrusted.mockResolvedValue({ docs: [] });
+    const res = await app.inject({ method: 'GET', url: '/api/v1/usage/gpu', headers: AUTH });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().hours).toEqual([]);
+  });
 });
