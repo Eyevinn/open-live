@@ -125,6 +125,9 @@ const SourceInput = z.object({
   status: z.enum(['active', 'inactive']).default('inactive'),
   liveCamera: z.boolean().optional(),
   latency: z.number().int().min(20).max(8000).optional(),
+  // Optional 0-based audio elementary-stream index (ADR-006 Decision 1). SRT/EFP only
+  // (enforced in the route handler); absent => 0. Non-live property: no 409 guard.
+  audioStreamIndex: z.number().int().min(0).optional(),
   // Optional id of the Gateway that registered this source (OL-5, spec
   // studio-gateways.md). Absent for manually-created sources; when present it
   // must name an existing gateway (validated in the route handler).
@@ -143,6 +146,9 @@ const SourcePatch = z.object({
   status: z.enum(['active', 'inactive']).optional(),
   liveCamera: z.boolean().optional(),
   latency: z.number().int().min(20).max(8000).optional(),
+  // Optional 0-based audio elementary-stream index (ADR-006 Decision 1). SRT/EFP only
+  // (enforced in the route handler); absent => 0. Non-live property: no 409 guard.
+  audioStreamIndex: z.number().int().min(0).optional(),
   // A gateway can re-tag or clear a source's gateway link. `null` clears the
   // link (unlinks the source); a string re-links it to an (existing) gateway.
   gatewayId: z.string().nullable().optional(),
@@ -336,6 +342,9 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.status(400).send({ error: `Gateway "${body.gatewayId}" not found`, statusCode: 400 });
     }
     const isSrt = body.streamType === 'srt' || body.streamType === 'efp';
+    if (body.audioStreamIndex !== undefined && !isSrt) {
+      return reply.status(400).send({ error: 'audioStreamIndex is only valid for srt/efp sources', statusCode: 400 });
+    }
     const id = `src-${randomUUID()}`;
     // A listener source binds a port on the shared Strom: it must lie inside this
     // instance's lease and no other source or output may hold it. Port 0 asks
@@ -366,6 +375,7 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
         status: body.status,
         liveCamera: body.liveCamera,
         latency: body.latency,
+        ...(body.audioStreamIndex !== undefined ? { audioStreamIndex: body.audioStreamIndex } : {}),
         // Only persist gatewayId when supplied — existing clients omit it and
         // the field stays absent, keeping the doc backward-compatible.
         ...(body.gatewayId !== undefined ? { gatewayId: body.gatewayId } : {}),
@@ -412,6 +422,9 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       // while the stored doc.address may hold an encrypted passphrase.
       const effectiveStreamType = body.streamType ?? doc.streamType;
       const effectiveAddress = body.address ?? decryptAddressPassphrase(doc.address);
+      if (body.audioStreamIndex !== undefined && effectiveStreamType !== 'srt' && effectiveStreamType !== 'efp') {
+        return reply.status(400).send({ error: 'audioStreamIndex is only valid for srt/efp sources', statusCode: 400 });
+      }
       if (effectiveAddress) {
         try {
           if (effectiveStreamType === 'html') {
@@ -559,6 +572,28 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
     }
     await getSourcesDb().insert(updated);
     return reply.send(toApi(updated));
+  });
+
+  // Read-only audio-stream discovery (ADR-006 Decision 3). The stream list is
+  // derived at read time, never persisted. Until the Strom probe capability
+  // exists (#516) it always reports `unavailable`; `selectedIndex` is local
+  // state and always present (absent audioStreamIndex => 0).
+  fastify.get<{ Params: { id: string } }>('/api/v1/sources/:id/audio-streams', async (req, reply) => {
+    let doc: SourceDoc;
+    try {
+      doc = await getSourcesDb().get(req.params.id);
+    } catch (err: unknown) {
+      if (err && typeof err === 'object' && 'statusCode' in err && (err as { statusCode: number }).statusCode === 404) {
+        return reply.status(404).send({ error: 'Source not found', statusCode: 404 });
+      }
+      throw err;
+    }
+    return reply.send({
+      selectedIndex: doc.audioStreamIndex ?? 0,
+      discovery: 'unavailable' as const,
+      reason: 'strom-probe-unsupported' as const,
+      streams: null,
+    });
   });
 
   // Design-C interactive-login provisioning — GATED. Stock upstream cefsrc has
