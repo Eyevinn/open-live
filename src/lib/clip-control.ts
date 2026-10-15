@@ -58,6 +58,15 @@ export class ClipNotActivatedError extends Error {
   }
 }
 
+/** Thrown when a Cue targets a slot whose player is currently playing (→ 409). */
+export class ClipSlotPlayingError extends Error {
+  readonly statusCode = 409;
+  constructor(message = 'Clip slot is playing; stop it before cueing another clip') {
+    super(message);
+    this.name = 'ClipSlotPlayingError';
+  }
+}
+
 /** Thrown when `play` is requested but no clip has been cued (→ 409). */
 export class ClipNotCuedError extends Error {
   readonly statusCode = 409;
@@ -346,8 +355,11 @@ export function mapPlayerState(
  * in Strom `stop` is pause + seek 0, i.e. exactly "parked at the first frame".
  * This also fixes the restore path (`controller.ts` re-cues a persisted cue).
  *
- * The clip source is resolved from the production's source assignments for this
- * mixer input; `clipId`, when supplied, must match the assigned source id.
+ * The caller resolves WHICH clip source to load (see {@link resolveCueSource}):
+ * the source assigned to the mixer input by default, or — when the Cue carries a
+ * `clipId` — that clip source (the slot is a player; the clip is chosen at Cue
+ * time). `clipId` here is only the label echoed in the returned ClipState and
+ * defaults to the loaded `source._id`.
  *
  * Before touching Strom, the resolved URL is preflight-checked for
  * reachability, and after `setPlaylist`/`goto`/the parking `stop` the cue
@@ -435,4 +447,58 @@ export async function resolveClipSource(
   }
   if (source.streamType !== 'clip') throw new ClipNotFoundError('Source is not a clip source');
   return source;
+}
+
+/**
+ * Resolves the clip source a Cue should load. Without `clipId` this is exactly
+ * {@link resolveClipSource} (the source assigned to the slot). With `clipId`,
+ * `clipId` is a clip SOURCE id: it must exist and be `streamType: 'clip'`, else
+ * {@link ClipNotFoundError} (404). The slot itself (player block) must still
+ * exist — checked by `cueClip` via {@link resolveClipTarget}.
+ */
+export async function resolveCueSource(
+  doc: ProductionDoc,
+  mixerInput: string,
+  clipId: string | undefined,
+  loadSource: (sourceId: string) => Promise<SourceDoc>,
+): Promise<SourceDoc> {
+  if (clipId === undefined) return resolveClipSource(doc, mixerInput, loadSource);
+  let source: SourceDoc;
+  try {
+    source = await loadSource(clipId);
+  } catch {
+    throw new ClipNotFoundError(`Clip source "${clipId}" not found`);
+  }
+  if (source.streamType !== 'clip') throw new ClipNotFoundError(`Source "${clipId}" is not a clip source`);
+  return source;
+}
+
+/**
+ * Restore-path variant: re-cue the persisted source; if it was deleted (or is
+ * no longer a clip source) fall back to the slot's assigned default.
+ */
+export async function resolvePersistedCueSource(
+  doc: ProductionDoc,
+  mixerInput: string,
+  persistedClipId: string | undefined,
+  loadSource: (sourceId: string) => Promise<SourceDoc>,
+): Promise<SourceDoc> {
+  if (persistedClipId !== undefined) {
+    try {
+      return await resolveCueSource(doc, mixerInput, persistedClipId, loadSource);
+    } catch (err) {
+      if (!(err instanceof ClipNotFoundError)) throw err;
+    }
+  }
+  return resolveClipSource(doc, mixerInput, loadSource);
+}
+
+/**
+ * On-air guard for change-clip Cues: throws {@link ClipSlotPlayingError} (409)
+ * when the slot's player is currently `playing`. The operator must Stop first.
+ */
+export async function assertSlotNotPlaying(strom: StromClient, doc: ProductionDoc, mixerInput: string): Promise<void> {
+  const { flowId, blockId } = resolveClipTarget(doc, mixerInput);
+  const player = await strom.player.getState(flowId, blockId);
+  if (player.state === 'playing') throw new ClipSlotPlayingError();
 }

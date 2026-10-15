@@ -61,11 +61,13 @@ vi.mock('../lib/strom-token.js', () => ({
 // ---------------------------------------------------------------------------
 let playerState: Record<string, unknown> = { state: 'stopped' };
 const stromWrites: string[] = [];
+const playlistBodies: string[] = [];
 const stromServer: Server = createServer((req, res) => {
   const chunks: Buffer[] = [];
   req.on('data', (c: Buffer) => chunks.push(c));
   req.on('end', () => {
     if (req.method !== 'GET') stromWrites.push(`${req.method} ${req.url}`);
+    if ((req.url ?? '').endsWith('/player/playlist')) playlistBodies.push(Buffer.concat(chunks).toString('utf8'));
     res.writeHead(200, { 'content-type': 'application/json' });
     if ((req.url ?? '').endsWith('/player/state')) res.end(JSON.stringify(playerState));
     else res.end(JSON.stringify({ success: true }));
@@ -80,10 +82,11 @@ afterAll(() => stromServer.close());
 // for the fixture clip URL below; everything else (real StromClient traffic
 // to the throwaway server above) passes through to the real fetch untouched.
 const CLIP_URL = 'https://media.example.com/story-a.mp4';
+const CLIP_URL_B = 'https://media.example.com/story-b.mp4';
 const realFetch = globalThis.fetch;
 vi.spyOn(globalThis, 'fetch').mockImplementation(((input: RequestInfo | URL, init?: RequestInit) => {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-  if (url === CLIP_URL) return Promise.resolve(new Response(null, { status: 200 }));
+  if (url === CLIP_URL || url === CLIP_URL_B) return Promise.resolve(new Response(null, { status: 200 }));
   return realFetch(input as never, init);
 }) as typeof fetch);
 afterAll(() => { globalThis.fetch = realFetch; });
@@ -141,6 +144,7 @@ beforeEach(async () => {
   clearClipStateForProduction(PROD);
   playerState = { state: 'stopped' };
   stromWrites.length = 0;
+  playlistBodies.length = 0;
   productionDocs.clear();
   sourceDocs.clear();
   productionDocs.set(PROD, makeProductionDoc());
@@ -225,6 +229,29 @@ describe('WS connect snapshot — CLIP_STATE (spec §3)', () => {
     expect(clip).toBeDefined();
     expect(clip).toMatchObject({ mixerInput: 'video_in_0', state: 'cued', clipId: 'src-clip', positionMs: 4000 });
     expect(clip!.state).not.toBe('playing');
+  });
+
+  it('restore re-cues the persisted clip source, not the assignment (OL-19)', async () => {
+    sourceDocs.set('src-clip-b', { ...sourceDocs.get('src-clip'), _id: 'src-clip-b', address: JSON.stringify({ type: 'url', url: CLIP_URL_B }) });
+    productionDocs.set(PROD, makeProductionDoc({
+      clipCues: { video_in_0: { clipId: 'src-clip-b', positionMs: 0, durationMs: 12000 } },
+    }));
+    playerState = { state: 'paused', position_ns: 0, duration_ns: 12_000_000_000 };
+
+    const messages = await connectAndCollect(PROD);
+    expect(messages.find((m) => m.type === 'CLIP_STATE')).toMatchObject({ state: 'cued', clipId: 'src-clip-b' });
+    expect(JSON.parse(playlistBodies[0]!)).toEqual({ files: [CLIP_URL_B] });
+  });
+
+  it('restore falls back to the assigned default when the persisted source was deleted (OL-19)', async () => {
+    productionDocs.set(PROD, makeProductionDoc({
+      clipCues: { video_in_0: { clipId: 'src-deleted', positionMs: 0, durationMs: 12000 } },
+    }));
+    playerState = { state: 'paused', position_ns: 0, duration_ns: 12_000_000_000 };
+
+    const messages = await connectAndCollect(PROD);
+    expect(messages.find((m) => m.type === 'CLIP_STATE')).toMatchObject({ state: 'cued', clipId: 'src-clip' });
+    expect(JSON.parse(playlistBodies[0]!)).toEqual({ files: [CLIP_URL] });
   });
 
   it('a watch-only connection reports live state and leaves the persisted cue for the operator', async () => {
