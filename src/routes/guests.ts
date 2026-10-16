@@ -27,7 +27,6 @@ import { assertSameStromOrigin } from '../lib/url-validation.js';
 import { slotTakesWhip } from '../lib/guest-scope.js';
 import {
   applyGuestSlotMixerLabel,
-  applyGuestSlotAudioStripLabel,
   guestSlotDefaultLabel,
   clearGuestSlotPicture,
   restoreGuestSlotPicture,
@@ -253,9 +252,6 @@ async function teardownGuestWhip(
  * invite is revoked. Loads the production fresh (the live flow/mixer ids and the
  * `mixerInputMap` live there) and best-effort:
  *   - resets the multiview tile back to its `Guest N` label (issue #466);
- *   - resets the audio mixer strip name back to the same `Guest N` label so the
- *     audio desk no longer carries the departed guest's stale name and matches
- *     the tile again (issue #494);
  *   - blacks the slot's picture so the dropped guest's last decoded frame no
  *     longer stays frozen on PGM / the multiview (issue #493).
  * Never throws: a failure must not block the leave/kick/revoke that frees the
@@ -276,7 +272,11 @@ async function resetGuestSlot(
   }
   const defaultLabel = guestSlotDefaultLabel(production, mixerInput);
   await applyGuestSlotMixerLabel(production, mixerInput, defaultLabel, log);
-  await applyGuestSlotAudioStripLabel(production, mixerInput, defaultLabel, log);
+  // The audio mixer strip is NOT reset with a live PATCH here: `ch{N}_label` is
+  // not a live Strom property (issue #522), so the write was always refused.
+  // `GET /audio` resolves the strip label from the active guest-session instead,
+  // so once this guest's session is marked `left` the strip reverts to "Guest N"
+  // on its own.
   await clearGuestSlotPicture(production, mixerInput, log);
 }
 
@@ -671,9 +671,11 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
       //     keeps `Guest N` — the join has already succeeded and must not fail.
       const joinedLabel = invite.label ?? guestSlotDefaultLabel(production, mixerInput);
       await applyGuestSlotMixerLabel(production, mixerInput, joinedLabel, fastify.log);
-      // Same name on the slot's audio strip (issue #497); reset to `Guest N` on
-      // leave/kick/revoke. Best-effort like the tile label above.
-      await applyGuestSlotAudioStripLabel(production, mixerInput, joinedLabel, fastify.log);
+      // The slot's audio strip name is NOT pushed with a live PATCH (issues #497,
+      // #522): `ch{N}_label` is not a live Strom property, so the write was always
+      // refused and only logged noise. `GET /audio` instead resolves the strip
+      // label from this active guest-session's invite name, so it shows on join and
+      // survives a controller reload with no live write.
       // Restore the slot's picture to fully opaque (issue #493): a previous guest
       // leaving this slot blacked it (input alpha 0), so without this a rejoining
       // or next guest on the same live flow would stay invisible. Best-effort —
