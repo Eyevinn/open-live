@@ -22,6 +22,16 @@ import { graphicUrl } from '../lib/url-validation.js';
 import { decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
 import { loadAudioChannels } from '../lib/audio-channels.js';
 import {
+  type AudioProcStage,
+  type StageParams,
+  parseStageParams,
+  stageAllowedOnElement,
+  stageToStromProps,
+  mergeIntoStore,
+  allStoredStages,
+  liveStromPropsFromStore,
+} from '../lib/audio-processing.js';
+import {
   mirrorToMainForPersistedReturns,
   returnSendMatrix,
   type PersistedReturnBus,
@@ -131,6 +141,8 @@ function coalesceKey(msg: InboundMessage): string | null {
       return `SET_EFFECT:${msg.target === 'master' ? 'master' : `input:${msg.target.input}`}`;
     case 'AUDIO_SET':
       return `AUDIO_SET:${msg.elementId}:${msg.property}`;
+    case 'AUDIO_PROC_SET':
+      return `AUDIO_PROC_SET:${msg.elementId}:${msg.stage}`;
     case 'AUX_SEND_SET':
       return `AUX_SEND_SET:${msg.elementId}:${msg.auxBus}`;
     case 'AUX_MASTER_SET':
@@ -345,6 +357,7 @@ type InboundMessage =
   | { type: 'DSK_TOGGLE'; layer: number; visible?: boolean; cmdId?: string }
   | { type: 'MACRO_EXEC'; macroId: string; cmdId?: string }
   | { type: 'AUDIO_SET'; elementId: string; property: 'volume' | 'mute'; value: unknown; ramp_ms?: number; cmdId?: string }
+  | { type: 'AUDIO_PROC_SET'; elementId: string; stage: AudioProcStage; params: Record<string, unknown>; cmdId?: string }
   | { type: 'AFV_SET'; mixerInput: string; enabled: boolean; cmdId?: string }
   | { type: 'AFV_RAMP_SET'; rampUpMs: number; rampDownMs: number; cmdId?: string }
   | { type: 'PFL_SET'; elementId: string; enabled: boolean; volume?: number; cmdId?: string }
@@ -427,6 +440,17 @@ const InboundMessageSchema = z.discriminatedUnion('type', [
     property: z.enum(['volume', 'mute']),
     value: z.union([z.number().min(0).max(10), z.boolean()]),
     ramp_ms: rampMsSchema.optional(),
+    cmdId: cmdIdSchema,
+  }),
+  // Audio processing control (issue #527, OL-25). The envelope is validated here;
+  // `params` is validated per-stage in the handler against the Strom ranges
+  // (src/lib/audio-processing.ts) so an out-of-range value NACKs with a clear
+  // message and nothing reaches Strom.
+  z.object({
+    type: z.literal('AUDIO_PROC_SET'),
+    elementId: elementIdSchema,
+    stage: z.enum(['gain', 'hpf', 'gate', 'comp', 'eq', 'limiter']),
+    params: z.record(z.string(), z.unknown()),
     cmdId: cmdIdSchema,
   }),
   z.object({ type: z.literal('AFV_SET'), mixerInput: mixerInputSchema, enabled: z.boolean(), cmdId: cmdIdSchema }),
@@ -2705,6 +2729,87 @@ export async function handleMessage(
       }
       break;
     }
+    case 'AUDIO_PROC_SET': {
+      // Audio processing control (issue #527, OL-25): per-channel gain/HPF/gate/
+      // comp/EQ and main-bus comp/EQ/limiter.
+      //
+      // 1. Stage/element compatibility — limiter + main comp/EQ only on `main`;
+      //    gain/hpf/gate only on a channel. Rejected before anything reaches Strom.
+      if (!stageAllowedOnElement(msg.stage, msg.elementId)) {
+        const errText = `Audio processing: stage '${msg.stage}' is not valid on '${msg.elementId}'`;
+        if (cmdId) sendNack(ws, productionId, cmdId, errText);
+        else ws.send(JSON.stringify({ type: 'ERROR', error: errText }));
+        break;
+      }
+      // 2. Range-validate params against the Strom ranges (reject out-of-range,
+      //    no silent clamp). On failure nothing is persisted, broadcast or written.
+      const parsed = parseStageParams(msg.stage, msg.params);
+      if (!parsed.ok) {
+        const errText = `Audio processing: ${parsed.error}`;
+        if (cmdId) sendNack(ws, productionId, cmdId, errText);
+        else ws.send(JSON.stringify({ type: 'ERROR', error: errText }));
+        break;
+      }
+      const procParams: StageParams = parsed.params;
+
+      // 3. Persist on the production doc so it survives deactivate/reactivate and
+      //    is re-applied through the flow generator (including the
+      //    construction-time ch{N}_hpf_enabled). Best-effort; 409-safe.
+      const nextStore = mergeIntoStore(doc.audioProcessing, msg.elementId, msg.stage, procParams);
+      updateProductionDoc(productionId, { audioProcessing: nextStore })
+        .catch((err) => console.warn('[controller] AUDIO_PROC_SET persist error:', err));
+
+      // 4. Optimistic broadcast for UI responsiveness; the debounced Strom write
+      //    re-broadcasts with applied:true. Mirrors the fader/aux paths.
+      broadcast(productionId, { type: 'AUDIO_PROC_STATE', elementId: msg.elementId, stage: msg.stage, params: procParams });
+
+      const { live } = stageToStromProps(msg.elementId, msg.stage, procParams);
+      // Only construction-time keys changed (e.g. HPF on/off), or the production
+      // is not active: the persisted value applies on next activation.
+      if (Object.keys(live).length === 0 || !doc.stromFlowId) {
+        if (cmdId) sendAck(ws, productionId, cmdId, 'executed');
+        break;
+      }
+      // Resolve the audio mixer block id (cached on ctx for later messages).
+      if (!ctx.audioBlockId) {
+        const strom = await makeStromClient();
+        const { flow } = await strom.flows.get(doc.stromFlowId);
+        const audioBlock = (flow.blocks ?? []).find((b) => b.block_definition_id === 'builtin.mixer');
+        if (audioBlock) ctx.audioBlockId = audioBlock.id;
+      }
+      if (!ctx.audioBlockId) {
+        const errText = 'Audio processing: mixer block not found';
+        if (cmdId) sendNack(ws, productionId, cmdId, errText);
+        else ws.send(JSON.stringify({ type: 'ERROR', error: errText }));
+        break;
+      }
+      // Debounce per element:stage — one Strom block-properties PATCH per window,
+      // so a knob drag that outruns the 20 msg/s cap still lands its final value.
+      const procFlowId = doc.stromFlowId;
+      const procBlockId = ctx.audioBlockId;
+      const procElementId = msg.elementId;
+      const procStage = msg.stage;
+      const procCmdId = cmdId;
+      const procDebounceKey = `${productionId}:proc:${msg.elementId}:${msg.stage}`;
+      const prevProc = pendingVolume.get(procDebounceKey);
+      if (prevProc) clearTimeout(prevProc);
+      pendingVolume.set(procDebounceKey, setTimeout(async () => {
+        pendingVolume.delete(procDebounceKey);
+        try {
+          const s = await makeStromClient();
+          await s.flows.updateBlockProperties(procFlowId, procBlockId, { properties: live });
+          // The write reached Strom (applied:true) — tell every operator.
+          broadcast(productionId, { type: 'AUDIO_PROC_STATE', elementId: procElementId, stage: procStage, params: procParams, applied: true });
+          if (procCmdId) sendAck(ws, productionId, procCmdId, 'executed');
+        } catch (err) {
+          console.warn('[controller] AUDIO_PROC_SET Strom error:', err);
+          const errText = `Audio processing: ${stromErrorMessage(err)}`;
+          if (procCmdId) sendNack(ws, productionId, procCmdId, errText);
+          else ws.send(JSON.stringify({ type: 'ERROR', error: errText }));
+        }
+      }, 150));
+      break;
+    }
     case 'AFV_SET': {
       // Register or deregister this mixer input in the per-production AFV set
       // so that applyAudioFollow knows which channels to route on cuts.
@@ -3689,6 +3794,23 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               // Watchers that connected first were shown Strom's pre-reset values.
               // Skipped when the write failed outright: Strom still holds those values.
               if (applied) broadcastAudioReset(id, numChannels, mutedElementsByProduction.get(id) ?? new Set<string>());
+              // Re-apply persisted audio processing (issue #527, OL-25) to the
+              // running flow. The connect-time init above only resets
+              // fader/mute/to_main — it NEVER touches processing keys, so this
+              // RESTORES rather than clears them. Live keys only; the
+              // construction-time ch{N}_hpf_enabled is applied by the flow
+              // generator at build and would be refused on a running pipeline.
+              const procLiveProps = liveStromPropsFromStore(connectDoc.audioProcessing);
+              if (Object.keys(procLiveProps).length > 0) {
+                await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: procLiveProps })
+                  .catch((err) => console.warn('[controller] connect audio-processing re-apply error:', err));
+              }
+            }
+            // Replay the current (non-default) audio processing state to THIS
+            // socket so a client that connects after the changes restores every
+            // set stage without sending anything (issue #527 §scope 2).
+            for (const { elementId, stage, params } of allStoredStages(connectDoc.audioProcessing)) {
+              socket.send(JSON.stringify({ type: 'AUDIO_PROC_STATE', elementId, stage, params }));
             }
             // Restore fader levels and mute state.
             // Server-side cache (channelLevelsByProduction) is authoritative — it is updated
