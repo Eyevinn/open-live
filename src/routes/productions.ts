@@ -20,6 +20,7 @@ import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-m
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type OutputStatusEntry } from '../lib/production-health.js';
 import { settleOnStop, preserveGpuUsageOnDelete } from '../services/gpu-usage.js';
+import { checkProductionStartAllowed } from '../services/production-gate.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -899,6 +900,15 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
           error: `Production is already '${doc.status}'`,
           statusCode: 409,
         });
+      }
+
+      // Guard (issue #523): a NEW production cannot start while the workspace
+      // balance is zero or negative (metered instances only; fails open on a
+      // lookup error). This is the only place the balance is consulted — a
+      // running production is never stopped because of balance.
+      const gate = await checkProductionStartAllowed(req.log);
+      if (!gate.allowed) {
+        return reply.status(402).send({ error: gate.message, statusCode: 402 });
       }
 
       // Guard: reject if any non-WHEP output is already active in another production
