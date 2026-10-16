@@ -278,6 +278,28 @@ export const config = {
   minioUseSsl: parseBoolEnv('MINIO_USE_SSL', true),
   /** Optional prefix prepended to every recording object key. */
   recordingKeyPrefix: process.env['RECORDING_KEY_PREFIX'] ?? '',
+  // --- Storage connections (issue #520, OL-21, docs/specs/storage-connections.md, ADR-009) ---
+  /**
+   * SSRF allowlist for operator-supplied storage-connection endpoints (ADR-009
+   * Decision 2, §5). Comma-separated private/loopback/link-local IP literals or
+   * CIDR ranges that a `StorageConnection` endpoint MAY resolve to, for
+   * self-hosted MinIO on a private LAN (e.g. "192.168.1.0/24,10.10.0.5"). Empty
+   * by default: every private/loopback/link-local endpoint is rejected — the
+   * safe cloud/OSC posture. Parsed with the existing `TRUSTED_HOSTS` idiom and
+   * matched by the same CIDR / IPv4-mapped-IPv6 logic
+   * (`src/lib/url-validation.ts`). Never relaxes http/graphic/SRT SSRF checks.
+   * NEVER add 169.254.0.0/16 (cloud metadata) or 0.0.0.0/0.
+   */
+  trustedStorageHosts: (process.env['TRUSTED_STORAGE_HOSTS'] ?? '')
+    .split(',')
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean),
+  /**
+   * Server-side page-size cap for `GET /api/v1/storage-connections/:id/objects`
+   * (spec §2.8). A caller-requested `max-keys` is clamped to this. Bounds
+   * listing enumeration / cost on a huge bucket. Default 1000.
+   */
+  storageListMaxKeys: parsePositiveIntEnv('STORAGE_LIST_MAX_KEYS', 1000),
   /** Presigned playback URL TTL in seconds (used by #42's listing endpoint). */
   recordingPresignTtlS: parsePositiveIntEnv('RECORDING_PRESIGN_TTL_S', 3600),
   /**
