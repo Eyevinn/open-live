@@ -52,6 +52,10 @@ const clipReferenceS3Schema = z.object({
   bucket: z.string().min(1).max(256),
   key: z.string().min(1).max(1024),
   timerange: timerangeSchema.optional(),
+  // Optional storage connection (issue #520). Shape-only here; a connectionId
+  // that no longer resolves is a Cue-time error, where a bad bucket surfaces
+  // today. Absent = the default (env) connection, exactly as before.
+  connectionId: z.string().min(1).max(128).optional(),
 });
 
 const clipReferenceTamsSchema = z.object({
@@ -79,7 +83,7 @@ const S3_BUCKET_RE = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/;
 const S3_KEY_CONTROL_RE = /[\x00-\x1f\x7f]/;
 
 /** Throws if the bucket name is not a valid S3/MinIO bucket name. */
-function assertS3Bucket(bucket: string): void {
+export function assertS3Bucket(bucket: string): void {
   if (!S3_BUCKET_RE.test(bucket)) {
     throw new Error(
       `Invalid S3 bucket "${bucket}" — must be 3–63 chars, lowercase alphanumeric with dots/hyphens, starting and ending alphanumeric`,

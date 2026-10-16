@@ -32,7 +32,8 @@ import { createHash, createHmac } from 'crypto';
 import type { StromClient, PlayerStateResponse } from './strom.js';
 import type { ClipReference, ClipState, ProductionDoc, SourceDoc } from '../db/types.js';
 import { deserializeClipReference } from './clip-reference.js';
-import { minioTargetFromConfig, type MinioTarget } from './recording-uploader.js';
+import { type MinioTarget } from './recording-uploader.js';
+import { resolveStorageTarget, StorageConnectionNotFoundError } from './storage-connection.js';
 import { httpUrlOnly } from './url-validation.js';
 import { config } from '../config.js';
 import { markClipPlayPending } from '../services/clip-state.service.js';
@@ -165,16 +166,27 @@ function presignS3Get(target: MinioTarget, key: string, expiresS: number, now: D
  * Reference resolution is confined to `cue`; downstream play/pause/stop/seek and
  * the state machine never see the reference type (spec invariant).
  */
-export function resolveClipFile(source: SourceDoc): string {
+export async function resolveClipFile(source: SourceDoc): Promise<string> {
   const ref: ClipReference = deserializeClipReference(source.address);
   switch (ref.type) {
     case 'url':
       return ref.url;
     case 's3': {
-      // Presign against the bucket stored on the reference (issue #505); the
-      // endpoint/credentials come from config. Falls back to MINIO_BUCKET only
-      // when the reference carries no bucket.
-      const target = minioTargetFromConfig(ref.bucket);
+      // Presign against the bucket stored on the reference (issue #505) using
+      // the reference's storage connection when it carries one (issue #520),
+      // else the env-derived default connection. Falls back to MINIO_BUCKET
+      // only when the reference carries no bucket.
+      let target: MinioTarget | null;
+      try {
+        target = await resolveStorageTarget(ref.connectionId, ref.bucket);
+      } catch (err) {
+        if (err instanceof StorageConnectionNotFoundError) {
+          // A connectionId that no longer resolves is a Cue-time error, the same
+          // place a bad bucket surfaces today (spec §2.9).
+          throw new ClipNotFoundError(err.message);
+        }
+        throw err;
+      }
       if (!target) {
         throw new ClipNotFoundError('Object storage is not configured — cannot resolve s3 clip reference');
       }
@@ -376,7 +388,7 @@ export async function cueClip(
   clipId?: string,
 ): Promise<ClipState> {
   const { flowId, blockId } = resolveClipTarget(doc, mixerInput);
-  const file = resolveClipFile(source);
+  const file = await resolveClipFile(source);
   const ref = deserializeClipReference(source.address);
   const objectLabel = ref.type === 's3' ? `bucket "${ref.bucket || config.minioBucket}", key "${ref.key}"` : undefined;
   await preflightClipUrl(file, config.clipPreflightTimeoutMs, objectLabel);

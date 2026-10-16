@@ -91,8 +91,15 @@ const OutputInput = z.object({
   outputType: z.enum(['mpegtssrt', 'efpsrt', 'whep', 'recording', 'rtmp']),
   url: z.string().optional(),
   rtmp: RtmpInput.optional(),
+  // Optional storage connection for a `recording` output (issue #520). Absent =
+  // the default (env) connection, exactly as today. A connectionId that no
+  // longer resolves surfaces at upload time, where a bad bucket does today.
+  connectionId: z.string().min(1).max(128).optional(),
 }).superRefine((data, ctx) => {
   const isRtmp = data.outputType === 'rtmp';
+  if (data.connectionId !== undefined && data.outputType !== 'recording') {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['connectionId'], message: 'connectionId is only valid on a recording output' });
+  }
   // `rtmp` must be present on an rtmp output and absent on every other type.
   if (isRtmp && !data.rtmp) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['rtmp'], message: 'rtmp is required for an rtmp output' });
@@ -137,6 +144,8 @@ const OutputPatch = z.object({
     streamKey: z.string().optional(),
     ingestUrl: z.string().optional(),
   }).optional(),
+  // Re-point a recording output at a different storage connection (issue #520).
+  connectionId: z.string().min(1).max(128).optional(),
 });
 
 /** Masks passphrase values in SRT URIs so credentials are never returned to clients. */
@@ -261,6 +270,8 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
         outputType: body.outputType,
         // Encrypt any embedded SRT passphrase before it touches CouchDB (issue #260).
         url: url !== undefined ? encryptAddressPassphrase(url) : url,
+        // Storage connection for a recording output (issue #520); absent = default.
+        ...(body.outputType === 'recording' && body.connectionId ? { connectionId: body.connectionId } : {}),
         createdAt: now,
         updatedAt: now,
       };
@@ -302,6 +313,9 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       }
       if (doc.outputType === 'rtmp' && body.url !== undefined) {
         return reply.status(400).send({ error: 'url is not valid on an rtmp output', statusCode: 400 });
+      }
+      if (body.connectionId !== undefined && doc.outputType !== 'recording') {
+        return reply.status(400).send({ error: 'connectionId is only valid on a recording output', statusCode: 400 });
       }
 
       // ---- RTMP patch: re-resolve ingestUrl, re-encrypt/clear/keep key ----
