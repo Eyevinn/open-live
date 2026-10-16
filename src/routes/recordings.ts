@@ -20,47 +20,55 @@ import type { FastifyBaseLogger, FastifyPluginAsync } from 'fastify';
 import { getDb, getRecordingsDb } from '../db/index.js';
 import type { RecordingDoc } from '../db/types.js';
 import { config, isRecordingEnabled } from '../config.js';
-import { minioTargetFromConfig, presignGetUrl } from '../lib/recording-uploader.js';
+import { minioTargetFromConfig, presignGetUrl, type MinioTarget } from '../lib/recording-uploader.js';
+import { resolveStorageTarget } from '../lib/storage-connection.js';
 
 /**
  * Maps a stored RecordingDoc to the public API shape: `_id` → `id`, drops the
  * CouchDB envelope, and attaches a presigned `playbackUrl`. The presign is
  * derived on read (never persisted) so the URL is always freshly time-boxed.
- * When presigning is not possible (storage misconfigured) `playbackUrl` is
- * omitted rather than emitting a broken URL.
+ *
+ * A recording that carries a `connectionId` (issue #520) is presigned against
+ * that connection's target (bucket from the doc). One without (every pre-#520
+ * recording) keeps the current default-bucket-matched path, so old recordings
+ * are unaffected. When presigning is not possible (storage misconfigured, or a
+ * since-deleted connection) `playbackUrl` is omitted rather than mis-signed.
  */
-function toApi(
+async function toApi(
   doc: RecordingDoc,
-  presign: (bucketKey: { bucket: string; key: string }) => string | undefined,
-) {
+  defaultTarget: MinioTarget | null,
+  log: FastifyBaseLogger,
+): Promise<Record<string, unknown>> {
   const { _id, _rev, type, ...rest } = doc;
   const api: Record<string, unknown> = { id: _id, ...rest };
-  const url = presign({ bucket: doc.bucket, key: doc.key });
+  const url = await presignRecording(doc, defaultTarget, log);
   if (url) api['playbackUrl'] = url;
   return api;
 }
 
-/**
- * Builds a presign function bound to the current MinIO config, or null when
- * recording storage is not configured. The returned function only presigns keys
- * whose bucket matches the configured bucket — a recording persisted against a
- * different (since-reconfigured) bucket cannot be presigned with the current
- * credentials, so it is left without a `playbackUrl` rather than mis-signed.
- */
-function buildPresigner(
+async function presignRecording(
+  doc: RecordingDoc,
+  defaultTarget: MinioTarget | null,
   log: FastifyBaseLogger,
-): ((bucketKey: { bucket: string; key: string }) => string | undefined) | null {
-  const target = minioTargetFromConfig();
-  if (!target) return null;
-  return ({ bucket, key }) => {
-    if (bucket !== target.bucket) return undefined;
-    try {
-      return presignGetUrl(target, key, config.recordingPresignTtlS);
-    } catch (err) {
-      log.warn({ err, key }, 'recordings — presign failed, omitting playbackUrl');
-      return undefined;
+): Promise<string | undefined> {
+  try {
+    if (doc.connectionId) {
+      // Presign against the connection that wrote the asset (bucket from the
+      // doc). A since-deleted connection throws → omit playbackUrl, exactly as
+      // the default-path bucket mismatch below degrades.
+      const target = await resolveStorageTarget(doc.connectionId, doc.bucket);
+      if (!target) return undefined;
+      return presignGetUrl(target, doc.key, config.recordingPresignTtlS);
     }
-  };
+    // Default path: only presign when the stored bucket matches the configured
+    // one — a recording persisted against a different (since-reconfigured)
+    // bucket cannot be signed with the current credentials (unchanged from #42).
+    if (!defaultTarget || doc.bucket !== defaultTarget.bucket) return undefined;
+    return presignGetUrl(defaultTarget, doc.key, config.recordingPresignTtlS);
+  } catch (err) {
+    log.warn({ err, key: doc.key }, 'recordings — presign failed, omitting playbackUrl');
+    return undefined;
+  }
 }
 
 const recordingsRoutes: FastifyPluginAsync = async (fastify) => {
@@ -78,10 +86,7 @@ const recordingsRoutes: FastifyPluginAsync = async (fastify) => {
       } catch {
         return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
       }
-      const presign = buildPresigner(fastify.log);
-      if (!presign) {
-        return reply.status(503).send({ error: 'Object storage unavailable', statusCode: 503 });
-      }
+      const defaultTarget = minioTargetFromConfig();
       let result: Awaited<ReturnType<ReturnType<typeof getRecordingsDb>['find']>>;
       try {
         result = await getRecordingsDb().find({
@@ -93,7 +98,9 @@ const recordingsRoutes: FastifyPluginAsync = async (fastify) => {
         return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
       }
       return reply.send(
-        (Array.isArray(result?.docs) ? result.docs : []).map((doc) => toApi(doc, presign)),
+        await Promise.all(
+          (Array.isArray(result?.docs) ? result.docs : []).map((doc) => toApi(doc, defaultTarget, fastify.log)),
+        ),
       );
     },
   );
@@ -103,10 +110,7 @@ const recordingsRoutes: FastifyPluginAsync = async (fastify) => {
     if (!isRecordingEnabled()) {
       return reply.status(503).send({ error: 'Object storage unavailable', statusCode: 503 });
     }
-    const presign = buildPresigner(fastify.log);
-    if (!presign) {
-      return reply.status(503).send({ error: 'Object storage unavailable', statusCode: 503 });
-    }
+    const defaultTarget = minioTargetFromConfig();
     let result: Awaited<ReturnType<ReturnType<typeof getRecordingsDb>['find']>>;
     try {
       result = await getRecordingsDb().find({ selector: { type: 'recording' }, limit: 500 });
@@ -115,7 +119,9 @@ const recordingsRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
     }
     return reply.send(
-      (Array.isArray(result?.docs) ? result.docs : []).map((doc) => toApi(doc, presign)),
+      await Promise.all(
+        (Array.isArray(result?.docs) ? result.docs : []).map((doc) => toApi(doc, defaultTarget, fastify.log)),
+      ),
     );
   });
 
@@ -124,13 +130,10 @@ const recordingsRoutes: FastifyPluginAsync = async (fastify) => {
     if (!isRecordingEnabled()) {
       return reply.status(503).send({ error: 'Object storage unavailable', statusCode: 503 });
     }
-    const presign = buildPresigner(fastify.log);
-    if (!presign) {
-      return reply.status(503).send({ error: 'Object storage unavailable', statusCode: 503 });
-    }
+    const defaultTarget = minioTargetFromConfig();
     try {
       const doc = await getRecordingsDb().get(req.params.id);
-      return reply.send(toApi(doc, presign));
+      return reply.send(await toApi(doc, defaultTarget, fastify.log));
     } catch {
       return reply.status(404).send({ error: 'Recording not found', statusCode: 404 });
     }

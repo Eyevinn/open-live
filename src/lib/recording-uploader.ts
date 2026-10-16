@@ -108,7 +108,7 @@ export class S3AuthError extends Error {
  * plain text, so we substring-match the known codes first and fall back to the
  * 401/403 status.
  */
-function detectS3AuthError(status: number, body: string): string | null {
+export function detectS3AuthError(status: number, body: string): string | null {
   for (const code of S3_AUTH_ERROR_CODES) {
     if (body.includes(code)) return code;
   }
@@ -137,16 +137,7 @@ export function minioTargetFromConfig(bucketOverride?: string): MinioTarget | nu
   ) {
     return null;
   }
-  // Accept either a bare host[:port] or a full URL for MINIO_ENDPOINT — normalise
-  // to host[:port] + a useSsl flag derived from the scheme when present.
-  let endpoint = config.minioEndpoint;
-  let useSsl = config.minioUseSsl;
-  const schemeMatch = /^(https?):\/\/(.+)$/i.exec(endpoint);
-  if (schemeMatch) {
-    useSsl = schemeMatch[1]!.toLowerCase() === 'https';
-    endpoint = schemeMatch[2]!;
-  }
-  endpoint = endpoint.replace(/\/+$/, '');
+  const { endpoint, useSsl } = normalizeS3Endpoint(config.minioEndpoint, config.minioUseSsl);
   return {
     endpoint,
     useSsl,
@@ -155,6 +146,27 @@ export function minioTargetFromConfig(bucketOverride?: string): MinioTarget | nu
     secretKey: config.minioSecretKey,
     bucket,
   };
+}
+
+/**
+ * Normalises an S3/MinIO endpoint — a bare `host[:port]` or a full URL — to a
+ * `host[:port]` string plus a `useSsl` flag derived from the scheme when one is
+ * present (otherwise `useSslDefault`). Shared by `minioTargetFromConfig()` and
+ * the storage-connection resource (issue #520) so both normalise identically.
+ */
+export function normalizeS3Endpoint(
+  raw: string,
+  useSslDefault: boolean,
+): { endpoint: string; useSsl: boolean } {
+  let endpoint = raw;
+  let useSsl = useSslDefault;
+  const schemeMatch = /^(https?):\/\/(.+)$/i.exec(endpoint);
+  if (schemeMatch) {
+    useSsl = schemeMatch[1]!.toLowerCase() === 'https';
+    endpoint = schemeMatch[2]!;
+  }
+  endpoint = endpoint.replace(/\/+$/, '');
+  return { endpoint, useSsl };
 }
 
 function hmac(key: Buffer | string, data: string): Buffer {

@@ -10,6 +10,7 @@ import { composeRtmpUrl } from './rtmp.js';
 import { safeFlowProjection } from './log-redact.js';
 import { VIRTUAL_SOURCES, assignAudioChannels } from './audio-channels.js';
 import { assignReturnBuses, returnSendMatrix } from './return-feeds.js';
+import { buildStromPropsFromStore } from './audio-processing.js';
 import { withGuestSlotStudioInputSuffix } from './mixer-input-map.js';
 import { assignPortsToFlow, unassignPortsFromFlow } from '../services/port-reservation.js';
 import { listenerPortRequest } from '../services/listener-ports.js';
@@ -607,6 +608,12 @@ export async function activateStromFlow(
       }
       Object.assign(props, returnSendMatrix(rb.auxBus, rb.ownChannel, rb.mode, numChannels));
     }
+    // Seed persisted audio processing (issue #527, OL-25) at flow BUILD time so
+    // it survives deactivate/reactivate. This includes the construction-time
+    // ch{N}_hpf_enabled flag (Strom marks it live:false), which is why it must
+    // be applied here rather than over the live block-properties PATCH — hence
+    // the "takes effect on next activation" note on the HPF on/off control.
+    Object.assign(props, buildStromPropsFromStore(production.audioProcessing));
     audioMixerBlock['properties'] = props;
   }
 

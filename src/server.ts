@@ -33,6 +33,7 @@ import outputsRoutes from './routes/outputs.js';
 import recordingsRoutes from './routes/recordings.js';
 import authRoutes from './routes/auth.js';
 import gatewaysRoutes from './routes/gateways.js';
+import storageConnectionsRoutes from './routes/storage-connections.js';
 import clipsRoutes from './routes/clips.js';
 import guestsRoutes from './routes/guests.js';
 import guestPageRoutes from './routes/guest-page.js';
@@ -226,6 +227,8 @@ export async function buildServer() {
           'secret',
           'signingSecret',
           'encryptionSecret',
+          'secretKey',
+          'secretKeyEnc',
           'address',
           '*.srt_uri',
           '*.passphrase',
@@ -234,6 +237,8 @@ export async function buildServer() {
           '*.secret',
           '*.signingSecret',
           '*.encryptionSecret',
+          '*.secretKey',
+          '*.secretKeyEnc',
           '*.address',
           'req.headers.authorization',
           'headers.authorization',
@@ -528,6 +533,7 @@ export async function buildServer() {
   await fastify.register(recordingsRoutes);
   await fastify.register(authRoutes);
   await fastify.register(gatewaysRoutes);
+  await fastify.register(storageConnectionsRoutes);
   await fastify.register(clipsRoutes);
   await fastify.register(guestsRoutes);
   await fastify.register(guestPageRoutes);

@@ -150,6 +150,7 @@ otherwise ignored. The inbound type union (`src/ws/controller.ts`):
 | `DSK_TOGGLE` | `layer: number`, `visible?: boolean` | Toggle a downstream keyer layer |
 | `MACRO_EXEC` | `macroId: string` | Execute a stored macro |
 | `AUDIO_SET` | `elementId: string`, `property: 'volume' \| 'mute'`, `value: unknown`, `ramp_ms?: number` | Set a channel/main fader or mute |
+| `AUDIO_PROC_SET` | `elementId: 'chN' \| 'main'`, `stage: 'gain' \| 'hpf' \| 'gate' \| 'comp' \| 'eq' \| 'limiter'`, `params: {...}` | Set one audio processing stage (issue #527, OL-25). `params` is partial (move one knob) and range-validated against the Strom ranges — an out-of-range value is rejected (`NACK`/`ERROR`) and nothing reaches Strom (no silent clamp). Stage/element rules: `limiter` and the main `comp`/`eq` are main-only; `gain`/`hpf`/`gate` are channel-only. Params by stage: `gain` → `{gain:-20..20 dB}`; `hpf` → `{enabled?, freq?:20..500 Hz}`; `gate` → `{enabled?, threshold?:-60..0 dB, attack?:0.1..200 ms, release?:10..1000 ms}`; `comp` → `{enabled?, threshold?:-60..0 dB, ratio?:1..20, attack?:0.1..200 ms, release?:10..1000 ms, makeup?:0..24 dB, knee?:-24..0 dB}`; `eq` → `{enabled?, bands?: [{band:1..4, freq?:20..20000 Hz, gain?:-15..15 dB, q?:0.1..10}]}`; `limiter` → `{enabled?, threshold?:-20..0 dB}`. One Strom block-properties PATCH per message, debounced per `elementId:stage` and coalesced under the rate limit (`AUDIO_PROC_SET` is in `coalesceKey`). Persisted on the production and re-applied on activation; excluded from the connect-time mixer reset. The HPF on/off flag (`hpf.enabled`) is a **construction-time** Strom property — persisted and applied at flow build, so it **takes effect on next activation** (the HPF cutoff `hpf.freq` is live). The main limiter sits **before** the master fader until `Eyevinn/strom#1023` is fixed, and is not defaulted on here. With a `cmdId`: `ACK accepted` then `ACK executed` after the Strom write (or persist, when a change is construction-time-only or the production is inactive), `NACK {cmdId, error}` on a rejected value or Strom error. Without a `cmdId`, failures send `ERROR`. |
 | `AFV_SET` | `mixerInput: string`, `enabled: boolean` | Enable/disable audio-follows-video for an input |
 | `AFV_RAMP_SET` | `rampUpMs: number`, `rampDownMs: number` | Set the AFV ramp times |
 | `PFL_SET` | `elementId: string`, `enabled: boolean`, `volume?: number` | Pre-fade listen on a strip |
@@ -199,6 +200,7 @@ are emitted from `src/ws/controller.ts` and `src/services/meter-relay.ts`:
 | `MACRO_EXECUTED` | `macroId: string` | A macro completed successfully |
 | `MACRO_ERROR` | `macroId: string`, `failedActionIndex: number`, `error: string` | A macro action failed (sent to originating socket) |
 | `AUDIO_STATE` | `elementId: string`, `property: 'volume' \| 'mute'`, `value: unknown` | A channel/main fader or mute changes; also replayed on connect; also broadcast for each audio-follow-video channel whose `chN_to_main` is switched at a cut (`property: 'mute'`, `value` = !routed, as reported by Strom) |
+| `AUDIO_PROC_STATE` | `elementId: 'chN' \| 'main'`, `stage: 'gain' \| 'hpf' \| 'gate' \| 'comp' \| 'eq' \| 'limiter'`, `params: {...}`, `applied?: true` | An audio processing stage changes (issue #527, OL-25). Broadcast optimistically on `AUDIO_PROC_SET`, then re-broadcast with `applied: true` once the debounced write reaches Strom. Replayed on connect for every stage that differs from default (params completed with the Strom defaults); a production that never set any processing replays nothing. |
 | `AFV_STATE` | `mixerInput: string`, `enabled: boolean` | AFV toggled for an input; also replayed on connect |
 | `AFV_RAMP_STATE` | `rampUpMs: number`, `rampDownMs: number` | AFV ramp times change; also sent on connect |
 | `PFL_STATE` | `elementId: string`, `enabled: boolean` | PFL state changes; also replayed on connect |
@@ -246,7 +248,8 @@ On connect (and when a production is active), the server pushes a snapshot of cu
 state to the new socket before any further broadcasts: `TALLY`, `OVL_STATE` (if set),
 `PIP_STATE`, any `DSK_STATE` layers, per-channel and master `AUDIO_STATE` /
 `AUX_MASTER_STATE` / `GRP_MASTER_STATE` / `MONITOR_STATE`, `AUX_SEND_STATE`,
-`GRP_SEND_STATE` (or `GRP_STATE_RESET`), `AFV_STATE`, `PFL_STATE` / `AFL_STATE`,
+`GRP_SEND_STATE` (or `GRP_STATE_RESET`), `AUDIO_PROC_STATE` (one per processing
+stage that differs from default — issue #527), `AFV_STATE`, `PFL_STATE` / `AFL_STATE`,
 `SOURCE_OFFSET_STATE` / `SOURCE_AUDIO_OFFSET_STATE`, `AFV_RAMP_STATE`, `FX_STATE`,
 `HTML_SOURCE_STATE` (per HTML source with forwarded params), `CLIP_STATE` (one per
 clip source — a `mixerInput` present in `clipPlayerBlockIds`), `GUEST_STATE` (one per

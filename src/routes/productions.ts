@@ -15,7 +15,8 @@ import { clearPipState, clearAudioState, clearFxState, clearClipStateForProducti
 import { forceStopMeterRelay } from '../services/meter-relay.js';
 import { forceStopClipRelay } from '../services/clip-relay.js';
 import { config, isRecordingEnabled } from '../config.js';
-import { minioTargetFromConfig, uploadRecordings } from '../lib/recording-uploader.js';
+import { uploadRecordings } from '../lib/recording-uploader.js';
+import { resolveStorageTarget } from '../lib/storage-connection.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type OutputStatusEntry } from '../lib/production-health.js';
@@ -277,16 +278,16 @@ async function writeDeactivatedDoc(
  * read failure returns undefined rather than blocking teardown, since the field
  * is optional.
  */
-async function firstRecordingOutputId(
+async function firstRecordingOutput(
   doc: ProductionDoc,
   log: { warn: (obj: unknown, msg: string) => void },
-): Promise<string | undefined> {
+): Promise<OutputDoc | undefined> {
   const assignedIds = (doc.outputAssignments ?? []).map((a) => a.outputId);
   if (assignedIds.length === 0) return undefined;
   for (const outputId of assignedIds) {
     try {
       const output = await getOutputsDb().get(outputId);
-      if (output.outputType === 'recording') return output._id;
+      if (output.outputType === 'recording') return output;
     } catch (err) {
       log.warn({ err, outputId }, 'could not resolve output while stamping RecordingDoc');
     }
@@ -1057,8 +1058,17 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       // recordings to MinIO — Strom's recorder has no native S3 sink, so
       // open-live pulls the segments and pushes them to object storage.
       // Best-effort: a failed upload must not block deactivation/teardown.
-      if (doc.recorderBlockId && isRecordingEnabled()) {
-        const target = minioTargetFromConfig();
+      // Resolve the recording output first: a `recording` output may carry a
+      // storage connectionId (issue #520) that routes its segments to a store
+      // other than the env default. Absent connectionId = the env default,
+      // exactly as before (gated by isRecordingEnabled).
+      const recordingOutput = doc.recorderBlockId ? await firstRecordingOutput(doc, log) : undefined;
+      const recordingConnectionId = recordingOutput?.connectionId;
+      if (doc.recorderBlockId && (isRecordingEnabled() || recordingConnectionId)) {
+        const target = await resolveStorageTarget(recordingConnectionId).catch((err) => {
+          log.error({ err, productionId: doc._id }, 'could not resolve storage connection for recording upload');
+          return null;
+        });
         if (target) {
           try {
             await strom.recorder.splitNow(doc.stromFlowId, doc.recorderBlockId).catch(() => undefined);
@@ -1093,7 +1103,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
             // playback endpoint can enumerate and presign recordings without
             // round-tripping the bucket. Best-effort: a failed persist must not
             // block teardown, mirroring the upload's non-fatal contract.
-            const recordingOutputId = await firstRecordingOutputId(doc, log);
+            const recordingOutputId = recordingOutput?._id;
             const finalizedAt = new Date().toISOString();
             for (const seg of uploadRes.uploaded) {
               try {
@@ -1103,6 +1113,9 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
                   type: 'recording',
                   productionId: doc._id,
                   ...(recordingOutputId ? { outputId: recordingOutputId } : {}),
+                  // Record which connection wrote the asset (issue #520); absent
+                  // = the default (env) connection — no backfill on old docs.
+                  ...(recordingConnectionId ? { connectionId: recordingConnectionId } : {}),
                   bucket: target.bucket,
                   key: seg.key,
                   sizeBytes: seg.sizeBytes,
