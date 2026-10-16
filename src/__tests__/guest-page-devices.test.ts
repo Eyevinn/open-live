@@ -111,7 +111,15 @@ const DEVICES = [
   { kind: 'audioinput', deviceId: 'mic-b', label: 'Mic B' },
 ];
 
-type Constraint = boolean | { deviceId: { exact: string } } | undefined;
+type Constraint =
+  | boolean
+  | {
+      deviceId?: { exact: string };
+      aspectRatio?: { ideal: number };
+      width?: { ideal: number };
+      height?: { ideal: number };
+    }
+  | undefined;
 
 interface PageOpts {
   /** Device ids getUserMedia refuses to open. */
@@ -193,7 +201,7 @@ function runPage(script: string, opts: PageOpts = {}) {
 
   const open = (kind: 'audio' | 'video', c: Constraint) => {
     const fallback = kind === 'audio' ? 'mic-a' : 'cam-a';
-    const id = c && typeof c === 'object' ? c.deviceId.exact : fallback;
+    const id = c && typeof c === 'object' && c.deviceId ? c.deviceId.exact : fallback;
     if (opts.broken?.has(id)) return null;
     const t = new FakeTrack(kind, id);
     t.muted = !!opts.mutedAtOpen?.has(id);
@@ -340,6 +348,23 @@ describe('guest page devices', () => {
     expect(page.replaced.map((r) => r.kind)).toEqual(['video']);
     expect(page.whipPosts()).toBe(1);
     expect(page.els['cam']!.value).toBe('cam-b');
+  });
+
+  it('publishes a 16:9 video capture at join and when switching camera (iPhone black-bar fix, #521)', async () => {
+    const page = await goLive();
+    const wide = { aspectRatio: { ideal: 16 / 9 }, width: { ideal: 1280 }, height: { ideal: 720 } };
+
+    // Every getUserMedia that asks for video must request 16:9 so the guest
+    // publishes widescreen rather than an iPhone Ultra Wide ~4:3 that
+    // pillarboxes on the source bus, multiview, PVW and PGM.
+    const videoCalls = page.gumCalls.filter((c) => c.video);
+    expect(videoCalls.length).toBeGreaterThan(0);
+    for (const c of videoCalls) expect(c.video).toMatchObject(wide);
+
+    page.pick('cam', 'cam-b');
+    await flush();
+    expect(page.track('video').deviceId).toBe('cam-b');
+    expect(page.gumCalls.at(-1)!.video).toMatchObject({ ...wide, deviceId: { exact: 'cam-b' } });
   });
 
   it('only uses the newest of two quick picks', async () => {
