@@ -287,6 +287,26 @@ write so a REST mix change no longer leaves live WS clients stale. `broadcast()`
 (`src/services/tally.service.ts`) takes `message: unknown`, so there is no outgoing-message union
 to extend — the extra field is accepted as-is.
 
+## Audio processing: one Strom mixer property is construction-time (`chN_hpf_enabled`)
+
+The `builtin.mixer` audio processing (issue #527, OL-25) maps all stages to **live** block
+properties **except** the per-channel HPF on/off flag `chN_hpf_enabled`, which Strom marks
+`live: false` (`backend/src/blocks/builtin/mixer/definition.rs:674-690` @`8fce2ee`). A live
+`PATCH .../blocks/{id}/properties` carrying it is **rejected** (lands in the `rejected` map →
+`StromPropertiesRejectedError`), exactly like `chN_aux{M}_pre` (#395). So `src/lib/audio-processing.ts`
+splits a stage's Strom props into `{ live, construct }`: `stageToStromProps` puts only
+`chN_hpf_enabled` in `construct`. The WS/REST handlers write **only `live`** to the running flow;
+the construct key is persisted on `ProductionDoc.audioProcessing` and applied by
+`flow-generator.ts` at **build** time (`buildStromPropsFromStore`), so HPF on/off **takes effect on
+next activation** — documented as such in the contract. The HPF *cutoff* (`chN_hpf_freq`) is live.
+
+Related: the connect-time mixer reset (`src/ws/controller.ts`, first-connect init) only writes
+`chN_fader`/`chN_mute`/`chN_to_main`/`main_fader` — it never touches processing keys, so persisted
+processing is **naturally excluded** from the reset. On first connect it is **re-applied** (live
+keys only) and `AUDIO_PROC_STATE` is replayed for each stored stage. Ranges mirror Strom exactly
+(cross-checked against `frontend/src/mixer/detail.rs` slider ranges, not just the backend
+descriptions, which round e.g. attack to `0-200` where the UI enforces `0.1-200`).
+
 ## Controller WS rate-limit drops are coalesced and idempotent setters are replayed
 
 The per-connection WS rate limiter (`src/ws/controller.ts`, `checkRateLimit`, 20 msg/s general +
