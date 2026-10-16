@@ -1,7 +1,8 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
-import { getDb } from '../db/index.js';
+import { getDb, getGuestInvitesDb, getGuestSessionsDb } from '../db/index.js';
 import { loadAudioChannels } from '../lib/audio-channels.js';
+import { guestSlotDefaultLabel } from '../lib/guest-slot-label.js';
 import { StromClient, StromPropertiesRejectedError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
@@ -97,16 +98,52 @@ const audioRoutes: FastifyPluginAsync = async (fastify) => {
           }
         } catch { /* sources DB unavailable */ }
 
+        // Resolve the JOINED guest's invite name onto its slot's strip (issue #522).
+        // The flow writes the build-time "Guest N" to ch{N}_label, but ch{N}_label
+        // is NOT a live Strom property ("requires flow restart"), so the join-time
+        // live PATCH is refused and the stale "Guest N" is what a read-back of the
+        // flow would return. open-live already holds the joined guest's name
+        // server-side (the active guest-session's invite `label`), so we resolve the
+        // strip label from there instead — this survives a controller reload and
+        // falls back to "Guest N" the moment the guest leaves. Best-effort: if the
+        // guest DBs are unavailable the strip simply keeps its "Guest N" default.
+        const guestNameByMixerInput = new Map<string, string>();
+        try {
+          const sessionsResult = await getGuestSessionsDb().find({
+            selector: { type: 'guest-session', productionId: req.params.id },
+          });
+          const sessions = (Array.isArray(sessionsResult?.docs) ? sessionsResult.docs : [])
+            .filter((s) => s.state !== 'left');
+          if (sessions.length > 0) {
+            const invitesResult = await getGuestInvitesDb().find({
+              selector: { type: 'guest-invite', productionId: req.params.id },
+            });
+            const labelByInvite = new Map(
+              (Array.isArray(invitesResult?.docs) ? invitesResult.docs : [])
+                .map((inv) => [inv._id, inv.label] as const),
+            );
+            for (const s of sessions) {
+              const name = labelByInvite.get(s.inviteId)?.trim();
+              if (name) guestNameByMixerInput.set(s.mixerInput, name);
+            }
+          }
+        } catch { /* guest DBs unavailable — fall back to the "Guest N" default */ }
+
         const channels = Array.from({ length: numChannels }, (_, i) => {
           const chIdx = i + 1;
           const chLabel = mixerBlock.properties?.[`ch${chIdx}_label`] as string | undefined;
-          // Guest slots: the flow's ch{N}_label ("Guest N") takes precedence over
-          // the generic "WHIP Input" virtual-source name. Everything else keeps the
-          // resolved source name first, falling back to the flow label then "Ch N".
+          const mixerInput = audioChannelMixerInputMap.get(i) ?? null;
+          // Guest slots: prefer the joined guest's invite name (issue #522), then the
+          // "Guest N" default (NOT the stale ch{N}_label read back from the flow, which
+          // Strom refuses to live-update), ahead of the generic "WHIP Input" name.
+          // Everything else keeps the resolved source name first, falling back to the
+          // flow label then "Ch N".
           const label = guestWhipChannels.has(i)
-            ? (chLabel ?? audioChannelNameMap.get(i) ?? `Ch ${chIdx}`)
+            ? ((mixerInput ? guestNameByMixerInput.get(mixerInput) : undefined)
+                ?? (mixerInput ? guestSlotDefaultLabel(doc, mixerInput) : undefined)
+                ?? chLabel ?? audioChannelNameMap.get(i) ?? `Ch ${chIdx}`)
             : (audioChannelNameMap.get(i) ?? chLabel ?? `Ch ${chIdx}`);
-          return { id: `ch${chIdx}`, elementId: `ch${chIdx}`, blockId: mixerBlock.id, label, mixerInput: audioChannelMixerInputMap.get(i) ?? null };
+          return { id: `ch${chIdx}`, elementId: `ch${chIdx}`, blockId: mixerBlock.id, label, mixerInput };
         });
 
         // MAIN is always the master output strip of the mixer
