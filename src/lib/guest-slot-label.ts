@@ -38,7 +38,7 @@ import type { FastifyBaseLogger } from 'fastify';
 import { config } from '../config.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { StromClient } from './strom.js';
-import { mixerInputToStromPad } from './mixer-input-map.js';
+import { mixerInputToStromPad, withGuestSlotStudioInputSuffix } from './mixer-input-map.js';
 import { loadAudioChannels } from './audio-channels.js';
 import type { ProductionDoc } from '../db/types.js';
 
@@ -135,7 +135,12 @@ export async function applyGuestSlotMixerLabel(
   await patchGuestSlotMixerInput(
     production,
     mixerInput,
-    (pad) => (text ? { [`input_${pad}_label`]: text } : null),
+    // ADR-007 Option C (guest tiles only): the live multiview tile carries the
+    // operator's stored Studio slot number alongside the invite / `Guest N` name
+    // (e.g. "Ada · In 6"), matching the build-time label in flow-generator.ts.
+    // The audio strip (applyGuestSlotAudioStripLabel) keeps the plain name.
+    (pad) =>
+      text ? { [`input_${pad}_label`]: withGuestSlotStudioInputSuffix(text, mixerInput) } : null,
     log,
     // Older Strom (pre strom#1014/PR#1014) does not know the live
     // `input_{N}_label` property and rejects it (StromPropertiesRejectedError),
