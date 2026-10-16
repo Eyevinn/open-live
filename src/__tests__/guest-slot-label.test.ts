@@ -216,7 +216,9 @@ describe('guest slot live multiview label (#466)', () => {
       expect(labelPatch).toBeDefined();
       expect(labelPatch!.flowId).toBe('flow-1');
       expect(labelPatch!.blockId).toBe('b-mixer');
-      expect(labelPatch!.properties['input_1_label']).toBe('Anna, Helsinki');
+      // ADR-007 Option C: the live tile carries the stored Studio slot number
+      // (video_in_15 → "In 16") alongside the invite name.
+      expect(labelPatch!.properties['input_1_label']).toBe('Anna, Helsinki · In 16');
     } finally {
       vi.unstubAllGlobals();
     }
@@ -232,7 +234,8 @@ describe('guest slot live multiview label (#466)', () => {
       expect((await join(invite)).statusCode).toBe(200);
       const labelPatch = captured.find((c) => 'input_0_label' in c.properties);
       expect(labelPatch).toBeDefined();
-      expect(labelPatch!.properties['input_0_label']).toBe('Guest 2');
+      // ADR-007 Option C: video_in_14 → stored Studio slot "In 15".
+      expect(labelPatch!.properties['input_0_label']).toBe('Guest 2 · In 15');
     } finally {
       vi.unstubAllGlobals();
     }
@@ -255,7 +258,7 @@ describe('guest slot live multiview label (#466)', () => {
       expect(leave.statusCode).toBe(204);
       const labelPatch = captured.find((c) => 'input_1_label' in c.properties);
       expect(labelPatch).toBeDefined();
-      expect(labelPatch!.properties['input_1_label']).toBe('Guest 1');
+      expect(labelPatch!.properties['input_1_label']).toBe('Guest 1 · In 16');
     } finally {
       vi.unstubAllGlobals();
     }
@@ -277,7 +280,7 @@ describe('guest slot live multiview label (#466)', () => {
       });
       expect(kick.statusCode).toBe(204);
       const labelPatch = captured.find((c) => 'input_1_label' in c.properties);
-      expect(labelPatch!.properties['input_1_label']).toBe('Guest 1');
+      expect(labelPatch!.properties['input_1_label']).toBe('Guest 1 · In 16');
     } finally {
       vi.unstubAllGlobals();
     }
@@ -299,7 +302,7 @@ describe('guest slot live multiview label (#466)', () => {
       });
       expect(revoke.statusCode).toBe(204);
       const labelPatch = captured.find((c) => 'input_1_label' in c.properties);
-      expect(labelPatch!.properties['input_1_label']).toBe('Guest 1');
+      expect(labelPatch!.properties['input_1_label']).toBe('Guest 1 · In 16');
     } finally {
       vi.unstubAllGlobals();
     }
