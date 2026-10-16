@@ -103,6 +103,170 @@ export const BLOCKED_HOSTNAMES = new Set([
 ]);
 
 /**
+ * Normalises a host for allowlist matching the SAME way `isPrivateHost()` does:
+ * trims, strips IPv6 brackets, lowercases, and canonicalises an IPv4-mapped IPv6
+ * literal (both `::ffff:a.b.c.d` and the `::ffff:hi:lo` hex-hextet form) to its
+ * embedded dotted IPv4 — so `::ffff:192.168.1.5` matches a `192.168.1.0/24`
+ * allowlist entry (closing the same mapped-address gap #58 covered).
+ */
+function canonicalHostForMatch(hostname: string): string {
+  const host = hostname.trim().replace(/^\[|\]$/g, '').toLowerCase();
+  const mappedDotted = host.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  if (mappedDotted) return mappedDotted[1]!;
+  const mappedHex = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (mappedHex) {
+    const hi = parseInt(mappedHex[1]!, 16);
+    const lo = parseInt(mappedHex[2]!, 16);
+    return [hi >> 8, hi & 0xff, lo >> 8, lo & 0xff].join('.');
+  }
+  return host;
+}
+
+/** Parses a dotted-quad IPv4 literal to a 32-bit unsigned int, or null if invalid. */
+function ipv4ToInt(host: string): number | null {
+  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!m) return null;
+  const octets = m.slice(1, 5).map(Number);
+  if (octets.some((n) => n > 255)) return null;
+  return ((octets[0]! << 24) | (octets[1]! << 16) | (octets[2]! << 8) | octets[3]!) >>> 0;
+}
+
+/**
+ * Expands an IPv6 literal (supporting one `::` run and a trailing embedded IPv4)
+ * to a 128-bit BigInt, or null if malformed.
+ */
+function ipv6ToBigInt(host: string): bigint | null {
+  let text = host;
+  // A trailing embedded IPv4 (e.g. ::ffff:1.2.3.4) → two hextets.
+  const v4 = text.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  if (v4) {
+    const asInt = ipv4ToInt(v4[1]!);
+    if (asInt === null) return null;
+    const hi = (asInt >>> 16) & 0xffff;
+    const lo = asInt & 0xffff;
+    text = text.slice(0, v4.index) + hi.toString(16) + ':' + lo.toString(16);
+  }
+  const halves = text.split('::');
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0]!.split(':') : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1]!.split(':') : [];
+  const missing = 8 - (head.length + tail.length);
+  if (halves.length === 1) {
+    if (head.length !== 8) return null;
+  } else if (missing < 0) {
+    return null;
+  }
+  const groups = halves.length === 2
+    ? [...head, ...Array(missing).fill('0'), ...tail]
+    : head;
+  if (groups.length !== 8) return null;
+  let result = 0n;
+  for (const g of groups) {
+    if (!/^[0-9a-f]{1,4}$/.test(g)) return null;
+    result = (result << 16n) | BigInt(parseInt(g, 16));
+  }
+  return result;
+}
+
+/**
+ * True iff `hostname` (an IP literal) matches a `TRUSTED_*_HOSTS` allowlist
+ * entry — bare IP literal (exact, normalised equality) or CIDR range
+ * (`a.b.c.d/len` IPv4 prefix, `x::/len` IPv6 prefix). Non-IP hostnames (public
+ * DNS names) NEVER match, consistent with `isPrivateHost()` which only reasons
+ * about IP literals. Malformed entries never match (fail-closed).
+ *
+ * Shared between SSRF allowlists (the storage-connection `TRUSTED_STORAGE_HOSTS`
+ * gate today; the SRT `TRUSTED_SRT_HOSTS` gate reuses the same matcher when that
+ * spec is implemented) so there is ONE SSRF matching implementation to audit
+ * (ADR-009 Decision 2).
+ */
+export function isTrustedHost(hostname: string, trusted: readonly string[]): boolean {
+  const host = canonicalHostForMatch(hostname);
+  const hostV4 = ipv4ToInt(host);
+  const hostV6 = hostV4 === null ? ipv6ToBigInt(host) : null;
+  // Only IP-literal hosts are ever matched — a public DNS name is never a
+  // "trusted private host" (consistent with `isPrivateHost()`, which only
+  // reasons about IP literals).
+  if (hostV4 === null && hostV6 === null) return false;
+  for (const rawEntry of trusted) {
+    const entry = rawEntry.trim().toLowerCase();
+    if (!entry) continue;
+    const slash = entry.indexOf('/');
+    if (slash === -1) {
+      // Bare literal: exact normalised equality.
+      if (canonicalHostForMatch(entry) === host) return true;
+      continue;
+    }
+    const base = entry.slice(0, slash).replace(/^\[|\]$/g, '');
+    const len = Number(entry.slice(slash + 1));
+    if (!Number.isInteger(len) || len < 0) continue;
+    if (base.includes(':')) {
+      // IPv6 CIDR.
+      if (hostV6 === null || len > 128) continue;
+      const baseInt = ipv6ToBigInt(base);
+      if (baseInt === null) continue;
+      const shift = BigInt(128 - len);
+      if ((hostV6 >> shift) === (baseInt >> shift)) return true;
+    } else {
+      // IPv4 CIDR.
+      if (hostV4 === null || len > 32) continue;
+      const baseInt = ipv4ToInt(base);
+      if (baseInt === null) continue;
+      // `>>> 0` keeps it unsigned; a /0 mask is the whole space.
+      const mask = len === 0 ? 0 : (0xffffffff << (32 - len)) >>> 0;
+      if ((hostV4 & mask) >>> 0 === (baseInt & mask) >>> 0) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Validates an operator-supplied storage-connection endpoint against SSRF
+ * (ADR-009 Decision 2, spec §5). Normalises the endpoint to `host[:port]`
+ * exactly as `minioTargetFromConfig()` does (strips an http/https scheme and
+ * trailing slashes), then rejects a host that `isPrivateHost()` flags UNLESS it
+ * matches `trustedStorageHosts` (bare IP literal or CIDR). Also rejects the
+ * well-known internal hostnames `isPrivateHost` cannot catch (`localhost`,
+ * `metadata.google.internal`). Returns the normalised `host[:port]` on success.
+ *
+ * Default (empty allowlist): every private/loopback/link-local endpoint is
+ * rejected — the safe cloud/OSC posture. DNS-name endpoints are NOT resolved
+ * synchronously (same limitation as `httpUrlOnly`/`isPrivateHost`); this blocks
+ * the direct-IP-literal vector.
+ */
+export function storageEndpointHost(
+  endpoint: string,
+  trustedStorageHosts: readonly string[] = [],
+): string {
+  let normalised = endpoint.trim();
+  const schemeMatch = /^(https?):\/\/(.+)$/i.exec(normalised);
+  if (schemeMatch) normalised = schemeMatch[2]!;
+  normalised = normalised.replace(/\/+$/, '');
+  if (!normalised) throw new Error('Storage endpoint must not be empty');
+  // Split host[:port], supporting a bracketed IPv6 literal.
+  let host: string;
+  const bracketed = normalised.match(/^\[([^\]]*)\](?::\d+)?$/);
+  if (bracketed) {
+    host = bracketed[1]!;
+  } else {
+    host = normalised.replace(/:\d+$/, '');
+  }
+  if (isPrivateHost(host) && !isTrustedHost(host, trustedStorageHosts)) {
+    throw new Error(
+      'endpoint resolves to a private/loopback/link-local address; ' +
+        'add its host or CIDR to TRUSTED_STORAGE_HOSTS to allow it',
+    );
+  }
+  if (BLOCKED_HOSTNAMES.has(host.toLowerCase())) {
+    throw new Error(
+      'endpoint resolves to a private/loopback/link-local address; ' +
+        'add its host or CIDR to TRUSTED_STORAGE_HOSTS to allow it',
+    );
+  }
+  return normalised;
+}
+
+/**
  * Throws if the URL is not a safe http/https URL.
  * Rejects private/loopback/link-local/internal IP literals (via `isPrivateHost`,
  * which also catches IPv4-mapped IPv6 such as ::ffff:169.254.169.254 — the AWS

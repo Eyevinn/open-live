@@ -1,6 +1,6 @@
 import Nano from 'nano';
 import { config } from '../config.js';
-import type { ProductionDoc, SourceDoc, ProductionConfigDoc, GraphicDoc, OutputDoc, GatewayDoc, RecordingDoc, GuestInviteDoc, GuestSessionDoc, GuestSigningKeyDoc, CredentialEncryptionKeyDoc, RtmpCredentialKeyDoc, MigrationStateDoc, GpuUsageLedgerDoc } from './types.js';
+import type { ProductionDoc, SourceDoc, ProductionConfigDoc, GraphicDoc, OutputDoc, GatewayDoc, RecordingDoc, GuestInviteDoc, GuestSessionDoc, GuestSigningKeyDoc, CredentialEncryptionKeyDoc, RtmpCredentialKeyDoc, MigrationStateDoc, GpuUsageLedgerDoc, StorageConnectionDoc } from './types.js';
 
 
 let db: Nano.DocumentScope<ProductionDoc>;
@@ -174,6 +174,10 @@ export function getMigrationStateDb(): GuardedScope<MigrationStateDoc> {
 
 export function getGpuUsageLedgerDb(): GuardedScope<GpuUsageLedgerDoc> {
   return withTypeGuard(db as unknown as Nano.DocumentScope<GpuUsageLedgerDoc>, 'gpu-usage-ledger');
+}
+
+export function getStorageConnectionsDb(): GuardedScope<StorageConnectionDoc> {
+  return withTypeGuard(db as unknown as Nano.DocumentScope<StorageConnectionDoc>, 'storage-connection');
 }
 
 const DB_NAME = 'open-live';
