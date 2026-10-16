@@ -2,15 +2,34 @@ import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
 import { loadAudioChannels } from '../lib/audio-channels.js';
-import { StromClient } from '../lib/strom.js';
+import { StromClient, StromPropertiesRejectedError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
 import { broadcast } from '../services/tally.service.js';
+import { updateProductionDoc } from './productions.js';
+import {
+  type AudioProcStage,
+  AUDIO_PROC_STAGES,
+  parseStageParams,
+  stageAllowedOnElement,
+  stageToStromProps,
+  mergeIntoStore,
+  defaultStageParams,
+  mergeStageParams,
+  stagesForElement,
+} from '../lib/audio-processing.js';
 
 const AudioPatch = z.object({
   property: z.enum(['volume', 'mute']),
   // volume: 0.0–10.0 (Strom mixer ceiling); mute: boolean
   value: z.union([z.number().min(0).max(10), z.boolean()]),
+});
+
+// Audio processing PATCH envelope (issue #527). `params` is range-validated
+// per-stage against the Strom ranges in the handler (shared with the WS path).
+const AudioProcPatch = z.object({
+  stage: z.enum(AUDIO_PROC_STAGES),
+  params: z.record(z.string(), z.unknown()),
 });
 
 const MIXER_BLOCK_TYPE = 'builtin.mixer';
@@ -188,6 +207,103 @@ const audioRoutes: FastifyPluginAsync = async (fastify) => {
           applied: true,
         });
         return reply.send({ element_id: req.params.elementId, properties: { [body.property]: body.value } });
+      } catch (err) {
+        const e = err as { statusCode?: number };
+        if (e?.statusCode === 404) {
+          return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+        }
+        throw err;
+      }
+    },
+  );
+
+  // Get an element's current audio processing state (issue #527, OL-25). Returns
+  // every stage valid on the element — gain/hpf/gate/comp/eq on a channel;
+  // comp/eq/limiter on main — with Strom defaults overlaid by any persisted
+  // operator changes, so a never-touched production reports the defaults.
+  fastify.get<{ Params: { id: string; elementId: string } }>(
+    '/api/v1/productions/:id/audio/:elementId/processing',
+    async (req, reply) => {
+      try {
+        const doc = await getDb().get(req.params.id);
+        const elementId = req.params.elementId;
+        const isMain = elementId === 'main';
+        const ch = isMain ? null : chNum(elementId);
+        if (!isMain && ch === null) {
+          return reply.status(400).send({ error: 'Invalid channel id', statusCode: 400 });
+        }
+        const store = doc.audioProcessing;
+        const processing: Record<string, unknown> = {};
+        for (const stage of stagesForElement(elementId)) {
+          const stored = store?.[elementId]?.[stage];
+          processing[stage] = mergeStageParams(stage, defaultStageParams(stage), stored ?? {});
+        }
+        return reply.send({ element_id: elementId, processing });
+      } catch (err) {
+        const e = err as { statusCode?: number };
+        if (e?.statusCode === 404) {
+          return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+        }
+        throw err;
+      }
+    },
+  );
+
+  // Update an element's audio processing (issue #527, OL-25). Same params as the
+  // WS AUDIO_PROC_SET: validated against the Strom ranges (out-of-range → 400,
+  // no silent clamp), persisted on the production doc, applied live to Strom
+  // when the pipeline is running, and broadcast as AUDIO_PROC_STATE so live WS
+  // clients stay in sync. The construction-time ch{N}_hpf_enabled flag is
+  // persisted but only takes effect on the next activation (via the flow
+  // generator) — the live write carries just the live keys.
+  fastify.patch<{ Params: { id: string; elementId: string } }>(
+    '/api/v1/productions/:id/audio/:elementId/processing',
+    async (req, reply) => {
+      const body = AudioProcPatch.parse(req.body);
+      const elementId = req.params.elementId;
+      const isMain = elementId === 'main';
+      const ch = isMain ? null : chNum(elementId);
+      if (!isMain && ch === null) {
+        return reply.status(400).send({ error: 'Invalid channel id', statusCode: 400 });
+      }
+      const stage = body.stage as AudioProcStage;
+      if (!stageAllowedOnElement(stage, elementId)) {
+        return reply.status(400).send({ error: `Stage '${stage}' is not valid on '${elementId}'`, statusCode: 400 });
+      }
+      const parsed = parseStageParams(stage, body.params);
+      if (!parsed.ok) {
+        return reply.status(400).send({ error: parsed.error, statusCode: 400 });
+      }
+      const params = parsed.params;
+      try {
+        const doc = await getDb().get(req.params.id);
+        // Persist regardless of activation so the setting applies on next
+        // activation and survives deactivate/reactivate.
+        const nextStore = mergeIntoStore(doc.audioProcessing, elementId, stage, params);
+        await updateProductionDoc(req.params.id, { audioProcessing: nextStore });
+
+        const { live } = stageToStromProps(elementId, stage, params);
+        let applied = false;
+        if (doc.stromFlowId && Object.keys(live).length > 0) {
+          const stromToken = await getStromToken(config.stromToken).catch(() => undefined);
+          const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
+          const { flow } = await withTimeout(strom.flows.get(doc.stromFlowId), 5000);
+          const mixerBlock = (flow.blocks ?? []).find((b) => b.block_definition_id === MIXER_BLOCK_TYPE);
+          if (!mixerBlock) return reply.status(404).send({ error: 'Mixer block not found', statusCode: 404 });
+          try {
+            await withTimeout(strom.flows.updateBlockProperties(doc.stromFlowId, mixerBlock.id, { properties: live }), 5000);
+            applied = true;
+          } catch (werr) {
+            if (werr instanceof StromPropertiesRejectedError) {
+              return reply.status(422).send({ error: werr.message, statusCode: 422 });
+            }
+            throw werr;
+          }
+        }
+        // Same AUDIO_PROC_STATE shape the WS path broadcasts; applied:true only
+        // when the live write reached Strom.
+        broadcast(req.params.id, { type: 'AUDIO_PROC_STATE', elementId, stage, params, ...(applied ? { applied: true } : {}) });
+        return reply.send({ element_id: elementId, stage, params, applied });
       } catch (err) {
         const e = err as { statusCode?: number };
         if (e?.statusCode === 404) {

@@ -707,6 +707,17 @@ export interface ProductionDoc {
   tally: Tally;
   mixerBlockId?: string;
   audioMixerBlockId?: string;
+  /**
+   * Persisted audio processing state (issue #527, OL-25) — per-channel gain,
+   * HPF, gate, compressor, EQ and the main-bus compressor, EQ and limiter.
+   * Keyed by elementId ('ch1' | 'main'), then by stage; only stages an operator
+   * has actually set are present. Set via the WS `AUDIO_PROC_SET` handler and
+   * the REST processing route; survives deactivate/reactivate and is re-applied
+   * through the flow generator at build time (including the construction-time
+   * `chN_hpf_enabled`). DELIBERATELY NOT cleared on deactivate and NOT touched
+   * by the connect-time mixer reset. See {@link AudioProcessingStore}.
+   */
+  audioProcessing?: import('../lib/audio-processing.js').AudioProcessingStore;
   /** ID of the builtin.loudness block on the main audio bus — set on activate, cleared on deactivate */
   loudnessMainBlockId?: string;
   /** Maps mixerInput (e.g. 'video_in_1') → time_offset block ID — set on activate, cleared on deactivate */
