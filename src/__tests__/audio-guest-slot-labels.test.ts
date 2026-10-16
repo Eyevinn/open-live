@@ -32,6 +32,15 @@ const SOURCES: Record<string, Record<string, unknown>> = {
 
 const mockProductionGet = vi.fn();
 
+// Mutable guest-session / guest-invite stores the #522 tests populate to drive
+// GET /audio's dynamic strip-label resolution. `find` filters by every selector
+// key (type + productionId + whatever else the route passes).
+const guestSessions: Array<Record<string, unknown>> = [];
+const guestInvites: Array<Record<string, unknown>> = [];
+function matchSelector(docs: Array<Record<string, unknown>>, selector: Record<string, unknown>) {
+  return docs.filter((d) => Object.entries(selector).every(([k, v]) => d[k] === v));
+}
+
 vi.mock('../db/index.js', () => {
   const sourcesGet = (id: string) =>
     SOURCES[id] ? Promise.resolve({ ...SOURCES[id] }) : Promise.reject(Object.assign(new Error('not found'), { statusCode: 404 }));
@@ -39,6 +48,14 @@ vi.mock('../db/index.js', () => {
     getDb: () => ({ get: mockProductionGet, insert: vi.fn().mockResolvedValue({ ok: true }) }),
     getSourcesDb: () => ({ get: sourcesGet }),
     getGraphicsDb: () => ({ get: vi.fn().mockRejectedValue(new Error('not found')) }),
+    getGuestSessionsDb: () => ({
+      find: (q: { selector: Record<string, unknown> }) =>
+        Promise.resolve({ docs: matchSelector(guestSessions, q.selector) }),
+    }),
+    getGuestInvitesDb: () => ({
+      find: (q: { selector: Record<string, unknown> }) =>
+        Promise.resolve({ docs: matchSelector(guestInvites, q.selector) }),
+    }),
   };
 });
 
@@ -139,7 +156,22 @@ async function getAudioChannels() {
 beforeEach(() => {
   createdFlow = null;
   mockProductionGet.mockReset();
+  guestSessions.length = 0;
+  guestInvites.length = 0;
 });
+
+/** Seed a joined guest on `mixerInput` carrying `label` (or an unnamed invite). */
+function seedJoinedGuest(mixerInput: string, label?: string, prodId = PROD) {
+  const inviteId = `guest-invite-${mixerInput}`;
+  guestInvites.push({
+    _id: inviteId, type: 'guest-invite', productionId: prodId, mixerInput,
+    ...(label ? { label } : {}),
+  });
+  guestSessions.push({
+    _id: `guest-session-${mixerInput}`, type: 'guest-session', productionId: prodId,
+    inviteId, mixerInput, state: 'joined',
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -196,5 +228,87 @@ describe('GET /audio — guest-slot strip labels (#464)', () => {
     const whip = channels.find((c) => c.mixerInput === 'video_in_1');
     expect(whip!.label).toBe('WHIP Input');
     expect(channels.map((c) => c.label)).not.toContain('Guest 1');
+  });
+});
+
+describe('GET /audio — joined guest name on the strip (#522)', () => {
+  it('resolves the invite name onto the strip when a named guest has joined', async () => {
+    await generate([
+      { sourceId: 'cam-srt', mixerInput: 'video_in_0' },
+      { sourceId: 'Whip', mixerInput: 'video_in_5', returnFeed: { synced: 'program-minus' } },
+    ]);
+    // Guest joined on the slot with a named invite — the strip must read the name,
+    // NOT the stale build-time "Guest 1" (which Strom refuses to live-update).
+    seedJoinedGuest('video_in_5', 'Anna, Helsinki');
+
+    const channels = await getAudioChannels();
+    expect(channels.find((c) => c.mixerInput === 'video_in_5')!.label).toBe('Anna, Helsinki');
+  });
+
+  it('survives a controller reload — a fresh GET still returns the joined name', async () => {
+    await generate([
+      { sourceId: 'cam-srt', mixerInput: 'video_in_0' },
+      { sourceId: 'Whip', mixerInput: 'video_in_5', returnFeed: { synced: 'program-minus' } },
+    ]);
+    seedJoinedGuest('video_in_5', 'Anna, Helsinki');
+
+    // Each getAudioChannels() builds a brand-new Fastify app and injects a new
+    // request, i.e. exactly what a reloaded controller does — the name persists.
+    expect((await getAudioChannels()).find((c) => c.mixerInput === 'video_in_5')!.label)
+      .toBe('Anna, Helsinki');
+    expect((await getAudioChannels()).find((c) => c.mixerInput === 'video_in_5')!.label)
+      .toBe('Anna, Helsinki');
+  });
+
+  it('falls back to "Guest N" once the guest has left (session state "left")', async () => {
+    await generate([
+      { sourceId: 'cam-srt', mixerInput: 'video_in_0' },
+      { sourceId: 'Whip', mixerInput: 'video_in_5', returnFeed: { synced: 'program-minus' } },
+    ]);
+    seedJoinedGuest('video_in_5', 'Anna, Helsinki');
+    // The guest leaves/kick/revoke marks the session `left`; the strip reverts.
+    (guestSessions[0] as Record<string, unknown>)['state'] = 'left';
+
+    const channels = await getAudioChannels();
+    expect(channels.find((c) => c.mixerInput === 'video_in_5')!.label).toBe('Guest 1');
+  });
+
+  it('falls back to "Guest N" for an unnamed invite', async () => {
+    await generate([
+      { sourceId: 'cam-srt', mixerInput: 'video_in_0' },
+      { sourceId: 'Whip', mixerInput: 'video_in_5', returnFeed: { synced: 'program-minus' } },
+    ]);
+    seedJoinedGuest('video_in_5'); // no label on the invite
+
+    const channels = await getAudioChannels();
+    expect(channels.find((c) => c.mixerInput === 'video_in_5')!.label).toBe('Guest 1');
+  });
+
+  it('gives each guest its own name across two slots', async () => {
+    await generate([
+      { sourceId: 'cam-srt', mixerInput: 'video_in_0' },
+      { sourceId: 'Whip', mixerInput: 'video_in_4', returnFeed: { synced: 'program-minus' } },
+      { sourceId: 'Whip', mixerInput: 'video_in_5', returnFeed: { synced: 'program-minus' } },
+    ]);
+    // video_in_5 is Guest 1, video_in_4 is Guest 2 (descending pad order).
+    seedJoinedGuest('video_in_5', 'Anna');
+    seedJoinedGuest('video_in_4', 'Björn');
+
+    const channels = await getAudioChannels();
+    expect(channels.find((c) => c.mixerInput === 'video_in_5')!.label).toBe('Anna');
+    expect(channels.find((c) => c.mixerInput === 'video_in_4')!.label).toBe('Björn');
+  });
+
+  it('shows the joined name on one slot and "Guest N" on an unjoined sibling', async () => {
+    await generate([
+      { sourceId: 'cam-srt', mixerInput: 'video_in_0' },
+      { sourceId: 'Whip', mixerInput: 'video_in_4', returnFeed: { synced: 'program-minus' } },
+      { sourceId: 'Whip', mixerInput: 'video_in_5', returnFeed: { synced: 'program-minus' } },
+    ]);
+    seedJoinedGuest('video_in_5', 'Anna'); // only Guest 1 joined
+
+    const channels = await getAudioChannels();
+    expect(channels.find((c) => c.mixerInput === 'video_in_5')!.label).toBe('Anna');
+    expect(channels.find((c) => c.mixerInput === 'video_in_4')!.label).toBe('Guest 2');
   });
 });
