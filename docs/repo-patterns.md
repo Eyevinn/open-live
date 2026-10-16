@@ -3,6 +3,30 @@
 Running notes on non-obvious behaviours in `open-live` that have bitten (or nearly bitten)
 implementers. Add to this as you discover them — one short section per pattern.
 
+## The SSRF `TRUSTED_SRT_HOSTS` matcher is spec-only — the shared matcher lives in `url-validation.ts`
+
+ADR-009 and `docs/specs/storage-connections.md` §5 say the storage-endpoint SSRF guard "reuses
+the `TRUSTED_SRT_HOSTS` matcher verbatim". That matcher does **not** exist in code yet —
+`docs/specs/configurable-srt-private-host-allowlist.md` (issue #246) is still an unimplemented
+spec, and `srtUrl()` has no `trustedSrtHosts` parameter. So #520 introduced the shared matcher
+fresh: `isTrustedHost(hostname, trusted)` + `storageEndpointHost(endpoint, trusted)` in
+`src/lib/url-validation.ts` (IPv4/IPv6 CIDR + IPv4-mapped-IPv6 canonicalisation, fail-closed on a
+malformed entry, DNS names never match). When #246 is finally implemented, wire `srtUrl()`'s new
+gate through `isTrustedHost` rather than writing a second matcher — the whole point of ADR-009
+Decision 2 is one SSRF matching implementation to audit.
+
+## Storage-connection secrets share the credential key, but `SRT_PASSPHRASE_KEY`-only deployments need `STORAGE_CONNECTION_KEY`
+
+`storage-connection-crypto.ts` uses `KeySource { envVar: 'STORAGE_CONNECTION_KEY',
+allowStoredKeyFallback: true }` — the SHARED credential-key family (ADR-009 Decision 1), like
+SRT/HTML. Zero-config on OSC: no env key set → `ensureCredentialEncryptionKey()` generates the
+shared stored key → storage secrets encrypt fine. **Gotcha:** `ensureCredentialEncryptionKey()`
+early-returns `null` (no stored key generated) when `SRT_PASSPHRASE_KEY` is set. So a self-hosted
+deployment that sets `SRT_PASSPHRASE_KEY` but NOT `STORAGE_CONNECTION_KEY` has no key for storage
+secrets and fails closed in production. Such deployments must also set `STORAGE_CONNECTION_KEY`
+(unlike HTML-auth, whose bespoke `loadHtmlAuthKey()` reads `SRT_PASSPHRASE_KEY` as a second env
+fallback; the generic `KeySource` abstraction reads only its one `envVar`).
+
 ## `toApi()` spreads the whole doc — new secret-bearing fields leak by default
 
 `src/routes/outputs.ts` `toApi()` builds its response with `const { _id, _rev, type, status, ...rest } = doc; { id: _id, ...rest }`. The `...rest` spread echoes **every** other field of the
@@ -286,6 +310,26 @@ previously broadcast nothing; it now emits the same `AUDIO_STATE { ..., applied:
 write so a REST mix change no longer leaves live WS clients stale. `broadcast()`
 (`src/services/tally.service.ts`) takes `message: unknown`, so there is no outgoing-message union
 to extend — the extra field is accepted as-is.
+
+## Audio processing: one Strom mixer property is construction-time (`chN_hpf_enabled`)
+
+The `builtin.mixer` audio processing (issue #527, OL-25) maps all stages to **live** block
+properties **except** the per-channel HPF on/off flag `chN_hpf_enabled`, which Strom marks
+`live: false` (`backend/src/blocks/builtin/mixer/definition.rs:674-690` @`8fce2ee`). A live
+`PATCH .../blocks/{id}/properties` carrying it is **rejected** (lands in the `rejected` map →
+`StromPropertiesRejectedError`), exactly like `chN_aux{M}_pre` (#395). So `src/lib/audio-processing.ts`
+splits a stage's Strom props into `{ live, construct }`: `stageToStromProps` puts only
+`chN_hpf_enabled` in `construct`. The WS/REST handlers write **only `live`** to the running flow;
+the construct key is persisted on `ProductionDoc.audioProcessing` and applied by
+`flow-generator.ts` at **build** time (`buildStromPropsFromStore`), so HPF on/off **takes effect on
+next activation** — documented as such in the contract. The HPF *cutoff* (`chN_hpf_freq`) is live.
+
+Related: the connect-time mixer reset (`src/ws/controller.ts`, first-connect init) only writes
+`chN_fader`/`chN_mute`/`chN_to_main`/`main_fader` — it never touches processing keys, so persisted
+processing is **naturally excluded** from the reset. On first connect it is **re-applied** (live
+keys only) and `AUDIO_PROC_STATE` is replayed for each stored stage. Ranges mirror Strom exactly
+(cross-checked against `frontend/src/mixer/detail.rs` slider ranges, not just the backend
+descriptions, which round e.g. attack to `0-200` where the UI enforces `0.1-200`).
 
 ## Controller WS rate-limit drops are coalesced and idempotent setters are replayed
 
