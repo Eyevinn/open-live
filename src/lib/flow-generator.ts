@@ -13,6 +13,7 @@ import { assignReturnBuses, returnSendMatrix } from './return-feeds.js';
 import { withGuestSlotStudioInputSuffix } from './mixer-input-map.js';
 import { assignPortsToFlow, unassignPortsFromFlow } from '../services/port-reservation.js';
 import { listenerPortRequest } from '../services/listener-ports.js';
+import { activationRecordingsDirName, productionRecordingsDir } from './recording-uploader.js';
 
 /**
  * Generates a Strom flow from a template + source assignments,
@@ -1029,7 +1030,9 @@ export async function activateStromFlow(
         // Per-production output directory: recorder writes
         // {media_path}/{output_dir}/{prefix}_%05d.{ext} (Strom recorder.rs). We key
         // it by production id so segments are trivially locatable + uploadable.
-        const outputDir = `recordings/${production._id}`;
+        // Each activation gets its own subdirectory, named by its start time, so
+        // deactivate can tell which activation recorded each file.
+        const outputDir = `${productionRecordingsDir(production._id)}/${activationRecordingsDirName()}`;
         flow.blocks.push({
           id: blockId,
           block_definition_id: 'builtin.recorder',
