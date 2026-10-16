@@ -59,6 +59,14 @@ export interface ClipReferenceS3 {
   bucket: string;
   key: string;
   timerange?: string;
+  /**
+   * Optional id of the {@link StorageConnectionDoc} whose endpoint/region/
+   * credentials presign this object (issue #520, OL-21). Absent = the implicit
+   * default connection built from the `MINIO_*` / `S3_ENDPOINT` env — exactly
+   * today's behaviour. A `connectionId` that no longer resolves is a Cue-time
+   * error, the same place a bad bucket surfaces today.
+   */
+  connectionId?: string;
 }
 
 /** BBC Time-Addressable Media Store (flow + timerange). Reserved — not v1. */
@@ -324,6 +332,13 @@ export interface OutputDoc {
    */
   rtmp?: RtmpDestination;
   /**
+   * Optional id of the {@link StorageConnectionDoc} a `recording` output writes
+   * its segments to (issue #520, OL-21). Present only on `recording` outputs;
+   * absent = the implicit default connection built from the env, exactly as
+   * today. Stamped onto each {@link RecordingDoc} written by this output.
+   */
+  connectionId?: string;
+  /**
    * Derived output health (issue #255). Optional; when absent, read as
    * `unknown`. Computed on read from the owning production's live flow state
    * rather than persisted (see `src/lib/production-health.ts`).
@@ -355,6 +370,13 @@ export interface RecordingDoc {
   type: 'recording';
   productionId: string;   // references ProductionDoc._id
   outputId?: string;      // the 'recording' OutputDoc that produced it, when known
+  /**
+   * Id of the {@link StorageConnectionDoc} this asset was written to (issue
+   * #520, OL-21). Absent = the implicit default (env) connection — no backfill
+   * runs on existing recordings, and "absent" and `"default"` resolve
+   * identically for playback presigning (spec §3.3).
+   */
+  connectionId?: string;
   bucket: string;
   key: string;            // object key, e.g. "<productionId>/<segment>.mp4"
   sizeBytes?: number;
@@ -518,6 +540,47 @@ export interface RtmpCredentialKeyDoc {
   /** Randomly generated 32-byte AES-256 key (base64). Never logged or returned. */
   encryptionSecret: string;
   createdAt: string;        // ISO 8601
+}
+
+// --------------- Storage connections (issue #520, OL-21) ---------------
+
+/** Advisory least-privilege tag; NOT enforced by the backend in v1 (spec §2.1). */
+export type StorageConnectionRole = 'clip' | 'recording' | 'both';
+
+/**
+ * A named, operator-managed object-storage connection (issue #520, OL-21,
+ * `docs/specs/storage-connections.md`, ADR-009). Clip sources and recording
+ * targets each OPTIONALLY choose a connection; absent means the implicit default
+ * connection built from the `MINIO_*` / `S3_ENDPOINT` env, so existing
+ * instances, `s3` references, and recordings keep working unchanged.
+ *
+ * A `StorageConnectionDoc` maps 1:1 onto a `MinioTarget`
+ * (`src/lib/recording-uploader.ts`) once `secretKeyEnc` is decrypted and a bucket
+ * is supplied, so the existing presign / putObject / list code paths are reused
+ * with a per-connection target instead of `minioTargetFromConfig()`.
+ *
+ * The reserved id `"default"` is NEVER a stored document — it denotes the
+ * env-derived connection, materialised on demand from `minioTargetFromConfig()`.
+ *
+ * `secretKeyEnc` is a credential: it is encrypted at rest (`encv1:` AES-256-GCM,
+ * `src/lib/storage-connection-crypto.ts`), NEVER returned by any route (the API
+ * exposes only `secretKeySet: boolean`), and NEVER logged (`secret` substring
+ * redaction in `src/lib/log-redact.ts` and the Fastify logger redact paths).
+ */
+export interface StorageConnectionDoc {
+  _id: string;              // "stconn-<uuid>"
+  _rev?: string;
+  type: 'storage-connection';
+  name: string;
+  endpoint: string;         // host[:port], scheme stripped (as MinioTarget.endpoint)
+  useSsl: boolean;
+  region: string;
+  accessKey: string;        // access key id — not secret, stored/returned in clear
+  secretKeyEnc: string;     // "encv1:<base64url(iv|tag|ciphertext)>" — NEVER plaintext, NEVER returned
+  defaultBucket?: string;
+  role: StorageConnectionRole;
+  createdAt: string;        // ISO 8601
+  updatedAt: string;        // ISO 8601
 }
 
 // --------------- Shared-GPU usage ledger (issue #500) ---------------
