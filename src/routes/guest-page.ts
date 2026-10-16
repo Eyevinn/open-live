@@ -273,11 +273,27 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     }
 
     // ---- Device setup ------------------------------------------------------
+    // Request a 16:9 capture so the guest publishes a widescreen stream over
+    // WHIP. Without this an iPhone front Ultra Wide camera publishes its native
+    // ~4:3, which pillarboxes (black side bars) on the source bus, multiview,
+    // PVW and PGM. "ideal" (not "exact") keeps devices that cannot deliver 16:9
+    // working instead of throwing OverconstrainedError. Used for both the
+    // initial publish and camera switches so the back camera is 16:9 too.
+    function videoConstraints(camId) {
+      var c = {
+        aspectRatio: { ideal: 16 / 9 },
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      };
+      if (camId) c.deviceId = { exact: camId };
+      return c;
+    }
+
     function selectedConstraints() {
       var camId = camSel.value;
       var micId = micSel.value;
       return {
-        video: camId ? { deviceId: { exact: camId } } : true,
+        video: videoConstraints(camId),
         audio: micId ? { deviceId: { exact: micId } } : true
       };
     }
@@ -402,12 +418,12 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       var seq = ++deviceSeq[kind];
       var sel = kind === "audio" ? micSel : camSel;
       var exact = {};
-      exact[kind] = sel.value ? { deviceId: { exact: sel.value } } : true;
+      exact[kind] = kind === "video" ? videoConstraints(sel.value) : (sel.value ? { deviceId: { exact: sel.value } } : true);
       return navigator.mediaDevices.getUserMedia(exact).catch(function (err) {
         // The picked device may be the one that went away: take the default.
         if (!sel.value) throw err;
         var any = {};
-        any[kind] = true;
+        any[kind] = kind === "video" ? videoConstraints(null) : true;
         return navigator.mediaDevices.getUserMedia(any);
       }).then(function (stream) {
         var fresh = stream.getTracks().filter(function (t) { return t.kind === kind; })[0];
