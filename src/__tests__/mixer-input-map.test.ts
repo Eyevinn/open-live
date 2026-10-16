@@ -7,6 +7,8 @@ import {
   mixerInputToStromPad,
   storedPadToStromPad,
   expandToStoredPadIndex,
+  guestSlotStudioInputNumber,
+  withGuestSlotStudioInputSuffix,
 } from '../lib/mixer-input-map.js';
 
 // 4 cameras + 2 guest slots (video_in_15 = Guest 1, video_in_14 = Guest 2),
@@ -72,5 +74,29 @@ describe('expandToStoredPadIndex (inverse)', () => {
   it('passes the array through unchanged when no map is present', () => {
     const compact = ['a', 'b'];
     expect(expandToStoredPadIndex(compact, undefined)).toEqual(['a', 'b']);
+  });
+});
+
+describe('guestSlotStudioInputNumber (ADR-007 Option C)', () => {
+  it('returns the 1-indexed stored Studio slot number', () => {
+    // The #512 worked example: video_in_5 is "Input 6" in Studio.
+    expect(guestSlotStudioInputNumber('video_in_5')).toBe(6);
+    expect(guestSlotStudioInputNumber('video_in_0')).toBe(1);
+    expect(guestSlotStudioInputNumber('video_in_15')).toBe(16);
+  });
+  it('returns null for a non-pad name', () => {
+    expect(guestSlotStudioInputNumber('not_a_pad')).toBeNull();
+  });
+});
+
+describe('withGuestSlotStudioInputSuffix (ADR-007 Option C)', () => {
+  it('carries the stored Studio slot number into the guest-tile label', () => {
+    // #512: a guest placed in Studio "Input 6" (video_in_5) renders on the
+    // #463-compacted pad but the overlay now surfaces the operator's slot number.
+    expect(withGuestSlotStudioInputSuffix('Guest 1', 'video_in_5')).toBe('Guest 1 · In 6');
+    expect(withGuestSlotStudioInputSuffix('Ada', 'video_in_5')).toBe('Ada · In 6');
+  });
+  it('leaves the label unchanged for a non-pad name', () => {
+    expect(withGuestSlotStudioInputSuffix('Guest 1', 'not_a_pad')).toBe('Guest 1');
   });
 });

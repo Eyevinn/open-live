@@ -103,7 +103,9 @@ describe('activateStromFlow — guest-slot multiview labels (#458)', () => {
     // is compacted (issue #463): video_in_0→pad 0, video_in_5→pad 1. The label must
     // land on the COMPACT pad and must NOT be left unset (which would make Strom
     // fall back to its default "In 2").
-    expect(props['input_1_label']).toBe('Guest 1');
+    // ADR-007 Option C: the overlay carries the stored Studio slot number
+    // (video_in_5 → "In 6") alongside "Guest 1".
+    expect(props['input_1_label']).toBe('Guest 1 · In 6');
     expect(props['input_1_label']).not.toBe('WHIP Input');
   });
 
@@ -122,9 +124,10 @@ describe('activateStromFlow — guest-slot multiview labels (#458)', () => {
     // Highest stored trailing index is Guest 1, next is Guest 2 (matches Studio's
     // top-of-range-down slot allocation). Compaction (issue #463) maps video_in_0→0,
     // video_in_4→1, video_in_5→2, so Guest 1 (video_in_5) lands on compact pad 2 and
-    // Guest 2 (video_in_4) on compact pad 1.
-    expect(props['input_2_label']).toBe('Guest 1');
-    expect(props['input_1_label']).toBe('Guest 2');
+    // Guest 2 (video_in_4) on compact pad 1. ADR-007 Option C adds the stored
+    // Studio slot number suffix: video_in_5 → "In 6", video_in_4 → "In 5".
+    expect(props['input_2_label']).toBe('Guest 1 · In 6');
+    expect(props['input_1_label']).toBe('Guest 2 · In 5');
   });
 
   it('keeps a named non-guest source label and does not label it "Guest N"', async () => {
@@ -141,7 +144,9 @@ describe('activateStromFlow — guest-slot multiview labels (#458)', () => {
     const props = visionMixerProps(strom.capturedFlows[0]!);
     // Compaction (issue #463): video_in_0→pad 0 (Camera A), video_in_5→pad 1 (Guest 1).
     expect(props['input_0_label']).toBe('Camera A');
-    expect(props['input_1_label']).toBe('Guest 1');
+    // ADR-007 Option C: guest tile carries the stored slot number (video_in_5 →
+    // "In 6"); the non-guest source "Camera A" gets no suffix.
+    expect(props['input_1_label']).toBe('Guest 1 · In 6');
   });
 
   it('does not apply the "Guest N" fallback to a WHIP input without a returnFeed (not a guest slot)', async () => {
@@ -203,8 +208,11 @@ describe('activateStromFlow — guest-slot audio mixer strip labels (#464)', () 
     // Labels land on the COMPACT pad (issue #463): video_in_0→0, video_in_4→1,
     // video_in_5→2, so Guest 1 (video_in_5) is input_2 and Guest 2 (video_in_4)
     // is input_1.
-    expect(visProps['input_2_label']).toBe('Guest 1');
-    expect(visProps['input_1_label']).toBe('Guest 2');
+    // ADR-007 Option C: the video tile carries the stored Studio slot number
+    // (video_in_5 → "In 6", video_in_4 → "In 5"); the audio strip keeps the
+    // plain "Guest N" (audio desk is out of scope for the slot-number suffix).
+    expect(visProps['input_2_label']).toBe('Guest 1 · In 6');
+    expect(visProps['input_1_label']).toBe('Guest 2 · In 5');
     expect(audioLabels).toContain('Guest 1');
     expect(audioLabels).toContain('Guest 2');
     expect(audioLabels).not.toContain('WHIP Input');
@@ -425,8 +433,10 @@ describe('activateStromFlow — guest slots do not pad the mixer to 16 inputs (#
 
     const props = visionMixerProps(strom.capturedFlows[0]!);
     // video_in_15 (Guest 1) → compact pad 5; video_in_14 (Guest 2) → compact pad 4.
-    expect(props['input_5_label']).toBe('Guest 1');
-    expect(props['input_4_label']).toBe('Guest 2');
+    // ADR-007 Option C: overlay carries the stored Studio slot number
+    // (video_in_15 → "In 16", video_in_14 → "In 15").
+    expect(props['input_5_label']).toBe('Guest 1 · In 16');
+    expect(props['input_4_label']).toBe('Guest 2 · In 15');
     // Cameras keep their own names on the low pads.
     expect(props['input_0_label']).toBe('Cam 0');
     expect(props['input_3_label']).toBe('Cam 3');
