@@ -22,6 +22,7 @@ import type Nano from 'nano';
 import { config, isGpuMeteringEnabled } from '../config.js';
 import { getDb, getGpuUsageLedgerDb, isDbConnected } from '../db/index.js';
 import type { ProductionDoc, GpuUsageLedgerDoc } from '../db/types.js';
+import { renderProductionGateMetrics } from './production-gate.js';
 
 const HOUR_MS = 3_600_000;
 
@@ -559,6 +560,7 @@ export async function buildPrometheusMetrics(log: FastifyBaseLogger, nowMs: numb
     '# HELP osc_gpu_active Number of GPU-consuming workloads running right now.',
     '# TYPE osc_gpu_active gauge',
     ...gaugeSamples,
+    ...renderProductionGateMetrics(),
   ];
   return lines.join('\n') + '\n';
 }
