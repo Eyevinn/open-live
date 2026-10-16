@@ -608,6 +608,92 @@ components:
           type: string
           nullable: true
 
+    # Audio processing (issue #527, OL-25). Ranges mirror Strom exactly; a
+    # running Strom's GET /api/blocks is authoritative. All numeric params are
+    # partial so a single knob can move per request.
+    AudioProcessingStageParams:
+      type: object
+      description: >
+        Params for one processing stage. Which keys apply depends on the stage:
+        gain → {gain}; hpf → {enabled, freq}; gate → {enabled, threshold,
+        attack, release}; comp → {enabled, threshold, ratio, attack, release,
+        makeup, knee}; eq → {enabled, bands[]}; limiter → {enabled, threshold}.
+      additionalProperties: false
+      properties:
+        enabled:
+          type: boolean
+        gain:
+          type: number
+          description: Channel input gain, dB (-20 to +20).
+          minimum: -20
+          maximum: 20
+        freq:
+          type: number
+          description: HPF cutoff, Hz (20 to 500). Live; the hpf enable flag takes effect on next activation.
+          minimum: 20
+          maximum: 500
+        threshold:
+          type: number
+          description: "Gate/comp threshold dB (-60 to 0); limiter threshold dB (-20 to 0)."
+        ratio:
+          type: number
+          description: Compressor ratio (1:1 to 20:1).
+          minimum: 1
+          maximum: 20
+        attack:
+          type: number
+          description: Gate/comp attack, ms (0.1 to 200).
+          minimum: 0.1
+          maximum: 200
+        release:
+          type: number
+          description: Gate/comp release, ms (10 to 1000).
+          minimum: 10
+          maximum: 1000
+        makeup:
+          type: number
+          description: Compressor makeup gain, dB (0 to 24).
+          minimum: 0
+          maximum: 24
+        knee:
+          type: number
+          description: Compressor knee, dB (-24 to 0).
+          minimum: -24
+          maximum: 0
+        bands:
+          type: array
+          maxItems: 4
+          items:
+            type: object
+            additionalProperties: false
+            required: [band]
+            properties:
+              band:
+                type: integer
+                minimum: 1
+                maximum: 4
+              freq:
+                type: number
+                description: EQ band frequency, Hz (20 to 20000).
+                minimum: 20
+                maximum: 20000
+              gain:
+                type: number
+                description: EQ band gain, dB (-15 to +15).
+                minimum: -15
+                maximum: 15
+              q:
+                type: number
+                description: EQ band Q (0.1 to 10).
+                minimum: 0.1
+                maximum: 10
+
+    AudioProcessing:
+      type: object
+      description: Current processing state keyed by stage (gain/hpf/gate/comp/eq on a channel; comp/eq/limiter on main).
+      additionalProperties:
+        $ref: '#/components/schemas/AudioProcessingStageParams'
+
     Production:
       type: object
       required: [id, name, status, sources, pipeline, macros, createdAt, updatedAt]
@@ -2397,6 +2483,96 @@ paths:
                     additionalProperties: true
         '404':
           description: Not found
+
+  /api/v1/productions/{id}/audio/{elementId}/processing:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: elementId
+        in: path
+        required: true
+        description: "'ch1', 'ch2', … for a channel strip, or 'main' for the main bus."
+        schema:
+          type: string
+    get:
+      summary: Get audio processing state
+      description: >
+        Returns the current audio processing state for the element — every stage
+        valid on it (gain, hpf, gate, comp, eq on a channel; comp, eq, limiter on
+        main) with the Strom defaults overlaid by any persisted operator changes.
+      operationId: getAudioProcessing
+      tags: [Audio]
+      responses:
+        '200':
+          description: Audio processing state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  element_id:
+                    type: string
+                  processing:
+                    $ref: '#/components/schemas/AudioProcessing'
+        '400':
+          description: Invalid channel id
+        '404':
+          description: Not found
+    patch:
+      summary: Update audio processing
+      description: >
+        Sets one processing stage for the element. `params` is partial (move one
+        knob) and validated against the Strom ranges — an out-of-range value is
+        rejected with 400 and nothing reaches Strom (no silent clamp). The
+        setting is persisted on the production and re-applied on activation; it is
+        applied live to the running pipeline and broadcast to controller WS
+        clients as `AUDIO_PROC_STATE`. Stage/element rules: `limiter` and the main
+        `comp`/`eq` are main-only; `gain`/`hpf`/`gate` are channel-only. The HPF
+        on/off flag (`hpf.enabled`) is a construction-time Strom property — it is
+        persisted but only takes effect on the next activation (the HPF cutoff
+        `hpf.freq` is live). The main limiter sits before the master fader until
+        Eyevinn/strom#1023 is fixed.
+      operationId: updateAudioProcessing
+      tags: [Audio]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [stage, params]
+              properties:
+                stage:
+                  type: string
+                  enum: [gain, hpf, gate, comp, eq, limiter]
+                params:
+                  $ref: '#/components/schemas/AudioProcessingStageParams'
+      responses:
+        '200':
+          description: Updated stage
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  element_id:
+                    type: string
+                  stage:
+                    type: string
+                  params:
+                    $ref: '#/components/schemas/AudioProcessingStageParams'
+                  applied:
+                    type: boolean
+                    description: true when the value reached the running Strom pipeline; false when stored for the next activation.
+        '400':
+          description: Invalid channel id, stage not valid on element, or param out of range
+        '404':
+          description: Not found
+        '422':
+          description: Strom refused the write (e.g. a required audio plugin is not available)
 
   # Production — Stats
 
