@@ -1,9 +1,11 @@
 # Spec: Allow users to choose which audio stream an SRT/input uses
 
 - Issue: [Eyevinn/open-live#511](https://github.com/Eyevinn/open-live/issues/511) — "Allow users to choose which audio stream an SRT/input uses" (split from #508; needs-spec half)
-- Status: Draft (architect, Phase 1 — pre-implementation; `skills/epic-workflow.md` §Phase 1)
+- Follow-up issues: #515 (data model + discovery endpoint — **done**, PR #518), [#516](https://github.com/Eyevinn/open-live/issues/516) (flow-generator wiring + Studio warning — this revision)
+- Status: Draft, **revised 2026-10-17** for #516 (architect, Phase 1; `skills/epic-workflow.md` §Phase 1). §2–§3 are implemented as written. §1, §4–§8 are revised per @svensson00's 2026-10-15 corrections on #516.
 - Repos affected: `Eyevinn/open-live` (backend + flow generator), `Eyevinn/open-live-studio` (controller UI), and a **load-bearing Strom capability** (see §5.3 / §7.1)
-- Companion ADR: [`docs/decisions/ADR-006-audio-stream-selection.md`](../decisions/ADR-006-audio-stream-selection.md)
+- Companion ADRs: [`ADR-006`](../decisions/ADR-006-audio-stream-selection.md) (Decisions 1–3: data model, API, discovery) and [`ADR-010`](../decisions/ADR-010-audio-stream-selection-pipeline-wiring.md) (supersedes ADR-006 Decisions 4–5: pipeline wiring, v1 scope, clamp + warning)
+- Upstream dependency: [Eyevinn/strom#1077](https://github.com/Eyevinn/strom/issues/1077) (takeover fix, "Option Park") **plus a PID-order mapping follow-up that is not yet filed** (§7.1)
 - Type: cross-service feature (new API field + persisted config + pipeline audio mapping + UI control)
 
 ---
@@ -37,13 +39,26 @@ wiring. The issue asks to make it a first-class, operator-chosen value, **with t
 staying the first stream** (the sibling default-stream bug — issue #511 "Dependencies" — is
 assumed landed first so that "first stream" is already sane).
 
-**The hard part is not storing an index — it is that the Strom input block does not currently
-expose any way to select among multiple audio streams** (it has one `srt_uri`, one `latency`,
-one `audio_out_0`). Delivering this feature therefore depends on a Strom-side capability that
-does not yet exist (§5.3, §7.1), exactly the kind of upstream pipeline dependency ADR-004
-gated on. This spec defines the Open Live contract and the migration/validation strategy so
-that the backend and UI are ready the moment that capability lands, and degrade safely until
-then.
+**The hard part is not storing an index. It is that the Strom input block cannot yet route a
+*chosen* stream to a *known* output.**
+
+> **Correction (2026-10-17, @svensson00 on #516).** The original text of this section said the
+> input block exposes only one `audio_out_0`. That is wrong, and `docs/strom-block-config.md:50-59`
+> is incomplete on this point. `builtin.mpegtssrt_input` already has `num_audio_tracks` (UInt,
+> default 1, non-live), which creates `audio_out_0` … `audio_out_{N-1}` (Eyevinn/strom
+> `backend/src/blocks/builtin/mpegtssrt_input.rs:77-85,682-693` at `8fce2ee`). What is missing
+> is a **stable mapping**. A demuxer pad takes the first output nothing feeds
+> (`link_to_output`, `mpegtssrt_input.rs:450`), so pad-added order (not PID order) decides which
+> stream lands on `audio_out_k`. When every output is fed, the retire branch
+> (`mpegtssrt_input.rs:498`, from strom#877) takes over the oldest output. That is the #510 bug,
+> filed as strom#1077. Its "Option Park" fix restores "first stream wins" only. Mapping
+> `audio_out_k` to the k-th stream in PID order is an upstream follow-up that has **not yet
+> been filed**.
+
+Delivering selection for `k > 0` therefore depends on that Strom follow-up (§5.3, §7.1). This
+is the same kind of upstream gate ADR-004 had. The Open Live contract (§2–§3) is already shipped
+(#518). This revision specifies the flow-generator wiring and the operator warning, so that both
+are ready the moment the capability lands and degrade to "first stream + warning" until then.
 
 ---
 
@@ -184,6 +199,64 @@ GET /api/v1/sources/:id/audio-streams
 `selectedIndex` is always present (it is local state), so the UI can show the current choice
 even when the stream list cannot be enumerated.
 
+### 2.5 Changed contract (#516): input-scoped activation warning
+
+The sources endpoints (§2.2–§2.4) are **unchanged** by #516. In particular,
+`GET /api/v1/sources/:id/audio-streams` keeps returning
+`discovery: "unavailable", reason: "strom-probe-unsupported"` (`src/routes/sources.ts:581-597`)
+until Strom can report the stream list (§6 Q5).
+
+The one contract change is an **additive variant on `ActivationWarning`**
+(`src/lib/flow-generator.ts:82`). Today the union has a single member, `recording-no-audio`. It
+is persisted as `ProductionDoc.activationWarnings` (`src/db/types.ts:837`), returned on the
+production resource (`GET /api/v1/productions/:id`, written at `src/routes/productions.ts:427`)
+and replayed as WS `ERROR` frames on controller connect while the production is active
+(`src/ws/controller.ts:4019-4022`):
+
+```ts
+// src/lib/flow-generator.ts:82 (and the mirrored type at src/db/types.ts:837)
+export type ActivationWarning =
+  | { type: 'recording-no-audio'; message: string }
+  | {
+      type: 'audio-stream-not-applied';
+      sourceId: string;          // SourceDoc._id
+      mixerInput: string;        // stored assignment key, e.g. 'video_in_3' (the "input" in Studio)
+      requestedIndex: number;    // effective SourceDoc.audioStreamIndex (> 0)
+      appliedIndex: 0;           // v1 always clamps to the first stream
+      reason: 'stream-type-unsupported' | 'strom-capability-missing' | 'stream-not-present';
+      message: string;           // human text, also used for the WS ERROR toast
+    };
+```
+
+```jsonc
+// GET /api/v1/productions/:id (active production), excerpt
+{
+  "status": "active",
+  "activationWarnings": [
+    {
+      "type": "audio-stream-not-applied",
+      "sourceId": "src-3f1c…",
+      "mixerInput": "video_in_3",
+      "requestedIndex": 1,
+      "appliedIndex": 0,
+      "reason": "strom-capability-missing",
+      "message": "Camera 1 (SRT): audio stream 2 was not applied, using stream 1. This Strom cannot select an audio stream by PID yet."
+    }
+  ]
+}
+```
+
+- **No new endpoint, no new status codes.** The warning never changes an HTTP status.
+  Activation still succeeds (`202`/`200` as today), and the input is built on the first stream.
+- `mixerInput` is the **stored** key, not the compacted Strom pad (`mixerInputMap`, issue #463),
+  so Studio can match it to the input tile directly.
+- The `message` text numbers streams 1-based for the operator. The fields stay 0-based like
+  `audioStreamIndex`.
+- Older Studio builds keep working. They show the existing production-level list and toast,
+  and they ignore the extra fields.
+- `docs/openapi.yaml` must document the `activationWarnings` item schema as a `oneOf` with both
+  variants.
+
 ---
 
 ## 3. Data Model
@@ -241,50 +314,79 @@ documented *"additive and defaulted-absent — every existing source stays valid
 - CouchDB optimistic concurrency is unchanged: the PATCH handler already merges
   `{ ...doc, ...body, updatedAt }` and re-`insert`s with `_rev` (`src/routes/sources.ts:457`).
 
+### 3.3 #516 data-model change: `activationWarnings` widened (no migration)
+
+`ProductionDoc.activationWarnings?` (`src/db/types.ts:837`) changes its element type from
+`{ type: 'recording-no-audio'; message }` to the `ActivationWarning` union in §2.5. It is
+additive: existing docs hold only `recording-no-audio` items, which stay valid. The field is
+already cleared when a new activation starts (`src/routes/productions.ts:971`) and when
+activation fails (`:653`), so no stale `audio-stream-not-applied` items carry into the next run. **No migration.** `SourceDoc` is unchanged
+by #516.
+
 ---
 
 ## 4. Service Interactions
 
-Two flows: (a) the operator sets the selection and it is applied on activation; (b) the UI
-discovers the available streams.
+(a) The selection is set (unchanged, shipped in #518). (b) Activation applies it or clamps
+and warns (#516). (c) Studio shows the warning on the input. (d) Discovery, unchanged.
 
 ```mermaid
 sequenceDiagram
     actor Op as Operator
     participant Studio as Open Live Studio
-    participant API as open-live API (sources.ts / audio-streams)
-    participant DB as CouchDB (SourceDoc)
+    participant API as open-live API
+    participant DB as CouchDB
     participant Gen as flow-generator.ts
-    participant Strom as Strom / GStreamer
+    participant Strom as Strom (mpegtssrt_input)
 
-    Note over Op,Strom: (a) Set the selection
-    Op->>Studio: pick audio stream in source edit form
-    Studio->>API: PATCH /api/v1/sources/:id { audioStreamIndex: 1 }
-    API->>API: zod validate (int>=0, srt/efp only) — 400 on bad input
-    API->>DB: insert { ...doc, audioStreamIndex: 1, updatedAt }
-    API-->>Studio: 200 toApi(doc) incl. audioStreamIndex
-    Note right of Studio: non-live; takes effect on next (re)activation
+    Note over Op,Strom: (a) Set the selection — shipped (#518)
+    Op->>Studio: set audio stream on SRT source
+    Studio->>API: PATCH /api/v1/sources/:id { audioStreamIndex: k }
+    API->>DB: insert SourceDoc { ...doc, audioStreamIndex: k }
+    API-->>Studio: 200 toApi(doc)
+    Note right of Studio: non-live: applies on next (re)activation
 
-    Note over Op,Strom: activation applies it
-    Op->>API: activate production
-    API->>Gen: generateFlow(sources…)
-    Gen->>Gen: read source.audioStreamIndex (default 0)
-    Gen->>Gen: set input-block audio-stream selector + pick audio pad (§5.3)
-    Gen->>Strom: flows.start(flow JSON)
-    Strom-->>Strom: demux selected audio stream -> audio_out -> mixer
+    Note over Op,Strom: (b) Activation (#516)
+    Op->>API: POST /api/v1/productions/:id/activate
+    API->>Gen: activateStromFlow(production, sources…)
+    Gen->>Strom: GET /api/blocks (+ /api/version) — capability check (once per activation)
+    Strom-->>Gen: block definitions
+    loop each srt/efp assignment
+        Gen->>Gen: k = source.audioStreamIndex ?? 0
+        alt k == 0
+            Gen->>Gen: block as today (no num_audio_tracks), link audio_out_0
+        else streamType efp, or Strom lacks PID-order mapping
+            Gen->>Gen: block as today, link audio_out_0 (clamp)
+            Gen->>Gen: warnings += audio-stream-not-applied {reason}
+        else srt and capability present
+            Gen->>Gen: num_audio_tracks = k+1, link audio_out_k → time_offset
+            Gen->>Gen: drain audio_out_j (j≠k) → fakesink
+        end
+    end
+    Gen->>Strom: create + start flow
+    Gen-->>API: ActivationResult { warnings }
+    API->>DB: ProductionDoc.activationWarnings = warnings
+    Strom-->>Strom: demux; audio_out_k = k-th audio PID (upstream follow-up)
+    opt feed carries fewer than k+1 audio streams (needs upstream §7.1 b)
+        Strom-->>Strom: in-block fallback: audio_out_k fed from first stream
+        Strom-->>API: runtime signal "output k fell back / unfed"
+        API->>DB: append audio-stream-not-applied {reason: stream-not-present}
+        API-->>Studio: WS ERROR toast (+ refreshed production state)
+    end
 
-    Note over Op,Strom: (b) Discover available streams
-    Op->>Studio: open source edit form
+    Note over Op,Strom: (c) Studio shows it on the input
+    Studio->>API: GET /api/v1/productions/:id   (and WS connect replay)
+    API-->>Studio: activationWarnings[]
+    Studio-->>Op: warning badge on input tile for mixerInput + tooltip message
+
+    Note over Op,Strom: (d) Discovery — unchanged
     Studio->>API: GET /api/v1/sources/:id/audio-streams
-    API->>Strom: probe live flow for input audio streams (if available)
-    Strom-->>API: stream list (or unsupported)
-    API-->>Studio: { selectedIndex, discovery, streams|null }
-    Studio-->>Op: show stream list + current selection (or numeric fallback)
+    API-->>Studio: { selectedIndex, discovery: "unavailable", reason: "strom-probe-unsupported", streams: null }
 ```
 
-The media path never touches Open Live: Strom demuxes and routes the chosen audio stream
-inside the pipeline. Open Live's job is to persist the choice, hand it to the flow generator,
-and surface the available streams.
+The media path never touches Open Live. Strom demuxes and routes the chosen stream inside the
+pipeline. Open Live persists the choice, builds the matching flow JSON, decides when it cannot
+apply the choice, and reports that per input.
 
 ---
 
@@ -292,161 +394,242 @@ and surface the available streams.
 
 ### 5.1 Studio UI (open-live-studio)
 
-- Extend `ApiSource` (`src/lib/api.ts:106-126`) and the store mirror `Source`
-  (`src/store/sources.store.ts:8-24`, `fromApi()` `:56-69`) with `audioStreamIndex?: number`.
-- Add the control to the source edit form: `EditState` (`SourcesPanel.tsx:252-280`) and the
-  save path `handleEdit()` (`SourcesPanel.tsx:467-533`, PATCH built at `:524-529` through
-  `sourcesApi.update`, `src/lib/api.ts:371`). Show it only for SRT/EFP sources (reuse `isSrt()`
-  `SourcesPanel.tsx:56` / `STREAM_TYPE_HAS_LATENCY` `:44-52`, where `latency` already renders).
-- Populate the picker from `GET /api/v1/sources/:id/audio-streams` (§2.4). When `discovery` is
-  `"unavailable"`, render a plain non-negative number input defaulting to the current
-  `selectedIndex` — never block editing on discovery being present.
+The source-edit control is shipped. `audioStreamIndex` already exists on `ApiSource`
+(`src/lib/api.ts:115`) and is edited in `SourcesPanel.tsx` with the validation helper
+`src/lib/audio-stream-index.ts`. #516 adds the **input-scoped warning** only:
+
+- Widen the `activationWarnings` element type in `src/lib/api.ts:237` and `:268` (today a
+  literal `recording-no-audio`) to the §2.5 union. Thread it through
+  `src/store/productions.store.ts:292` unchanged.
+- In the production view, show a warning indicator on the **input** whose stored `mixerInput`
+  matches an `audio-stream-not-applied` item, with `message` as the tooltip/label. Typical
+  wording: "Audio stream 2 not applied, using stream 1". The existing production-level list
+  (`ProductionsPanel.tsx:1171-1177`) keeps rendering every warning's `message`, so nothing is
+  lost on screens without input tiles.
+- The source edit form shows no extra hint unless the source is in an active production that
+  carries a matching warning. If it is, the form shows the same text next to the audio-stream
+  field (optional, frontend-developer's call).
 
 ### 5.2 Environment variables
 
-**None.** No new env var is required — the selection is per-source data, not deployment config.
+**None.** No new env var is needed. The capability is detected from Strom at activation
+(§5.3), not configured.
 
-### 5.3 Strom pipeline JSON shape change
+### 5.3 Strom pipeline JSON shape (revised — ADR-010 Decision 1)
 
-The selection has to reach the `builtin.mpegtssrt_input` / `builtin.efpsrt_input` block. Today
-that block exposes only `srt_uri` + `latency` and a single `audio_out_0` pad
-(`docs/strom-block-config.md:50-58`), and the generator wires `audio_out_0` unconditionally
-(`src/lib/flow-generator.ts:892`). There is **no existing property or pad for stream
-selection** (confirmed: no `audio_stream`/`audio_pid`/`audio_out_1` anywhere in `src/`). So one
-of two Strom-side shapes is needed — this is the load-bearing upstream dependency (§7.1):
+No new Strom property is used. The existing `num_audio_tracks` and `audio_out_<N>` pads are
+used. Build rules at `src/lib/flow-generator.ts:906-928`, with `k = source.audioStreamIndex ?? 0`:
 
-- **Option A — a selector property on the input block (recommended).** Strom adds a property
-  (proposed name `audio_stream_index`, 0-based, default 0) that selects which demuxed audio
-  elementary stream is emitted on the existing `audio_out_0` pad. Open Live change is minimal
-  and additive — one property at `flow-generator.ts:874-877`, wiring unchanged:
+**k = 0, or k > 0 but not applied (clamp).** The block and links are **byte-identical to
+today**:
 
-  ```jsonc
-  // builtin.mpegtssrt_input / builtin.efpsrt_input block (flow-generator.ts:870-879)
+```jsonc
+{ "id": "<inputId>", "block_definition_id": "builtin.mpegtssrt_input",   // or efpsrt_input
+  "properties": { "srt_uri": "srt://192.0.2.10:9000?mode=caller", "latency": 125 } }
+// links
+{ "from": "<inputId>:video_out",   "to": "<offsetId>:in" }
+{ "from": "<inputId>:audio_out_0", "to": "<audioOffsetId>:in" }
+```
+
+**k > 0, `streamType: 'srt'`, Strom capability present** (example k = 2):
+
+```jsonc
+{ "id": "<inputId>", "block_definition_id": "builtin.mpegtssrt_input",
   "properties": {
     "srt_uri": "srt://192.0.2.10:9000?mode=caller",
     "latency": 125,
-    "audio_stream_index": 1        // NEW (proposed Strom property; default 0)
-  }
-  ```
+    "num_audio_tracks": 3                 // = k + 1; existing UInt property, non-live
+    // + the PID-order opt-in property IF upstream makes it opt-in (§7.1 c) — name TBC from GET /api/blocks
+  } }
+// elements (one fakesink per non-selected output, same shape as the loudness drain, flow-generator.ts:1226-1231)
+{ "id": "e-audio-drain-<padIndex>-0-<endpointSuffix>", "element_type": "fakesink", "properties": { "sync": false } }
+{ "id": "e-audio-drain-<padIndex>-1-<endpointSuffix>", "element_type": "fakesink", "properties": { "sync": false } }
+// links
+{ "from": "<inputId>:video_out",   "to": "<offsetId>:in" }
+{ "from": "<inputId>:audio_out_2", "to": "<audioOffsetId>:in" }      // selected stream
+{ "from": "<inputId>:audio_out_0", "to": "e-audio-drain-<padIndex>-0-<endpointSuffix>:sink" }
+{ "from": "<inputId>:audio_out_1", "to": "e-audio-drain-<padIndex>-1-<endpointSuffix>:sink" }
+```
 
-- **Option B — multiple audio output pads.** Strom exposes `audio_out_0 … audio_out_{N-1}`
-  (one per demuxed stream), and the generator changes the link at `flow-generator.ts:892` from
-  the hard-coded `audio_out_0` to `audio_out_${audioStreamIndex}`. More flexible (enables
-  routing several streams at once later) but a larger pipeline-shape change and needs the pad
-  count known at build time.
+Rules:
 
-ADR-006 recommends **Option A** (minimal, additive, matches how `latency` is already a
-scalar block property). Either way the exact property/pad name **must be confirmed against the
-live `GET /api/blocks` `exposed_properties`** before implementation — per the standing rule in
-`docs/strom-block-config.md` (header + Agent Rule 9), the runtime OpenAPI schema is
-authoritative and this spec must not invent a name that is not there. A Strom issue tracking
-the capability is a prerequisite recorded in §7.1.
+1. **Every `audio_out_0..k` appears in exactly one link.** An unconnected Strom output pad can
+   fail the flow at startup (the `group_out_N` precedent, `flow-generator.ts:1237-1238`).
+2. Downstream of `<audioOffsetId>` nothing changes. The vision-mixer `audio_in_<pad>` and the
+   audio-mixer `input_<ch>` links (`flow-generator.ts:929-931`) and `src/lib/audio-channels.ts`
+   numbering are untouched. Stream-level selection keeps one audio stream per input
+   (`audio-channels.ts:49-52` invariant holds).
+3. **Capability check.** This happens once per activation, following the `stromHasAudioEncoder`
+   precedent (`flow-generator.ts:84-95`): read `GET /api/blocks` and, if needed, `GET /api/version`
+   (`src/lib/strom.ts:870`), and decide whether `builtin.mpegtssrt_input` maps `audio_out_k` by
+   PID order. **The predicate is defined by the upstream follow-up (§7.1 c) and must not be
+   guessed.** Until it exists, the check returns `false`. An unreadable block list returns `false`
+   for this feature: wiring an unordered `audio_out_k` is the #510 failure mode, so the
+   conservative answer here is the opposite of `stromHasAudioEncoder`'s.
+4. **EFP (`builtin.efpsrt_input`) is out of v1 scope** (ADR-010 Decision 3). An `efp` source
+   with `k > 0` always takes the clamp shape and warns `stream-type-unsupported`.
+5. `docs/strom-block-config.md` §`builtin.mpegtssrt_input` is corrected in the implementation PR
+   (lists `num_audio_tracks`, `decode`, `tsdemux_latency`, `ignore_pcr`, `wait_for_connection`,
+   `auto_reconnect`, `keep_listening`, and pads `audio_out_0..N-1`). That file is outside this
+   docs-only spec PR's scope (`docs/specs/**`, `docs/decisions/**`).
+
+### 5.4 When the selection is "not applied" (clamp + warn — ADR-010 Decision 4)
+
+| Case | Detected by | When | Pipeline | `reason` |
+|---|---|---|---|---|
+| `k = 0` / absent | Open Live | build | today's shape | — (no warning) |
+| `efp` source, `k > 0` | Open Live | build | clamp (`audio_out_0`) | `stream-type-unsupported` |
+| `srt`, `k > 0`, Strom lacks PID-order mapping (or check fails) | Open Live | build | clamp (`audio_out_0`) | `strom-capability-missing` |
+| `srt`, `k > 0`, capability present, feed has < k+1 audio streams | Strom (upstream §7.1 b) | runtime | in-block fallback to first stream (preferred upstream behaviour) | `stream-not-present` |
+
+The flow is **never** failed over `audioStreamIndex`. Each not-applied case yields exactly one
+`audio-stream-not-applied` warning per affected `mixerInput`. A source assigned to two inputs
+yields two warnings.
 
 ---
 
-## 6. Open Questions (resolved unless flagged)
+## 6. Open Questions
 
-1. **Where the selection lives — per-input vs per-production-use.** **Resolved: per-source on
-   `SourceDoc.audioStreamIndex`** (§3.1), with a per-production override deferred as a clean
-   future extension on `ProductionSourceAssignment`. Engineering-consistency call (mirrors
-   `latency`), decided here.
+Resolved items from the original spec (Q1 per-source, Q2 discovery layering, Q3 fall back to
+first + warn) stand. Q4 is now **resolved by @svensson00 (#516, 2026-10-15)**.
 
-2. **How streams are discovered — static config vs probed from the live flow.** **Resolved:
-   both, layered.** The *selection* is static persisted data (`audioStreamIndex`); the
-   *available-stream list* is discovered at read time via `GET …/audio-streams` (§2.4). Since
-   no stream-probe facility exists in the codebase today (no ffprobe / SRT stream metadata —
-   confirmed) and the Strom input block does not report its streams, discovery returns
-   `unavailable` until the Strom capability (§5.3) lands, and the UI falls back to a numeric
-   input. Cross-team dependency, tracked in §7.1 — not a product trade-off.
+1. **Per-input vs per-production-use.** *Resolved* — per-source (§3.1). Unchanged.
 
-3. **Behaviour when the selected index is absent on the actual feed.** **Resolved: fall back
-   to the first stream (index 0) and never hard-fail the flow.** This matches the issue's
-   "default remains the first stream" and the single-audio assumption the pipeline already
-   makes (`src/lib/audio-channels.ts:49-52`). Concretely: the flow generator clamps an
-   out-of-range / absent selection to `0` when building the block, and — once discovery (§2.4)
-   can confirm the real stream count — the backend surfaces a **non-fatal warning** (via the
-   `audio-streams` response and, if a live flow is up, the existing source `liveIngest`-style
-   read channel) rather than refusing activation. Losing audio because a feed changed its
-   stream layout mid-event is a worse failure than silently using stream 0.
+2. **PID order vs PMT (program-map) order for "stream k".** @svensson00 and the Strom triage
+   both say "k-th stream in PID order". Most encoders allocate audio PIDs in PMT order, so the
+   two agree, but nothing guarantees it. Operators read "stream 2" off encoder or analyser UIs,
+   which usually list PMT order. **Proposed resolution:** ascending PID order as stated, written
+   into the upstream follow-up verbatim. Revisit only if a real feed disagrees. Once discovery
+   (Q5) returns `pid` per stream, Studio shows the PID next to each choice, so the ambiguity is
+   visible. *Owner: team-lead to confirm with @svensson00 when filing upstream.*
 
-4. **Channel-level vs stream-level selection.** The issue notes the source report mentions
-   *channel pairs 1&2 / 3&4*. This spec scopes v1 to **stream-level** selection: choosing which
-   audio *elementary stream* (PID) the input uses. Whether operators also need **intra-stream
-   channel-pair** selection (e.g. one stereo stream carrying two language pairs, selecting
-   1&2 vs 3&4 within it) is a genuine product/requirements trade-off — it materially changes
-   the data model (an index is no longer enough; you need a stream + a channel-pair/mapping)
-   and the mixer-input fan-out in `src/lib/audio-channels.ts`. **@svensson00 — please confirm
-   whether v1 needs intra-stream channel-pair selection, or whether stream-level selection is
-   sufficient and channel-pair routing can be a follow-up epic.** The rest of this spec assumes
-   stream-level; if channel-pairs are required for v1, `audioStreamIndex` generalises to an
-   `audioSelection?: { streamIndex: number; channelPair?: number }` object and §5.3's Strom
-   capability must also expose channel-pair routing.
+3. **What does Strom do when output k has no stream (feed has < k+1 audio streams)?** Two
+   upstream options: (A) in-block fallback, where `audio_out_k` is fed from the first audio stream
+   and a runtime signal is emitted; (B) leave `audio_out_k` unfed (silent) and emit a runtime
+   signal. Only (A) satisfies "clamp to the first stream" without an Open Live flow restart
+   (rejected in ADR-010 because it restarts every input on air). **Proposed resolution:** ask for
+   (A) in the follow-up. If Strom only ships (B), Open Live still raises `stream-not-present`, and
+   the clamp for that case becomes "next activation builds `k` as not applied" (a degraded but
+   honest behaviour). *Owner: team-lead when filing upstream.*
+
+4. **Channel-level vs stream-level.** *Resolved by @svensson00 (#516): stream-level for v1.*
+   Out-of-range → clamp to first stream + Studio warning on the input (§5.4). Channel-pair
+   selection is a separate future epic. `audioStreamIndex` stays a scalar.
+
+5. **Runtime signal channel and discovery.** How does Strom tell Open Live (i) that output k
+   fell back or is unfed (Q3), and (ii) the list of audio streams (PID, codec, channels,
+   language) to unblock `GET …/audio-streams`? Candidates are a block-state field readable via
+   `strom.flows.get` (polled today at `src/routes/productions.ts:441`) or a Strom WebSocket
+   event. **Proposed resolution:** ask for both in the same follow-up, as one read-only
+   block-state field per `mpegtssrt_input` instance (e.g. the PMT audio list plus which output
+   each stream feeds). Open Live reads it in the existing post-start poll and in the discovery
+   endpoint. Exact shape is set upstream and must not be invented here. Until then, only
+   build-time reasons are raised and discovery stays `unavailable`.
+
+6. **Capability detection predicate.** How does Open Live know a given Strom maps by PID
+   order (§5.3 rule 3)? **Proposed resolution:** prefer an explicit, discoverable signal in the
+   block definition (an opt-in property in `exposed_properties`, which also protects existing
+   `num_audio_tracks > 1` users from a behaviour change). Fall back to a Strom version floor via
+   `GET /api/version`. Decided when the follow-up is filed. The predicate lives in one helper next
+   to `stromHasAudioEncoder`.
+
+7. **Upper bound on `audioStreamIndex`.** The API accepts any non-negative integer (#518).
+   Building `num_audio_tracks = k + 1` for a mistyped `k = 99` creates 100 decode branches.
+   **Proposed resolution:** treat `k > 7` (more than 8 audio streams, beyond any realistic
+   contribution feed) as not applied at build time with `reason: 'stream-not-present'`, and do
+   not change the API validation (keeps #518's contract). *Owner: backend-developer may tune the
+   constant; flag if a real feed needs more.*
+
+8. **EFP in a later version.** *Resolved for v1: out of scope* (ADR-010 Decision 3). A future
+   EFP path needs an upstream audio-pinning primitive analogous to `data_stream_ids`
+   (`efpsrt_input.rs:40-70`). No action now. Studio could hide the audio-stream field for `efp`
+   sources, but the API keeps accepting it. **Proposed resolution:** leave the field visible with
+   a "MPEG-TS/SRT only for now" hint rather than hide it (frontend-developer's call).
 
 ---
 
 ## 7. Risks
 
-- **Upstream Strom gap — the feature cannot ship without it (§5.3).** The input block has no
-  stream-selection property or multi-audio pad today (`docs/strom-block-config.md:50-58`;
-  nothing in `src/`). Like ADR-004's dependence on strom#783/#840, implementation is **gated**
-  on a Strom capability + a confirmed property/pad name from live `GET /api/blocks`. Mitigation:
-  the Open Live contract (field + discovery endpoint) is defined so backend/UI land green and
-  degrade to "stream 0 only / numeric fallback" until Strom ships; file and link a Strom issue
-  before Phase 2.
-- **Inventing a pipeline shape.** Guessing `audio_stream_index` / `audio_out_N` names risks
-  drift from Strom reality. Mitigation: standing rule — confirm against runtime
-  `exposed_properties` (`docs/strom-block-config.md` header + Agent Rule 9) before wiring;
-  flag any drift.
-- **Silent wrong-audio / lost-audio.** A persisted index that no longer matches the live feed
-  could route the wrong stream or (worse) no audio. Mitigation: clamp-to-0 fallback + non-fatal
-  warning (§6 Q3); never hard-fail activation on a stale index.
-- **`toApi()` spread.** `audioStreamIndex` rides the `...rest` spread (`src/routes/sources.ts:235-238`)
-  — correct here (non-secret, exposure desired), but the spread is the exact mechanism behind
-  the secret-leak gotcha in `docs/repo-patterns.md`; the implementer must not reuse this field's
-  "just spread it" treatment for any future credential-bearing source field.
-- **Single-audio assumption elsewhere.** `src/lib/audio-channels.ts:49-52` hard-assumes one
-  audio stream per source for channel numbering. Stream-level selection (one stream → one
-  channel strip) keeps that invariant; a channel-pair extension (§6 Q4) would break it and
-  needs that code revisited. Mitigation: keep v1 stream-level unless §6 Q4 says otherwise.
-- **Low blast radius for the chosen shape.** Per-source additive field, no migration, no new
-  env var, non-live (applies on reactivation) — so the data-model change itself cannot disturb
-  a running pipeline; all risk concentrates in the Strom wiring, which is gated.
+### 7.1 Upstream Strom dependency (gating)
+
+- **strom#1077 (open)** — "Option Park" fixes the takeover so that `audio_out_0` carries the
+  first stream (fixes #510). It is needed for the default `k = 0` path to be correct, but it does
+  **not** enable `k > 0`.
+- **PID-order follow-up (not yet filed)** must cover:
+  (a) `audio_out_k` ← k-th audio stream in ascending PID order when `num_audio_tracks > 1`,
+      stable across reconnects/PID changes, in both `decode` and passthrough modes;
+  (b) defined behaviour for a missing k-th stream (Q3, prefer in-block fallback) plus a runtime
+      signal (Q5);
+  (c) a capability signal Open Live can detect (Q6).
+  Filing it is a team-lead action outside this PR. Link it in ADR-010 before moving it to
+  Accepted.
+- Until (a) + (c) land, every `k > 0` is clamped and warns `strom-capability-missing`. The
+  feature is safe but inert.
+
+### 7.2 Other risks
+
+- **Wiring `audio_out_k` without the capability gate** reintroduces #510 silently.
+  *Mitigation:* rule 3 in §5.3, plus a flow-generator test asserting `audio_out_0` + warning
+  when the capability check is false.
+- **Unconnected output pads.** *Mitigation:* drains (§5.3 rule 1). A test asserts every
+  `audio_out_0..k` is linked exactly once.
+- **Decode cost.** `decodebin` decodes every exposed audio stream, so `k + 1` streams are
+  decoded per input and `k` are discarded. *Mitigation:* Q7 ceiling. A later upstream
+  optimisation could skip decoding unlinked outputs.
+- **Invented names.** The opt-in property, the runtime signal and the capability predicate are
+  deliberately **unnamed** here. *Mitigation:* the standing rule in `docs/strom-block-config.md`
+  (confirm against live `GET /api/blocks`).
+- **Warning noise.** A source used on several inputs produces one warning per input, which is
+  intended (each input tile needs its own). The WS `ERROR` replay on connect
+  (`controller.ts:4019-4022`) will toast each one. *Mitigation:* acceptable for v1. Studio may
+  de-duplicate toasts by `sourceId`.
+- **`toApi()` spread** (unchanged from the original spec): `audioStreamIndex` rides `...rest`.
+  Do not copy that treatment for credential-bearing fields.
 
 ---
 
-## 8. Implementation checklist (ordered, file-level) — hand-off scope
+## 8. Implementation checklist (ordered, file-level) — #516 hand-off scope
 
-**Prerequisite (cross-team):**
-0. Strom capability for audio-stream selection (§5.3 Option A recommended) — file/track a
-   Strom issue; confirm the property/pad name against live `GET /api/blocks`. Gates steps 5–6.
+Steps 1–4 of the original checklist (data model, zod, discovery endpoint, tests) shipped in #518.
+`docs/openapi.yaml` coverage of `audioStreamIndex` and `audio-streams` should be verified in
+step 5 below.
 
-**Backend (`Eyevinn/open-live`) — backend-developer:**
-1. `src/db/types.ts`: add `audioStreamIndex?: number` to `SourceDoc` (near `latency?`, :170).
-2. `src/routes/sources.ts`: add `audioStreamIndex: z.number().int().min(0).optional()` to
-   `SourceInput` (:120) and `SourcePatch` (:138); in each `.superRefine()` (:133, :150) reject
-   a non-zero/absent index on non-srt/efp effective `streamType` with a 400.
-3. `src/routes/sources.ts`: add `GET /api/v1/sources/:id/audio-streams` (§2.4), modelled on the
-   `auth/profile/status` sub-resource (:550); 404 on unknown id; `discovery: "unavailable"`
-   until the Strom probe exists.
-4. `docs/openapi.yaml`: extend `Source` (:166), `SourceInput` (:215), `SourcePatch` (:236) with
-   `audioStreamIndex`; document the "applies on reactivation" semantics and add the
-   `audio-streams` path.
-5. `src/lib/flow-generator.ts`: at the input-block build (:874-877) read
-   `source.audioStreamIndex ?? 0`, clamp out-of-range to 0, and apply the Strom shape from §5.3
-   (Option A: set the selector property; Option B: wire `audio_out_${index}` at :892).
-6. Tests: zod accept/reject (int≥0, non-srt/efp→400); `toApi` round-trips the field;
-   flow-generator sets the selector / picks the pad for a non-zero index and clamps a stale one
-   to 0; `audio-streams` returns `selectedIndex` + the unavailable fallback.
+**Prerequisite (cross-team, gating step 3 only):**
+0. team-lead files the Strom PID-order follow-up (§7.1 a–c) and links it from #516 and
+   ADR-010. strom#1077 must be merged for the `k = 0` default to be correct (#510).
 
-**Frontend (`Eyevinn/open-live-studio`) — frontend-developer (after backend on staging):**
-7. `src/lib/api.ts`: add `audioStreamIndex?: number` to `ApiSource` (:106) and a
-   `getAudioStreams(id)` call for `GET …/audio-streams`.
-8. `src/store/sources.store.ts`: thread the field through `Source` (:8), `fromApi()` (:56) and
-   `updateSource` (:121-136).
-9. `src/pages/SetupPage/SourcesPanel.tsx`: add the picker to `EditState` (:252) / `handleEdit`
-   (:467) for SRT/EFP sources, populated from discovery with a numeric fallback.
-10. Frontend test/visual check: SRT source with 2 streams shows a picker; selection persists via
-    PATCH; discovery-unavailable shows the numeric fallback.
+**Backend (`Eyevinn/open-live`) — backend-developer. Steps 1, 2, 4, 5 can ship before
+step 0 lands:**
+1. `src/lib/flow-generator.ts:82` + `src/db/types.ts:837`: widen `ActivationWarning` /
+   `activationWarnings` to the §2.5 union (one shared type).
+2. `src/lib/flow-generator.ts:906-928`: compute `k`. Apply the §5.4 table: for `efp` with `k > 0`,
+   or `srt` with `k > 0` and the capability absent, or `k > 7`, build today's shape and push
+   `audio-stream-not-applied`. Message text uses 1-based stream numbers and the source name.
+3. *(Gated on step 0.)* Add a `stromMapsAudioByPid(strom)` capability helper next to
+   `stromHasAudioEncoder` (`flow-generator.ts:84`), using the predicate from the follow-up. When
+   it is true and `srt` with `0 < k ≤ 7`: set `num_audio_tracks: k + 1` (+ opt-in property if
+   any), link `audio_out_<k>`, and drain `audio_out_<j≠k>` to `fakesink` elements (§5.3).
+   Later, once Q5's runtime signal exists, read it in the post-start poll
+   (`src/routes/productions.ts:441`) and append `stream-not-present` warnings + WS `ERROR`.
+4. Tests (`src/__tests__/flow-generator-*.test.ts`): `k = 0` produces a byte-identical block and
+   links to today; `efp` with `k = 1` produces the clamp + `stream-type-unsupported`; `srt` with
+   `k = 1` and no capability produces the clamp + `strom-capability-missing`; `k = 9` produces
+   the clamp; with the capability mocked true, `k = 2` gives `num_audio_tracks: 3`, `audio_out_2`
+   linked to the audio offset, and `audio_out_0/1` each drained exactly once; a source on two
+   inputs gives two warnings; `activationWarnings` persists both variants.
+5. `docs/openapi.yaml`: `activationWarnings` item `oneOf` (both variants), and confirm the
+   `audioStreamIndex` / `audio-streams` entries from #518. `docs/strom-block-config.md`: correct
+   the `builtin.mpegtssrt_input` section (§5.3 rule 5).
 
-Once this spec + ADR-006 are merged and the Strom prerequisite is tracked, #511 can move
-**Backlog → Ready** with steps 1–10 as the scope.
+**Frontend (`Eyevinn/open-live-studio`) — frontend-developer, after backend steps 1–2 are on
+staging:**
+6. `src/lib/api.ts:237,268`: widen the `activationWarnings` type to the §2.5 union.
+7. Production view: a warning indicator on the input matching `mixerInput`, with the
+   `message` tooltip. Keep `ProductionsPanel.tsx:1171-1177`'s list. Optional hint in the source
+   edit form (§5.1, Q8).
+8. Test: an active production with an `audio-stream-not-applied` warning shows the indicator on
+   the right input only. A `recording-no-audio` warning still renders as before.
+
+Once this revision + ADR-010 are reviewed and Q2/Q3/Q5/Q6 are carried into the upstream
+follow-up, #516 can move **Backlog → Ready** with steps 1, 2, 4–8 as immediately buildable scope
+and step 3 gated.
