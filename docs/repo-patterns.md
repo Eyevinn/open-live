@@ -420,3 +420,15 @@ the raw env: explicit `GPU_POOL` wins, otherwise `resolveGpuMetering()`
 silently disagree with the meter once the switch is flipped. The constant itself is changed only
 by the human flip PR of open-live-site#205 step 2a. Note that WHATWG `URL` normalises `:443` on
 an `https` URL to `port === ''`, so the port allowlist treats it like "no port".
+
+## Shared-GPU accrual never starts from raw `activatedAt` — use `accrualStartMs()`
+
+`activatedAt` is written on every activation even with metering off and survives a restart
+(reconcile), so a production live across the restart that enables metering would be
+back-charged if accrual started at `activatedAt`. Every `computeHourBuckets` caller in
+`src/services/gpu-usage.ts` passes `accrualStartMs(activatedAtMs)` = `max(activatedAt, enabledAt)`
+(issue #535). `enabledAt` is the `gpu-metering-state` marker doc, written once by
+`startGpuUsageSweep` and never overwritten; with the DB down the floor is the in-memory sweep
+start. A new accrual path that skips `accrualStartMs()` reintroduces the back-charge. The floor is
+`null` (no clamp) only when the sweep never started, which is why unit tests that call the accrual
+functions directly see raw `activatedAt`.

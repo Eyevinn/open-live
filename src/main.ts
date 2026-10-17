@@ -152,7 +152,10 @@ async function main() {
   // above, so a production found still live after a restart has kept its
   // activatedAt and the first sweep accrues the hours elapsed across the downtime
   // from the recorded start, not from zero.
-  startGpuUsageSweep(app.log);
+  // It also sets the accrual floor (issue #535) from the persisted metering
+  // `enabledAt` marker before the server listens, so nothing from before
+  // metering was enabled on this instance is ever reported.
+  await startGpuUsageSweep(app.log);
   startPortReservation(app.log);
   await app.listen({ port: config.port, host: '0.0.0.0' });
 
