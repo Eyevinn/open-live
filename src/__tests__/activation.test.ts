@@ -82,6 +82,12 @@ vi.mock('../lib/strom.js', async (importOriginal) => {
   };
 });
 
+const mockBroadcast = vi.fn();
+vi.mock('../services/tally.service.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../services/tally.service.js')>();
+  return { ...actual, broadcast: (...args: unknown[]) => mockBroadcast(...args) };
+});
+
 // Mock strom-token
 vi.mock('../lib/strom-token.js', () => ({
   getStromToken: vi.fn().mockResolvedValue('test-token'),
@@ -128,12 +134,25 @@ function makeActivationResult(flowId: string, mixerBlockId: string) {
     recorderBlockId: undefined,
     whepOutputEntries: [],
     pgmWhepEndpointId: undefined,
+    warnings: [],
     sourceOffsetBlockIds: {},
     sourceAudioOffsetBlockIds: {},
     clipPlayerBlockIds: {},
     returnBuses: [],
     returnWhepEntries: [],
     mixerInputMap: {},
+  };
+}
+
+const noAudioWarning = { type: 'recording-no-audio', message: 'Recording "VOD" has no sound' };
+
+function activationResultWithWarning() {
+  return {
+    ...makeActivationResult('flow-abc', ''),
+    mixerBlockId: null,
+    audioMixerBlockId: null,
+    loudnessMainBlockId: null,
+    warnings: [noAudioWarning],
   };
 }
 
@@ -166,6 +185,88 @@ describe('POST /api/v1/productions/:id/activate', () => {
     const body = JSON.parse(res.body);
     expect(body.status).toBe('activating');
     expect(body.id).toBe('prod-test-1');
+  });
+
+  it('saves activation warnings, and sends each as an ERROR frame once the production is live', async () => {
+    const doc = makeProductionDoc();
+    mockGet.mockResolvedValue(doc);
+    mockInsert.mockResolvedValue({ rev: '2-bcd', ok: true, id: doc._id });
+    mockActivateStromFlow.mockResolvedValue(activationResultWithWarning());
+    mockStromFlowsGet.mockResolvedValue({ flow: { id: 'flow-abc', running: true, blocks: [] } });
+
+    const app = await buildServer();
+    await app.inject({ method: 'POST', url: '/api/v1/productions/prod-test-1/activate' });
+
+    await vi.waitFor(() => {
+      expect(mockBroadcast).toHaveBeenCalledWith('prod-test-1', { type: 'ERROR', error: noAudioWarning.message });
+    });
+    const saved = mockInsert.mock.calls.map((c) => c[0] as Record<string, unknown>);
+    expect(saved.some((d) => d['stromFlowId'] === 'flow-abc' && (d['activationWarnings'] as unknown[])?.length === 1)).toBe(true);
+    await app.close();
+  });
+
+  it('does not send the warning if the production is deactivated before it goes live', async () => {
+    const doc = makeProductionDoc();
+    mockGet.mockResolvedValue(doc);
+    let releaseStep2!: () => void;
+    const step2Gate = new Promise<void>((r) => { releaseStep2 = r; });
+    let step2Reached = false;
+    mockInsert.mockImplementation(async (d: Record<string, unknown>) => {
+      if (d['stromFlowId'] === 'flow-abc' && d['activationWarnings']) {
+        step2Reached = true;
+        await step2Gate;
+      }
+      return { rev: '2-bcd', ok: true, id: doc._id };
+    });
+    mockActivateStromFlow.mockResolvedValue(activationResultWithWarning());
+    mockStromFlowsGet.mockResolvedValue({ flow: { id: 'flow-abc', running: true, blocks: [] } });
+    mockDeactivateStromFlow.mockResolvedValue(undefined);
+
+    const app = await buildServer();
+    await app.inject({ method: 'POST', url: '/api/v1/productions/prod-test-1/activate' });
+    await vi.waitFor(() => expect(step2Reached).toBe(true));
+    await app.inject({ method: 'POST', url: '/api/v1/productions/prod-test-1/deactivate' });
+    releaseStep2();
+
+    await vi.waitFor(() => expect(mockDeactivateStromFlow).toHaveBeenCalledWith('flow-abc', expect.anything()));
+    const types = mockBroadcast.mock.calls.map((c) => (c[1] as { type: string }).type);
+    expect(types).toContain('PRODUCTION_DEACTIVATED');
+    expect(types).not.toContain('ERROR');
+    await app.close();
+  });
+
+  it('clears the previous activation warnings when the production is activated again', async () => {
+    const doc = makeProductionDoc({ status: 'ended', activationWarnings: [noAudioWarning] });
+    mockGet.mockResolvedValue(doc);
+    mockInsert.mockResolvedValue({ rev: '2-bcd', ok: true, id: doc._id });
+    mockActivateStromFlow.mockReturnValue(new Promise(() => {}));
+
+    const app = await buildServer();
+    await app.inject({ method: 'POST', url: '/api/v1/productions/prod-test-1/activate' });
+
+    const activating = mockInsert.mock.calls[0]![0] as Record<string, unknown>;
+    expect(activating['status']).toBe('activating');
+    expect(activating['activationWarnings']).toBeUndefined();
+    await app.close();
+  });
+
+  it('clears activation warnings when activation fails', async () => {
+    const doc = makeProductionDoc();
+    mockGet.mockImplementation(async () => mockInsert.mock.calls.at(-1)?.[0] ?? doc);
+    mockInsert.mockResolvedValue({ rev: '2-bcd', ok: true, id: doc._id });
+    mockActivateStromFlow.mockResolvedValue(activationResultWithWarning());
+    mockStromFlowsGet.mockRejectedValue(new Error('Strom down'));
+    mockDeactivateStromFlow.mockResolvedValue(undefined);
+
+    const app = await buildServer();
+    await app.inject({ method: 'POST', url: '/api/v1/productions/prod-test-1/activate' });
+
+    await vi.waitFor(() => {
+      const last = mockInsert.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+      expect(last['status']).toBe('inactive');
+      expect(last['activationWarnings']).toBeUndefined();
+    });
+    await app.close();
   });
 
   it('returns 409 if production is already active', async () => {
