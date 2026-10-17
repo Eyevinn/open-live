@@ -616,6 +616,23 @@ export interface GpuUsageLedgerDoc {
   updatedAt: string;        // ISO 8601
 }
 
+// --------------- Shared-GPU metering enablement marker ---------------
+
+/**
+ * Instance-wide record of when shared-GPU metering was first enabled on this
+ * instance (issue #535, part of #526). Written once by `startGpuUsageSweep` under
+ * a fixed id and never overwritten on later restarts. GPU accrual starts at
+ * `max(activatedAt, enabledAt)`, so a production that was already live when
+ * metering was switched on is never back-charged for the time before the switch.
+ */
+export interface GpuMeteringStateDoc {
+  _id: string;              // fixed: "gpu-metering-state"
+  _rev?: string;
+  type: 'gpu-metering-state';
+  /** First time metering was enabled on this instance — the accrual floor. */
+  enabledAt: string;        // ISO 8601
+}
+
 // --------------- One-time data migration marker ---------------
 
 /**

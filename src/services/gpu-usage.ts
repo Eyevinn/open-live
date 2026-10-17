@@ -20,8 +20,8 @@
 import type { FastifyBaseLogger } from 'fastify';
 import type Nano from 'nano';
 import { config, isGpuMeteringEnabled } from '../config.js';
-import { getDb, getGpuUsageLedgerDb, isDbConnected } from '../db/index.js';
-import type { ProductionDoc, GpuUsageLedgerDoc } from '../db/types.js';
+import { getDb, getGpuMeteringStateDb, getGpuUsageLedgerDb, isDbConnected } from '../db/index.js';
+import type { ProductionDoc, GpuUsageLedgerDoc, GpuMeteringStateDoc } from '../db/types.js';
 import { renderProductionGateMetrics } from './production-gate.js';
 
 const HOUR_MS = 3_600_000;
@@ -137,6 +137,75 @@ export function computeHourBuckets(
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Accrual floor — no back-charge for time before metering was enabled (#535)
+// ---------------------------------------------------------------------------
+
+/** Fixed id of the per-instance metering enablement marker doc. */
+export const GPU_METERING_STATE_DOC_ID = 'gpu-metering-state';
+
+/**
+ * Earliest instant (ms) GPU time may accrue from, or `null` when no floor is set.
+ *
+ * `activatedAt` is written on every activation even with metering off and is
+ * kept across a restart (reconcile), so without a floor a production that was
+ * live across the restart that enabled metering would accrue — and be billed
+ * for — time from before metering was on. {@link startGpuUsageSweep} sets the
+ * floor to the persisted `enabledAt` marker (written once, never overwritten),
+ * or to the in-memory sweep start when the DB is unavailable (undercharges,
+ * never back-charges). `null` only when the sweep was never started — i.e.
+ * metering is disabled, or a unit test calls the accrual functions directly.
+ */
+let accrualFloorMs: number | null = null;
+
+/** The current accrual floor (ms), or `null` if none is set. */
+export function getGpuAccrualFloorMs(): number | null {
+  return accrualFloorMs;
+}
+
+/** Accrual start for a production: `max(activatedAt, enabledAt)`. */
+export function accrualStartMs(activatedAtMs: number): number {
+  return accrualFloorMs === null ? activatedAtMs : Math.max(activatedAtMs, accrualFloorMs);
+}
+
+function hasStatusCode(err: unknown, status: number): boolean {
+  return (err as { statusCode?: number } | null)?.statusCode === status;
+}
+
+/**
+ * Read the persisted enablement marker, creating it with `nowMs` the first time
+ * metering is enabled on this instance. An existing marker is never overwritten.
+ * Returns the marker's `enabledAt` in ms. Throws on any DB failure (the caller
+ * falls back to the in-memory sweep start).
+ */
+async function loadOrCreateEnabledAt(nowMs: number): Promise<number> {
+  const db = getGpuMeteringStateDb();
+  const read = async (): Promise<number> => {
+    const doc = await db.get(GPU_METERING_STATE_DOC_ID);
+    const t = Date.parse(doc.enabledAt);
+    if (!Number.isFinite(t)) throw new Error(`invalid enabledAt in ${GPU_METERING_STATE_DOC_ID}`);
+    return t;
+  };
+  try {
+    return await read();
+  } catch (err) {
+    if (!hasStatusCode(err, 404)) throw err;
+  }
+  const doc: GpuMeteringStateDoc = {
+    _id: GPU_METERING_STATE_DOC_ID,
+    type: 'gpu-metering-state',
+    enabledAt: new Date(nowMs).toISOString(),
+  };
+  try {
+    await db.insert(doc);
+    return nowMs;
+  } catch (err) {
+    // Lost a create race to another process: use the winner's marker.
+    if (!hasStatusCode(err, 409)) throw err;
+    return read();
+  }
+}
+
 /** Drop closed-hour buckets older than the configured retention window. */
 export function pruneExpiredHours(hours: Record<string, number>, nowMs: number): Record<string, number> {
   const cutoff = nowMs - config.gpuUsageRetentionHours * HOUR_MS;
@@ -168,7 +237,7 @@ export function settleOnStop(
   const activatedAtMs = Date.parse(doc.activatedAt);
   if (!Number.isFinite(activatedAtMs)) return undefined;
   const existing = doc.gpuHours ?? {};
-  const fresh = computeHourBuckets(activatedAtMs, nowMs, existing);
+  const fresh = computeHourBuckets(accrualStartMs(activatedAtMs), nowMs, existing);
   const merged = pruneExpiredHours({ ...existing, ...fresh }, nowMs);
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
@@ -261,7 +330,7 @@ async function settleOneProduction(productionId: string, nowMs: number, log: Fas
     const existing = doc.gpuHours ?? {};
     // Only fully-closed hours — the current partial hour stays derived from
     // activatedAt and is never persisted for a live production.
-    const fresh = computeHourBuckets(activatedAtMs, startOfUtcHour(nowMs), existing);
+    const fresh = computeHourBuckets(accrualStartMs(activatedAtMs), startOfUtcHour(nowMs), existing);
     const prunedExisting = pruneExpiredHours(existing, nowMs);
     const hasFresh = Object.keys(fresh).length > 0;
     const prunedAway = Object.keys(prunedExisting).length !== Object.keys(existing).length;
@@ -306,8 +375,17 @@ export async function settleActiveProductions(log: FastifyBaseLogger, nowMs: num
 
 let sweepInterval: NodeJS.Timeout | null = null;
 
-/** Start the periodic settle sweep. No-op (logged) when metering is disabled. */
-export function startGpuUsageSweep(log: FastifyBaseLogger): void {
+/**
+ * Start the periodic settle sweep and set the accrual floor (#535). No-op
+ * (logged) when metering is disabled.
+ *
+ * The floor is set to the sweep start synchronously, before anything can
+ * accrue, then replaced by the persisted `enabledAt` marker — created here the
+ * first time metering is enabled on this instance and never overwritten. If the
+ * DB is unavailable the floor stays at the sweep start: that can undercharge a
+ * production live across the restart, but never back-charges it.
+ */
+export async function startGpuUsageSweep(log: FastifyBaseLogger, nowMs: number = Date.now()): Promise<void> {
   if (sweepInterval !== null) return;
   if (!isGpuMeteringEnabled()) {
     log.info(
@@ -315,6 +393,7 @@ export function startGpuUsageSweep(log: FastifyBaseLogger): void {
     );
     return;
   }
+  accrualFloorMs = nowMs;
   log.info(
     `[gpu-usage] Shared-GPU metering enabled (source: ${config.gpuMeteringSource}, pool: ${config.gpuPool}, class: ${config.gpuClass}, settle: ${config.gpuSettleIntervalMs / 1000}s)`,
   );
@@ -323,6 +402,17 @@ export function startGpuUsageSweep(log: FastifyBaseLogger): void {
   }, config.gpuSettleIntervalMs);
   // Never keep the process alive for the sweep.
   sweepInterval.unref();
+
+  if (!isDbConnected()) {
+    log.warn('[gpu-usage] DB unavailable — accrual floor is the sweep start (no back-charge; may undercharge)');
+    return;
+  }
+  try {
+    accrualFloorMs = await loadOrCreateEnabledAt(nowMs);
+    log.info(`[gpu-usage] Accrual floor (metering enabledAt): ${new Date(accrualFloorMs).toISOString()}`);
+  } catch (err) {
+    log.warn({ err }, '[gpu-usage] Could not read/write the metering enablement marker — accrual floor is the sweep start');
+  }
 }
 
 /** Stop the sweep. Idempotent; exported for graceful shutdown and tests. */
@@ -335,6 +425,12 @@ export function stopGpuUsageSweep(): void {
 
 export function isGpuUsageSweepRunning(): boolean {
   return sweepInterval !== null;
+}
+
+/** Test-only: stop the sweep and clear the accrual floor. */
+export function __resetGpuUsageSweepForTests(): void {
+  stopGpuUsageSweep();
+  accrualFloorMs = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -382,7 +478,7 @@ function hoursForProduction(doc: ProductionDoc, nowMs: number, includeCurrentPar
     const activatedAtMs = Date.parse(doc.activatedAt);
     if (Number.isFinite(activatedAtMs)) {
       const endMs = includeCurrentPartialHour ? nowMs : startOfUtcHour(nowMs);
-      for (const [key, seconds] of Object.entries(computeHourBuckets(activatedAtMs, endMs, existing))) {
+      for (const [key, seconds] of Object.entries(computeHourBuckets(accrualStartMs(activatedAtMs), endMs, existing))) {
         all[key] = seconds;
       }
     }
