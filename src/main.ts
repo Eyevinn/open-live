@@ -145,8 +145,10 @@ async function main() {
   }
 
   startIdleWatchdog(app.log);
-  // Shared-GPU usage settle sweep (issue #500). No-op unless GPU_POOL is set, so
-  // self-hosted / BYO-Strom deployments are unchanged. Reconcile has already run
+  // Shared-GPU usage settle sweep (issue #500). No-op unless metering is enabled
+  // (`isGpuMeteringEnabled()`: explicit GPU_POOL, or the platform default for a
+  // managed shared-Strom instance, issue #537), so self-hosted / BYO-Strom
+  // deployments are unchanged. Reconcile has already run
   // above, so a production found still live after a restart has kept its
   // activatedAt and the first sweep accrues the hours elapsed across the downtime
   // from the recorded start, not from zero.

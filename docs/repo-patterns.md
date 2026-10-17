@@ -408,3 +408,15 @@ block-property writes rely on the same). Known gap: this blacks the composited/P
 certain; whether Strom also dims the raw multiview tile for a 0-alpha input is a Strom-internal
 detail not verifiable from this repo — if a frozen *multiview* tile persists, that is a Strom-side
 follow-up, not a backend bug.
+
+## Shared-GPU metering has one predicate — never read `process.env.GPU_POOL` directly
+
+Whether an instance is metered (and gated at zero balance, `production-gate.ts`) is
+`isGpuMeteringEnabled()` = `Boolean(config.gpuPool)`, and `config.gpuPool` is *resolved*, not
+the raw env: explicit `GPU_POOL` wins, otherwise `resolveGpuMetering()`
+(`src/lib/gpu-metering-defaults.ts`, issue #537) derives a pool for an OSC-managed instance
+(`OSC_HOSTNAME`) on the platform shared Strom (`https://strom-se-stoNN.osaas.io:8080`) when
+`PLATFORM_DEFAULT_METERING_ENABLED` is on. A new check that reads `process.env.GPU_POOL` would
+silently disagree with the meter once the switch is flipped. The constant itself is changed only
+by the human flip PR of open-live-site#205 step 2a. Note that WHATWG `URL` normalises `:443` on
+an `https` URL to `port === ''`, so the port allowlist treats it like "no port".
