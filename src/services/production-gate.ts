@@ -9,9 +9,11 @@
  * no hook into any running production: nothing here stops, pauses or degrades a
  * live flow, and nothing may be added that does.
  *
- * Applies only to metered instances (`GPU_POOL` set — the shared and the alternate
- * Strom). Self-hosted and bring-your-own-Strom instances are not metered
- * (open-live#500 AC5, BYO usage is zero-rated) and are never gated.
+ * Applies only to metered instances (`isGpuMeteringEnabled()`: an explicit
+ * `GPU_POOL`, or the platform default for a managed instance on the shared Strom
+ * once `PLATFORM_DEFAULT_METERING_ENABLED` is on, issue #537). Self-hosted and
+ * bring-your-own-Strom instances are not metered (open-live#500 AC5, BYO usage is
+ * zero-rated) and are never gated.
  *
  * Fails open: if the balance cannot be read, the start is allowed and the failure
  * is logged and counted, so a release check can tell a working gate from one that
