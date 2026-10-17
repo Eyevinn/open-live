@@ -1,13 +1,22 @@
 # ADR-006: Audio-stream selection is persisted per-source on `SourceDoc` as a 0-based index, applied in the pipeline via a Strom input-block selector, with the stream list discovered at read time (never persisted)
 
 **Date**: 2026-10-15
-**Status**: Proposed
+**Status**: Proposed — Decisions 1–3 stand (implemented in #518); **Decisions 4–5 superseded by
+[ADR-010](ADR-010-audio-stream-selection-pipeline-wiring.md)** (2026-10-17)
 
 > Companion spec: [`docs/specs/audio-stream-selection.md`](../specs/audio-stream-selection.md).
 > Issue: [Eyevinn/open-live#511](https://github.com/Eyevinn/open-live/issues/511).
 > This ADR settles the two significant design choices of #511: **where the selection lives**
 > and **how available streams are discovered**. It does not settle spec Open Question 4
 > (stream-level vs channel-level), which is a product decision escalated to @svensson00.
+>
+> **Revision note (2026-10-17).** The §Context statement that the Strom input block exposes
+> "only `srt_uri`, `latency`, and one `audio_out_0` pad" is wrong. `builtin.mpegtssrt_input`
+> already has `num_audio_tracks` (default 1) creating `audio_out_0..N-1`. What is missing
+> upstream is a stable PID-order mapping of `audio_out_k` (@svensson00 on #516; strom#1077).
+> Spec Open Question 4 is settled: stream-level for v1, clamp to the first stream when out of
+> range, and warn on the input in Studio. Decisions 4–5 are replaced by ADR-010. This ADR's
+> original text is kept unchanged below for the record.
 
 ## Context
 
