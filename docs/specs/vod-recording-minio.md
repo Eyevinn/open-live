@@ -162,6 +162,20 @@ sequenceDiagram
     OpenLive-->>Client: 200 [ RecordingAsset w/ playbackUrl ]
 ```
 
+### Segments left on Strom
+
+Deactivate uploads every file under Strom's `recordings/<productionId>/`, not only the
+segments the ending session wrote. Files earlier sessions left there (a failed upload, or a
+session recorded before object storage was configured) are uploaded by the next deactivate
+that has storage, then deleted from Strom like the rest. The first deactivate after storage is
+added therefore uploads the whole backlog at once.
+
+Each `RecordingDoc.startedAt` comes from the timestamp Strom's recorder puts in the segment
+name (`{filename_prefix}_{YYYYmmdd_HHMMSS}_%05d.{ext}`), so a backlog segment keeps the date of
+the session that recorded it. Strom writes that stamp in its host's local time with no offset;
+open-live reads it as UTC, which is correct for Strom's container image. A name without a stamp
+falls back to the start of the activation being deactivated. `endedAt` is the time of the upload.
+
 ## Configuration (env vars)
 
 Added to `src/config.ts` (same `process.env` + optional-fallback style used there today):
