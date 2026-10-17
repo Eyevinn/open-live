@@ -310,11 +310,13 @@ let sweepInterval: NodeJS.Timeout | null = null;
 export function startGpuUsageSweep(log: FastifyBaseLogger): void {
   if (sweepInterval !== null) return;
   if (!isGpuMeteringEnabled()) {
-    log.info('[gpu-usage] Shared-GPU metering disabled (GPU_POOL unset) — settle sweep not started');
+    log.info(
+      '[gpu-usage] Shared-GPU metering disabled (no GPU_POOL and no platform-default match) — settle sweep not started',
+    );
     return;
   }
   log.info(
-    `[gpu-usage] Shared-GPU metering enabled (pool: ${config.gpuPool}, class: ${config.gpuClass}, settle: ${config.gpuSettleIntervalMs / 1000}s)`,
+    `[gpu-usage] Shared-GPU metering enabled (source: ${config.gpuMeteringSource}, pool: ${config.gpuPool}, class: ${config.gpuClass}, settle: ${config.gpuSettleIntervalMs / 1000}s)`,
   );
   sweepInterval = setInterval(() => {
     settleActiveProductions(log).catch((err) => log.error({ err }, '[gpu-usage] Settle sweep error'));

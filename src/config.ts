@@ -3,6 +3,7 @@
 // time — `isGuestCallingEnabled()` only calls `isGuestSigningKeyAvailable()` at
 // runtime, by which point every module in the cycle is fully initialised.
 import { isGuestSigningKeyAvailable } from './lib/guest-signing-key.js';
+import { PLATFORM_DEFAULT_METERING_ENABLED, resolveGpuMetering } from './lib/gpu-metering-defaults.js';
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -111,6 +112,15 @@ export function buildStromPublicUrl(): string | undefined {
   }
   return raw.replace(/\/+$/, '');
 }
+
+// Resolved once at import, like the rest of `config` (issue #537).
+const gpuMetering = resolveGpuMetering({
+  enabled: PLATFORM_DEFAULT_METERING_ENABLED,
+  gpuPoolEnv: optionalEnv('GPU_POOL'),
+  gpuClassEnv: optionalEnv('GPU_CLASS'),
+  oscHostname: optionalEnv('OSC_HOSTNAME'),
+  stromUrl: process.env['STROM_URL'],
+});
 
 export const config = {
   port: parseInt(process.env['PORT'] ?? '3000', 10),
@@ -260,7 +270,7 @@ export const config = {
   /**
    * MinIO / S3 object storage for VOD recordings (epic #5, issue #41).
    *
-   * Strom's recorder writes local files only ({media_path}/{output_dir}/{prefix}_%05d.{ext},
+   * Strom's recorder writes local files only ({media_path}/{output_dir}/{filename_prefix}_{timestamp}_%05d.{ext},
    * backend/src/blocks/builtin/recorder.rs) — it has no native S3/MinIO sink. So open-live
    * uploads the recorder's local segments to object storage after a production deactivates,
    * fetching them via Strom's existing media download API (`GET /api/media/file/:path`).
@@ -393,21 +403,30 @@ export const config = {
   intercomManagerToken: process.env['INTERCOM_MANAGER_TOKEN'] ?? undefined,
   // --- Shared-GPU usage metering (issue #500, docs/specs/shared-gpu-usage-metering.md, ADR-005) ---
   /**
-   * Shared-GPU pool label (e.g. `fra-1`) surfaced as the `gpu_pool` label /
-   * `gpuPool` field. **Metering is enabled iff this is set**: the platform
-   * provisions managed shared-GPU instances with `GPU_POOL` (+ `GPU_CLASS`) and
-   * leaves it unset everywhere else, so self-hosted / BYO-Strom deployments
-   * report zero shared-GPU time (`/api/v1/usage/gpu` → `hours: []`, `/metrics`
-   * emits no `osc_gpu_*` samples). There is no existing field that marks an
-   * instance as "on the shared GPU", so this explicit opt-in gates all accrual.
+   * Shared-GPU pool label (e.g. `se-sto01`) surfaced as the `gpu_pool` label /
+   * `gpuPool` field. **Metering is enabled iff this is set.** Resolved by
+   * `resolveGpuMetering` (`src/lib/gpu-metering-defaults.ts`, issue #537):
+   * - an explicit `GPU_POOL` env value always wins and enables metering
+   *   anywhere (source `env`);
+   * - otherwise, when `PLATFORM_DEFAULT_METERING_ENABLED` is on, an
+   *   OSC-managed instance (`OSC_HOSTNAME`, platform-injected) whose
+   *   `STROM_URL` is the platform-hosted shared Strom gets a pool derived from
+   *   the Strom host (source `platform-default`);
+   * - otherwise unset, so self-hosted / BYO-Strom deployments report zero
+   *   shared-GPU time (`/api/v1/usage/gpu` → `hours: []`, `/metrics` emits no
+   *   `osc_gpu_*` samples).
+   * No published service option maps to `GPU_POOL`; nothing else may read
+   * `process.env.GPU_POOL`.
    */
-  gpuPool: optionalEnv('GPU_POOL'),
+  gpuPool: gpuMetering?.pool,
   /**
-   * `gpu_class` label value (default `shared`). Only the shared class is metered
-   * to tokens; a `dedicated` value can be emitted for dashboards without
-   * implying billing.
+   * `gpu_class` label value (default `shared`; `GPU_CLASS` env overrides). Only
+   * the shared class is metered to tokens; a `dedicated` value can be emitted
+   * for dashboards without implying billing.
    */
-  gpuClass: optionalEnv('GPU_CLASS') ?? 'shared',
+  gpuClass: gpuMetering?.class ?? optionalEnv('GPU_CLASS') ?? 'shared',
+  /** Where `gpuPool` came from (`env` / `platform-default`); undefined when metering is off. Logged at startup. */
+  gpuMeteringSource: gpuMetering?.source,
   /**
    * Settle-sweep cadence in ms (default 5 min). The sweep writes each fully
    * elapsed UTC hour's GPU-seconds into the owning production's append-only
@@ -444,12 +463,16 @@ export function isGuestCallingEnabled(): boolean {
 }
 
 /**
- * True when shared-GPU usage metering is enabled — i.e. `GPU_POOL` is set
- * (issue #500). When false (every self-hosted / BYO-Strom deployment, and any
- * managed instance the platform has not opted in), no GPU-seconds accrue,
+ * True when shared-GPU usage metering is enabled, i.e. `config.gpuPool` is
+ * resolved: from an explicit `GPU_POOL`, or from the platform default for an
+ * OSC-managed instance on the platform-hosted shared Strom when
+ * `PLATFORM_DEFAULT_METERING_ENABLED` is on (issue #537). When false (every
+ * self-hosted / BYO-Strom deployment, and every managed instance while the
+ * switch is off and no `GPU_POOL` is set), no GPU-seconds accrue,
  * `/api/v1/usage/gpu` returns `hours: []`, and `/metrics` emits no `osc_gpu_*`
- * samples. This is the single gate for all accrual, so a non-shared-GPU
- * instance reports exactly zero.
+ * samples. This is the single predicate for all accrual AND the zero-balance
+ * start gate (`production-gate.ts`), so the metered set and the gated set are
+ * the same by construction.
  */
 export function isGpuMeteringEnabled(): boolean {
   return Boolean(config.gpuPool);

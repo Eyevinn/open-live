@@ -381,7 +381,7 @@ export interface RecordingDoc {
   key: string;            // object key, e.g. "<productionId>/<segment>.mp4"
   sizeBytes?: number;
   durationMs?: number;
-  startedAt: string;      // ISO 8601 — when the recording session began
+  startedAt: string;      // ISO 8601 — when the recording session began, from the segment's file name
   endedAt?: string;       // ISO 8601 — when the segment was finalized/uploaded
   createdAt: string;
   updatedAt: string;
@@ -830,6 +830,11 @@ export interface ProductionDoc {
   intercomProductionId?: string;
   /** Warnings accumulated when a referenced source/graphic/output was deleted while production was inactive */
   deletionWarnings?: Array<{ type: 'source' | 'graphic' | 'output'; name: string }>;
+  /**
+   * Problems found while going on air that did not stop activation, such as a
+   * recording that will have no sound. Cleared on next activation.
+   */
+  activationWarnings?: Array<{ type: 'recording-no-audio'; message: string }>;
   /** Set when the idle watchdog auto-deactivated this production; cleared on next activation */
   autoDeactivated?: boolean;
   /**
