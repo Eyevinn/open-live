@@ -160,6 +160,7 @@ function makeActivationResult(flowId: string, mixerBlockId: string) {
     returnBuses: [],
     returnWhepEntries: [],
     mixerInputMap: {},
+    warnings: [],
   };
 }
 
