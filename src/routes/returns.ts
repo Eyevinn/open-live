@@ -6,6 +6,7 @@ import { getStromToken } from '../lib/strom-token.js';
 import { assertSameStromOrigin } from '../lib/url-validation.js';
 import { config, isGuestCallingEnabled } from '../config.js';
 import { resolveGuestSession } from '../lib/guest-scope.js';
+import { previewStromUrl, previewTarget } from '../lib/commentator-preview.js';
 import { applyReturnMode } from '../ws/controller.js';
 import { returnModesFor } from './guests.js';
 
@@ -19,6 +20,11 @@ import { returnModesFor } from './guests.js';
  * production doc's `returnWhepUrls` (scoped to the guest's mixerInput), never
  * `/whep-proxy?target=` which would forward to any Strom URL and so could not be
  * guest-scoped (spec §"Return feeds", §Scoping).
+ *
+ * The commentator preview routes (spec §"Commentator preview") share the same
+ * server-scoped signaling proxy: an undelayed WHEP output of a source marked
+ * `commentatorPreview`, its target derived from the production's
+ * `previewWhepUrls`.
  */
 
 // Only `program` / `program-minus` in v1. `low-latency-minus` is a client-side
@@ -57,36 +63,39 @@ function returnView(doc: ProductionDoc, mixerInput: string) {
 }
 
 /**
- * Proxies a return-picture WHEP offer to the production's server-scoped Strom
- * target and scopes teardown back through THIS app (never a raw target param).
- * Shared by the crew route (`/api/v1/productions/...`) and the guest alias
- * (`/api/v1/guests/:inviteId/...`, issue #423); `buildLocation` maps the Strom
- * session id to the caller-appropriate teardown path, the only part that differs.
+ * Proxies a WHEP offer to a server-scoped Strom target (`target`, derived from
+ * the production doc by the caller — never a client-supplied URL) and scopes
+ * teardown back through THIS app (never a raw target param). Shared by the
+ * return-picture routes — crew (`/api/v1/productions/...`) and guest alias
+ * (`/api/v1/guests/:inviteId/...`, issue #423) — and the commentator preview
+ * routes; `buildLocation` maps the Strom session id to the caller-appropriate
+ * teardown path.
  *
- * When `guestSession` is set the minted WHEP session id is bound to that guest's
- * live session (issue #380) so the matching DELETE can verify a guest caller
- * only tears down their OWN return session. Crew/API_KEY callers pass no
- * `guestSession` and are not bound (unchanged behaviour).
+ * When `bindGuestSession` is set, the guest session doc it returns for the
+ * minted WHEP session id is persisted (issue #380) so the matching DELETE can
+ * verify a guest caller only tears down their OWN session. Crew/API_KEY
+ * callers pass none and are not bound (unchanged behaviour).
  */
-async function proxyReturnPictureWhep(args: {
+async function proxyScopedWhep(args: {
   reply: FastifyReply;
   doc: ProductionDoc;
-  mixerInput: string;
+  target: string | undefined;
+  /** Names the feed in the origin-check error and logs, e.g. 'Return'. */
+  feed: string;
   offerSdp: string;
   buildLocation: (sessionId: string) => string;
-  guestSession?: GuestSessionDoc;
+  bindGuestSession?: (sessionId: string) => GuestSessionDoc;
 }): Promise<FastifyReply> {
-  const { reply, doc, mixerInput, offerSdp, buildLocation, guestSession } = args;
+  const { reply, doc, target, feed, offerSdp, buildLocation, bindGuestSession } = args;
   if (doc.status !== 'active' || !doc.stromFlowId) {
     return reply.status(409).send({ error: 'production_inactive', statusCode: 409 });
   }
-  const target = returnStromUrl(doc, mixerInput);
   if (!target) {
     return reply.status(404).send({ error: 'feed_unavailable', statusCode: 404 });
   }
   // Defence in depth: the derived target must be on the Strom host.
   try {
-    assertSameStromOrigin(target, config.stromUrl, 'Return target');
+    assertSameStromOrigin(target, config.stromUrl, `${feed} target`);
   } catch {
     return reply.status(404).send({ error: 'feed_unavailable', statusCode: 404 });
   }
@@ -99,7 +108,7 @@ async function proxyReturnPictureWhep(args: {
   try {
     upstream = await fetch(target, { method: 'POST', headers, body: offerSdp });
   } catch (err) {
-    reply.log.warn({ err }, 'return picture WHEP: upstream unreachable');
+    reply.log.warn({ err }, `${feed} WHEP: upstream unreachable`);
     return reply.status(503).send({ error: 'feed_unavailable', statusCode: 503 });
   }
   if (!upstream.ok) {
@@ -115,20 +124,16 @@ async function proxyReturnPictureWhep(args: {
     reply.header('Location', buildLocation(encodeURIComponent(sessionId)));
   }
   // Bind this WHEP session id to the guest's live session (issue #380) so the
-  // matching DELETE can verify a guest caller only tears down their OWN return
+  // matching DELETE can verify a guest caller only tears down their OWN
   // session — never another guest's :sessionId. Best-effort: a persist failure
   // here does not fail the (already-established) upstream session; the guest
   // just fails closed on their next DELETE instead of silently trusting an
   // unbound id (see the DELETE handlers below).
-  if (guestSession && sessionId) {
+  if (bindGuestSession && sessionId) {
     try {
-      await getGuestSessionsDb().insert({
-        ...guestSession,
-        returnWhepSessionId: sessionId,
-        updatedAt: new Date().toISOString(),
-      });
+      await getGuestSessionsDb().insert(bindGuestSession(sessionId));
     } catch (err) {
-      reply.log.warn({ err }, 'return picture WHEP: guest session-id bind failed');
+      reply.log.warn({ err }, `${feed} WHEP: guest session-id bind failed`);
     }
   }
   reply.header('Content-Type', 'application/sdp');
@@ -136,18 +141,41 @@ async function proxyReturnPictureWhep(args: {
 }
 
 /**
- * Tears down a return-picture WHEP session on Strom, rebuilding the Strom
- * resource URL from the endpoint origin + session id (the session is tied to
- * THIS return's endpoint path, not an arbitrary target). Shared by the crew and
- * guest DELETE routes; the caller is responsible for the ownership check first.
+ * Proxies a return-picture WHEP offer (crew route and guest alias). When
+ * `guestSession` is set the minted session id is bound to it as
+ * `returnWhepSessionId` (issue #380).
  */
-async function teardownReturnPictureWhep(
+function proxyReturnPictureWhep(args: {
+  reply: FastifyReply;
+  doc: ProductionDoc;
+  mixerInput: string;
+  offerSdp: string;
+  buildLocation: (sessionId: string) => string;
+  guestSession?: GuestSessionDoc;
+}): Promise<FastifyReply> {
+  const { mixerInput, guestSession, ...rest } = args;
+  return proxyScopedWhep({
+    ...rest,
+    target: returnStromUrl(args.doc, mixerInput),
+    feed: 'Return',
+    bindGuestSession: guestSession
+      ? (sessionId) => ({ ...guestSession, returnWhepSessionId: sessionId, updatedAt: new Date().toISOString() })
+      : undefined,
+  });
+}
+
+/**
+ * Tears down a server-scoped WHEP session on Strom, rebuilding the Strom
+ * resource URL from the endpoint origin + session id (the session is tied to
+ * THIS feed's endpoint `base` URL, not an arbitrary target). Shared by the
+ * crew and guest DELETE routes of the return picture and the commentator
+ * preview; the caller is responsible for the ownership check first.
+ */
+async function teardownScopedWhep(
   reply: FastifyReply,
-  doc: ProductionDoc,
-  mixerInput: string,
+  base: string | undefined,
   sessionId: string,
 ): Promise<FastifyReply> {
-  const base = returnStromUrl(doc, mixerInput);
   if (!base) return reply.status(204).send();
   const origin = new URL(base).origin;
   const target = `${origin}/whep/${encodeURIComponent(sessionId)}`;
@@ -248,7 +276,48 @@ const returnsRoutes: FastifyPluginAsync = async (fastify) => {
       } catch {
         return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
       }
-      return teardownReturnPictureWhep(reply, doc, req.params.mixerInput, req.params.sessionId);
+      return teardownScopedWhep(reply, returnStromUrl(doc, req.params.mixerInput), req.params.sessionId);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // Crew — POST/DELETE a commentator preview WHEP feed (server-scoped)
+  // -------------------------------------------------------------------------
+  // Shared-key only: unlike the return picture, these paths are NOT in the
+  // guest-eligible families of guest-scope.ts — guests use the invite-scoped
+  // aliases below.
+  fastify.post<{ Params: { id: string; mixerInput: string } }>(
+    '/api/v1/productions/:id/previews/:mixerInput/whep',
+    { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
+    async (req, reply) => {
+      let doc: ProductionDoc;
+      try {
+        doc = await getDb().get(req.params.id);
+      } catch {
+        return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+      }
+      return proxyScopedWhep({
+        reply,
+        doc,
+        target: previewTarget(doc, req.params.mixerInput),
+        feed: 'Preview',
+        offerSdp: req.body as string,
+        buildLocation: (sessionId) =>
+          `/api/v1/productions/${doc._id}/previews/${encodeURIComponent(req.params.mixerInput)}/whep/${sessionId}`,
+      });
+    },
+  );
+
+  fastify.delete<{ Params: { id: string; mixerInput: string; sessionId: string } }>(
+    '/api/v1/productions/:id/previews/:mixerInput/whep/:sessionId',
+    async (req, reply) => {
+      let doc: ProductionDoc;
+      try {
+        doc = await getDb().get(req.params.id);
+      } catch {
+        return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+      }
+      return teardownScopedWhep(reply, previewStromUrl(doc, req.params.mixerInput), req.params.sessionId);
     },
   );
 
@@ -362,7 +431,77 @@ const returnsRoutes: FastifyPluginAsync = async (fastify) => {
       if (slot.session.returnWhepSessionId !== req.params.sessionId) {
         return reply.status(403).send({ error: 'Session does not belong to this guest', statusCode: 403 });
       }
-      return teardownReturnPictureWhep(reply, slot.production, slot.mixerInput, req.params.sessionId);
+      return teardownScopedWhep(reply, returnStromUrl(slot.production, slot.mixerInput), req.params.sessionId);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // Guest — commentator preview WHEP (token-authed; spec §"Commentator preview")
+  // -------------------------------------------------------------------------
+  // A guest may watch any commentator preview of THEIR invite's production —
+  // the production is taken from the invite, never from the request, so another
+  // production's previews are unreachable. Needs the invite's live session, like
+  // the return aliases, but not a return on the guest's own slot.
+  async function guestPreviewScope(
+    req: FastifyRequest<{ Params: { inviteId: string } }>,
+    reply: FastifyReply,
+  ): Promise<{ session: GuestSessionDoc; production: ProductionDoc } | null> {
+    if (!isGuestCallingEnabled()) {
+      await reply.status(503).send({ error: 'Guest calling is disabled', statusCode: 503 });
+      return null;
+    }
+    const token = bearerToken(req);
+    const who = token ? await resolveGuestSession(token) : undefined;
+    if (!who?.ok || who.invite._id !== req.params.inviteId) {
+      await reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
+      return null;
+    }
+    let production: ProductionDoc;
+    try {
+      production = await getDb().get(who.invite.productionId);
+    } catch {
+      await reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+      return null;
+    }
+    return { session: who.session, production };
+  }
+
+  fastify.post<{ Params: { inviteId: string; mixerInput: string } }>(
+    '/api/v1/guests/:inviteId/previews/:mixerInput/whep',
+    { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
+    async (req, reply) => {
+      const scope = await guestPreviewScope(req, reply);
+      if (!scope) return reply;
+      const { session, production } = scope;
+      const { mixerInput } = req.params;
+      return proxyScopedWhep({
+        reply,
+        doc: production,
+        target: previewTarget(production, mixerInput),
+        feed: 'Preview',
+        offerSdp: req.body as string,
+        buildLocation: (sessionId) =>
+          `/api/v1/guests/${req.params.inviteId}/previews/${encodeURIComponent(mixerInput)}/whep/${sessionId}`,
+        bindGuestSession: (sessionId) => ({
+          ...session,
+          previewWhepSessionIds: { ...session.previewWhepSessionIds, [mixerInput]: sessionId },
+          updatedAt: new Date().toISOString(),
+        }),
+      });
+    },
+  );
+
+  fastify.delete<{ Params: { inviteId: string; mixerInput: string; sessionId: string } }>(
+    '/api/v1/guests/:inviteId/previews/:mixerInput/whep/:sessionId',
+    async (req, reply) => {
+      const scope = await guestPreviewScope(req, reply);
+      if (!scope) return reply;
+      // A guest may only tear down the preview session bound to THEIR OWN live
+      // session for this input (issue #380 pattern).
+      if (scope.session.previewWhepSessionIds?.[req.params.mixerInput] !== req.params.sessionId) {
+        return reply.status(403).send({ error: 'Session does not belong to this guest', statusCode: 403 });
+      }
+      return teardownScopedWhep(reply, previewStromUrl(scope.production, req.params.mixerInput), req.params.sessionId);
     },
   );
 };

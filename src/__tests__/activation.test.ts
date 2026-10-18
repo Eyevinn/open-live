@@ -140,6 +140,7 @@ function makeActivationResult(flowId: string, mixerBlockId: string) {
     clipPlayerBlockIds: {},
     returnBuses: [],
     returnWhepEntries: [],
+    previewWhepEntries: [],
     mixerInputMap: {},
   };
 }
@@ -352,6 +353,23 @@ describe('POST /api/v1/productions/:id/deactivate', () => {
     expect(insertedDoc.whepEndpoint).toBeUndefined();
     expect(insertedDoc.stromFlowId).toBeUndefined();
     expect(insertedDoc.mixerBlockId).toBeUndefined();
+  });
+
+  it('clears commentator preview WHEP URLs on deactivate', async () => {
+    const doc = makeProductionDoc({
+      status: 'active',
+      stromFlowId: 'flow-abc',
+      previewWhepUrls: [{ mixerInput: 'video_in_0', url: 'http://strom/whep/p', endpointId: 'p' }],
+    });
+    mockGet.mockResolvedValue(doc);
+    mockDeactivateStromFlow.mockResolvedValue(undefined);
+    mockInsert.mockResolvedValue({ rev: '3-cde', ok: true, id: doc._id });
+
+    const app = await buildServer();
+    const res = await app.inject({ method: 'POST', url: '/api/v1/productions/prod-test-1/deactivate' });
+
+    expect(res.statusCode).toBe(200);
+    expect(mockInsert.mock.calls[0][0].previewWhepUrls).toBeUndefined();
   });
 
   it('clears clipPlayerBlockIds on deactivate (issue #276)', async () => {

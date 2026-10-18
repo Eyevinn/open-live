@@ -278,6 +278,44 @@ returnMode: 'program' | 'program-minus';   // current mode of the picture feed's
   catalogue `whip` sources too, not only the virtual `Whip` source
   (`src/routes/productions.ts:296`).
 
+### Commentator preview (per source, opt-in)
+
+A remote commentator (a guest) usually comments on one incoming source, such as a stadium camera.
+Operators may delay sources with their `time_offset` blocks to bring commentary and picture into
+sync, and every WHEP output (program, multiview, monitor, guest returns) comes after those
+offsets. A commentator preview is an extra WHEP output of one source, fed from the source's input
+block — its video plus its own first audio track — before the offset blocks and outside the
+mixer, so the commentator watches the source undelayed and unswitched.
+
+- **Flag** — `commentatorPreview: true` on the source assignment
+  (`POST /api/v1/productions/:id/sources`). Accepted on SRT, EFP and clip sources, whose input is
+  a Strom block with raw pads; `400` on any other source (WHIP guest slots and contributors, HTML,
+  test patterns). Built at activation, so marking a source takes effect on the next activation;
+  unmarking stops new viewers at once.
+- **Flow** — per marked source a `builtin.videoenc` (4 Mbit/s, like `Enc View`) and a
+  `builtin.whep_output` (`low_latency`, one audio track), endpoint
+  `whep-preview-{pad}-{production suffix}`. The Strom URLs are stored as `previewWhepUrls` on
+  the production when it goes active and cleared on deactivate.
+- **Routes** — same server-scoped signaling proxy as the return picture (target derived from
+  `previewWhepUrls`, never `/whep-proxy?target=`; `Location` rewritten to the route's session
+  subpath; same `production_inactive` / `feed_unavailable` errors):
+
+  ```
+  POST/DELETE /api/v1/productions/:id/previews/:mixerInput/whep[/:sessionId]   # crew (shared key only)
+  POST/DELETE /api/v1/guests/:inviteId/previews/:mixerInput/whep[/:sessionId]  # guest token
+  ```
+
+- **Scoping** — the guest route needs the invite's live session and takes the production from the
+  invite, so a guest can watch any commentator preview of their own production and none of
+  another's. The minted session id is bound to the guest session (`previewWhepSessionIds`, per
+  mixerInput, next to `returnWhepSessionId`), and a guest DELETE of any other id is `403`. The crew
+  path is not guest-eligible.
+- **Discovery** — the join and slot responses carry
+  `previews: { mixerInput; label; url }[]` (label = source name, url = the guest route), empty
+  unless the production is active. `feeds` is unchanged.
+- **Cost** — one extra 4 Mbit/s encode (and one WHEP output) per marked source, whether or not
+  anyone is watching, which is why it is opt-in.
+
 ### WebSocket — guest lifecycle and return events
 
 Add a broadcast event to the controller's event model (same `broadcast(productionId, {...})`

@@ -569,6 +569,13 @@ components:
               type: boolean
               enum: [false]
               default: false
+        commentatorPreview:
+          type: boolean
+          description: >-
+            Present (true) when the source has a commentator preview: an extra
+            WHEP output of the source fed from its input block, before its time
+            offsets and outside the mixer, built at activation. SRT, EFP and
+            clip sources only.
 
     ProductionGraphicAssignment:
       type: object
@@ -950,7 +957,7 @@ components:
 
     GuestJoinResult:
       type: object
-      required: [guestId, returnOnly, feeds, modes, defaultMode, returnMode]
+      required: [guestId, returnOnly, feeds, previews, modes, defaultMode, returnMode]
       properties:
         guestId:
           type: string
@@ -980,6 +987,24 @@ components:
                 type: string
               video:
                 type: boolean
+        previews:
+          type: array
+          description: >-
+            Commentator previews of this production: undelayed WHEP feeds of the
+            sources marked `commentatorPreview`, taken before their time offsets.
+            Empty unless the production is active.
+          items:
+            type: object
+            required: [mixerInput, label, url]
+            properties:
+              mixerInput:
+                type: string
+              label:
+                type: string
+                description: The source's display name (falls back to the mixerInput).
+              url:
+                type: string
+                description: Guest-scoped WHEP URL (`/api/v1/guests/{inviteId}/previews/{mixerInput}/whep`).
         modes:
           type: array
           items:
@@ -1845,6 +1870,9 @@ paths:
         input. Include `returnFeed` to declare the assignment as a guest slot
         (issue #381): a mix-minus return reserved for a guest and built into the
         flow at activation. Guest invites may only target a declared guest slot.
+        Set `commentatorPreview` to build an undelayed WHEP preview of the
+        source (before its time offsets) at activation; it is accepted on SRT,
+        EFP and clip sources only and rejected with 400 on any other source.
       operationId: assignSource
       tags: [Productions]
       requestBody:
@@ -1875,6 +1903,11 @@ paths:
                       type: boolean
                       enum: [false]
                       default: false
+                commentatorPreview:
+                  type: boolean
+                  description: >-
+                    Build an undelayed commentator preview WHEP output of this
+                    source at activation (SRT, EFP and clip sources only).
       responses:
         '200':
           description: Assignment created
@@ -1882,6 +1915,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ProductionSourceAssignment'
+        '400':
+          description: Invalid body, or `commentatorPreview` on a source kind that does not support it
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   /api/v1/productions/{id}/sources/{mixerInput}:
     parameters:
@@ -2886,12 +2925,27 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [mixerInput, returnOnly]
+                required: [mixerInput, returnOnly, previews]
                 properties:
                   mixerInput:
                     type: string
                   returnOnly:
                     type: boolean
+                  previews:
+                    type: array
+                    description: >-
+                      Commentator previews of this production (as on join);
+                      watchable once joined. Empty unless the production is active.
+                    items:
+                      type: object
+                      required: [mixerInput, label, url]
+                      properties:
+                        mixerInput:
+                          type: string
+                        label:
+                          type: string
+                        url:
+                          type: string
         '401':
           description: Missing, invalid, or revoked invite token
           content:
@@ -3239,6 +3293,187 @@ paths:
       responses:
         '204':
           description: Session torn down (idempotent)
+
+  /api/v1/productions/{id}/previews/{mixerInput}/whep:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Establish a commentator preview WHEP session (server-scoped signaling proxy)
+      description: >-
+        Proxies a WHEP offer to the source's commentator preview output — the
+        source's own video and audio, before its time offsets and outside the
+        mixer — derived SERVER-SIDE from the production's persisted
+        `previewWhepUrls`. Only for an assignment still marked
+        `commentatorPreview`. Shared API key only; guests use
+        `/api/v1/guests/{inviteId}/previews/{mixerInput}/whep`.
+      operationId: startPreviewWhep
+      tags: [Returns]
+      requestBody:
+        required: true
+        content:
+          application/sdp:
+            schema:
+              type: string
+      responses:
+        '201':
+          description: WHEP answer SDP
+          content:
+            application/sdp:
+              schema:
+                type: string
+        '404':
+          description: Production not found, or no commentator preview on the input (`feed_unavailable`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Production inactive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Upstream Strom unreachable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/productions/{id}/previews/{mixerInput}/whep/{sessionId}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: sessionId
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      summary: Tear down a commentator preview WHEP session
+      operationId: stopPreviewWhep
+      tags: [Returns]
+      responses:
+        '204':
+          description: Session torn down (idempotent)
+
+  /api/v1/guests/{inviteId}/previews/{mixerInput}/whep:
+    parameters:
+      - name: inviteId
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Guest commentator preview WHEP (token-authed)
+      description: >-
+        Guest alias of the crew preview route. Authenticates with the per-invite
+        token and needs the invite's live session. The production is the
+        invite's own, so a guest can watch any commentator preview of their
+        production and none of another's. The minted session id is bound to the
+        guest's session for the matching DELETE.
+      operationId: guestStartPreviewWhep
+      tags: [Guests]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/sdp:
+            schema:
+              type: string
+      responses:
+        '201':
+          description: WHEP answer SDP
+          content:
+            application/sdp:
+              schema:
+                type: string
+        '401':
+          description: Missing, invalid, revoked or expired invite token, or no live guest session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Production not found, or no commentator preview on the input (`feed_unavailable`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Production inactive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Guest calling disabled, or upstream Strom unreachable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/guests/{inviteId}/previews/{mixerInput}/whep/{sessionId}:
+    parameters:
+      - name: inviteId
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: sessionId
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      summary: Tear down the guest's own commentator preview WHEP session
+      operationId: guestStopPreviewWhep
+      tags: [Guests]
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Session torn down (idempotent)
+        '401':
+          description: Missing, invalid, revoked or expired invite token, or no live guest session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: The session id is not bound to this guest's session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   /api/v1/productions/{id}/guests:
     parameters:
