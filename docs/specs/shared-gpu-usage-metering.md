@@ -5,7 +5,8 @@
 **Related issues:** #500 (this feature). Reuses the OSC generic-metering pattern established for
 CDN acceleration ([agent-team-osc-dev ADR-0057](https://github.com/Eyevinn/agent-team-osc-dev/blob/main/adr/0057-per-endpoint-cdn-acceleration-metered-to-tokens.md):
 per-hour events → money-manager `POST /meters/:meterId/events`).
-**Related ADR:** `docs/decisions/ADR-005-shared-gpu-usage-metering-allocation-basis.md`.
+**Related ADR:** `docs/decisions/ADR-005-shared-gpu-usage-metering-allocation-basis.md` (incl.
+Amendment 1, default metering on the platform-hosted shared Strom, #526).
 
 > Proposed spec, not an accepted decision. Phase-1 deliverable per `epic-workflow.md` §Phase 1.
 > No implementation starts until the team-lead gate passes and the human-level Open Questions
@@ -137,8 +138,8 @@ Field contract:
 | `hours[].hour` | ISO 8601 UTC, top of hour | Bucket start. `hour + 1h <= settledThrough`. |
 | `hours[].tenantId` | string | OSC workspace id if resolvable, else `"unattributed"` (§3.6). Never dropped. |
 | `hours[].resource` | string | `"production-<ProductionDoc._id>"` — stable per production. |
-| `hours[].gpuPool` | string | From `GPU_POOL` config (§5). |
-| `hours[].gpuClass` | `"shared"` \| other | From `GPU_CLASS` config (§5), default `"shared"`. |
+| `hours[].gpuPool` | string | `config.gpuPool`: the explicit `GPU_POOL` env value, else the platform-default pool derived from the shared Strom host (`strom-se-sto01` → `se-sto01`) (§5). |
+| `hours[].gpuClass` | `"shared"` \| other | `config.gpuClass`: `GPU_CLASS` env if set, else `"shared"` (§5). |
 | `hours[].seconds` | integer ≥ 0 | GPU-seconds accrued in that hour for that resource. `0 <= seconds <= 3600` per (hour × resource). |
 
 **Errors:** `400` (malformed `since`), `401` (missing/invalid bearer), `503` (CouchDB unreachable and
@@ -152,10 +153,11 @@ A usage query that fails while the database is connected (production or ledger s
 ledger (`preserveGpuUsageOnDelete`). That ledger write is best-effort for v1: a failed write is logged
 and does not fail the delete.
 
-**Self-hosted / BYO Strom:** when metering is not enabled (no `GPU_POOL`, or `STROM_AUTH_MODE=direct`
-self-hosted — §5), the endpoint returns `200` with `hours: []` and `basis: "allocation"`. It never
-reports non-zero shared-GPU time for an instance that is not on the managed shared GPU (issue AC:
-"Productions on a self-hosted or BYO Strom report zero shared-GPU time").
+**Self-hosted / BYO Strom:** when metering is not enabled (`isGpuMeteringEnabled()` is false: no
+`GPU_POOL` and no platform-default match, §5), the endpoint returns `200` with `hours: []` and
+`basis: "allocation"`. It never reports non-zero shared-GPU time for an instance that is not on the
+managed shared GPU (issue AC: "Productions on a self-hosted or BYO Strom report zero shared-GPU
+time"). `STROM_AUTH_MODE` plays no part in this: managed instances also run `direct`.
 
 ### 2.3 `GET /metrics`
 
@@ -328,29 +330,77 @@ sequenceDiagram
 
 ## 5. Configuration
 
-New env vars (all optional; metering is **off** unless `GPU_POOL` is set, so self-hosted/BYO
-deployments are unchanged):
+Metering is resolved once at startup by `resolveGpuMetering` (`src/lib/gpu-metering-defaults.ts`,
+issue #537, ADR-005 Amendment 1), called from `src/config.ts`. The result sets `config.gpuPool`,
+`config.gpuClass` and `config.gpuMeteringSource` (`env` or `platform-default`).
+`isGpuMeteringEnabled()` is `Boolean(config.gpuPool)`, and it is the single predicate for both the
+meter and the zero-balance start gate (`checkProductionStartAllowed`,
+`src/services/production-gate.ts`, issue #523). Nothing else reads `process.env.GPU_POOL`.
+
+Env vars (all optional):
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `GPU_POOL` | *(unset)* | Pool label (e.g. `fra-1`). **Metering is enabled iff this is set.** Unset → `/api/v1/usage/gpu` returns `hours: []`, `/metrics` emits no `osc_gpu_*` samples. |
-| `GPU_CLASS` | `shared` | `gpu_class` label value. Only the shared class is metered to tokens; a `dedicated` value can be emitted for dashboards without implying billing. |
+| `GPU_POOL` | *(unset)* | Explicit pool label override (e.g. `fra-1`). When set it always wins and **enables metering anywhere** (source `env`). When unset, the pool comes from the platform-default rule below, or metering is off. Unset and no default match → `/api/v1/usage/gpu` returns `hours: []`, `/metrics` emits no `osc_gpu_*` samples. |
+| `GPU_CLASS` | `shared` | `gpu_class` label value override. Does **not** enable metering on its own. Only the shared class is metered to tokens; a `dedicated` value can be emitted for dashboards without implying billing. |
+| `OSC_HOSTNAME` | *(unset)* | Read only as the "OSC-managed" signal of the default rule. Injected by the platform (`osaas-lib-orchestrator` `envVarRefs`, a fieldRef to the instance url annotation, applied after the service options); no published `eyevinn-open-live` option maps to it. |
+| `STROM_URL` | `http://localhost:7000` | Existing setting. Its host and port decide whether the default rule matches (below). |
 | `GPU_SETTLE_INTERVAL_MS` | `300000` (5 min) | Settle-sweep cadence. Lower bounds the worst-case lost partial-hour on crash (§3.5); higher reduces writes. |
 | `GPU_USAGE_RETENTION_HOURS` | `2160` (90 days) | How long closed `gpuHours` buckets are retained/returned. Old buckets are pruned on settle. Must exceed the platform's re-poll + 7-day dead-letter window (§6). |
 | `OSC_WORKSPACE_ID` | *(unset)* | If the platform injects the workspace id, it is emitted as `tenantId`. Unset → `"unattributed"` (§3.6). |
+
+No published service option maps to `GPU_POOL` or `GPU_CLASS`; the platform does not set them on
+managed instances. The env vars stay as overrides so a later option needs no code change.
+
+**Default rule (platform-hosted shared Strom).** An instance with no `GPU_POOL` is metered iff all
+of these hold:
+
+1. `PLATFORM_DEFAULT_METERING_ENABLED` is `true`. This is a code constant, not an env var or service
+   option. It ships `false`; only the human flip PR in Eyevinn/open-live-site#205 step 2a may change
+   it.
+2. `OSC_HOSTNAME` is non-empty (the instance is OSC-managed). A self-hosted deployment has no
+   `OSC_HOSTNAME` and stays at zero.
+3. `STROM_URL` parses as `https`, has no userinfo, its host matches
+   `PLATFORM_STROM_HOST_RE = /^strom-se-sto\d{2}\.osaas\.io$/i`, and its port is in
+   `PLATFORM_STROM_PORTS = ['8080']` (the shared Strom). Path and trailing slash are ignored.
+
+Then pool = the host label minus `strom-` (`strom-se-sto01` → `se-sto01`) and class = `shared`
+(source `platform-default`). Everything else stays at zero: a BYO Strom, a tenant's own
+`eyevinn-strom` instance (multi-label host under the service domain), the alternate Strom on `:8082`
+(internal, not metered; svensson00 on #526, 2026-10-16 14:14), the testbed on `:8084`, no port or
+`:443` (nothing listens there; WHATWG `URL` normalises `:443` to no port), `http`, and an unparsable
+URL. There is no tenant off switch. Why the host is anchored, and why no wildcard on the OSC instance
+domain is accepted, is recorded in ADR-005 Amendment 1.
+
+**`STROM_AUTH_MODE` is not a signal.** Managed instances do not run `STROM_AUTH_MODE=osc`: the
+open-live-site funnel creates them with `StromAuthMode: "direct"` (and its `StromUrl` reaches the
+container as `STROM_URL`). Auth mode cannot tell managed from self-hosted, so it plays no part in
+metering.
+
+**Accrual floor (issue #535).** The first time metering is enabled on an instance,
+`startGpuUsageSweep` writes a `gpu-metering-state` marker doc (`GpuMeteringStateDoc`, fixed id
+`GPU_METERING_STATE_DOC_ID`) with `enabledAt` to the instance CouchDB. It is never overwritten on
+later restarts. Every accrual path starts at `accrualStartMs()` = `max(activatedAt, enabledAt)`, so
+a production that was live across the enabling restart is not charged for time before metering was
+on. If the DB is unavailable, or the marker cannot be read or written, the floor is the in-memory
+sweep start: that can undercharge, but never back-charges.
+
+**Existing instances.** The rule lives in the image; nothing is set per instance. After the
+Eyevinn/open-live-site#205 step 2a flip is released, an existing managed instance on the shared
+Strom meters, and is subject to the zero-balance start gate, from its **next restart** onto that
+image. No forced remake is needed. An instance that does not restart keeps running the old image
+and stays unmetered (and ungated) until it does. BYO and self-hosted deployments are unaffected.
+
+**Fail-to-zero risk.** The rule matches only the listed host pattern and port. If the funnel's
+`STROM_URL` moves to a host or port that is not listed, new instances on it silently stop metering
+(they report `hours: []`, and the gate does not apply). Before the funnel changes its Strom URL,
+`PLATFORM_STROM_HOST_RE` / `PLATFORM_STROM_PORTS` must be updated in a released image. A new
+`strom-se-stoNN` box on `:8080` needs no code change.
 
 **No Strom config change.** Accrual reads only the existing flow lifecycle open-live already observes
 (`stromFlowId`, the `prod:<id>` description tag, reconcile's `flows.list()`). The spec deliberately
 does **not** depend on a new Strom per-pipeline usage API (see §7 — whether Strom can report that is
 unverified; the allocation basis is chosen precisely to avoid needing it).
-
-**Shared vs self-hosted detection:** the managed shared-GPU deployment runs `STROM_AUTH_MODE=osc`
-against an OSC-hosted Strom (`src/config.ts:130`, README 69 EUR shared-GPU plan); self-hosted runs
-`direct` (15 EUR self-hosted Strom). `GPU_POOL` being set is the explicit opt-in that gates all
-metering, so the platform (which provisions the managed instance) sets `GPU_POOL`+`GPU_CLASS=shared`
-on managed instances and leaves them unset everywhere else. There is **no existing field that marks
-an instance as "on the shared GPU"**, which is why this explicit opt-in is introduced rather than
-inferred.
 
 ## 6. The `osc-gpu-usage/v1` standard (cross-service surface)
 
@@ -371,7 +421,7 @@ implement; open-live is its first implementor.
 
 **Platform side (separate tickets, NOT this repo), described so the contract is complete:**
 register a `gpu-time` meter in the generic metering engine (`unitLabel: "hour"`, dimensioned by
-`gpuClass`) with a rate card in tokens/GPU-hour; a poller reads each opted-in instance's
+`gpuClass`) with a rate card in tokens/GPU-hour; a poller reads each metered instance's
 `/api/v1/usage/gpu`, resolves instance→tenant, and posts
 `{ tenantId, idempotencyKey: "gpu:<instanceId>:<YYYYMMDDHH>", occurredAt: <hour start>, dimensions: { gpuClass }, quantities: { hours: seconds/3600 } }`
 to `POST /meters/gpu-time/events`. The idempotency key makes re-polling safe; the engine's 7-day
