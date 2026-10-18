@@ -1,7 +1,7 @@
 # ADR-005: Shared-GPU usage is metered on an allocation basis (wall-clock slot time), exposed as closed hourly buckets reusing the CDN metering pattern
 
 **Date**: 2026-10-13
-**Status**: Proposed
+**Status**: Proposed (amended 2026-10-18, see Amendment 1)
 
 > Proposed at Phase-1 (architect). Awaiting the team-lead gate. The full spec is in
 > `docs/specs/shared-gpu-usage-metering.md` (issue #500). Two product-level Open Questions
@@ -111,3 +111,80 @@ Constraints grounded in the code:
 - **Infer "shared GPU" from `STROM_AUTH_MODE=osc`.** *Rejected as the gate.* Too implicit; an explicit
   `GPU_POOL` opt-in (metering off unless set) keeps self-hosted/BYO instances reporting zero with no
   guesswork, and lets the platform turn metering on only where it provisions the shared GPU.
+
+## Amendment 1: default metering on the platform-hosted shared Strom (2026-10-18)
+
+**Issues**: #526 (parent), #537 (detection + switch, PR #538), #535 (accrual floor, PR #540), #536
+(this amendment). The original Decision above is unchanged. This amendment replaces only the
+assumption that "the platform sets `GPU_POOL` on managed instances" and the related part of the
+`STROM_AUTH_MODE=osc` alternative.
+
+### Context
+
+Nothing on the platform ever set `GPU_POOL`, and no published `eyevinn-open-live` service option
+maps to it, so metering never ran on managed instances. The `STROM_AUTH_MODE=osc` premise was also
+false: the open-live-site funnel creates managed instances with `StromAuthMode: "direct"`, so auth
+mode cannot tell a managed instance from a self-hosted one. Decision (birme, #526): the defaults live
+in Open Live itself; the service definition is not changed.
+
+### Decision
+
+1. **Switch constant.** `PLATFORM_DEFAULT_METERING_ENABLED` in `src/lib/gpu-metering-defaults.ts` is
+   a code constant (not env, not a service option, not tenant-settable). It ships `false`, so
+   merging the mechanism changed nothing on any managed instance. Only the human flip PR in
+   Eyevinn/open-live-site#205 step 2a may set it to `true`; that flip starts production-hour
+   charging (40 tokens per hour) and zero-balance gating.
+2. **Rule.** `resolveGpuMetering` meters an instance with no `GPU_POOL` iff the switch is on AND
+   `OSC_HOSTNAME` is non-empty AND `STROM_URL` parses as `https` with no userinfo, its host matches
+   the anchored `PLATFORM_STROM_HOST_RE = /^strom-se-sto\d{2}\.osaas\.io$/i`, and its port is in
+   `PLATFORM_STROM_PORTS = ['8080']`. Path and trailing slash are ignored. Pool = host label minus
+   `strom-` (`se-sto01`), class = `shared`, source `platform-default`. `GPU_POOL`/`GPU_CLASS` env
+   override the defaults, and `GPU_POOL` alone still enables metering anywhere (source `env`). There
+   is no tenant off switch.
+   - `OSC_HOSTNAME` is the OSC-managed signal because it is injected by `osaas-lib-orchestrator`
+     (`envVarRefs`, applied after the service options) and no published option maps to it. A
+     self-hosted deployment does not have it.
+   - The host + port pair is the platform-hosted-Strom signal: it meters exactly the shared Strom
+     endpoint the funnel hands to tenants (svensson00, #526, 2026-10-16 12:30 and 14:14).
+3. **Only `:8080` is metered.** The alternate Strom on `:8082` is internal and is not metered
+   (svensson00, #526, 2026-10-16 14:14, replacing the earlier "meter the alternate Strom like the
+   shared one" on open-live-site#198). `:8084` (testbed), no port and `:443` also stay at zero.
+4. **Accrual floor.** The first time metering is enabled on an instance, `startGpuUsageSweep`
+   persists a `gpu-metering-state` marker (`enabledAt`) in the instance CouchDB, never overwritten
+   on later restarts. All accrual starts at `accrualStartMs()` = `max(activatedAt, enabledAt)`, so
+   nothing from before enablement is ever reported (no back-charge; svensson00, #526, 2026-10-16
+   14:14). If the DB is unavailable the floor is the in-memory sweep start, which can undercharge
+   but never back-charges.
+5. **One predicate.** `isGpuMeteringEnabled()` stays `Boolean(config.gpuPool)` and drives both the
+   meter and the zero-balance start gate, so the gate applies to exactly the metered instances.
+
+### Why a wildcard on the OSC instance domain is refused
+
+A suffix or wildcard match (for example any `*.osaas.io` host, or any host under the Strom service
+domain) would also match Strom instances that tenants run themselves: a tenant's `eyevinn-strom`
+instance gets a multi-label host under the OSC service domain. That is BYO usage, which must stay at
+zero (open-live#500 AC5): with a wildcard, a tenant whose `StromUrl` points at their own Strom
+instance would be metered, charged and gated for GPU time the platform does not provide. The regex is anchored to one `strom-se-stoNN` label directly under
+`osaas.io`. No tenant-reachable path issues such a name: there is no apex wildcard on `osaas.io`,
+My Apps names are multi-label, and `osaas.io` is a reserved zone for tenant custom domains in
+osaas-deploy-manager (verified in PR #538). A new `strom-se-stoNN` box on `:8080` meters with no code
+change.
+
+### Existing instances
+
+The behaviour lives in the image; nothing is set per instance. After the open-live-site#205 step 2a
+flip is released, an existing managed shared-Strom instance meters and is gated from its **next
+restart** onto that image, with no forced remake. Instances that do not restart stay unmetered (and
+ungated) until they do. BYO and self-hosted deployments are unaffected.
+
+### Consequences and risks
+
+- **Fail to zero.** If the funnel's `STROM_URL` moves to a host or port not covered by
+  `PLATFORM_STROM_HOST_RE` / `PLATFORM_STROM_PORTS`, new instances silently stop metering (and are
+  not gated). The list must be updated in a released image before the funnel's URL changes.
+- **Flip back, then flip on again.** The `enabledAt` marker keeps the first enablement time. A
+  production live through an off window would accrue that window on re-enable unless the
+  `gpu-metering-state` doc is deleted before the re-enabling restart (PR #540, "Risks not covered").
+- Superseded: the "Infer shared GPU from `STROM_AUTH_MODE=osc`" alternative above remains rejected,
+  but its premise that the platform turns metering on by setting `GPU_POOL` no longer holds; the
+  default rule above replaces it.
