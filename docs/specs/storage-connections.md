@@ -273,6 +273,10 @@ today).
 
 **`recording` output** (`OutputDoc`): add optional `connectionId?: string` to the recording
 output's config. Absent = default connection (env) — exactly as today.
+*Amended by #534:* the `connectionId` must exist (`400 "Storage connection not found"` on `POST`
+and `PATCH`), and a recording output is accepted without `MINIO_*` env when it names a
+connection — see `vod-recording-minio.md` §"Connection-only targets, downloads and upload
+outcome".
 
 **`RecordingDoc`** (`src/db/types.ts:352-367`): add optional `connectionId?: string`, recording
 which connection wrote the asset. Written at upload time from the output's `connectionId` (absent

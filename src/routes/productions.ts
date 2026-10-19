@@ -3,7 +3,7 @@ import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { getDb, getOutputsDb, getRecordingsDb } from '../db/index.js';
 import { sweepGuestsOnProductionEnd } from '../services/guest-sweep.js';
-import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc, RecordingDoc } from '../db/types.js';
+import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc, RecordingDoc, ActiveRecording, RecordingUploadSummary } from '../db/types.js';
 import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { stromBrowserBaseUrl } from '../lib/strom-public-url.js';
@@ -15,8 +15,8 @@ import { clearPipState, clearAudioState, clearFxState, clearClipStateForProducti
 import { forceStopMeterRelay } from '../services/meter-relay.js';
 import { forceStopClipRelay } from '../services/clip-relay.js';
 import { config, isRecordingEnabled } from '../config.js';
-import { uploadRecordings } from '../lib/recording-uploader.js';
-import { resolveStorageTarget } from '../lib/storage-connection.js';
+import { uploadRecordings, type MinioTarget } from '../lib/recording-uploader.js';
+import { DEFAULT_CONNECTION_ID, resolveStorageTarget, StorageConnectionNotFoundError } from '../lib/storage-connection.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type OutputStatusEntry } from '../lib/production-health.js';
@@ -197,6 +197,7 @@ const inFlightDeactivations = new Map<string, Promise<DeactivateResult>>();
 function deactivatedDoc(
   doc: ProductionDoc,
   stopped?: Pick<ProductionDoc, 'status' | 'endedReason'>,
+  lastRecordingUpload?: RecordingUploadSummary,
 ): ProductionDoc {
   const status = stopped?.status ?? stoppedStatus(doc.status);
   // Settle shared-GPU usage up to now (including the final partial hour) and
@@ -214,6 +215,9 @@ function deactivatedDoc(
     audioMixerBlockId: undefined,
     loudnessMainBlockId: undefined,
     recorderBlockId: undefined,
+    recording: undefined,
+    // Replaced only by a deactivate that had a recording to upload (issue #534).
+    ...(lastRecordingUpload ? { lastRecordingUpload } : {}),
     sourceOffsetBlockIds: undefined,
     sourceAudioOffsetBlockIds: undefined,
     clipPlayerBlockIds: undefined,
@@ -247,8 +251,9 @@ function deactivatedDoc(
 async function writeDeactivatedDoc(
   doc: ProductionDoc,
   log: FastifyBaseLogger,
+  lastRecordingUpload?: RecordingUploadSummary,
 ): Promise<{ doc: ProductionDoc; rev: string }> {
-  let updated = deactivatedDoc(doc);
+  let updated = deactivatedDoc(doc, undefined, lastRecordingUpload);
   for (let attempt = 0; ; attempt++) {
     try {
       const response = await getDb().insert(updated);
@@ -261,10 +266,10 @@ async function writeDeactivatedDoc(
         (current.intercomProductionId === undefined || current.intercomProductionId === doc.intercomProductionId);
       if (!tornDown) throw err;
       if (current.status === doc.status && current.stromFlowId === doc.stromFlowId) {
-        updated = deactivatedDoc(current);
+        updated = deactivatedDoc(current, undefined, lastRecordingUpload);
       } else if ((current.status === 'inactive' || current.status === 'ended') && !current.stromFlowId) {
         log.info({ productionId: doc._id, status: current.status }, 'Production already stopped by another writer — keeping its status');
-        updated = deactivatedDoc(current, current);
+        updated = deactivatedDoc(current, current, lastRecordingUpload);
       } else {
         throw err;
       }
@@ -293,6 +298,167 @@ async function firstRecordingOutput(
     }
   }
   return undefined;
+}
+
+/**
+ * Uploads the recordings of the activation being torn down and summarises the
+ * outcome for `ProductionDoc.lastRecordingUpload` (issue #534). Never throws.
+ *
+ * The target is the activation-time snapshot (`doc.recording`), so changing the
+ * production's output assignments while it is live cannot change or drop the
+ * upload. A production activated before the snapshot existed falls back to its
+ * current assignments, as before.
+ */
+async function uploadProductionRecording(
+  doc: ProductionDoc,
+  stromFlowId: string,
+  recorderBlockId: string,
+  strom: StromClient,
+  stromToken: string | undefined,
+  log: FastifyBaseLogger,
+): Promise<RecordingUploadSummary> {
+  let outputId: string | undefined;
+  let connectionId: string | undefined;
+  if (doc.recording) {
+    ({ outputId, connectionId } = doc.recording);
+  } else {
+    const output = await firstRecordingOutput(doc, log);
+    outputId = output?._id;
+    connectionId = output?.connectionId;
+  }
+  const summarise = (fields: Partial<RecordingUploadSummary>): RecordingUploadSummary => ({
+    finishedAt: new Date().toISOString(),
+    ...(outputId ? { outputId } : {}),
+    ...(connectionId ? { connectionId } : {}),
+    uploaded: 0,
+    failed: [],
+    ...fields,
+  });
+
+  const nothingUploaded = (reason: RecordingUploadSummary['reason'], message: string): RecordingUploadSummary => {
+    log.warn({ productionId: doc._id, reason }, `VOD recording not uploaded — ${message}`);
+    return summarise({ reason, message: `${message} The recording stays on Strom.` });
+  };
+
+  // Resolve the target. Absent (or "default") connectionId = the env default (MINIO_*).
+  const namedConnection = !!connectionId && connectionId !== DEFAULT_CONNECTION_ID;
+  if (!namedConnection && !isRecordingEnabled()) {
+    return nothingUploaded(
+      'no-storage-target',
+      'No storage connection is set on the recording output and MINIO_* object storage is not configured.',
+    );
+  }
+  let target: MinioTarget | null;
+  try {
+    target = await resolveStorageTarget(connectionId);
+  } catch (err) {
+    if (err instanceof StorageConnectionNotFoundError) {
+      return nothingUploaded('connection-not-found', `Storage connection "${connectionId}" was not found.`);
+    }
+    log.error({ err, productionId: doc._id }, 'could not resolve storage target for recording upload');
+    return nothingUploaded('upload-error', 'The storage target could not be resolved.');
+  }
+  if (!target) {
+    return namedConnection
+      ? nothingUploaded('connection-no-bucket', `Storage connection "${connectionId}" has no default bucket.`)
+      : nothingUploaded('no-storage-target', 'MINIO_* object storage is not configured.');
+  }
+
+  let uploadRes: Awaited<ReturnType<typeof uploadRecordings>>;
+  try {
+    await strom.recorder.splitNow(stromFlowId, recorderBlockId).catch(() => undefined);
+    uploadRes = await uploadRecordings({
+      strom,
+      stromUrl: config.stromUrl,
+      stromToken,
+      outputDir: `recordings/${doc._id}`,
+      productionId: doc._id,
+      target,
+      // Guard (issue #366): re-check the production doc immediately before
+      // uploadRecordings' delete-after-upload pass. Nothing else in the
+      // deactivate handler writes to the production doc before its own final
+      // status update, which runs after this — so `doc._rev` cannot
+      // legitimately change between the read at the top of the handler and
+      // here. A different _rev means something else (most plausibly a
+      // reactivation) touched the doc while the upload was in flight; treat
+      // the activation as still live and skip deletion rather than risk
+      // deleting recordings it still needs.
+      isStillRecording: async () => {
+        try {
+          const current = await getDb().get(doc._id);
+          return current._rev !== doc._rev;
+        } catch {
+          // Doc gone entirely — nothing left to protect.
+          return false;
+        }
+      },
+    });
+  } catch (err) {
+    log.error({ err, productionId: doc._id }, 'VOD recording upload failed — continuing deactivation');
+    return summarise({
+      bucket: target.bucket,
+      reason: 'upload-error',
+      message: `The recording upload failed: ${err instanceof Error ? err.message : String(err)}. The recording stays on Strom.`,
+    });
+  }
+
+  // Persist one RecordingDoc per uploaded object so #42's listing/playback
+  // endpoint can enumerate and presign recordings without round-tripping the
+  // bucket. Best-effort: a failed persist must not block teardown.
+  const finalizedAt = new Date().toISOString();
+  for (const seg of uploadRes.uploaded) {
+    try {
+      const recDoc: RecordingDoc = {
+        _id: `recording-${randomUUID()}`,
+        type: 'recording',
+        productionId: doc._id,
+        ...(outputId ? { outputId } : {}),
+        // Record which connection wrote the asset (issue #520); absent = the
+        // default (env) connection — no backfill on old docs.
+        ...(connectionId ? { connectionId } : {}),
+        bucket: target.bucket,
+        key: seg.key,
+        sizeBytes: seg.sizeBytes,
+        ...(seg.durationMs !== undefined ? { durationMs: seg.durationMs } : {}),
+        // The sweep also uploads segments earlier sessions left on Strom, so
+        // take the start from each segment's own name; otherwise this
+        // activation's start (issue #534), then the legacy doc.updatedAt.
+        startedAt: seg.startedAt ?? doc.recording?.startedAt ?? doc.updatedAt,
+        endedAt: finalizedAt,
+        createdAt: finalizedAt,
+        updatedAt: finalizedAt,
+      };
+      await getRecordingsDb().insert(recDoc);
+    } catch (persistErr) {
+      log.error({ persistErr, productionId: doc._id, key: seg.key }, 'RecordingDoc persist failed — object uploaded but unlisted');
+    }
+  }
+
+  let reason: RecordingUploadSummary['reason'];
+  let message: string | undefined;
+  if (uploadRes.abortedOnAuthError) {
+    // The store rejected our credentials, so the sweep stopped after the first
+    // rejection instead of grinding through every segment (#465).
+    reason = 'auth-error';
+    message =
+      `The object store rejected the credentials or permission (${uploadRes.abortedOnAuthError.code}); ` +
+      'the upload stopped and the remaining files stay on Strom.';
+    log.warn(
+      { productionId: doc._id, code: uploadRes.abortedOnAuthError.code, file: uploadRes.abortedOnAuthError.file },
+      'VOD recording upload sweep aborted on object-store auth/permission error — skipping remaining segments; deactivation continues',
+    );
+  }
+  log.info(
+    { productionId: doc._id, uploaded: uploadRes.uploaded.length, failed: uploadRes.failed.length },
+    'VOD recordings uploaded to object storage',
+  );
+  return summarise({
+    bucket: target.bucket,
+    uploaded: uploadRes.uploaded.length,
+    failed: uploadRes.failed,
+    ...(reason ? { reason } : {}),
+    ...(message ? { message } : {}),
+  });
 }
 
 /**
@@ -397,6 +563,9 @@ async function runActivationFlow(
 
     // Step 1: Start the Strom flow
     if (signal.aborted) return;
+    // When the recorder block (if any) starts recording — the flow is created
+    // and started by the call below.
+    const activationStartedAt = new Date().toISOString();
     const activation = await activateStromFlow(doc, strom, config.stromUrl, outputDocs.length > 0 ? outputDocs : undefined);
     stromFlowId = activation.flowId;
     mixerBlockId = activation.mixerBlockId ?? undefined;
@@ -413,8 +582,23 @@ async function runActivationFlow(
       await deactivateStromFlow(stromFlowId, strom).catch(() => undefined);
       return;
     }
+    // Snapshot the recording's upload target with the recorder block (issue
+    // #534): deactivate uploads to this, not to whatever the assignments say by
+    // then. Written as undefined when there is no recorder so a stale snapshot
+    // from an earlier activation never leaks into this one.
+    const recordingOutput = activation.recorderOutputId
+      ? outputDocs.find((o) => o._id === activation.recorderOutputId)
+      : undefined;
+    const recording: ActiveRecording | undefined = activation.recorderBlockId && recordingOutput
+      ? {
+          outputId: recordingOutput._id,
+          ...(recordingOutput.connectionId ? { connectionId: recordingOutput.connectionId } : {}),
+          startedAt: activationStartedAt,
+        }
+      : undefined;
     await updateProductionDoc(productionId, {
       stromFlowId,
+      recording,
       ...(mixerBlockId !== undefined && { mixerBlockId }),
       ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
       ...(loudnessMainBlockId !== undefined && { loudnessMainBlockId }),
@@ -1062,111 +1246,17 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
     // group assignments — these are live-only and must not survive deactivation.
     broadcast(doc._id, { type: 'GRP_STATE_RESET' });
     broadcast(doc._id, { type: 'PRODUCTION_DEACTIVATED' });
+    let lastRecordingUpload: RecordingUploadSummary | undefined;
     if (doc.stromFlowId) {
       const stromToken = await getStromToken(config.stromToken).catch((err) => { log.error({ errMsg: err instanceof Error ? err.message : String(err) }, "SAT exchange failed — proceeding without auth"); return undefined; });
       const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
 
       // VOD recording (issue #41): when a recorder block is active, finalise
-      // the current segment (recorder.splitNow) then upload Strom's local
-      // recordings to MinIO — Strom's recorder has no native S3 sink, so
-      // open-live pulls the segments and pushes them to object storage.
-      // Best-effort: a failed upload must not block deactivation/teardown.
-      // Resolve the recording output first: a `recording` output may carry a
-      // storage connectionId (issue #520) that routes its segments to a store
-      // other than the env default. Absent connectionId = the env default,
-      // exactly as before (gated by isRecordingEnabled).
-      const recordingOutput = doc.recorderBlockId ? await firstRecordingOutput(doc, log) : undefined;
-      const recordingConnectionId = recordingOutput?.connectionId;
-      if (doc.recorderBlockId && (isRecordingEnabled() || recordingConnectionId)) {
-        const target = await resolveStorageTarget(recordingConnectionId).catch((err) => {
-          log.error({ err, productionId: doc._id }, 'could not resolve storage connection for recording upload');
-          return null;
-        });
-        if (target) {
-          try {
-            await strom.recorder.splitNow(doc.stromFlowId, doc.recorderBlockId).catch(() => undefined);
-            const uploadRes = await uploadRecordings({
-              strom,
-              stromUrl: config.stromUrl,
-              stromToken,
-              outputDir: `recordings/${doc._id}`,
-              productionId: doc._id,
-              target,
-              // Guard (issue #366): re-check the production doc immediately
-              // before uploadRecordings' delete-after-upload pass. Nothing
-              // else in this handler writes to the production doc before its
-              // own final status update below, which runs after this block —
-              // so `doc._rev` cannot legitimately change between the read at
-              // the top of this handler and here. A different _rev means
-              // something else (most plausibly a reactivation) touched the
-              // doc while the upload was in flight; treat the activation as
-              // still live and skip deletion rather than risk deleting
-              // recordings it still needs.
-              isStillRecording: async () => {
-                try {
-                  const current = await getDb().get(doc._id);
-                  return current._rev !== doc._rev;
-                } catch {
-                  // Doc gone entirely — nothing left to protect.
-                  return false;
-                }
-              },
-            });
-            // Persist one RecordingDoc per uploaded object so #42's listing/
-            // playback endpoint can enumerate and presign recordings without
-            // round-tripping the bucket. Best-effort: a failed persist must not
-            // block teardown, mirroring the upload's non-fatal contract.
-            const recordingOutputId = recordingOutput?._id;
-            const finalizedAt = new Date().toISOString();
-            for (const seg of uploadRes.uploaded) {
-              try {
-                const recId = `recording-${randomUUID()}`;
-                const recDoc: RecordingDoc = {
-                  _id: recId,
-                  type: 'recording',
-                  productionId: doc._id,
-                  ...(recordingOutputId ? { outputId: recordingOutputId } : {}),
-                  // Record which connection wrote the asset (issue #520); absent
-                  // = the default (env) connection — no backfill on old docs.
-                  ...(recordingConnectionId ? { connectionId: recordingConnectionId } : {}),
-                  bucket: target.bucket,
-                  key: seg.key,
-                  sizeBytes: seg.sizeBytes,
-                  // The sweep also uploads segments earlier sessions left on
-                  // Strom, so take the start from each segment's own name;
-                  // doc.updatedAt is this activation's start.
-                  startedAt: seg.startedAt ?? doc.updatedAt,
-                  endedAt: finalizedAt,
-                  createdAt: finalizedAt,
-                  updatedAt: finalizedAt,
-                };
-                await getRecordingsDb().insert(recDoc);
-              } catch (persistErr) {
-                log.error({ persistErr, productionId: doc._id, key: seg.key }, 'RecordingDoc persist failed — object uploaded but unlisted');
-              }
-            }
-            if (uploadRes.abortedOnAuthError) {
-              // Best-effort upload is bounded by time, not just failures: the
-              // store rejected our credentials, so the sweep stopped after the
-              // first rejection instead of grinding through every segment.
-              // Teardown (deactivateStromFlow + guest sweep, below) continues.
-              log.warn(
-                {
-                  productionId: doc._id,
-                  code: uploadRes.abortedOnAuthError.code,
-                  file: uploadRes.abortedOnAuthError.file,
-                },
-                'VOD recording upload sweep aborted on object-store auth/permission error — skipping remaining segments; deactivation continues',
-              );
-            }
-            log.info(
-              { productionId: doc._id, uploaded: uploadRes.uploaded.length, failed: uploadRes.failed.length },
-              'VOD recordings uploaded to object storage',
-            );
-          } catch (err) {
-            log.error({ err, productionId: doc._id }, 'VOD recording upload failed — continuing deactivation');
-          }
-        }
+      // the current segment and upload Strom's local recordings to object
+      // storage. Best-effort: a failed upload must not block teardown. The
+      // outcome is stored on the production as `lastRecordingUpload` (#534).
+      if (doc.recorderBlockId) {
+        lastRecordingUpload = await uploadProductionRecording(doc, doc.stromFlowId, doc.recorderBlockId, strom, stromToken, log);
       }
 
       await deactivateStromFlow(doc.stromFlowId, strom);
@@ -1190,7 +1280,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
     // deactivation, matching the Strom/intercom teardown contract.
     await sweepGuestsOnProductionEnd(doc._id, log);
 
-    const { doc: stored, rev } = await writeDeactivatedDoc(doc, log);
+    const { doc: stored, rev } = await writeDeactivatedDoc(doc, log, lastRecordingUpload);
     notifyProductionDeactivated(doc._id);
     emitProductionStatus(stored);
     return { id: stored._id, name: stored.name, status: stored.status, _rev: rev };

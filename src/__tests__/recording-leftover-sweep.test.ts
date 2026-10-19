@@ -135,3 +135,29 @@ describe('deactivate — RecordingDoc.startedAt for segments left by earlier ses
     });
   });
 });
+
+describe('deactivate — RecordingDoc.durationMs (issue #534)', () => {
+  it('stamps durationMs read from each MP4 header; omits it when the header is unreadable', async () => {
+    // ftyp + moov/mvhd (version 0, timescale 1000, duration 61 234).
+    const mvhd = Buffer.alloc(108);
+    mvhd.writeUInt32BE(108, 0);
+    mvhd.write('mvhd', 4, 'latin1');
+    mvhd.writeUInt32BE(1000, 20);
+    mvhd.writeUInt32BE(61_234, 24);
+    const moov = Buffer.concat([Buffer.from([0, 0, 0, 116]), Buffer.from('moov', 'latin1'), mvhd]);
+    const ftyp = Buffer.concat([Buffer.from([0, 0, 0, 16]), Buffer.from('ftypisom\0\0\0\0', 'latin1')]);
+    const mp4 = Buffer.concat([ftyp, moov]);
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: { method?: string }) => {
+      if (init?.method === 'PUT') return new Response('', { status: 200 });
+      return new Response(new Uint8Array(String(url).includes('legacy') ? [1, 2, 3] : mp4), { status: 200 });
+    }));
+    mockGet.mockResolvedValue(prod());
+    const app = await buildServer();
+    await app.inject({ method: 'POST', url: '/api/v1/productions/prod-rec-1/deactivate' });
+
+    const docs = mockRecordingInsert.mock.calls.map((c) => c[0] as { key: string; durationMs?: number });
+    const byKey = Object.fromEntries(docs.map((d) => [d.key, d.durationMs]));
+    expect(byKey['prod-rec-1/recording_20260301_100002_00000.mp4']).toBe(61_234);
+    expect(byKey['prod-rec-1/legacy_00000.mp4']).toBeUndefined();
+  });
+});

@@ -1,8 +1,8 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
-import { getOutputsDb, getDb } from '../db/index.js';
-import type { OutputDoc, ProductionDoc, OutputStatus, RtmpDestination } from '../db/types.js';
+import { getOutputsDb, getDb, getStorageConnectionsDb } from '../db/index.js';
+import type { OutputDoc, ProductionDoc, OutputStatus, RtmpDestination, StorageConnectionDoc } from '../db/types.js';
 import { updateProductionDoc } from './productions.js';
 import { deriveOutputStatus } from '../lib/production-health.js';
 import { srtUrl } from '../lib/url-validation.js';
@@ -11,6 +11,8 @@ import { encryptStreamKey } from '../lib/rtmp-credentials-crypto.js';
 import { resolveIngestUrl, validateStreamKey } from '../lib/rtmp.js';
 import { resolveSrtConnect } from '../lib/srt-connect.js';
 import { config, isRecordingEnabled } from '../config.js';
+import { DEFAULT_CONNECTION_ID } from '../lib/storage-connection.js';
+import { isDocNotFoundError } from '../lib/db-errors.js';
 import { getPortReservation } from '../services/port-reservation.js';
 import { clashesAfterWrite, listenerPortRequest, resolveListenerAddress, usedListenerPorts } from '../services/listener-ports.js';
 
@@ -77,6 +79,29 @@ async function outputInActiveProduction(outputId: string): Promise<boolean> {
   });
 }
 
+/**
+ * Why a `recording` output with this `connectionId` has nowhere to upload to,
+ * or null when it does (issue #534). A real connection must exist and name a
+ * bucket; no connection (or the reserved `"default"`) needs the MINIO_* env.
+ */
+async function recordingTargetError(connectionId: string | undefined): Promise<string | null> {
+  if (!connectionId || connectionId === DEFAULT_CONNECTION_ID) {
+    return isRecordingEnabled()
+      ? null
+      : 'Recording needs object storage: set the MINIO_* environment variables or choose a storage connection (connectionId)';
+  }
+  let conn: StorageConnectionDoc;
+  try {
+    conn = await getStorageConnectionsDb().get(connectionId);
+  } catch (err) {
+    // 404, or an id that names a document of another type (the type guard).
+    if (isDocNotFoundError(err)) return 'Storage connection not found';
+    throw err;
+  }
+  // Recordings upload into the connection's default bucket (resolveStorageTarget).
+  return conn.defaultBucket ? null : 'Storage connection has no default bucket';
+}
+
 // RTMP destination fields on create/patch. `streamKey` is write-only (accepted
 // here, never returned); `ingestUrl` is only honoured for the 'custom' platform
 // — named presets resolve their ingest URL server-side from the static table.
@@ -92,8 +117,8 @@ const OutputInput = z.object({
   url: z.string().optional(),
   rtmp: RtmpInput.optional(),
   // Optional storage connection for a `recording` output (issue #520). Absent =
-  // the default (env) connection, exactly as today. A connectionId that no
-  // longer resolves surfaces at upload time, where a bad bucket does today.
+  // the default (env) connection, exactly as today. Must exist (checked in the
+  // handler, issue #534) so a bad id is a 400 here, not a silent upload failure.
   connectionId: z.string().min(1).max(128).optional(),
 }).superRefine((data, ctx) => {
   const isRtmp = data.outputType === 'rtmp';
@@ -211,12 +236,13 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
 
   fastify.post('/api/v1/outputs', async (req, reply) => {
     const body = OutputInput.parse(req.body);
-    // A 'recording' output only makes sense when MinIO/S3 is configured — Strom's
-    // recorder writes local files that open-live uploads to object storage. Reject
-    // the type at creation time when recording is disabled so the feature degrades
-    // cleanly (spec: vod-recording-minio.md, issue #41).
-    if (body.outputType === 'recording' && !isRecordingEnabled()) {
-      return reply.status(400).send({ error: 'Recording is disabled — MinIO/S3 is not configured', statusCode: 400 });
+    // A 'recording' output needs somewhere to upload to — Strom's recorder writes
+    // local files that open-live uploads to object storage on deactivate. Accept
+    // it when the named storage connection resolves, or (no connection) when the
+    // MINIO_* env store is configured; otherwise 400 (issues #41, #534).
+    if (body.outputType === 'recording') {
+      const targetError = await recordingTargetError(body.connectionId);
+      if (targetError) return reply.status(400).send({ error: targetError, statusCode: 400 });
     }
     const id = `output-${randomUUID()}`;
     // RTMP is an outbound connect to the platform — it leases NO SRT listener
@@ -316,6 +342,10 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       }
       if (body.connectionId !== undefined && doc.outputType !== 'recording') {
         return reply.status(400).send({ error: 'connectionId is only valid on a recording output', statusCode: 400 });
+      }
+      if (body.connectionId !== undefined) {
+        const targetError = await recordingTargetError(body.connectionId);
+        if (targetError) return reply.status(400).send({ error: targetError, statusCode: 400 });
       }
 
       // ---- RTMP patch: re-resolve ingestUrl, re-encrypt/clear/keep key ----
