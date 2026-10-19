@@ -27,6 +27,8 @@ function notFound(): Error {
 vi.mock('../db/index.js', () => ({
   getDb: () => ({
     get: vi.fn(async (id: string) => {
+      // Same CouchDB as the recordings DB: an outage fails this lookup first.
+      if (dbDown) throw Object.assign(new Error('ECONNREFUSED'), { code: 'ECONNREFUSED' });
       if (id !== 'prod-1') throw notFound();
       return { _id: 'prod-1' };
     }),
@@ -160,6 +162,12 @@ describe('recordings routes without MINIO_* (connection-only instance)', () => {
     expect(perProd.statusCode).toBe(503);
     const one = await app.inject({ method: 'GET', url: '/api/v1/recordings/recording-x', headers: AUTH });
     expect(one.statusCode).toBe(503);
+  });
+
+  it('returns 404 for a missing production', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/v1/productions/prod-missing/recordings', headers: AUTH });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error).toBe('Production not found');
   });
 
   it('returns 404 for a missing recording', async () => {

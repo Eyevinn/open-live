@@ -12,6 +12,7 @@ import { resolveIngestUrl, validateStreamKey } from '../lib/rtmp.js';
 import { resolveSrtConnect } from '../lib/srt-connect.js';
 import { config, isRecordingEnabled } from '../config.js';
 import { DEFAULT_CONNECTION_ID } from '../lib/storage-connection.js';
+import { isDocNotFoundError } from '../lib/db-errors.js';
 import { getPortReservation } from '../services/port-reservation.js';
 import { clashesAfterWrite, listenerPortRequest, resolveListenerAddress, usedListenerPorts } from '../services/listener-ports.js';
 
@@ -94,9 +95,7 @@ async function recordingTargetError(connectionId: string | undefined): Promise<s
     conn = await getStorageConnectionsDb().get(connectionId);
   } catch (err) {
     // 404, or an id that names a document of another type (the type guard).
-    const notFound = (err as { statusCode?: number } | null)?.statusCode === 404
-      || (err instanceof Error && err.message.startsWith('Document type mismatch'));
-    if (notFound) return 'Storage connection not found';
+    if (isDocNotFoundError(err)) return 'Storage connection not found';
     throw err;
   }
   // Recordings upload into the connection's default bucket (resolveStorageTarget).

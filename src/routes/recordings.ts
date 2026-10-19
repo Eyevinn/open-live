@@ -27,6 +27,7 @@ import { getDb, getRecordingsDb } from '../db/index.js';
 import type { RecordingDoc } from '../db/types.js';
 import { config } from '../config.js';
 import { minioTargetFromConfig, presignGetUrl, type MinioTarget } from '../lib/recording-uploader.js';
+import { isDocNotFoundError } from '../lib/db-errors.js';
 import { resolveStorageTarget, StorageConnectionNotFoundError } from '../lib/storage-connection.js';
 
 /** Why a recording has no `playbackUrl` / `downloadUrl` (issue #534). */
@@ -117,10 +118,15 @@ const recordingsRoutes: FastifyPluginAsync = async (fastify) => {
     async (req, reply) => {
       // 404 when the production itself does not exist, matching the other
       // production sub-resource routes.
+      // Any other lookup failure is the database being unavailable (503).
       try {
         await getDb().get(req.params.id);
-      } catch {
-        return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+      } catch (err) {
+        if (isDocNotFoundError(err)) {
+          return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+        }
+        fastify.log.warn({ err }, 'GET /api/v1/productions/:id/recordings — production lookup failed');
+        return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
       }
       const defaultTarget = minioTargetFromConfig();
       let result: Awaited<ReturnType<ReturnType<typeof getRecordingsDb>['find']>>;
@@ -167,9 +173,7 @@ const recordingsRoutes: FastifyPluginAsync = async (fastify) => {
     } catch (err) {
       // A missing doc (or an id naming another document type) is a 404; any
       // other failure is the database being unavailable.
-      const notFound = (err as { statusCode?: number } | null)?.statusCode === 404
-        || (err instanceof Error && err.message.startsWith('Document type mismatch'));
-      if (notFound) return reply.status(404).send({ error: 'Recording not found', statusCode: 404 });
+      if (isDocNotFoundError(err)) return reply.status(404).send({ error: 'Recording not found', statusCode: 404 });
       fastify.log.warn({ err }, 'GET /api/v1/recordings/:id — DB read failed');
       return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
     }

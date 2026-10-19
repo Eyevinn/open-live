@@ -428,7 +428,13 @@ export interface RecordingUploadSummary {
   bucket?: string;
   /** Number of files uploaded (and listed as recordings). */
   uploaded: number;
-  /** Files that failed to upload; they stay on Strom for the next sweep. */
+  /**
+   * Files that failed to upload; they stay on Strom for the next sweep.
+   * `error` includes up to the first 200 characters of the S3 error body. It
+   * never holds the secret key or a presigned URL (PUT uses header auth). For
+   * some codes S3 echoes `<AWSAccessKeyId>`/`<StringToSign>` later in the body;
+   * the 200-character cut normally drops those.
+   */
   failed: Array<{ file: string; error: string }>;
   /** Set when nothing was attempted or the sweep stopped early. */
   reason?: RecordingUploadReason;

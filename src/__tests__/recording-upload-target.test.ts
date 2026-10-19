@@ -311,6 +311,55 @@ describe('recording upload target snapshot (issue #534)', () => {
     await app.close();
   });
 
+  it('falls back to the assigned output connection for a production activated before the snapshot existed', async () => {
+    // Legacy shape: recorderBlockId set, no `recording` snapshot. The assigned
+    // recording output names stconn-C, so the upload must go there.
+    productions.set('prod-1', production({
+      status: 'active', stromFlowId: 'flow-1', recorderBlockId: 'b-out-rec',
+    }));
+    expect(productions.get('prod-1')!.recording).toBeUndefined();
+    mockUploadRecordings.mockResolvedValue({
+      uploaded: [{ key: 'prod-1/seg.mp4', sizeBytes: 1, stromPath: 'recordings/prod-1/seg.mp4' }],
+      failed: [],
+    });
+    const app = await buildServer();
+    const res = await app.inject({ method: 'POST', url: '/api/v1/productions/prod-1/deactivate' });
+    expect(res.statusCode).toBe(200);
+    expect(mockUploadRecordings).toHaveBeenCalledTimes(1);
+    const args = mockUploadRecordings.mock.calls[0]![0] as { target: { bucket: string; endpoint: string; accessKey: string } };
+    expect(args.target).toMatchObject({ bucket: 'tenant-vod', endpoint: 's3.tenant.example.com', accessKey: 'AKTENANT' });
+    expect(recordingInserts[0]).toMatchObject({ outputId: 'output-rec', connectionId: 'stconn-C', bucket: 'tenant-vod' });
+    expect(productions.get('prod-1')!.lastRecordingUpload).toMatchObject({
+      outputId: 'output-rec', connectionId: 'stconn-C', uploaded: 1,
+    });
+    await app.close();
+  });
+
+  it('passes an isStillRecording guard that reports true once the stored _rev changes (#366)', async () => {
+    productions.set('prod-1', production({
+      status: 'active', stromFlowId: 'flow-1', recorderBlockId: 'b-out-rec',
+      recording: { outputId: 'output-rec', connectionId: 'stconn-C', startedAt: NOW },
+    }));
+    let guardBefore: boolean | undefined;
+    let guardAfter: boolean | undefined;
+    mockUploadRecordings.mockImplementation(async (opts: { isStillRecording: () => Promise<boolean> }) => {
+      // Unchanged _rev: the activation being torn down is not live any more.
+      guardBefore = await opts.isStillRecording();
+      // Something (e.g. a reactivation) writes the production mid-upload.
+      const current = productions.get('prod-1')!;
+      productions.set('prod-1', { ...current, _rev: `${++rev}-reactivated` });
+      guardAfter = await opts.isStillRecording();
+      return { uploaded: [], failed: [] };
+    });
+    const app = await buildServer();
+    const res = await app.inject({ method: 'POST', url: '/api/v1/productions/prod-1/deactivate' });
+    expect(res.statusCode).toBe(200);
+    expect(mockUploadRecordings).toHaveBeenCalledTimes(1);
+    expect(guardBefore).toBe(false);
+    expect(guardAfter).toBe(true);
+    await app.close();
+  });
+
   it('keeps the previous summary when a deactivate has no recording', async () => {
     const previous = { finishedAt: NOW, uploaded: 2, failed: [] };
     productions.set('prod-1', production({ status: 'active', stromFlowId: 'flow-1', lastRecordingUpload: previous }));
