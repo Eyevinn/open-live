@@ -432,3 +432,17 @@ back-charged if accrual started at `activatedAt`. Every `computeHourBuckets` cal
 start. A new accrual path that skips `accrualStartMs()` reintroduces the back-charge. The floor is
 `null` (no clamp) only when the sweep never started, which is why unit tests that call the accrual
 functions directly see raw `activatedAt`.
+
+## The recording upload target is the activation snapshot, not the current assignments
+
+Deactivate uploads a recording to `ProductionDoc.recording` (`{ outputId, connectionId?,
+startedAt }`), written at activation next to `recorderBlockId` (issue #534). Do not re-read
+`outputAssignments` at deactivate to find the target: assignments can change on a live production
+and only take effect at the next activation, so re-reading would send (or silently drop) the
+running recording's upload somewhere else. `firstRecordingOutput()` is only the fallback for a
+production activated before the snapshot existed. Every deactivate with a recorder writes
+`lastRecordingUpload` through `writeDeactivatedDoc` (not a separate write before the upload: the
+uploader's `isStillRecording` guard compares `_rev`, and an extra write would make it skip the
+delete-after-upload pass). Extra signed S3 query params such as `response-content-disposition`
+sort after the `X-Amz-*` ones (lowercase after uppercase), so `presignGetUrl` appends them last;
+the result was checked against botocore's `S3SigV4QueryAuth`.
