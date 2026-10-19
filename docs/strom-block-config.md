@@ -55,8 +55,27 @@ Receives an MPEG-TS stream over SRT.
 |---|---|---|
 | `srt_uri` | string | Full SRT URI, e.g. `srt://192.168.1.10:9000?mode=caller` |
 | `latency` | integer (ms) | 20–8000, default 125 |
+| `num_video_tracks` | uint | Number of video outputs. Default 1 |
+| `num_audio_tracks` | uint | Number of audio outputs (`audio_out_0` … `audio_out_{N-1}`). Default 1 |
+| `decode` | bool | Decode streams (true) or pass through encoded elementary streams (false). Default true |
+| `tsdemux_latency` | int (ms) | MPEG-TS demuxer latency |
+| `ignore_pcr` | bool | Ignore MPEG-TS PCR timestamps. Default true |
+| `wait_for_connection` | bool | Block the stream until a peer connects. Default false |
+| `auto_reconnect` | bool | Reconnect when the connection fails. Default true |
+| `keep_listening` | bool | Keep the SRT source alive after peer disconnect. Default true |
 
-**Pads**: outputs `video_out`, `audio_out_0`
+(Verified from Strom `backend/src/blocks/builtin/mpegtssrt_input.rs`.)
+
+**Pads**: outputs `video_out`, `audio_out_0` … `audio_out_{N-1}` (N = `num_audio_tracks`)
+
+Open Live sets only `srt_uri` and `latency` and links `audio_out_0`. With
+`num_audio_tracks > 1` Strom does **not** yet map `audio_out_k` to a stable
+audio stream (the #510 takeover, strom#1077; PID-order mapping is
+Eyevinn/strom#1081), so a source's `audioStreamIndex > 0` is clamped to
+`audio_out_0` and reported as an `audio-stream-not-applied` activation warning
+(`docs/specs/audio-stream-selection.md` §5.3/§5.4). Every `audio_out_N` that is
+created must be linked — an unconnected output pad can fail the flow. Confirm
+property names and defaults against live `GET /api/blocks` before relying on them.
 
 ---
 

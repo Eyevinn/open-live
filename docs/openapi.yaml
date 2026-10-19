@@ -184,6 +184,15 @@ components:
           minimum: 20
           maximum: 8000
           description: SRT latency in milliseconds
+        audioStreamIndex:
+          type: integer
+          minimum: 0
+          description: >-
+            0-based index of the audio elementary stream this srt/efp source uses
+            (issue #515). Absent means 0 (the first stream). Only valid for `srt`
+            and `efp` sources (400 otherwise). Applied at the next activation; a
+            value that cannot be applied is clamped to the first stream and
+            reported as an `audio-stream-not-applied` activation warning (#516).
         liveIngest:
           type: object
           description: >-
@@ -232,6 +241,15 @@ components:
           type: integer
           minimum: 20
           maximum: 8000
+        audioStreamIndex:
+          type: integer
+          minimum: 0
+          description: >-
+            0-based index of the audio elementary stream this srt/efp source uses
+            (issue #515). Absent means 0 (the first stream). Only valid for `srt`
+            and `efp` sources (400 otherwise). Applied at the next activation; a
+            value that cannot be applied is clamped to the first stream and
+            reported as an `audio-stream-not-applied` activation warning (#516).
 
     SourcePatch:
       type: object
@@ -251,6 +269,15 @@ components:
           type: integer
           minimum: 20
           maximum: 8000
+        audioStreamIndex:
+          type: integer
+          minimum: 0
+          description: >-
+            0-based index of the audio elementary stream this srt/efp source uses
+            (issue #515). Absent means 0 (the first stream). Only valid for `srt`
+            and `efp` sources (400 otherwise). Applied at the next activation; a
+            value that cannot be applied is clamped to the first stream and
+            reported as an `audio-stream-not-applied` activation warning (#516).
 
     # ── Graphic ─────────────────────────────────────────────────────────────────
 
@@ -694,6 +721,97 @@ components:
       additionalProperties:
         $ref: '#/components/schemas/AudioProcessingStageParams'
 
+    ActivationWarning:
+      description: >-
+        A problem found while going on air that did not stop activation. Each
+        `message` is also sent as a WS `ERROR` frame on controller connect while
+        the production is live. Clients should ignore unknown `type` values.
+      oneOf:
+        - $ref: '#/components/schemas/RecordingNoAudioWarning'
+        - $ref: '#/components/schemas/AudioStreamNotAppliedWarning'
+      discriminator:
+        propertyName: type
+        mapping:
+          recording-no-audio: '#/components/schemas/RecordingNoAudioWarning'
+          audio-stream-not-applied: '#/components/schemas/AudioStreamNotAppliedWarning'
+
+    RecordingNoAudioWarning:
+      type: object
+      required: [type, message]
+      properties:
+        type:
+          type: string
+          enum: [recording-no-audio]
+        message:
+          type: string
+
+    AudioStreamNotAppliedWarning:
+      type: object
+      description: >-
+        A source's `audioStreamIndex` was not applied on one input; the input
+        was built on the first audio stream instead (issue #516). One warning
+        per affected `mixerInput`.
+      required: [type, sourceId, mixerInput, requestedIndex, appliedIndex, reason, message]
+      properties:
+        type:
+          type: string
+          enum: [audio-stream-not-applied]
+        sourceId:
+          type: string
+        mixerInput:
+          type: string
+          description: Stored assignment key (e.g. `video_in_3`), matching the input in Studio.
+        requestedIndex:
+          type: integer
+          minimum: 1
+          description: The source's effective `audioStreamIndex` (0-based).
+        appliedIndex:
+          type: integer
+          enum: [0]
+          description: Always 0 (the first stream) in v1.
+        reason:
+          type: string
+          enum: [stream-type-unsupported, strom-capability-missing, stream-not-present]
+          description: >-
+            `stream-type-unsupported`: `efp` source (selection is MPEG-TS/SRT only).
+            `strom-capability-missing`: this Strom cannot map audio outputs by PID
+            order yet. `stream-not-present`: the index is above the supported
+            ceiling (more than 8 audio streams) or the feed lacks that stream.
+        message:
+          type: string
+          description: Human text with 1-based stream numbers.
+
+    AudioStreamDiscovery:
+      type: object
+      required: [selectedIndex, discovery, streams]
+      properties:
+        selectedIndex:
+          type: integer
+          minimum: 0
+          description: The persisted `audioStreamIndex`, or 0 when absent.
+        discovery:
+          type: string
+          enum: [available, unavailable]
+        reason:
+          type: string
+          enum: [no-live-flow, strom-probe-unsupported]
+          description: Present when `discovery` is `unavailable`.
+        streams:
+          type: array
+          nullable: true
+          description: Derived at read time, never persisted. `null` when discovery is unavailable.
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+              codec:
+                type: string
+              channels:
+                type: integer
+              language:
+                type: string
+
     Production:
       type: object
       required: [id, name, status, sources, pipeline, macros, createdAt, updatedAt]
@@ -749,6 +867,13 @@ components:
             $ref: '#/components/schemas/Macro'
         tally:
           $ref: '#/components/schemas/Tally'
+        activationWarnings:
+          type: array
+          description: >-
+            Problems found while going on air that did not stop activation.
+            Cleared when a new activation starts or activation fails.
+          items:
+            $ref: '#/components/schemas/ActivationWarning'
         createdAt:
           type: string
           format: date-time
@@ -1282,6 +1407,31 @@ paths:
       responses:
         '204':
           description: Deleted
+        '404':
+          description: Not found
+
+  /api/v1/sources/{id}/audio-streams:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Discover a source's audio streams
+      description: >-
+        Read-only (issue #515). Until Strom can report the stream list this
+        always returns `discovery: unavailable` with
+        `reason: strom-probe-unsupported` and `streams: null`.
+      operationId: getSourceAudioStreams
+      tags: [Sources]
+      responses:
+        '200':
+          description: Audio-stream discovery result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AudioStreamDiscovery'
         '404':
           description: Not found
 
