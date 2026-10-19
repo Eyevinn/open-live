@@ -205,6 +205,35 @@ describe('POST /api/v1/productions/:id/activate', () => {
     await app.close();
   });
 
+  it('persists both activation-warning variants and sends each message as an ERROR frame (#516)', async () => {
+    const audioWarning = {
+      type: 'audio-stream-not-applied',
+      sourceId: 'src-cam-1',
+      mixerInput: 'video_in_3',
+      requestedIndex: 1,
+      appliedIndex: 0,
+      reason: 'strom-capability-missing',
+      message: 'Cam 1 (SRT): audio stream 2 was not applied, using stream 1. This Strom cannot select an audio stream by PID yet.',
+    };
+    const doc = makeProductionDoc();
+    mockGet.mockResolvedValue(doc);
+    mockInsert.mockResolvedValue({ rev: '2-bcd', ok: true, id: doc._id });
+    mockActivateStromFlow.mockResolvedValue({ ...activationResultWithWarning(), warnings: [noAudioWarning, audioWarning] });
+    mockStromFlowsGet.mockResolvedValue({ flow: { id: 'flow-abc', running: true, blocks: [] } });
+
+    const app = await buildServer();
+    await app.inject({ method: 'POST', url: '/api/v1/productions/prod-test-1/activate' });
+
+    await vi.waitFor(() => {
+      expect(mockBroadcast).toHaveBeenCalledWith('prod-test-1', { type: 'ERROR', error: audioWarning.message });
+    });
+    expect(mockBroadcast).toHaveBeenCalledWith('prod-test-1', { type: 'ERROR', error: noAudioWarning.message });
+    const saved = mockInsert.mock.calls.map((c) => c[0] as Record<string, unknown>);
+    const live = saved.find((d) => d['stromFlowId'] === 'flow-abc' && d['activationWarnings']);
+    expect(live?.['activationWarnings']).toEqual([noAudioWarning, audioWarning]);
+    await app.close();
+  });
+
   it('does not send the warning if the production is deactivated before it goes live', async () => {
     const doc = makeProductionDoc();
     mockGet.mockResolvedValue(doc);

@@ -788,6 +788,38 @@ export type ProductionStatus = 'active' | 'inactive' | 'activating' | 'ended';
 /** Machine-readable reason a production reached `ended` (issue #255, optional). */
 export type EndedReason = 'deactivated' | 'idle' | 'flow-lost';
 
+/**
+ * Why a source's selected audio stream (`SourceDoc.audioStreamIndex`) was not
+ * applied at activation (spec docs/specs/audio-stream-selection.md §5.4,
+ * ADR-010 Decision 4). The input is always built on the first stream instead.
+ */
+export type AudioStreamNotAppliedReason =
+  | 'stream-type-unsupported'
+  | 'strom-capability-missing'
+  | 'stream-not-present';
+
+/**
+ * A problem found while going on air that did not stop activation. Persisted as
+ * `ProductionDoc.activationWarnings`, returned on the production resource and
+ * replayed as WS `ERROR` frames on controller connect (spec §2.5).
+ */
+export type ActivationWarning =
+  | { type: 'recording-no-audio'; message: string }
+  | {
+      type: 'audio-stream-not-applied';
+      /** SourceDoc._id */
+      sourceId: string;
+      /** Stored assignment key (e.g. 'video_in_3'), not the compacted Strom pad. */
+      mixerInput: string;
+      /** Effective SourceDoc.audioStreamIndex (> 0), 0-based. */
+      requestedIndex: number;
+      /** v1 always clamps to the first stream. */
+      appliedIndex: 0;
+      reason: AudioStreamNotAppliedReason;
+      /** Human text (1-based stream numbers), also used for the WS ERROR toast. */
+      message: string;
+    };
+
 export interface ProductionDoc {
   _id: string;
   _rev?: string;
@@ -921,7 +953,7 @@ export interface ProductionDoc {
    * Problems found while going on air that did not stop activation, such as a
    * recording that will have no sound. Cleared on next activation.
    */
-  activationWarnings?: Array<{ type: 'recording-no-audio'; message: string }>;
+  activationWarnings?: ActivationWarning[];
   /** Set when the idle watchdog auto-deactivated this production; cleared on next activation */
   autoDeactivated?: boolean;
   /**
