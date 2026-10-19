@@ -1,5 +1,7 @@
 import { randomUUID } from 'crypto';
-import type { ProductionDoc, SourceDoc, GraphicDoc, OutputDoc, ClipReference } from '../db/types.js';
+import type {
+  ProductionDoc, SourceDoc, GraphicDoc, OutputDoc, ClipReference, ActivationWarning, AudioStreamNotAppliedReason,
+} from '../db/types.js';
 import { getSourcesDb, getGraphicsDb } from '../db/index.js';
 import { deserializeClipReference } from './clip-reference.js';
 import { StromClient } from './strom.js';
@@ -81,7 +83,53 @@ export interface ActivationResult {
   mixerInputMap: Record<string, number>;
 }
 
-export type ActivationWarning = { type: 'recording-no-audio'; message: string };
+export type { ActivationWarning, AudioStreamNotAppliedReason };
+
+/**
+ * Highest `audioStreamIndex` that could ever be applied (spec §6 Q7): more than
+ * 8 audio streams is beyond any realistic contribution feed, and building
+ * `num_audio_tracks = k + 1` for a mistyped k would create k + 1 decode branches.
+ */
+export const MAX_APPLIED_AUDIO_STREAM_INDEX = 7;
+
+/**
+ * Whether Strom's `builtin.mpegtssrt_input` maps `audio_out_<k>` to the k-th
+ * audio stream in ascending PID order (spec §5.3 rule 3, ADR-010). The predicate
+ * is defined by the upstream follow-up Eyevinn/strom#1081, which has not landed,
+ * so this is `false` for every Strom today. Wiring an unordered `audio_out_k` is
+ * the #510 failure mode, so the answer must stay `false` until the real
+ * capability signal exists — do not guess it.
+ */
+function stromMapsAudioByPid(): boolean {
+  return false;
+}
+
+/**
+ * Decide whether an SRT/EFP source's selected audio stream can be applied
+ * (spec §5.4). Returns `null` when nothing needs reporting (k = 0, or applied),
+ * otherwise the reason the input is clamped to the first stream. A `null` for
+ * k > 0 means "apply k": the `num_audio_tracks` / `audio_out_<k>` / drain wiring
+ * for that case (spec §8 step 3) is gated on strom#1081 and is only reachable
+ * once `stromMapsAudioByPid()` can return true.
+ */
+export function audioStreamNotAppliedReason(
+  streamType: SourceDoc['streamType'],
+  audioStreamIndex: number | undefined,
+  capability: boolean,
+): AudioStreamNotAppliedReason | null {
+  const k = audioStreamIndex ?? 0;
+  if (k <= 0) return null;
+  if (streamType === 'efp') return 'stream-type-unsupported';
+  if (k > MAX_APPLIED_AUDIO_STREAM_INDEX) return 'stream-not-present';
+  if (!capability) return 'strom-capability-missing';
+  return null;
+}
+
+const AUDIO_STREAM_REASON_TEXT: Record<AudioStreamNotAppliedReason, string> = {
+  'stream-type-unsupported': 'Audio stream selection is only supported for MPEG-TS/SRT sources.',
+  'strom-capability-missing': 'This Strom cannot select an audio stream by PID yet.',
+  'stream-not-present': `Only audio streams 1-${MAX_APPLIED_AUDIO_STREAM_INDEX + 1} can be selected.`,
+};
 
 /**
  * Whether Strom has the builtin.audioenc block (added in Strom 0.6.9). If the
@@ -681,6 +729,7 @@ export async function activateStromFlow(
   // Maps mixerInput → time_offset block ID — returned so the WS layer can apply live changes.
   const sourceOffsetBlockIds: Record<string, string> = {};
   const sourceAudioOffsetBlockIds: Record<string, string> = {};
+  const warnings: ActivationWarning[] = [];
   // Maps mixerInput → builtin.media_player block ID for 'clip' sources — returned so the
   // clip cue/play control surface (#277/#278) can target the player block by mixer input.
   const clipPlayerBlockIds: Record<string, string> = {};
@@ -905,6 +954,26 @@ export async function activateStromFlow(
       }
     } else {
       // srt → builtin.mpegtssrt_input, efp → builtin.efpsrt_input
+      // Audio-stream selection (spec §5.3/§5.4, ADR-010): until Strom maps
+      // audio_out_<k> by PID order (strom#1081) every k > 0 is clamped to the
+      // first stream — the block and links stay byte-identical to k = 0 — and
+      // the operator gets a warning on this input.
+      const notApplied = audioStreamNotAppliedReason(source.streamType, source.audioStreamIndex, stromMapsAudioByPid());
+      if (notApplied) {
+        const requestedIndex = source.audioStreamIndex ?? 0;
+        const label = `${source.name} (${source.streamType === 'efp' ? 'EFP' : 'SRT'})`;
+        warnings.push({
+          type: 'audio-stream-not-applied',
+          sourceId: assignment.sourceId,
+          mixerInput: assignment.mixerInput,
+          requestedIndex,
+          appliedIndex: 0,
+          reason: notApplied,
+          message:
+            `${label}: audio stream ${requestedIndex + 1} was not applied, using stream 1. ` +
+            AUDIO_STREAM_REASON_TEXT[notApplied],
+        });
+      }
       flow.blocks.push({
         id: inputId,
         block_definition_id: source.streamType === 'efp' ? 'builtin.efpsrt_input' : 'builtin.mpegtssrt_input',
@@ -1043,7 +1112,6 @@ export async function activateStromFlow(
   let recorderBlockId: string | undefined;
   let recorderOutputId: string | undefined;
   let recorderOutputDir: string | undefined;
-  const warnings: ActivationWarning[] = [];
   let outputBlockIndex = 0;
   if (outputDocs && outputDocs.length > 0) {
     for (const outputDoc of outputDocs) {
