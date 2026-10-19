@@ -6,7 +6,9 @@
  *     attaches a presigned playbackUrl, and 404s for an unknown production.
  *   - GET /api/v1/recordings — lists across all productions.
  *   - GET /api/v1/recordings/:id — fetch one; 404 when missing.
- *   - 503 when object storage is not configured.
+ *   - downloadUrl (attachment disposition) next to playbackUrl, and the
+ *     bucket-mismatch playbackUnavailable reason (issue #534). The no-env case
+ *     lives in recordings-routes-connection-only.test.ts.
  *
  * CouchDB is mocked and the MinIO SigV4 presigner runs for real (no bucket
  * needed — presignGetUrl is pure crypto), so playbackUrl is asserted structurally.
@@ -155,6 +157,29 @@ describe('GET /api/v1/recordings', () => {
     const res = await app.inject({ method: 'GET', url: '/api/v1/recordings', headers: AUTH });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toHaveLength(2);
+  });
+});
+
+describe('downloadUrl and playbackUnavailable (issue #534)', () => {
+  it('adds a downloadUrl that saves the object under its basename', async () => {
+    const rec = makeRecording();
+    recordingsStore.set(rec._id, rec);
+    const res = await app.inject({ method: 'GET', url: `/api/v1/recordings/${rec._id}`, headers: AUTH });
+    const body = res.json();
+    expect(body.downloadUrl).toContain('/openlive-vod/prod-1/segment_00001.mp4?');
+    expect(body.downloadUrl).toContain('response-content-disposition=attachment%3B%20filename%3D%22segment_00001.mp4%22');
+    expect(body.downloadUrl).not.toBe(body.playbackUrl);
+    expect(body.playbackUnavailable).toBeUndefined();
+  });
+
+  it('says bucket-mismatch for a default recording in a bucket other than MINIO_BUCKET', async () => {
+    const rec = makeRecording({ bucket: 'old-bucket' });
+    recordingsStore.set(rec._id, rec);
+    const res = await app.inject({ method: 'GET', url: `/api/v1/recordings/${rec._id}`, headers: AUTH });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().playbackUrl).toBeUndefined();
+    expect(res.json().downloadUrl).toBeUndefined();
+    expect(res.json().playbackUnavailable).toBe('bucket-mismatch');
   });
 });
 

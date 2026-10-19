@@ -33,6 +33,7 @@
 import { createHash, createHmac } from 'crypto';
 import { config } from '../config.js';
 import type { StromClient } from './strom.js';
+import { mp4DurationMs } from './mp4-duration.js';
 
 export interface MinioTarget {
   endpoint: string; // host[:port], no scheme
@@ -59,6 +60,11 @@ export interface UploadedSegment {
    * carries none.
    */
   startedAt?: string;
+  /**
+   * Media duration in milliseconds, read from the MP4 movie header (issue
+   * #534). Undefined for a non-MP4 file or a header that cannot be read.
+   */
+  durationMs?: number;
 }
 
 export interface UploadResult {
@@ -177,6 +183,14 @@ function sha256Hex(data: Buffer | string): string {
   return createHash('sha256').update(data).digest('hex');
 }
 
+/** RFC 3986 percent-encoding, as required for SigV4 canonical query values. */
+function rfc3986(value: string): string {
+  return encodeURIComponent(value).replace(
+    /[!'()*]/g,
+    (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase(),
+  );
+}
+
 /** Encodes an object key path segment-by-segment for use in an S3 URI. */
 function encodeKey(key: string): string {
   return key
@@ -277,6 +291,7 @@ export function presignGetUrl(
   key: string,
   expiresInSeconds: number,
   now: Date = new Date(),
+  opts: { contentDisposition?: string } = {},
 ): string {
   const scheme = target.useSsl ? 'https' : 'http';
   const host = target.endpoint;
@@ -294,7 +309,13 @@ export function presignGetUrl(
     `&X-Amz-Credential=${encodeURIComponent(`${target.accessKey}/${credentialScope}`)}` +
     `&X-Amz-Date=${amzDate}` +
     `&X-Amz-Expires=${expiresInSeconds}` +
-    `&X-Amz-SignedHeaders=${signedHeaders}`;
+    `&X-Amz-SignedHeaders=${signedHeaders}` +
+    // S3 response-header override, signed like every other query param. It
+    // sorts after the X-Amz-* params (lowercase after uppercase in byte order),
+    // so appending keeps the canonical query sorted (issue #534).
+    (opts.contentDisposition !== undefined
+      ? `&response-content-disposition=${rfc3986(opts.contentDisposition)}`
+      : '');
 
   const canonicalRequest = [
     'GET',
@@ -431,11 +452,13 @@ export async function uploadRecordings(args: UploadRecordingsArgs): Promise<Uplo
       const key = `${prefix}${productionId}/${entry.name}`;
       await putObject(target, key, bytes, contentTypeForFile(entry.name));
       const startedAt = recordingStartFromFileName(entry.name);
+      const durationMs = contentTypeForFile(entry.name) === 'video/mp4' ? mp4DurationMs(bytes) : undefined;
       result.uploaded.push({
         key,
         sizeBytes: bytes.length,
         stromPath: entry.path,
         ...(startedAt ? { startedAt } : {}),
+        ...(durationMs !== undefined ? { durationMs } : {}),
       });
     } catch (err) {
       result.failed.push({
