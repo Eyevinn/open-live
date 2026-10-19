@@ -193,6 +193,15 @@ describe('DELETE /api/v1/storage-connections/:id (referential integrity)', () =>
     expect(store.has(id)).toBe(true);
   });
 
+  it('409s when referenced by a recording output (regression, issue #534)', async () => {
+    const id = seed();
+    outputsDocs.push({ _id: 'output-rec', outputType: 'recording', connectionId: id });
+    const res = await app.inject({ method: 'DELETE', url: `/api/v1/storage-connections/${id}`, headers: AUTH });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().references.outputs).toBe(1);
+    expect(store.has(id)).toBe(true);
+  });
+
   it('409s when referenced by an s3 clip source (connectionId inside the address JSON)', async () => {
     const id = seed();
     sourcesDocs.push({ address: JSON.stringify({ type: 's3', bucket: 'b', key: 'k', connectionId: id }) });
