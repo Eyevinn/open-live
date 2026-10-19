@@ -36,6 +36,8 @@ export interface ActivationResult {
    * open-live uploads them to MinIO after deactivate (see recording-uploader.ts).
    */
   recorderBlockId?: string;
+  /** ID of the 'recording' OutputDoc the recorder block was built for (issue #534). */
+  recorderOutputId?: string;
   /**
    * Relative media directory the recorder writes into (output_dir property). Used
    * post-deactivate to locate the recorded segments via Strom's media API.
@@ -1039,6 +1041,7 @@ export async function activateStromFlow(
   // Inject output blocks for each assigned OutputDoc
   const whepOutputEntries: Array<{ outputId: string; endpointId: string }> = [];
   let recorderBlockId: string | undefined;
+  let recorderOutputId: string | undefined;
   let recorderOutputDir: string | undefined;
   const warnings: ActivationWarning[] = [];
   let outputBlockIndex = 0;
@@ -1094,6 +1097,7 @@ export async function activateStromFlow(
           flow.links.push({ from: `${audioEncId}:encoded_out`, to: `${blockId}:audio_in_0` });
         }
         recorderBlockId = blockId;
+        recorderOutputId = outputDoc._id;
         recorderOutputDir = outputDir;
         outputBlockIndex++;
       } else if (outputDoc.outputType === 'whep') {
@@ -1315,6 +1319,7 @@ export async function activateStromFlow(
     whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined,
     pgmWhepEndpointId,
     recorderBlockId,
+    recorderOutputId,
     recorderOutputDir,
     warnings,
     sourceOffsetBlockIds,

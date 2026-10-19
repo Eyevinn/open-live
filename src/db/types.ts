@@ -380,11 +380,66 @@ export interface RecordingDoc {
   bucket: string;
   key: string;            // object key, e.g. "<productionId>/<segment>.mp4"
   sizeBytes?: number;
+  /** Media duration read from the MP4 movie header at upload (issue #534); absent when unreadable. */
   durationMs?: number;
   startedAt: string;      // ISO 8601 — when the recording session began, from the segment's file name
   endedAt?: string;       // ISO 8601 — when the segment was finalized/uploaded
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * The recording output a production's recorder block was wired for, captured
+ * at activation (issue #534).
+ */
+export interface ActiveRecording {
+  /** The `recording` OutputDoc wired into the recorder block. */
+  outputId: string;
+  /** That output's storage connection at activation; absent = the default (env) connection. */
+  connectionId?: string;
+  /** ISO 8601 — when the activation that built the recorder block started. */
+  startedAt: string;
+}
+
+/**
+ * Why a deactivate's recording upload uploaded nothing or stopped early (issue #534):
+ *  - `no-storage-target`: no connection on the output and the `MINIO_*` env is incomplete;
+ *  - `connection-not-found`: the output's storage connection no longer exists;
+ *  - `connection-no-bucket`: the connection has no default bucket to write to;
+ *  - `auth-error`: the store rejected the credentials or permission (sweep aborted);
+ *  - `upload-error`: listing the recordings on Strom or the upload pass itself failed.
+ */
+export type RecordingUploadReason =
+  | 'no-storage-target'
+  | 'connection-not-found'
+  | 'connection-no-bucket'
+  | 'auth-error'
+  | 'upload-error';
+
+/** Summary of a deactivate's recording upload, stored on the production (issue #534). */
+export interface RecordingUploadSummary {
+  /** ISO 8601 — when the upload step finished. */
+  finishedAt: string;
+  /** The recording output the upload was for, when known. */
+  outputId?: string;
+  /** Storage connection used; absent = the default (env) connection. */
+  connectionId?: string;
+  /** Bucket written to, when a target was resolved. */
+  bucket?: string;
+  /** Number of files uploaded (and listed as recordings). */
+  uploaded: number;
+  /**
+   * Files that failed to upload; they stay on Strom for the next sweep.
+   * `error` includes up to the first 200 characters of the S3 error body. It
+   * never holds the secret key or a presigned URL (PUT uses header auth). For
+   * some codes S3 echoes `<AWSAccessKeyId>`/`<StringToSign>` later in the body;
+   * the 200-character cut normally drops those.
+   */
+  failed: Array<{ file: string; error: string }>;
+  /** Set when nothing was attempted or the sweep stopped early. */
+  reason?: RecordingUploadReason;
+  /** Human-readable explanation accompanying `reason`. */
+  message?: string;
 }
 
 // --------------- Guest calling types (issue #299, epic #208) ---------------
@@ -758,6 +813,21 @@ export interface ProductionDoc {
   stromFlowId?: string;
   /** ID of the builtin.recorder block — set on activate when a 'recording' output is assigned, cleared on deactivate */
   recorderBlockId?: string;
+  /**
+   * Upload target of the running recording, snapshotted at activation next to
+   * {@link recorderBlockId} (issue #534). Deactivate uploads to this target
+   * instead of re-reading the production's current output assignments, so
+   * removing or re-pointing the recording output on a live production cannot
+   * change where the running recording goes or drop its upload. Cleared on
+   * deactivate.
+   */
+  recording?: ActiveRecording;
+  /**
+   * Outcome of the most recent deactivate that had a recording to upload (issue
+   * #534). Kept until the next such deactivate replaces it. Never holds secrets
+   * or presigned URLs.
+   */
+  lastRecordingUpload?: RecordingUploadSummary;
   /** WHEP multiview endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */
   whepEndpoint?: string;
   /** WHEP PGM output endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */

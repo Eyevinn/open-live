@@ -68,9 +68,9 @@ start/stop endpoints are strictly required for v1; segment rollover reuses the e
 
 ```
 GET /api/v1/productions/:id/recordings
-  200 → [ { id, productionId, key, sizeBytes, durationMs?, startedAt, endedAt?, playbackUrl } ]
+  200 → [ { id, productionId, key, sizeBytes, durationMs?, startedAt, endedAt?, playbackUrl?, downloadUrl?, playbackUnavailable? } ]
   404 → { error: 'Production not found' }
-  503 → { error: 'Object storage unavailable' }
+  503 → { error: 'Database unavailable' }   (#534: no longer returned for missing MINIO_* env)
 
 GET /api/v1/recordings                (optional: list across all productions)
   200 → [ RecordingAsset, ... ]
@@ -84,6 +84,44 @@ GET /api/v1/recordings/:id
 the bucket is public) — see Open Question 2. Field naming mirrors existing docs: `id`,
 `createdAt`/`updatedAt` ISO strings, camelCase.
 
+### Connection-only targets, downloads and upload outcome (#534)
+
+Amendment for recording end to end from Studio (issue #534). All changes are additive.
+
+- **Creating a recording output** (`POST /api/v1/outputs`, `outputType: "recording"`) needs a
+  storage target: the `MINIO_*` env store (no `connectionId`, or `"default"`) or a storage
+  connection (`connectionId`, see `storage-connections.md`). With neither →
+  `400 "Recording needs object storage: set the MINIO_* environment variables or choose a storage connection (connectionId)"`.
+  An unknown `connectionId` on `POST` or `PATCH` → `400 "Storage connection not found"`; a
+  connection without a default bucket → `400 "Storage connection has no default bucket"`.
+  Nothing is written in either case. A recording output with no target at all (disk-only, PR
+  #404) stays refused.
+- **Recordings routes** no longer return `503 "Object storage unavailable"` when the `MINIO_*`
+  env is incomplete: they return the stored `RecordingDoc`s (or `[]`). `503` is kept for a
+  database failure only (all three routes).
+- **Each recording** carries, next to `playbackUrl`, a `downloadUrl`: the same presigned GET
+  (same TTL) with `response-content-disposition=attachment; filename="<basename>.mp4"` in the
+  signed query, so a browser saves the file under the object key's basename. When neither URL
+  can be signed, `playbackUnavailable` gives the reason instead: `connection-missing`,
+  `connection-no-bucket`, `storage-not-configured` (default-connection recording, no `MINIO_*`),
+  `bucket-mismatch` (default-connection recording in a bucket other than `MINIO_BUCKET`) or
+  `signing-failed`.
+- **`durationMs`** is written on new recordings, read from the MP4 movie header (`moov/mvhd`, or
+  `mvex/mehd` for a fragmented file) at upload. `startedAt` comes from the segment's file name
+  (#407), falling back to the activation start.
+- **Upload target snapshot.** At activation, next to `recorderBlockId`, the production stores
+  `recording: { outputId, connectionId?, startedAt }`. Deactivate uploads to that target rather
+  than re-reading the output assignments, so removing or re-pointing the recording output on a
+  live production cannot change or drop the running recording's upload. Cleared on deactivate.
+  A production activated before this field existed falls back to its current assignments.
+- **Upload outcome.** Each deactivate that had a recorder stores
+  `lastRecordingUpload: { finishedAt, outputId?, connectionId?, bucket?, uploaded, failed: [{ file, error }], reason?, message? }`
+  on the production, returned by `GET /api/v1/productions/:id` and kept until the next such
+  deactivate. `reason` is one of `no-storage-target`, `connection-not-found`,
+  `connection-no-bucket`, `auth-error` (the store rejected the key; sweep aborted) or
+  `upload-error`. Files that failed stay on Strom for the next sweep. No secrets or presigned
+  URLs are stored.
+
 ### Error codes
 
 | Code | Condition |
@@ -92,7 +130,7 @@ the bucket is public) — see Open Question 2. Field naming mirrors existing doc
 | 401  | missing/invalid `API_KEY` bearer (when configured) |
 | 404  | production or recording not found |
 | 409  | recording output already assigned / active conflict |
-| 503  | CouchDB or object storage unreachable |
+| 503  | CouchDB unreachable (the recordings routes no longer 503 on a missing `MINIO_*` env, #534) |
 
 ## Data Model
 
