@@ -446,3 +446,15 @@ uploader's `isStillRecording` guard compares `_rev`, and an extra write would ma
 delete-after-upload pass). Extra signed S3 query params such as `response-content-disposition`
 sort after the `X-Amz-*` ones (lowercase after uppercase), so `presignGetUrl` appends them last;
 the result was checked against botocore's `S3SigV4QueryAuth`.
+
+## Recording segments are streamed, never buffered whole
+
+`uploadRecordings` pipes the Strom media download straight into `uploadStream` (issue #552): it
+buffers one 16 MiB part, uses a single PutObject if the stream ends inside it, and otherwise sends
+one UploadPart at a time, pulling the next part only after the previous one is acknowledged. Do
+not reintroduce `res.arrayBuffer()` or collect the chunks for a later step: anything that needs
+the bytes (the MP4 duration) must consume them as they pass, as `Mp4DurationScanner` does by
+following top-level box headers and keeping only `moov` (capped at `MOOV_MAX_BYTES`; over the cap
+it reports no duration). Strom's media download has no Range support, so the file can only be read
+once, front to back. `new Uint8Array(buffer)` copies; `signedS3Request` passes a view
+(`new Uint8Array(buf.buffer, buf.byteOffset, buf.length)`) so a part is not duplicated in memory.
