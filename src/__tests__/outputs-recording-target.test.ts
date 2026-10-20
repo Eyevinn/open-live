@@ -1,7 +1,7 @@
 /**
- * A `recording` output needs a storage target (issue #534): the MINIO_* env
- * store, or a storage connection that exists. No `MINIO_*` env is set here, so
- * only a storage connection makes a recording output valid. CouchDB is mocked.
+ * A `recording` output with a named storage connection needs that connection to
+ * exist and name a bucket (issue #534); with none it is accepted and stays on Strom. No `MINIO_*` env is set here.
+ * CouchDB is mocked.
  */
 import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import type { FastifyInstance } from 'fastify';
@@ -86,24 +86,21 @@ describe('POST /api/v1/outputs (recording)', () => {
     expect(res.json().outputType).toBe('recording');
   });
 
-  it('400s without a connectionId, naming both MINIO_* and storage connections', async () => {
+  it('creates a recording output without a connectionId when MINIO_* is not set', async () => {
     const res = await app.inject({
       method: 'POST', url: '/api/v1/outputs', headers: AUTH,
       payload: { name: 'VOD', outputType: 'recording' },
     });
-    expect(res.statusCode).toBe(400);
-    expect(res.json().error).toContain('MINIO_*');
-    expect(res.json().error).toContain('storage connection');
-    expect(outputsDb.insert).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(201);
+    expect(outputsDb.insert).toHaveBeenCalledTimes(1);
   });
 
-  it('400s with the reserved "default" connection when MINIO_* is not set', async () => {
+  it('creates a recording output with the reserved "default" connection when MINIO_* is not set', async () => {
     const res = await app.inject({
       method: 'POST', url: '/api/v1/outputs', headers: AUTH,
       payload: { name: 'VOD', outputType: 'recording', connectionId: 'default' },
     });
-    expect(res.statusCode).toBe(400);
-    expect(res.json().error).toContain('MINIO_*');
+    expect(res.statusCode).toBe(201);
   });
 
   it('400s "Storage connection not found" for an unknown connectionId and writes nothing', async () => {

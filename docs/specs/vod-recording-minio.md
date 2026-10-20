@@ -229,9 +229,9 @@ Added to `src/config.ts` (same `process.env` + optional-fallback style used ther
 | `RECORDING_KEY_PREFIX` | no | `""` | Optional prefix for all recording keys |
 | `RECORDING_PRESIGN_TTL_S` | no | `3600` | Presigned playback URL TTL |
 
-When the MinIO vars are unset, the `recording` output type is rejected at assignment time with
-`400` (recording disabled) so the feature degrades cleanly, matching how the service already
-tolerates optional config (`STROM_URL`, `API_KEY`, etc.).
+When the MinIO vars are unset, the `recording` output type is still accepted: Strom's recorder
+writes local files (Open Question 1), so recording works without object storage. The segments
+stay on Strom's media path and deactivate skips the upload, so there is no `RecordingDoc` to list.
 
 ## Open Questions (need a human/maintainer decision)
 
