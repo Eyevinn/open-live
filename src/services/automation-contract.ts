@@ -60,7 +60,7 @@ export interface TallyContributions {
  * @param pgmPip        - PiP slot index on PGM, or null
  * @param pvwPip        - PiP slot index on PVW, or null
  * @param pgmBg         - the real input behind a PiP that is on PGM, or null
- * @param pvwBefore     - the real input that was on PVW before a PiP was selected, or null
+ * @param pvwBg         - the real input behind a PiP that is on PVW, or null
  * @param pipConfigs    - per-slot PiP layout (bg + zones); may be empty/undefined
  * @param dskLayers     - map of layer→visible for DSK keyers
  * @param activeGraphics- list of active (non-null) graphic overlay IDs
@@ -71,7 +71,7 @@ export function computeTallyContributions(
   pgmPip: number | null,
   pvwPip: number | null,
   pgmBg: string | null,
-  pvwBefore: string | null,
+  pvwBg: string | null,
   pipConfigs: PipConfig[] | undefined,
   dskLayers: Record<number, boolean> | undefined,
   activeGraphics: string[],
@@ -125,8 +125,8 @@ export function computeTallyContributions(
 
   if (pvwPip !== null) {
     // A PiP slot is on preview.
-    if (pvwBefore) {
-      previewSet.add(pvwBefore);
+    if (pvwBg) {
+      previewSet.add(pvwBg);
     }
     const cfg = pipConfigs?.[pvwPip];
     if (cfg) {
