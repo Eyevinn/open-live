@@ -11,9 +11,11 @@
  *      (`GET /api/media?path=`), then
  *   2. downloads each segment via Strom's media file API
  *      (`GET /api/media/file/:path`), and
- *   3. uploads it to MinIO/S3 signed with AWS Signature V4 — a single PutObject
+ *   3. streams it to MinIO/S3 signed with AWS Signature V4 — a single PutObject
  *      for small files, S3 multipart upload above 16 MiB (issue #548: the OSC
- *      Silo ingress answers 413 to request bodies over ~64 MiB).
+ *      Silo ingress answers 413 to request bodies over ~64 MiB). The download
+ *      is piped into the upload one part at a time (issue #552), so a segment
+ *      is never held in memory whole.
  *
  * The S3 PutObject signer here is intentionally dependency-free (node's built-in
  * `crypto`, same as src/lib/srt-passphrase-crypto.ts) so the pinned lockfile
@@ -35,7 +37,7 @@
 import { createHash, createHmac } from 'crypto';
 import { config } from '../config.js';
 import type { StromClient } from './strom.js';
-import { mp4DurationMs } from './mp4-duration.js';
+import { Mp4DurationScanner } from './mp4-duration.js';
 
 export interface MinioTarget {
   endpoint: string; // host[:port], no scheme
@@ -282,7 +284,8 @@ async function signedS3Request(
   return fetch(url, {
     method,
     headers,
-    ...(method === 'DELETE' ? {} : { body: new Uint8Array(body) }),
+    // A view over the Buffer's bytes, not a copy — a part is up to 16 MiB.
+    ...(method === 'DELETE' ? {} : { body: new Uint8Array(body.buffer as ArrayBuffer, body.byteOffset, body.length) }),
   });
 }
 
@@ -336,6 +339,27 @@ export async function putObjectMultipart(
   contentType = 'application/octet-stream',
   partSize: number = MULTIPART_PART_SIZE,
 ): Promise<void> {
+  async function* slices(): AsyncGenerator<Buffer> {
+    for (let offset = 0; offset < body.length; offset += partSize) {
+      yield body.subarray(offset, Math.min(offset + partSize, body.length));
+    }
+  }
+  return multipartUpload(target, key, slices(), contentType);
+}
+
+/**
+ * The multipart upload itself, fed one part at a time by `parts` (issue #552):
+ * the next part is only pulled once the previous UploadPart has completed, so
+ * a streamed source never has more than one part in flight. An error thrown
+ * while producing a part (e.g. the Strom download dying mid-stream) aborts the
+ * upload exactly like a failed UploadPart.
+ */
+async function multipartUpload(
+  target: MinioTarget,
+  key: string,
+  parts: AsyncIterable<Buffer>,
+  contentType: string,
+): Promise<void> {
   const createRes = await signedS3Request(target, 'POST', key, {
     query: [['uploads', '']],
     contentType,
@@ -349,14 +373,14 @@ export async function putObjectMultipart(
 
   try {
     const etags: string[] = [];
-    for (let offset = 0; offset < body.length; offset += partSize) {
+    for await (const part of parts) {
       const partNumber = etags.length + 1;
       const res = await signedS3Request(target, 'PUT', key, {
         query: [
           ['partNumber', String(partNumber)],
           ['uploadId', uploadId],
         ],
-        body: body.subarray(offset, Math.min(offset + partSize, body.length)),
+        body: part,
       });
       await assertS3Ok(res, `UploadPart ${partNumber} of ${key}`);
       const etag = res.headers.get('etag');
@@ -406,6 +430,100 @@ export async function uploadObject(
     return putObject(target, key, body, contentType);
   }
   return putObjectMultipart(target, key, body, contentType, partSize);
+}
+
+/**
+ * Pull-based reader over a chunk stream that hands out fixed-size parts. Holds
+ * at most the part being assembled plus the unread remainder of one source
+ * chunk (the read-ahead), and only pulls from the source when asked.
+ */
+class PartReader {
+  private pending: Uint8Array | undefined;
+  private ended = false;
+
+  constructor(private readonly source: AsyncIterator<Uint8Array>) {}
+
+  private async pull(): Promise<Uint8Array | undefined> {
+    if (this.pending) {
+      const chunk = this.pending;
+      this.pending = undefined;
+      return chunk;
+    }
+    while (!this.ended) {
+      const r = await this.source.next();
+      if (r.done) {
+        this.ended = true;
+        break;
+      }
+      if (r.value.length > 0) return r.value;
+    }
+    return undefined;
+  }
+
+  /** Reads exactly `n` bytes, or fewer only at end of stream. */
+  async read(n: number): Promise<Buffer> {
+    const out = Buffer.allocUnsafe(n);
+    let filled = 0;
+    while (filled < n) {
+      const chunk = await this.pull();
+      if (!chunk) break;
+      const take = Math.min(n - filled, chunk.length);
+      out.set(chunk.subarray(0, take), filled);
+      filled += take;
+      if (take < chunk.length) this.pending = chunk.subarray(take);
+    }
+    return out.subarray(0, filled);
+  }
+
+  /** True once the source is exhausted (peeks one chunk ahead if needed). */
+  async atEnd(): Promise<boolean> {
+    if (this.pending) return false;
+    const chunk = await this.pull();
+    if (!chunk) return true;
+    this.pending = chunk;
+    return false;
+  }
+}
+
+/**
+ * Streams an object of unknown length to S3/MinIO (issue #552): buffers up to
+ * one part; if the source ends within it, a single PutObject, otherwise a
+ * multipart upload that reads and sends one `partSize` part at a time. At most
+ * one part plus one source chunk of read-ahead is held in memory. Returns the
+ * number of bytes uploaded. The source iterator is always closed (on success
+ * or failure), so an abandoned HTTP download is released.
+ */
+export async function uploadStream(
+  target: MinioTarget,
+  key: string,
+  source: AsyncIterable<Uint8Array>,
+  contentType = 'application/octet-stream',
+  partSize: number = MULTIPART_PART_SIZE,
+): Promise<number> {
+  const iterator = source[Symbol.asyncIterator]();
+  const reader = new PartReader(iterator);
+  try {
+    let first: Buffer | undefined = await reader.read(partSize);
+    if (await reader.atEnd()) {
+      await putObject(target, key, first, contentType);
+      return first.length;
+    }
+    let total = 0;
+    async function* parts(): AsyncGenerator<Buffer> {
+      let part: Buffer | undefined = first!;
+      first = undefined; // the generator now owns the only reference
+      while (part.length > 0) {
+        total += part.length;
+        yield part;
+        part = undefined; // drop the reference before reading the next part
+        part = await reader.read(partSize);
+      }
+    }
+    await multipartUpload(target, key, parts(), contentType);
+    return total;
+  } finally {
+    await iterator.return?.().catch(() => undefined);
+  }
 }
 
 /**
@@ -487,16 +605,18 @@ function contentTypeForFile(name: string): string {
 }
 
 /**
- * Downloads a single recorded file from Strom's media API as raw bytes.
- * Uses the same bearer token the StromClient holds. The StromClient.request()
- * helper rejects non-JSON bodies, so this fetches the binary directly against
- * the same `GET /api/media/file/:path` URL the client declares.
+ * Opens a download of a single recorded file from Strom's media API and returns
+ * its body as a chunk stream (issue #552 — never buffered whole). Uses the same
+ * bearer token the StromClient holds. The StromClient.request() helper rejects
+ * non-JSON bodies, so this fetches the binary directly against the same
+ * `GET /api/media/file/:path` URL the client declares. Strom serves the file
+ * without Range support, so it is read once, front to back.
  */
 async function downloadFromStrom(
   stromUrl: string,
   token: string | undefined,
   filePath: string,
-): Promise<Buffer> {
+): Promise<AsyncGenerator<Uint8Array>> {
   const base = stromUrl.replace(/\/$/, '');
   const url = `${base}/api/media/file/${encodeURIComponent(filePath)}`;
   const headers: Record<string, string> = {};
@@ -505,7 +625,35 @@ async function downloadFromStrom(
   if (!res.ok) {
     throw new Error(`Strom media download ${filePath} failed: ${res.status}`);
   }
-  return Buffer.from(await res.arrayBuffer());
+  return responseChunks(res);
+}
+
+/**
+ * Yields a fetch response body chunk by chunk. Closing the generator early
+ * (e.g. after a failed upload) cancels the body so the connection is released.
+ * A response with no body stream (an empty response) is read as a whole.
+ */
+async function* responseChunks(res: Response): AsyncGenerator<Uint8Array> {
+  if (!res.body) {
+    const buf = await res.arrayBuffer();
+    if (buf.byteLength > 0) yield new Uint8Array(buf);
+    return;
+  }
+  const reader = res.body.getReader();
+  let done = false;
+  try {
+    for (;;) {
+      const r = await reader.read();
+      if (r.done) {
+        done = true;
+        return;
+      }
+      yield r.value;
+    }
+  } finally {
+    if (!done) await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
 }
 
 /**
@@ -527,6 +675,17 @@ export function recordingStartFromFileName(name: string): string | undefined {
   if (date.getUTCMonth() !== mo - 1 || date.getUTCDate() !== d || date.getUTCHours() !== h
     || date.getUTCMinutes() !== mi || date.getUTCSeconds() !== sec) return undefined;
   return date.toISOString();
+}
+
+/** Passes every chunk of `source` through, calling `fn` on each first. */
+async function* tap(
+  source: AsyncIterable<Uint8Array>,
+  fn: (chunk: Uint8Array) => void,
+): AsyncGenerator<Uint8Array> {
+  for await (const chunk of source) {
+    fn(chunk);
+    yield chunk;
+  }
 }
 
 export interface UploadRecordingsArgs {
@@ -577,14 +736,18 @@ export async function uploadRecordings(args: UploadRecordingsArgs): Promise<Uplo
 
   for (const entry of files) {
     try {
-      const bytes = await downloadFromStrom(stromUrl, stromToken, entry.path);
+      const download = await downloadFromStrom(stromUrl, stromToken, entry.path);
       const key = `${prefix}${productionId}/${entry.name}`;
-      await uploadObject(target, key, bytes, contentTypeForFile(entry.name));
+      const contentType = contentTypeForFile(entry.name);
+      // Duration is read from the moov box as the bytes stream past (issue
+      // #552); the file itself is never held whole.
+      const scanner = contentType === 'video/mp4' ? new Mp4DurationScanner() : undefined;
+      const sizeBytes = await uploadStream(target, key, tap(download, (c) => scanner?.push(c)), contentType);
       const startedAt = recordingStartFromFileName(entry.name);
-      const durationMs = contentTypeForFile(entry.name) === 'video/mp4' ? mp4DurationMs(bytes) : undefined;
+      const durationMs = scanner?.finish();
       result.uploaded.push({
         key,
-        sizeBytes: bytes.length,
+        sizeBytes,
         stromPath: entry.path,
         ...(startedAt ? { startedAt } : {}),
         ...(durationMs !== undefined ? { durationMs } : {}),
