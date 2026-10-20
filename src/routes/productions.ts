@@ -1,5 +1,5 @@
 import type { FastifyBaseLogger, FastifyPluginAsync } from 'fastify';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { z } from 'zod';
 import { getDb, getOutputsDb, getRecordingsDb } from '../db/index.js';
 import { sweepGuestsOnProductionEnd } from '../services/guest-sweep.js';
@@ -15,7 +15,7 @@ import { clearPipState, clearAudioState, clearFxState, clearClipStateForProducti
 import { forceStopMeterRelay } from '../services/meter-relay.js';
 import { forceStopClipRelay } from '../services/clip-relay.js';
 import { config, isRecordingEnabled } from '../config.js';
-import { uploadRecordings, type MinioTarget } from '../lib/recording-uploader.js';
+import { uploadProductionRecordings, type MinioTarget } from '../lib/recording-uploader.js';
 import { DEFAULT_CONNECTION_ID, resolveStorageTarget, StorageConnectionNotFoundError } from '../lib/storage-connection.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
@@ -218,6 +218,7 @@ function deactivatedDoc(
     recording: undefined,
     // Replaced only by a deactivate that had a recording to upload (issue #534).
     ...(lastRecordingUpload ? { lastRecordingUpload } : {}),
+    recorderOutputDir: undefined,
     sourceOffsetBlockIds: undefined,
     sourceAudioOffsetBlockIds: undefined,
     clipPlayerBlockIds: undefined,
@@ -312,7 +313,7 @@ async function firstRecordingOutput(
 async function uploadProductionRecording(
   doc: ProductionDoc,
   stromFlowId: string,
-  recorderBlockId: string,
+  recorderBlockId: string | undefined,
   strom: StromClient,
   stromToken: string | undefined,
   log: FastifyBaseLogger,
@@ -336,7 +337,8 @@ async function uploadProductionRecording(
   });
 
   const nothingUploaded = (reason: RecordingUploadSummary['reason'], message: string): RecordingUploadSummary => {
-    log.warn({ productionId: doc._id, reason }, `VOD recording not uploaded — ${message}`);
+    // A production that never recorded has nothing to warn about.
+    if (recorderBlockId) log.warn({ productionId: doc._id, reason }, `VOD recording not uploaded — ${message}`);
     return summarise({ reason, message: `${message} The recording stays on Strom.` });
   };
 
@@ -364,18 +366,23 @@ async function uploadProductionRecording(
       : nothingUploaded('no-storage-target', 'MINIO_* object storage is not configured.');
   }
 
-  let uploadRes: Awaited<ReturnType<typeof uploadRecordings>>;
+  let uploadRes: Awaited<ReturnType<typeof uploadProductionRecordings>>;
   try {
-    await strom.recorder.splitNow(stromFlowId, recorderBlockId).catch(() => undefined);
-    uploadRes = await uploadRecordings({
+    if (recorderBlockId) {
+      await strom.recorder.splitNow(stromFlowId, recorderBlockId).catch(() => undefined);
+    }
+    uploadRes = await uploadProductionRecordings({
       strom,
       stromUrl: config.stromUrl,
       stromToken,
-      outputDir: `recordings/${doc._id}`,
       productionId: doc._id,
       target,
+      // A recorder activated before per-activation directories wrote straight
+      // into the production's directory.
+      includeSharedDir: Boolean(recorderBlockId && !doc.recorderOutputDir),
+      isUploaded: (key, sizeBytes) => isRecordingRegistered(target.bucket, key, sizeBytes),
       // Guard (issue #366): re-check the production doc immediately before
-      // uploadRecordings' delete-after-upload pass. Nothing else in the
+      // uploadProductionRecordings' delete-after-upload pass. Nothing else in the
       // deactivate handler writes to the production doc before its own final
       // status update, which runs after this — so `doc._rev` cannot
       // legitimately change between the read at the top of the handler and
@@ -409,7 +416,9 @@ async function uploadProductionRecording(
   for (const seg of uploadRes.uploaded) {
     try {
       const recDoc: RecordingDoc = {
-        _id: `recording-${randomUUID()}`,
+        // Derived from the object key so a retried deactivate conflicts
+        // instead of registering the same object twice.
+        _id: recordingDocId(target.bucket, seg.key),
         type: 'recording',
         productionId: doc._id,
         ...(outputId ? { outputId } : {}),
@@ -423,13 +432,19 @@ async function uploadProductionRecording(
         // The sweep also uploads segments earlier sessions left on Strom, so
         // take the start from each segment's own name; otherwise this
         // activation's start (issue #534), then the legacy doc.updatedAt.
-        startedAt: seg.startedAt ?? doc.recording?.startedAt ?? doc.updatedAt,
-        endedAt: finalizedAt,
+        startedAt: seg.startedAt ?? seg.activationStartedAt ?? doc.recording?.startedAt ?? doc.updatedAt,
+        endedAt: seg.modifiedAt ?? finalizedAt,
         createdAt: finalizedAt,
         updatedAt: finalizedAt,
       };
       await getRecordingsDb().insert(recDoc);
     } catch (persistErr) {
+      // Already registered: by a concurrent deactivate, or by an earlier
+      // one that saw the file before it was complete.
+      if (isConflict(persistErr)) {
+        await refreshRegisteredRecording(seg.key, target.bucket, seg.sizeBytes, seg.modifiedAt ?? finalizedAt, finalizedAt, log);
+        continue;
+      }
       log.error({ persistErr, productionId: doc._id, key: seg.key }, 'RecordingDoc persist failed — object uploaded but unlisted');
     }
   }
@@ -459,6 +474,49 @@ async function uploadProductionRecording(
     ...(reason ? { reason } : {}),
     ...(message ? { message } : {}),
   });
+}
+
+/**
+ * RecordingDoc id for an uploaded object. Deterministic, so deactivate can
+ * check whether an object is registered before uploading it, and two
+ * deactivates registering the same object conflict instead of duplicating it.
+ */
+function recordingDocId(bucket: string, key: string): string {
+  return `recording-${createHash('sha256').update(`${bucket}/${key}`).digest('hex').slice(0, 32)}`;
+}
+
+/**
+ * Whether an object has already been uploaded and registered as a RecordingDoc.
+ * A file that has since changed size was still being written when it was
+ * registered, so the object holds a truncated copy and the file is uploaded again.
+ */
+async function isRecordingRegistered(bucket: string, key: string, sizeBytes: number | undefined): Promise<boolean> {
+  try {
+    const doc = await getRecordingsDb().get(recordingDocId(bucket, key));
+    return sizeBytes === undefined || doc.sizeBytes === sizeBytes;
+  } catch (err) {
+    if (typeof err === 'object' && err !== null && (err as { statusCode?: unknown }).statusCode === 404) return false;
+    throw err;
+  }
+}
+
+/** Updates the size and end time of a registered RecordingDoc after its object was uploaded again. */
+async function refreshRegisteredRecording(
+  key: string,
+  bucket: string,
+  sizeBytes: number,
+  endedAt: string,
+  updatedAt: string,
+  log: FastifyBaseLogger,
+): Promise<void> {
+  try {
+    const db = getRecordingsDb();
+    const existing = await db.get(recordingDocId(bucket, key));
+    if (existing.sizeBytes === sizeBytes) return;
+    await db.insert({ ...existing, sizeBytes, endedAt, updatedAt });
+  } catch (err) {
+    log.error({ err, key }, 'RecordingDoc refresh failed — object uploaded again but its listing is stale');
+  }
 }
 
 /**
@@ -602,7 +660,10 @@ async function runActivationFlow(
       ...(mixerBlockId !== undefined && { mixerBlockId }),
       ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
       ...(loudnessMainBlockId !== undefined && { loudnessMainBlockId }),
-      ...(activation.recorderBlockId !== undefined && { recorderBlockId: activation.recorderBlockId }),
+      // Always written, so an activation without a recorder replaces any
+      // recorder fields a previous activation left behind.
+      recorderBlockId: activation.recorderBlockId,
+      recorderOutputDir: activation.recorderOutputDir,
       ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
       ...(Object.keys(activation.sourceAudioOffsetBlockIds).length > 0 && { sourceAudioOffsetBlockIds: activation.sourceAudioOffsetBlockIds }),
       ...(Object.keys(activation.clipPlayerBlockIds).length > 0 && { clipPlayerBlockIds: activation.clipPlayerBlockIds }),
@@ -831,6 +892,8 @@ async function runActivationFlow(
       ...(settledGpuHours ? { gpuHours: settledGpuHours } : {}),
       stromFlowId: undefined,
       mixerBlockId: undefined,
+      recorderBlockId: undefined,
+      recorderOutputDir: undefined,
       whepEndpoint: undefined,
       pgmWhepEndpoint: undefined,
       whipEndpoints: undefined,
@@ -1253,10 +1316,15 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
 
       // VOD recording (issue #41): when a recorder block is active, finalise
       // the current segment and upload Strom's local recordings to object
-      // storage. Best-effort: a failed upload must not block teardown. The
-      // outcome is stored on the production as `lastRecordingUpload` (#534).
-      if (doc.recorderBlockId) {
-        lastRecordingUpload = await uploadProductionRecording(doc, doc.stromFlowId, doc.recorderBlockId, strom, stromToken, log);
+      // storage. Every activation's directory is swept, so a session whose
+      // upload failed, or that ended without this route (e.g. the idle
+      // watchdog), is uploaded here instead of lost. Best-effort: a failed
+      // upload must not block teardown. The outcome is stored on the
+      // production as `lastRecordingUpload` (#534) when this deactivate had a
+      // recorder or found files to upload.
+      {
+        const summary = await uploadProductionRecording(doc, doc.stromFlowId, doc.recorderBlockId, strom, stromToken, log);
+        if (doc.recorderBlockId || summary.uploaded > 0 || summary.failed.length > 0) lastRecordingUpload = summary;
       }
 
       await deactivateStromFlow(doc.stromFlowId, strom);

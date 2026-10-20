@@ -34,9 +34,9 @@
  * Persisting a RecordingDoc and the listing/playback endpoint are issue #42 and
  * deliberately NOT implemented here.
  */
-import { createHash, createHmac } from 'crypto';
+import { createHash, createHmac, randomUUID } from 'crypto';
 import { config } from '../config.js';
-import type { StromClient } from './strom.js';
+import { StromClientError, type MediaEntry, type StromClient } from './strom.js';
 import { Mp4DurationScanner } from './mp4-duration.js';
 
 export interface MinioTarget {
@@ -54,8 +54,8 @@ export interface UploadedSegment {
   sizeBytes: number;
   /**
    * Strom media path the segment was read from (e.g.
-   * `recordings/<productionId>/seg_00001.mp4`) — retained so a successfully
-   * uploaded segment can be deleted from Strom afterward (issue #366).
+   * `recordings/<productionId>/<activation>/seg_00001.mp4`) — retained so a
+   * successfully uploaded segment can be deleted from Strom afterward (issue #366).
    */
   stromPath: string;
   /**
@@ -69,6 +69,10 @@ export interface UploadedSegment {
    * #534). Undefined for a non-MP4 file or a header that cannot be read.
    */
   durationMs?: number;
+  /** Start of the activation that recorded it, when its directory name carries one (ISO 8601). */
+  activationStartedAt?: string;
+  /** When Strom last wrote the file (ISO 8601), if Strom reported it. */
+  modifiedAt?: string;
 }
 
 export interface UploadResult {
@@ -688,6 +692,38 @@ async function* tap(
   }
 }
 
+/** Strom media directory holding every recording of a production. */
+export function productionRecordingsDir(productionId: string): string {
+  return `recordings/${productionId}`;
+}
+
+/**
+ * Directory name for one activation's recordings: the activation start as
+ * YYYYMMDDTHHMMSSZ, then a uuid so two activations never share a directory.
+ */
+export function activationRecordingsDirName(startedAt: Date = new Date()): string {
+  const stamp = startedAt.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+  return `${stamp}-${randomUUID()}`;
+}
+
+/** Inverse of activationRecordingsDirName's timestamp, as ISO 8601; undefined if absent. */
+function activationStartFromDirName(name: string): string | undefined {
+  const m = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z-/.exec(name);
+  if (!m) return undefined;
+  return `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}.000Z`;
+}
+
+function keyPrefix(): string {
+  return config.recordingKeyPrefix
+    ? `${config.recordingKeyPrefix.replace(/\/+$/, '')}/`
+    : '';
+}
+
+/** Object key a recorded file is uploaded to. */
+export function recordingObjectKey(productionId: string, fileName: string): string {
+  return `${keyPrefix()}${productionId}/${fileName}`;
+}
+
 export interface UploadRecordingsArgs {
   strom: StromClient;
   /** Base URL of the Strom instance (for the raw media download). */
@@ -724,20 +760,98 @@ export interface UploadRecordingsArgs {
  * sweep retries them.
  */
 export async function uploadRecordings(args: UploadRecordingsArgs): Promise<UploadResult> {
-  const { strom, stromUrl, stromToken, outputDir, productionId, target, isStillRecording } = args;
+  const { strom, outputDir, isStillRecording } = args;
+  const result: UploadResult = { uploaded: [], failed: [] };
+  const listing = await strom.media.list(outputDir);
+  const files = (listing.entries ?? []).filter((e) => !e.is_directory);
+  const done = await uploadFiles(args, files, undefined, async () => false, result);
+  await deleteFromStrom(strom, isStillRecording, [{ path: outputDir, fileCount: files.length, done }]);
+  return result;
+}
+
+export interface UploadProductionRecordingsArgs extends Omit<UploadRecordingsArgs, 'outputDir'> {
+  /**
+   * Also upload files directly in the production's directory, where a recorder
+   * activated before per-activation directories wrote them.
+   */
+  includeSharedDir: boolean;
+  /**
+   * Whether an object key has already been uploaded and registered with this
+   * file size (undefined when Strom does not report one); those files are skipped.
+   */
+  isUploaded: (key: string, sizeBytes: number | undefined) => Promise<boolean>;
+}
+
+/**
+ * Uploads every recording of a production that has not been uploaded yet:
+ * each activation's directory under productionRecordingsDir(), so a session
+ * whose upload failed at its own deactivate is picked up by a later one.
+ * A production that never recorded (no directory on Strom) uploads nothing.
+ *
+ * Stops at the first object-store auth rejection (abortedOnAuthError).
+ *
+ * Then deletes from Strom every swept file that is in object storage,
+ * including ones skipped as already uploaded, and removes each directory
+ * that leaves empty (issue #366).
+ */
+export async function uploadProductionRecordings(args: UploadProductionRecordingsArgs): Promise<UploadResult> {
+  const { strom, productionId, includeSharedDir, isUploaded, isStillRecording } = args;
   const result: UploadResult = { uploaded: [], failed: [] };
 
-  const listing = await strom.media.list(outputDir);
-  const files = (listing.entries ?? []).filter((e) => !e.is_dir);
+  let entries: MediaEntry[];
+  try {
+    entries = (await strom.media.list(productionRecordingsDir(productionId))).entries ?? [];
+  } catch (err) {
+    if (err instanceof StromClientError && err.status === 404) return result;
+    throw err;
+  }
 
-  const prefix = config.recordingKeyPrefix
-    ? `${config.recordingKeyPrefix.replace(/\/+$/, '')}/`
-    : '';
+  const swept: SweptDir[] = [];
+  for (const dir of entries.filter((e) => e.is_directory)) {
+    let files: MediaEntry[];
+    try {
+      files = ((await strom.media.list(dir.path)).entries ?? []).filter((e) => !e.is_directory);
+    } catch (err) {
+      result.failed.push({ file: dir.path, error: err instanceof Error ? err.message : String(err) });
+      continue;
+    }
+    const done = await uploadFiles(args, files, activationStartFromDirName(dir.name), isUploaded, result);
+    swept.push({ path: dir.path, fileCount: files.length, done });
+    // The store rejected our credentials; every other directory would fail the same way.
+    if (result.abortedOnAuthError) break;
+  }
+  if (includeSharedDir && !result.abortedOnAuthError) {
+    // Listed last so its directory, the production's, is only removed once
+    // every activation directory inside it has been.
+    const files = entries.filter((e) => !e.is_directory);
+    const done = await uploadFiles(args, files, undefined, isUploaded, result);
+    swept.push({ path: productionRecordingsDir(productionId), fileCount: files.length, done });
+  }
+  await deleteFromStrom(strom, isStillRecording, swept);
+  return result;
+}
 
+/**
+ * Uploads `files`, adding each to `result`. Returns the Strom paths that are
+ * now in object storage: those uploaded here and those isUploaded() skipped.
+ */
+async function uploadFiles(
+  args: Omit<UploadRecordingsArgs, 'outputDir'>,
+  files: MediaEntry[],
+  activationStartedAt: string | undefined,
+  isUploaded: (key: string, sizeBytes: number | undefined) => Promise<boolean>,
+  result: UploadResult,
+): Promise<string[]> {
+  const { stromUrl, stromToken, productionId, target } = args;
+  const done: string[] = [];
   for (const entry of files) {
     try {
+      const key = recordingObjectKey(productionId, entry.name);
+      if (await isUploaded(key, entry.size)) {
+        done.push(entry.path);
+        continue;
+      }
       const download = await downloadFromStrom(stromUrl, stromToken, entry.path);
-      const key = `${prefix}${productionId}/${entry.name}`;
       const contentType = contentTypeForFile(entry.name);
       // Duration is read from the moov box as the bytes stream past (issue
       // #552); the file itself is never held whole.
@@ -751,7 +865,10 @@ export async function uploadRecordings(args: UploadRecordingsArgs): Promise<Uplo
         stromPath: entry.path,
         ...(startedAt ? { startedAt } : {}),
         ...(durationMs !== undefined ? { durationMs } : {}),
+        ...(activationStartedAt ? { activationStartedAt } : {}),
+        ...(entry.modified ? { modifiedAt: new Date(entry.modified * 1000).toISOString() } : {}),
       });
+      done.push(entry.path);
     } catch (err) {
       result.failed.push({
         file: entry.path,
@@ -768,32 +885,48 @@ export async function uploadRecordings(args: UploadRecordingsArgs): Promise<Uplo
       }
     }
   }
+  return done;
+}
 
-  if (await isStillRecording()) {
-    return result;
-  }
+interface SweptDir {
+  path: string;
+  /** Files listed in it */
+  fileCount: number;
+  /** Strom paths of its files that are in object storage */
+  done: string[];
+}
 
-  // Delete only the segments that made it safely into object storage — a
-  // failed upload's local copy is the only remaining copy, so it must survive
-  // for the next sweep's retry (result.failed already drives that contract).
-  let allDeleted = result.failed.length === 0;
-  for (const seg of result.uploaded) {
-    try {
-      await strom.media.deleteFile(seg.stromPath);
-    } catch {
-      // Best-effort — the object is already safely in MinIO, so a stale local
-      // copy is a disk-cleanliness problem, not data loss. Leave it (and skip
-      // the directory cleanup below) for the next sweep to retry.
-      allDeleted = false;
+/**
+ * Deletes the swept files that are safely in object storage from Strom, then
+ * removes each directory whose listed files were all deleted. Skipped entirely
+ * when isStillRecording() resolves true.
+ */
+async function deleteFromStrom(
+  strom: StromClient,
+  isStillRecording: () => Promise<boolean> | boolean,
+  swept: SweptDir[],
+): Promise<void> {
+  if (await isStillRecording()) return;
+
+  for (const dir of swept) {
+    // Delete only the segments that made it safely into object storage — a
+    // failed upload's local copy is the only remaining copy, so it must survive
+    // for the next sweep's retry.
+    let allDeleted = dir.done.length === dir.fileCount;
+    for (const path of dir.done) {
+      try {
+        await strom.media.deleteFile(path);
+      } catch {
+        // Best-effort — the object is already safely in MinIO, so a stale local
+        // copy is a disk-cleanliness problem, not data loss. The next sweep
+        // finds it registered and deletes it then.
+        allDeleted = false;
+      }
+    }
+    // deleteDirectory only succeeds on an empty directory — only attempt it once
+    // every listed file was both uploaded and deleted.
+    if (allDeleted) {
+      await strom.media.deleteDirectory(dir.path).catch(() => undefined);
     }
   }
-
-  // deleteDirectory only succeeds on an empty directory — only attempt it once
-  // every listed file was both uploaded and deleted; otherwise leave the
-  // (non-empty) folder for the next deactivate to retry.
-  if (allDeleted) {
-    await strom.media.deleteDirectory(outputDir).catch(() => undefined);
-  }
-
-  return result;
 }
