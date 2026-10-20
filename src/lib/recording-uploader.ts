@@ -11,7 +11,9 @@
  *      (`GET /api/media?path=`), then
  *   2. downloads each segment via Strom's media file API
  *      (`GET /api/media/file/:path`), and
- *   3. uploads it to MinIO/S3 with a PutObject signed with AWS Signature V4.
+ *   3. uploads it to MinIO/S3 signed with AWS Signature V4 — a single PutObject
+ *      for small files, S3 multipart upload above 16 MiB (issue #548: the OSC
+ *      Silo ingress answers 413 to request bodies over ~64 MiB).
  *
  * The S3 PutObject signer here is intentionally dependency-free (node's built-in
  * `crypto`, same as src/lib/srt-passphrase-crypto.ts) so the pinned lockfile
@@ -200,21 +202,34 @@ function encodeKey(key: string): string {
 }
 
 /**
- * Uploads a single object to S3/MinIO via a SigV4-signed PutObject.
- * Path-style addressing (bucket in the path) — the only form MinIO supports
- * without per-bucket DNS.
+ * Sends one SigV4-signed S3 request (path-style addressing — the only form
+ * MinIO supports without per-bucket DNS). `query` entries are sorted and
+ * RFC 3986-encoded into the canonical query string as SigV4 requires; a
+ * valueless sub-resource such as `uploads` is passed as `['uploads', '']`.
+ * Does not interpret the response.
  */
-export async function putObject(
+async function signedS3Request(
   target: MinioTarget,
+  method: 'PUT' | 'POST' | 'DELETE',
   key: string,
-  body: Buffer,
-  contentType = 'application/octet-stream',
-  now: Date = new Date(),
-): Promise<void> {
+  opts: {
+    query?: Array<[string, string]>;
+    body?: Buffer;
+    contentType?: string;
+    now?: Date;
+  } = {},
+): Promise<Response> {
+  const body = opts.body ?? Buffer.alloc(0);
+  const now = opts.now ?? new Date();
   const scheme = target.useSsl ? 'https' : 'http';
   const host = target.endpoint;
   const canonicalUri = `/${encodeKey(target.bucket)}/${encodeKey(key)}`;
-  const url = `${scheme}://${host}${canonicalUri}`;
+  const canonicalQuery = (opts.query ?? [])
+    .map(([k, v]) => [rfc3986(k), rfc3986(v)] as const)
+    .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : x[1] < y[1] ? -1 : x[1] > y[1] ? 1 : 0))
+    .map(([k, v]) => `${k}=${v}`)
+    .join('&');
+  const url = `${scheme}://${host}${canonicalUri}${canonicalQuery ? `?${canonicalQuery}` : ''}`;
 
   // ISO-8601 basic format required by SigV4: YYYYMMDDTHHMMSSZ.
   // now.toISOString() → "2026-09-15T13:00:00.000Z"; strip separators + millis.
@@ -229,9 +244,9 @@ export async function putObject(
   const signedHeaders = 'host;x-amz-content-sha256;x-amz-date';
 
   const canonicalRequest = [
-    'PUT',
+    method,
     canonicalUri,
-    '', // no query
+    canonicalQuery,
     canonicalHeaders,
     signedHeaders,
     payloadHash,
@@ -256,27 +271,141 @@ export async function putObject(
     `${algorithm} Credential=${target.accessKey}/${credentialScope}, ` +
     `SignedHeaders=${signedHeaders}, Signature=${signature}`;
 
-  const res = await fetch(url, {
-    method: 'PUT',
-    headers: {
-      Host: host,
-      'x-amz-date': amzDate,
-      'x-amz-content-sha256': payloadHash,
-      'Content-Type': contentType,
-      Authorization: authorization,
-    },
-    body: new Uint8Array(body),
-  });
+  const headers: Record<string, string> = {
+    Host: host,
+    'x-amz-date': amzDate,
+    'x-amz-content-sha256': payloadHash,
+    Authorization: authorization,
+  };
+  if (opts.contentType) headers['Content-Type'] = opts.contentType;
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    const message = `S3 PutObject ${key} failed: ${res.status} ${text.slice(0, 200)}`;
-    const authCode = detectS3AuthError(res.status, text);
-    if (authCode) {
-      throw new S3AuthError(authCode, message);
-    }
-    throw new Error(message);
+  return fetch(url, {
+    method,
+    headers,
+    ...(method === 'DELETE' ? {} : { body: new Uint8Array(body) }),
+  });
+}
+
+/** Throws S3AuthError / Error for a non-2xx S3 response; no-op on success. */
+async function assertS3Ok(res: Response, what: string): Promise<void> {
+  if (res.ok) return;
+  const text = await res.text().catch(() => '');
+  const message = `S3 ${what} failed: ${res.status} ${text.slice(0, 200)}`;
+  const authCode = detectS3AuthError(res.status, text);
+  if (authCode) {
+    throw new S3AuthError(authCode, message);
   }
+  throw new Error(message);
+}
+
+/**
+ * Uploads a single object to S3/MinIO via a SigV4-signed PutObject.
+ * Path-style addressing (bucket in the path) — the only form MinIO supports
+ * without per-bucket DNS.
+ */
+export async function putObject(
+  target: MinioTarget,
+  key: string,
+  body: Buffer,
+  contentType = 'application/octet-stream',
+  now: Date = new Date(),
+): Promise<void> {
+  const res = await signedS3Request(target, 'PUT', key, { body, contentType, now });
+  await assertS3Ok(res, `PutObject ${key}`);
+}
+
+/**
+ * Size of each multipart part, and the threshold above which an object is
+ * uploaded multipart instead of with a single PutObject (issue #548). The OSC
+ * Silo ingress rejects request bodies over ~64 MiB with 413, so parts stay
+ * well under that. 16 MiB is also above S3's 5 MiB minimum part size.
+ */
+export const MULTIPART_PART_SIZE = 16 * 1024 * 1024;
+
+/**
+ * Uploads an object via S3 multipart upload: CreateMultipartUpload, one
+ * UploadPart per `partSize` slice, then CompleteMultipartUpload. If anything
+ * fails after the upload was created, AbortMultipartUpload is attempted
+ * (best-effort) so the store does not keep orphaned parts, and the original
+ * error is rethrown.
+ */
+export async function putObjectMultipart(
+  target: MinioTarget,
+  key: string,
+  body: Buffer,
+  contentType = 'application/octet-stream',
+  partSize: number = MULTIPART_PART_SIZE,
+): Promise<void> {
+  const createRes = await signedS3Request(target, 'POST', key, {
+    query: [['uploads', '']],
+    contentType,
+  });
+  await assertS3Ok(createRes, `CreateMultipartUpload ${key}`);
+  const createXml = await createRes.text();
+  const uploadId = /<UploadId>([^<]+)<\/UploadId>/.exec(createXml)?.[1];
+  if (!uploadId) {
+    throw new Error(`S3 CreateMultipartUpload ${key} returned no UploadId`);
+  }
+
+  try {
+    const etags: string[] = [];
+    for (let offset = 0; offset < body.length; offset += partSize) {
+      const partNumber = etags.length + 1;
+      const res = await signedS3Request(target, 'PUT', key, {
+        query: [
+          ['partNumber', String(partNumber)],
+          ['uploadId', uploadId],
+        ],
+        body: body.subarray(offset, Math.min(offset + partSize, body.length)),
+      });
+      await assertS3Ok(res, `UploadPart ${partNumber} of ${key}`);
+      const etag = res.headers.get('etag');
+      if (!etag) {
+        throw new Error(`S3 UploadPart ${partNumber} of ${key} returned no ETag`);
+      }
+      etags.push(etag);
+    }
+
+    const xml =
+      '<CompleteMultipartUpload>' +
+      etags
+        .map((e, i) => `<Part><PartNumber>${i + 1}</PartNumber><ETag>${e.replace(/&/g, '&amp;').replace(/</g, '&lt;')}</ETag></Part>`)
+        .join('') +
+      '</CompleteMultipartUpload>';
+    const completeRes = await signedS3Request(target, 'POST', key, {
+      query: [['uploadId', uploadId]],
+      body: Buffer.from(xml, 'utf8'),
+      contentType: 'application/xml',
+    });
+    await assertS3Ok(completeRes, `CompleteMultipartUpload ${key}`);
+    // S3 can answer 200 with an <Error> body when completion fails midway.
+    const completeText = await completeRes.text().catch(() => '');
+    if (/<Error>/.test(completeText)) {
+      throw new Error(`S3 CompleteMultipartUpload ${key} failed: ${completeText.slice(0, 200)}`);
+    }
+  } catch (err) {
+    await signedS3Request(target, 'DELETE', key, { query: [['uploadId', uploadId]] })
+      .then((r) => r.text().catch(() => undefined))
+      .catch(() => undefined);
+    throw err;
+  }
+}
+
+/**
+ * Uploads `body` with a single PutObject when it fits in one part, else via
+ * multipart upload (issue #548).
+ */
+export async function uploadObject(
+  target: MinioTarget,
+  key: string,
+  body: Buffer,
+  contentType = 'application/octet-stream',
+  partSize: number = MULTIPART_PART_SIZE,
+): Promise<void> {
+  if (body.length <= partSize) {
+    return putObject(target, key, body, contentType);
+  }
+  return putObjectMultipart(target, key, body, contentType, partSize);
 }
 
 /**
@@ -450,7 +579,7 @@ export async function uploadRecordings(args: UploadRecordingsArgs): Promise<Uplo
     try {
       const bytes = await downloadFromStrom(stromUrl, stromToken, entry.path);
       const key = `${prefix}${productionId}/${entry.name}`;
-      await putObject(target, key, bytes, contentTypeForFile(entry.name));
+      await uploadObject(target, key, bytes, contentTypeForFile(entry.name));
       const startedAt = recordingStartFromFileName(entry.name);
       const durationMs = contentTypeForFile(entry.name) === 'video/mp4' ? mp4DurationMs(bytes) : undefined;
       result.uploaded.push({
