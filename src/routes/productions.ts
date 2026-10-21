@@ -16,6 +16,7 @@ import { forceStopMeterRelay } from '../services/meter-relay.js';
 import { forceStopClipRelay } from '../services/clip-relay.js';
 import { config, isRecordingEnabled } from '../config.js';
 import { uploadRecordings, type MinioTarget } from '../lib/recording-uploader.js';
+import { recordingPartTimings } from '../lib/recording-parts.js';
 import { DEFAULT_CONNECTION_ID, resolveStorageTarget, StorageConnectionNotFoundError } from '../lib/storage-connection.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
@@ -406,7 +407,11 @@ async function uploadProductionRecording(
   // endpoint can enumerate and presign recordings without round-tripping the
   // bucket. Best-effort: a failed persist must not block teardown.
   const finalizedAt = new Date().toISOString();
-  for (const seg of uploadRes.uploaded) {
+  // Every part of one session shares the session stamp in its name, so offset
+  // each part by its predecessors' durations (issue #553).
+  const timings = recordingPartTimings(uploadRes.uploaded, config.recordingSegmentSecs);
+  for (const [i, seg] of uploadRes.uploaded.entries()) {
+    const timing = timings[i];
     try {
       const recDoc: RecordingDoc = {
         _id: `recording-${randomUUID()}`,
@@ -421,10 +426,12 @@ async function uploadProductionRecording(
         sizeBytes: seg.sizeBytes,
         ...(seg.durationMs !== undefined ? { durationMs: seg.durationMs } : {}),
         // The sweep also uploads segments earlier sessions left on Strom, so
-        // take the start from each segment's own name; otherwise this
-        // activation's start (issue #534), then the legacy doc.updatedAt.
-        startedAt: seg.startedAt ?? doc.recording?.startedAt ?? doc.updatedAt,
-        endedAt: finalizedAt,
+        // take the start from each segment's own name, offset by its part
+        // index (#553); otherwise this activation's start (issue #534), then
+        // the legacy doc.updatedAt. A part ends after its own duration when
+        // known, else at deactivate.
+        startedAt: timing.startedAt ?? doc.recording?.startedAt ?? doc.updatedAt,
+        endedAt: timing.endedAt ?? finalizedAt,
         createdAt: finalizedAt,
         updatedAt: finalizedAt,
       };
