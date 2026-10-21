@@ -5,6 +5,7 @@ import type {
 import { getSourcesDb, getGraphicsDb } from '../db/index.js';
 import { deserializeClipReference } from './clip-reference.js';
 import { StromClient } from './strom.js';
+import { config } from '../config.js';
 import { DEFAULT_FLOW, type FlowTopology } from './default-flow.js';
 import { decryptAddressPassphrase } from './srt-passphrase-crypto.js';
 import { decryptStreamKey } from './rtmp-credentials-crypto.js';
@@ -1137,6 +1138,11 @@ export async function activateStromFlow(
           properties: {
             output_dir: outputDir,
             filename_prefix: production._id,
+            // Cut the recording into time-based parts (RECORDING_SEGMENT_SECS,
+            // #553). 0 leaves it unset: one file per activation.
+            ...(config.recordingSegmentSecs > 0
+              ? { max_size_time_secs: config.recordingSegmentSecs }
+              : {}),
           },
           position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
         });

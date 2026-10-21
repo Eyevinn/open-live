@@ -239,6 +239,32 @@ describe('recording upload target snapshot (issue #534)', () => {
     await app.close();
   });
 
+  it('gives each part of one session its own consecutive startedAt/endedAt (#553)', async () => {
+    productions.set('prod-1', production({
+      status: 'active', stromFlowId: 'flow-1', recorderBlockId: 'b-out-rec',
+      recording: { outputId: 'output-rec', connectionId: 'stconn-C', startedAt: '2026-10-19T09:59:58.000Z' },
+    }));
+    const part = (i: number, durationMs: number) => ({
+      key: `prod-1/prod-1_20261019_100000_0000${i}.mp4`,
+      sizeBytes: 1,
+      stromPath: `recordings/prod-1/prod-1_20261019_100000_0000${i}.mp4`,
+      startedAt: '2026-10-19T10:00:00.000Z',
+      durationMs,
+    });
+    // Listing order from Strom is not guaranteed; part 2 comes first here.
+    mockUploadRecordings.mockResolvedValue({ uploaded: [part(2, 15_000), part(0, 60_000), part(1, 60_000)], failed: [] });
+    const app = await buildServer();
+    await app.inject({ method: 'POST', url: '/api/v1/productions/prod-1/deactivate' });
+    const byKey = new Map(recordingInserts.map((r) => [r.key, r]));
+    const docs = [0, 1, 2].map((i) => byKey.get(`prod-1/prod-1_20261019_100000_0000${i}.mp4`)!);
+    expect(docs.map((d) => [d.startedAt, d.endedAt])).toEqual([
+      ['2026-10-19T10:00:00.000Z', '2026-10-19T10:01:00.000Z'],
+      ['2026-10-19T10:01:00.000Z', '2026-10-19T10:02:00.000Z'],
+      ['2026-10-19T10:02:00.000Z', '2026-10-19T10:02:15.000Z'],
+    ]);
+    await app.close();
+  });
+
   it('falls back to the recording session start from the activation when the file name carries none', async () => {
     productions.set('prod-1', production({
       status: 'active', stromFlowId: 'flow-1', recorderBlockId: 'b-out-rec',
