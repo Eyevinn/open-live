@@ -82,6 +82,12 @@ const sessionsDb = {
   })),
 };
 
+// The join's ICE-server lookup would ask Strom for real; see docs/repo-patterns.md.
+vi.mock('../lib/ice-servers.js', () => ({
+  getIceServers: vi.fn().mockRejectedValue(new Error('Strom unreachable')),
+  resetIceServersCache: vi.fn(),
+}));
+
 vi.mock('../db/index.js', () => ({
   getDb: () => prodDb,
   getGuestInvitesDb: () => invitesDb,

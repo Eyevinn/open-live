@@ -34,6 +34,7 @@ let cacheTimestamp = 0;
  */
 export function resetIceServersCache(): void {
   cachedIceServers = null;
+  cacheTimestamp = 0;
 }
 
 /** The Strom token; undefined when there is none or the exchange fails. */
@@ -42,18 +43,18 @@ function stromToken(): Promise<string | undefined> {
 }
 
 /**
- * The Strom token, or a rejection once `ms` pass: a Strom that needs the
- * token cannot answer without it, so there is no point asking. The exchange
- * itself is shared with every other caller (getStromToken coalesces them), so
- * it is not aborted; this lookup only stops waiting for it.
+ * `work`, or a rejection once `ms` pass. The work is not aborted, only no
+ * longer waited for: the token exchange is shared with every other caller
+ * (getStromToken coalesces them), and the Strom call aborts itself on its own
+ * per-attempt timeout.
  */
-async function stromTokenWithin(ms: number): Promise<string | undefined> {
+async function within<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`No Strom token within ${ms} ms`)), ms);
+    timer = setTimeout(() => reject(new Error(`No ${what} within ${ms} ms`)), ms);
   });
   try {
-    return await Promise.race([stromToken(), timeout]);
+    return await Promise.race([work, timeout]);
   } finally {
     clearTimeout(timer);
   }
@@ -68,11 +69,20 @@ export async function getIceServers(
   }
   const deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
   try {
-    const token = timeoutMs === undefined ? await stromToken() : await stromTokenWithin(timeoutMs);
+    // A Strom that needs the token cannot answer without it, so a token that
+    // misses the deadline fails the lookup rather than asking Strom anyway.
+    const token = deadline === undefined
+      ? await stromToken()
+      : await within(stromToken(), timeoutMs!, 'Strom token');
     const strom = new StromClient({ baseUrl: config.stromUrl, token });
-    const { ice_servers } = await strom.system.iceServers(
+    // StromClient retries a dropped socket once, each attempt with its own
+    // timeout, so the deadline also bounds the call as a whole.
+    const lookup = strom.system.iceServers(
       deadline === undefined ? undefined : Math.max(1, deadline - Date.now()),
     );
+    const { ice_servers } = deadline === undefined
+      ? await lookup
+      : await within(lookup, Math.max(1, deadline - Date.now()), 'ICE servers');
     cachedIceServers = ice_servers;
     cacheTimestamp = Date.now();
     return { iceServers: ice_servers };

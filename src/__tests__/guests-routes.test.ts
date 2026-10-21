@@ -326,6 +326,12 @@ describe('POST /api/v1/guests/:inviteId/join', () => {
   });
 
   it('does NOT require the shared API key (token-authed route is exempt)', async () => {
+    // Also, as joins are rate-limited: a cached list served because Strom
+    // failed reaches the page, and the join says so in the log.
+    const cached: IceServer[] = [{ urls: 'stun:stun.example.com:3478' }];
+    const stale = new Error('Strom unreachable');
+    getIceServersMock.mockResolvedValueOnce({ iceServers: cached, stale });
+    const warn = vi.spyOn(app.log, 'warn');
     const invite = await createInvite();
     // No API key header, only the invite bearer token.
     const res = await app.inject({
@@ -334,6 +340,8 @@ describe('POST /api/v1/guests/:inviteId/join', () => {
       headers: { authorization: `Bearer ${invite.token}` },
     });
     expect(res.statusCode).toBe(200);
+    expect(res.json().iceServers).toEqual(cached);
+    expect(warn).toHaveBeenCalledWith({ err: stale }, expect.stringMatching(/cached ICE servers/));
   });
 
   it('401s on a missing, malformed, or wrong-secret token', async () => {

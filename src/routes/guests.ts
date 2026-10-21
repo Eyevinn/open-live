@@ -756,7 +756,11 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
       // the page keeps its built-in STUN server.
       let iceServers: IceServer[] | undefined;
       try {
-        ({ iceServers } = await getIceServers({ timeoutMs: JOIN_ICE_SERVERS_TIMEOUT_MS }));
+        let stale: Error | undefined;
+        ({ iceServers, stale } = await getIceServers({ timeoutMs: JOIN_ICE_SERVERS_TIMEOUT_MS }));
+        if (stale) {
+          fastify.log.warn({ err: stale }, 'POST guests/:id/join — Strom unreachable, serving cached ICE servers');
+        }
       } catch (err) {
         fastify.log.warn({ err }, 'POST guests/:id/join — ICE servers unavailable');
       }

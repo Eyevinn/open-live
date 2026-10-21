@@ -481,5 +481,7 @@ never `new RTCPeerConnection(ICE)`: a browser rejects the *whole* configuration 
 (a TURN URL without a username and credential, which Strom passes through), and the helper falls
 back to the STUN server instead of failing the guest's go-live. The join's lookup
 (`getIceServers({ timeoutMs: JOIN_ICE_SERVERS_TIMEOUT_MS })`) is bounded at 3s; the crew route
-calls it without a deadline. A join test that counts Strom calls through a stubbed `fetch`
-must mock `../lib/ice-servers.js`, as `guests-return-only.test.ts` does, or the lookup is counted.
+calls it without a deadline. Every test that reaches the real join route must mock
+`../lib/ice-servers.js` (`getIceServers` rejecting, as `guests-return-only.test.ts` does):
+otherwise the join asks `config.stromUrl` for real, so a stubbed `fetch` counts the lookup, and a
+Strom running locally on the default port answers and fills the module-level cache.
