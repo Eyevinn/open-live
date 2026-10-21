@@ -108,10 +108,19 @@ vi.mock('../lib/strom.js', async (importOriginal) => {
 
 vi.mock('../services/guest-sweep.js', () => ({ sweepGuestsOnProductionEnd: vi.fn().mockResolvedValue(undefined) }));
 
+// The real index waits for Strom's WebSocket, which the mocked client never opens.
+vi.mock('../services/recording-index.js', () => ({
+  openRecordingIndex: vi.fn(async (productionId: string) => ({ productionId })),
+  bindRecordingIndex: vi.fn(),
+  currentRecordingIndex: vi.fn(() => undefined),
+  waitForNextFiles: vi.fn().mockResolvedValue(undefined),
+  closeRecordingIndex: vi.fn().mockResolvedValue(undefined),
+}));
+
 const mockUploadRecordings = vi.fn();
 vi.mock('../lib/recording-uploader.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/recording-uploader.js')>();
-  return { ...actual, uploadRecordings: (...args: unknown[]) => mockUploadRecordings(...args) };
+  return { ...actual, uploadProductionRecordings: (...args: unknown[]) => mockUploadRecordings(...args) };
 });
 
 const { buildServer } = await import('../server.js');
@@ -146,6 +155,7 @@ function activationResult() {
     whepOutputEntries: undefined,
     pgmWhepEndpointId: undefined,
     warnings: [],
+    inputRecorders: [],
     sourceOffsetBlockIds: {},
     sourceAudioOffsetBlockIds: {},
     clipPlayerBlockIds: {},
