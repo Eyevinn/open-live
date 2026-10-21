@@ -135,6 +135,7 @@ and fill in the values:
 | `GUEST_INVITE_TTL_S` | Default guest invite lifetime in seconds (invites stay short-lived on purpose) | `86400` |
 | `INTERCOM_MANAGER_URL` | Base URL of the Open Intercom manager ([`Eyevinn/intercom-manager`](https://github.com/Eyevinn/intercom-manager)) for operator↔guest talkback. Optional: when unset, guest calling still works with WHIP video + WHEP return but no talkback line | _(empty — talkback disabled)_ |
 | `INTERCOM_MANAGER_TOKEN` | Auth token for the Open Intercom manager. Optional; held server-side only and redacted from logs | _(empty)_ |
+| `RECORDING_SEGMENT_SECS` | Length in seconds of each recording part. Strom's recorder cuts a recording into consecutive `<productionId>_<timestamp>_0000N.mp4` files of this length (its `max_size_time_secs`); deactivate uploads every part as its own recording. `0` turns cutting off: one file per activation. Must be an integer from 0 to 86400; startup fails otherwise. See [`docs/specs/vod-recording-minio.md`](docs/specs/vod-recording-minio.md) | `600` |
 
 > **Never commit `.env`** — it is gitignored. Use `.env.example` as the reference.
 

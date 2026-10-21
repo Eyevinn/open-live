@@ -127,7 +127,9 @@ describe('deactivate — RecordingDoc.startedAt for segments left by earlier ses
     const docs = mockRecordingInsert.mock.calls.map((c) => c[0] as { key: string; startedAt: string });
     expect(Object.fromEntries(docs.map((d) => [d.key, d.startedAt]))).toEqual({
       'prod-rec-1/recording_20260110_090000_00000.mp4': '2026-01-10T09:00:00.000Z',
-      'prod-rec-1/recording_20260110_090000_00001.mp4': '2026-01-10T09:00:00.000Z',
+      // Part 1 of the same session starts one part later (#553); no readable
+      // duration here, so the offset is RECORDING_SEGMENT_SECS (default 600).
+      'prod-rec-1/recording_20260110_090000_00001.mp4': '2026-01-10T09:10:00.000Z',
       'prod-rec-1/recording_20260205_183015_00000.mp4': '2026-02-05T18:30:15.000Z',
       'prod-rec-1/recording_20260301_100002_00000.mp4': '2026-03-01T10:00:02.000Z',
       // Falls back to this activation's start.
