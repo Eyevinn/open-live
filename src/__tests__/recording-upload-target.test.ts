@@ -151,6 +151,7 @@ function activationResult() {
     clipPlayerBlockIds: {},
     returnBuses: [],
     returnWhepEntries: [],
+    fastWhepEntries: [],
     mixerInputMap: {},
   };
 }
