@@ -927,6 +927,25 @@ components:
         statusCode:
           type: integer
 
+    RecordingDeleteError:
+      type: object
+      description: Error body of DELETE /api/v1/recordings/{id} for 409 and 502 (issue #550).
+      required: [error, reason, statusCode]
+      properties:
+        error:
+          type: string
+        reason:
+          type: string
+          enum:
+            - connection-missing
+            - connection-no-bucket
+            - storage-not-configured
+            - bucket-mismatch
+            - storage-denied
+            - storage-failed
+        statusCode:
+          type: integer
+
     # ── Guest calling (epic #208, issue #299) ─────────────────────────────────────
 
     GuestInviteCreate:
@@ -1727,6 +1746,53 @@ paths:
                 $ref: '#/components/schemas/Error'
         '503':
           description: Object storage unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      summary: Delete a recording
+      description: >-
+        Deletes the recording's stored object (signed DeleteObject against the
+        same storage target playback uses) and then its list entry (issue #550).
+        The object delete is idempotent: a key that is already gone counts as
+        deleted, so retrying after a 503 succeeds. On every error the recording
+        stays listed. In a versioned bucket only a delete marker is added.
+      operationId: deleteRecording
+      tags: [Recordings]
+      responses:
+        '204':
+          description: Object and list entry deleted
+        '404':
+          description: Recording not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: >-
+            The storage target cannot be resolved; nothing was deleted.
+            `reason` is `connection-missing`, `connection-no-bucket`,
+            `storage-not-configured` or `bucket-mismatch` (same values as
+            `playbackUnavailable`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordingDeleteError'
+        '502':
+          description: >-
+            The object store refused or failed the delete; the recording is
+            kept. `reason` is `storage-denied` (403 or another auth error) or
+            `storage-failed` (any other store error). No S3 response body,
+            credentials or URLs are returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordingDeleteError'
+        '503':
+          description: >-
+            Database unavailable. If the object was already deleted, a retry
+            succeeds.
           content:
             application/json:
               schema:

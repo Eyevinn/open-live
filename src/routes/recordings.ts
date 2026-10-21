@@ -11,6 +11,7 @@
  *   GET /api/v1/productions/:id/recordings   list a production's recordings
  *   GET /api/v1/recordings                    list recordings across productions
  *   GET /api/v1/recordings/:id                fetch a single recording
+ *   DELETE /api/v1/recordings/:id             delete the stored object and its entry (#550)
  *
  * The routes work whether or not the `MINIO_*` env store is configured: a
  * recording written to a storage connection (issue #520) is signed against
@@ -26,7 +27,13 @@ import type { FastifyBaseLogger, FastifyPluginAsync } from 'fastify';
 import { getDb, getRecordingsDb } from '../db/index.js';
 import type { RecordingDoc } from '../db/types.js';
 import { config } from '../config.js';
-import { minioTargetFromConfig, presignGetUrl, type MinioTarget } from '../lib/recording-uploader.js';
+import {
+  deleteObject,
+  minioTargetFromConfig,
+  presignGetUrl,
+  S3AuthError,
+  type MinioTarget,
+} from '../lib/recording-uploader.js';
 import { isDocNotFoundError } from '../lib/db-errors.js';
 import { resolveStorageTarget, StorageConnectionNotFoundError } from '../lib/storage-connection.js';
 
@@ -71,31 +78,50 @@ async function toApi(
   return api;
 }
 
+/** Why a recording's storage target cannot be resolved (issue #534, #550). */
+export type RecordingTargetUnavailableReason = Exclude<PlaybackUnavailableReason, 'signing-failed'>;
+
 /**
- * Resolves the target a recording was written to and signs both URLs.
+ * Resolves the target a recording was written to. Shared by playback signing
+ * and DELETE (issue #550) so both refuse with the same reasons.
  *
- * A recording with a `connectionId` (issue #520) is signed against that
- * connection (bucket from the doc). One without (every pre-#520 recording)
- * keeps the default-bucket-matched path: it is only signed when the stored
- * bucket matches the configured one, since a since-reconfigured bucket cannot
- * be signed with the current credentials (unchanged from #42).
+ * A recording with a `connectionId` (issue #520) resolves to that connection
+ * (bucket from the doc). One without (every pre-#520 recording) keeps the
+ * default-bucket-matched path: it only resolves when the stored bucket matches
+ * the configured one, since a since-reconfigured bucket cannot be reached with
+ * the current credentials (unchanged from #42). Any error other than a missing
+ * connection is rethrown.
  */
+export async function resolveRecordingTarget(
+  doc: RecordingDoc,
+  defaultTarget: MinioTarget | null,
+): Promise<{ target: MinioTarget } | { reason: RecordingTargetUnavailableReason }> {
+  if (doc.connectionId) {
+    let resolved: MinioTarget | null;
+    try {
+      resolved = await resolveStorageTarget(doc.connectionId, doc.bucket);
+    } catch (err) {
+      if (err instanceof StorageConnectionNotFoundError) return { reason: 'connection-missing' };
+      throw err;
+    }
+    if (!resolved) return { reason: 'connection-no-bucket' };
+    return { target: resolved };
+  }
+  if (!defaultTarget) return { reason: 'storage-not-configured' };
+  if (doc.bucket !== defaultTarget.bucket) return { reason: 'bucket-mismatch' };
+  return { target: defaultTarget };
+}
+
+/** Resolves the target a recording was written to and signs both URLs. */
 async function presignRecording(
   doc: RecordingDoc,
   defaultTarget: MinioTarget | null,
   log: FastifyBaseLogger,
 ): Promise<{ playbackUrl: string; downloadUrl: string } | { reason: PlaybackUnavailableReason }> {
-  let target: MinioTarget;
   try {
-    if (doc.connectionId) {
-      const resolved = await resolveStorageTarget(doc.connectionId, doc.bucket);
-      if (!resolved) return { reason: 'connection-no-bucket' };
-      target = resolved;
-    } else {
-      if (!defaultTarget) return { reason: 'storage-not-configured' };
-      if (doc.bucket !== defaultTarget.bucket) return { reason: 'bucket-mismatch' };
-      target = defaultTarget;
-    }
+    const resolved = await resolveRecordingTarget(doc, defaultTarget);
+    if ('reason' in resolved) return resolved;
+    const { target } = resolved;
     const now = new Date();
     const ttl = config.recordingPresignTtlS;
     return {
@@ -105,7 +131,6 @@ async function presignRecording(
       }),
     };
   } catch (err) {
-    if (err instanceof StorageConnectionNotFoundError) return { reason: 'connection-missing' };
     log.warn({ err, key: doc.key }, 'recordings — presign failed, omitting playbackUrl');
     return { reason: 'signing-failed' };
   }
@@ -178,6 +203,77 @@ const recordingsRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
     }
     return reply.send(await toApi(doc, defaultTarget, fastify.log));
+  });
+
+  // Delete a recording (issue #550): the stored object first, then its
+  // RecordingDoc. The object delete is idempotent (a missing key counts as
+  // done), so a retry after a database failure succeeds. Every failure leaves
+  // the RecordingDoc in place.
+  fastify.delete<{ Params: { id: string } }>('/api/v1/recordings/:id', async (req, reply) => {
+    let doc: RecordingDoc;
+    try {
+      doc = await getRecordingsDb().get(req.params.id);
+    } catch (err) {
+      if (isDocNotFoundError(err)) return reply.status(404).send({ error: 'Recording not found', statusCode: 404 });
+      fastify.log.warn({ err }, 'DELETE /api/v1/recordings/:id — DB read failed');
+      return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
+    }
+
+    let resolved: Awaited<ReturnType<typeof resolveRecordingTarget>>;
+    try {
+      resolved = await resolveRecordingTarget(doc, minioTargetFromConfig());
+    } catch (err) {
+      fastify.log.warn({ err, id: doc._id }, 'DELETE /api/v1/recordings/:id — storage target resolution failed');
+      return reply.status(502).send({
+        error: 'Could not reach the recording\'s storage',
+        reason: 'storage-failed',
+        statusCode: 502,
+      });
+    }
+    if ('reason' in resolved) {
+      return reply.status(409).send({
+        error: 'The recording\'s storage target cannot be resolved; the recording was not deleted',
+        reason: resolved.reason,
+        statusCode: 409,
+      });
+    }
+    const { target } = resolved;
+
+    try {
+      await deleteObject(target, doc.key);
+    } catch (err) {
+      // The S3 error text can carry the response body: log it, never echo it.
+      if (err instanceof S3AuthError) {
+        fastify.log.warn(
+          { id: doc._id, bucket: target.bucket, key: doc.key, code: err.code },
+          'DELETE /api/v1/recordings/:id — storage denied the delete',
+        );
+        return reply.status(502).send({
+          error: 'The storage rejected the delete for this key',
+          reason: 'storage-denied',
+          statusCode: 502,
+        });
+      }
+      fastify.log.warn(
+        { err, id: doc._id, bucket: target.bucket, key: doc.key },
+        'DELETE /api/v1/recordings/:id — object delete failed',
+      );
+      return reply.status(502).send({
+        error: 'The storage failed to delete the recording',
+        reason: 'storage-failed',
+        statusCode: 502,
+      });
+    }
+
+    try {
+      await getRecordingsDb().destroy(doc._id, doc._rev!);
+    } catch (err) {
+      fastify.log.warn({ err, id: doc._id }, 'DELETE /api/v1/recordings/:id — DB delete failed after object delete');
+      return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
+    }
+
+    fastify.log.info({ id: doc._id, bucket: target.bucket, key: doc.key }, 'recording deleted');
+    return reply.status(204).send();
   });
 };
 
