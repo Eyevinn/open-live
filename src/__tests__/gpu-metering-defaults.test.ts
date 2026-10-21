@@ -241,7 +241,7 @@ describe('config + gate wiring', () => {
     const usage = await import('../services/gpu-usage.js');
     expect((await usage.buildGpuUsageResponse({}, log)).hours).toEqual([]);
     const metrics = await usage.buildPrometheusMetrics(log);
-    expect(metrics).not.toMatch(/^osc_gpu_seconds_total\{/m);
-    expect(metrics).not.toMatch(/^osc_gpu_active\{/m);
+    // No osc_gpu_* sample of any family (HELP/TYPE comment lines start with '#').
+    expect(metrics).not.toMatch(/^osc_gpu_/m);
   });
 });
