@@ -1,7 +1,7 @@
 import type { FastifyBaseLogger, FastifyPluginAsync } from 'fastify';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
-import { getDb, getOutputsDb, getRecordingsDb } from '../db/index.js';
+import { getDb, getOutputsDb, getRecordingsDb, getSourcesDb } from '../db/index.js';
 import { sweepGuestsOnProductionEnd } from '../services/guest-sweep.js';
 import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc, RecordingDoc, ActiveRecording, RecordingUploadSummary } from '../db/types.js';
 import { StromClient, StromClientError } from '../lib/strom.js';
@@ -9,6 +9,8 @@ import { getStromToken } from '../lib/strom-token.js';
 import { stromBrowserBaseUrl } from '../lib/strom-public-url.js';
 import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js';
 import { expandToStoredPadIndex } from '../lib/mixer-input-map.js';
+import { VIRTUAL_SOURCES } from '../lib/audio-channels.js';
+import { PREVIEW_STREAM_TYPES } from '../lib/commentator-preview.js';
 import { setTally, broadcast, getSubscriberCount, getWatcherCount } from '../services/tally.service.js';
 import { clearProductionPflState } from '../services/pfl-state.js';
 import { clearPipState, clearAudioState, clearFxState, clearClipStateForProduction, reinitConnectedControllers } from '../ws/controller.js';
@@ -230,6 +232,7 @@ function deactivatedDoc(
     whepOutputUrls: undefined,
     returnBuses: undefined,
     returnWhepUrls: undefined,
+    previewWhepUrls: undefined,
     intercomProductionId: undefined,
     tally: { pgm: null, pvw: null },
     updatedAt: new Date().toISOString(),
@@ -749,6 +752,16 @@ async function runActivationFlow(
               }))
             : undefined;
 
+        // Commentator preview WHEP endpoints — same shape and server-side-only
+        // use as returnWhepUrls (the preview routes derive the Strom target from
+        // these). Written unconditionally so a source unmarked since the last
+        // activation never keeps a stale preview URL.
+        const previewWhepUrls = activation.previewWhepEntries.map(({ mixerInput, endpointId }) => ({
+          mixerInput,
+          url: `${config.stromUrl}/whep/${endpointId}`,
+          endpointId,
+        }));
+
         await updateProductionDoc(productionId, {
           status: 'active',
           // Shared-GPU accrual start (issue #500): the flow has reached 'playing',
@@ -762,6 +775,7 @@ async function runActivationFlow(
           srtOutputUri: undefined,
           whepOutputUrls: whepOutputUrls && whepOutputUrls.length > 0 ? whepOutputUrls : undefined,
           ...(returnWhepUrls && returnWhepUrls.length > 0 && { returnWhepUrls }),
+          previewWhepUrls: previewWhepUrls.length > 0 ? previewWhepUrls : undefined,
           ...(activation.returnBuses.length > 0 && { returnBuses: activation.returnBuses }),
           tally: initialTally,
           ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
@@ -951,6 +965,13 @@ const SourceAssignmentInput = z.object({
   sourceId: z.string().min(1).max(128),
   mixerInput: mixerInputSchema,
   returnFeed: ReturnFeedInput,
+  /**
+   * Opt-in commentator preview (`docs/specs/guest-calling-intercom.md`
+   * §"Commentator preview"): an undelayed WHEP output of this source, before
+   * its time offsets, built at activation. SRT, EFP and clip sources only —
+   * any other source kind is rejected with 400.
+   */
+  commentatorPreview: z.boolean().optional(),
 });
 
 const GraphicAssignmentInput = z.object({
@@ -1304,7 +1325,30 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       ...(body.returnFeed
         ? { returnFeed: { synced: body.returnFeed.synced, lowLatency: false as const } }
         : {}),
+      ...(body.commentatorPreview ? { commentatorPreview: true } : {}),
     };
+    // A commentator preview taps the source's raw input block, which only SRT,
+    // EFP and clip inputs have (PREVIEW_STREAM_TYPES) — reject it on any other
+    // source kind (WHIP guest slots, HTML, test patterns) rather than silently
+    // building nothing at activation.
+    if (body.commentatorPreview) {
+      let streamType: string | undefined = VIRTUAL_SOURCES[body.sourceId]?.streamType;
+      if (!streamType) {
+        try {
+          streamType = (await getSourcesDb().get(body.sourceId)).streamType;
+        } catch (err) {
+          if ((err as { statusCode?: number }).statusCode !== 404) {
+            return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
+          }
+        }
+      }
+      if (!streamType || !PREVIEW_STREAM_TYPES.has(streamType)) {
+        return reply.status(400).send({
+          error: 'commentatorPreview is only supported on SRT, EFP and clip sources',
+          statusCode: 400,
+        });
+      }
+    }
     for (let attempt = 0; attempt < MAX_DB_WRITE_RETRIES; attempt++) {
       try {
         const doc = await getDb().get(req.params.id);

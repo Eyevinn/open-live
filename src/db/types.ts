@@ -512,6 +512,16 @@ export interface GuestSessionDoc {
    * caller-supplied :sessionId for another guest's feed.
    */
   returnWhepSessionId?: string;
+  /**
+   * Strom WHEP session ids of this guest's commentator preview feeds, keyed by
+   * the previewed source's mixerInput. Bound on
+   * `POST /api/v1/guests/:inviteId/previews/:mixerInput/whep` so the matching
+   * DELETE can verify the guest tears down only THEIR OWN preview session
+   * (same binding as `returnWhepSessionId`, issue #380). Kept separate from
+   * the return binding because a commentator may watch the return and one or
+   * more previews at the same time.
+   */
+  previewWhepSessionIds?: Record<string, string>;
   createdAt: string;
   updatedAt: string;
 }
@@ -739,6 +749,16 @@ export interface ProductionSourceAssignment {
    * v1 accepts `lowLatency: false` only.
    */
   returnFeed?: { synced: 'program' | 'program-minus'; lowLatency?: boolean };
+  /**
+   * Opt-in commentator preview (`docs/specs/guest-calling-intercom.md`
+   * §"Commentator preview"). When true, activation adds a WHEP output fed
+   * straight from this source's input block — video plus the source's own
+   * audio, BEFORE its time_offset blocks and outside the mixer — so a remote
+   * commentator can watch the source undelayed while the operator offsets it
+   * to sync commentary and picture. Costs one extra encode per marked source.
+   * Honoured for SRT, EFP and clip sources only; absent = no preview.
+   */
+  commentatorPreview?: boolean;
 }
 
 /**
@@ -938,6 +958,13 @@ export interface ProductionDoc {
   returnBuses?: Array<{ mixerInput: string; auxBus: number; ownChannel: number; mode: 'program' | 'program-minus' }>;
   /** Per-guest return WHEP output URLs — set when flow reaches 'playing', cleared on deactivate */
   returnWhepUrls?: Array<{ mixerInput: string; url: string; endpointId: string }>;
+  /**
+   * Commentator preview WHEP output URLs (internal Strom URLs), one per source
+   * assignment with `commentatorPreview: true` — set when flow reaches
+   * 'playing', cleared on deactivate. The preview REST routes derive the
+   * server-scoped Strom target from these (never `/whep-proxy?target=`).
+   */
+  previewWhepUrls?: Array<{ mixerInput: string; url: string; endpointId: string }>;
   /**
    * Open Intercom production/line grouping id — set when guest calling is
    * enabled for this production (epic #208, issue #299,

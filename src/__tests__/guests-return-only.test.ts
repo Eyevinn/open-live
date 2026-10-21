@@ -154,10 +154,10 @@ describe('GET /api/v1/guests/:inviteId/slot', () => {
 
     const a = await app.inject({ method: 'GET', url: `/api/v1/guests/${srt.id}/slot`, headers: guest(srt.token) });
     expect(a.statusCode).toBe(200);
-    expect(a.json()).toEqual({ mixerInput: 'video_in_1', returnOnly: true });
+    expect(a.json()).toEqual({ mixerInput: 'video_in_1', returnOnly: true, previews: [] });
 
     const b = await app.inject({ method: 'GET', url: `/api/v1/guests/${whip.id}/slot`, headers: guest(whip.token) });
-    expect(b.json()).toEqual({ mixerInput: 'video_in_0', returnOnly: false });
+    expect(b.json()).toEqual({ mixerInput: 'video_in_0', returnOnly: false, previews: [] });
 
     expect(sessionsStore.size).toBe(0);
   });
