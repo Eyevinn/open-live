@@ -134,7 +134,7 @@ function sessionToApi(doc: GuestSessionDoc) {
 /**
  * Broadcast a GUEST_STATE lifecycle event to a production's controller
  * subscribers (epic #208, issue #301). Emitted on the persisted transitions
- * (`joined` on join, `left` on leave/kick). previewing/on-air are derived on
+ * (`joined` on join, `left` on leave/kick/revoke). previewing/on-air are derived on
  * the WS controller connect snapshot from the live tally, not re-derived here.
  */
 function broadcastGuestState(session: GuestSessionDoc, label?: string): void {
@@ -148,6 +148,45 @@ function broadcastGuestState(session: GuestSessionDoc, label?: string): void {
     muted: !!session.muted,
     ...(label ? { label } : {}),
     ...(session.intercomLineId ? { intercomLine: session.intercomLineId } : {}),
+  });
+}
+
+/**
+ * Broadcast `GUEST_STATE` `left` (no label) for a revoked invite's slot so every
+ * operator client reverts the strip live — Studio's handler re-fetches `/audio`
+ * on any GUEST_STATE, and `/audio` now resolves the slot to "Guest N" because
+ * the invite is gone (issue #561). One event per live session of the invite
+ * (`guestId` = session id, so Studio drops the right guest row); when the invite
+ * had no live session, one event keyed by the invite id still carries the slot's
+ * `mixerInput` so the strip refreshes. Skipped only when no slot is known (an
+ * unpinned invite nobody redeemed). Never throws — the invite is already revoked.
+ */
+async function broadcastInviteRevoked(
+  invite: GuestInviteDoc,
+  log: FastifyBaseLogger,
+): Promise<void> {
+  let live: GuestSessionDoc[] = [];
+  try {
+    const result = await getGuestSessionsDb().find({
+      selector: { type: 'guest-session', inviteId: invite._id },
+    });
+    live = (Array.isArray(result?.docs) ? result.docs : []).filter((s) => s.state !== 'left');
+  } catch (err) {
+    log.warn({ err }, 'DELETE guests/invites — guest-session lookup failed; broadcasting by invite');
+  }
+  if (live.length > 0) {
+    for (const session of live) {
+      broadcastGuestState({ ...session, state: 'left' });
+    }
+    return;
+  }
+  if (!invite.mixerInput) return;
+  broadcast(invite.productionId, {
+    type: 'GUEST_STATE',
+    guestId: invite._id,
+    mixerInput: invite.mixerInput,
+    state: 'left',
+    muted: false,
   });
 }
 
@@ -418,6 +457,10 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
       // named on air, nor leave a frozen last frame. Best-effort — the invite is
       // already revoked and the DELETE must not fail over a cosmetic label/picture.
       await resetGuestSlot(doc.productionId, doc.mixerInput, fastify.log);
+      // Tell every connected controller the slot is free (issue #561). Without
+      // this only the client that issued the DELETE re-fetched `/audio`; every
+      // other operator kept the revoked guest's name on the audio strip.
+      await broadcastInviteRevoked(doc, fastify.log);
       return reply.status(204).send();
     },
   );
