@@ -97,6 +97,20 @@ vi.mock('../ws/controller.js', () => ({
   applyReturnMode: (...args: unknown[]) => applyReturnModeMock(...args),
 }));
 
+// Spy on the tally broadcast bus (keeping its real behaviour) so revocation can
+// assert the GUEST_STATE it emits to controller subscribers (issue #561).
+const broadcasts: Array<{ productionId: string; message: Record<string, unknown> }> = [];
+vi.mock('../services/tally.service.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../services/tally.service.js')>();
+  return {
+    ...actual,
+    broadcast: (productionId: string, message: Record<string, unknown>) => {
+      broadcasts.push({ productionId, message });
+      actual.broadcast(productionId, message);
+    },
+  };
+});
+
 const AUTH = { authorization: `Bearer ${TEST_API_KEY}` };
 
 let app: FastifyInstance;
@@ -145,6 +159,7 @@ beforeEach(() => {
   sessionsStore.clear();
   productionsStore.clear();
   applyReturnModeMock.mockClear();
+  broadcasts.length = 0;
 });
 
 describe('POST /api/v1/productions/:id/guests/invites', () => {
@@ -410,6 +425,91 @@ describe('guest management + revocation', () => {
     });
     expect(ok.statusCode).toBe(204);
     expect(invitesStore.has(invite.id)).toBe(false);
+  });
+
+  const guestStates = () =>
+    broadcasts.filter((b) => b.message['type'] === 'GUEST_STATE');
+
+  // These tests seed any live session straight into the store rather than via
+  // POST .../join: the join route is rate-limited per client (10/min), which
+  // this suite already approaches.
+  async function createInvite(mixerInput: string, label?: string) {
+    seedProduction();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/productions/prod-1/guests/invites',
+      headers: AUTH,
+      payload: { mixerInput, ...(label ? { label } : {}) },
+    });
+    return res.json() as { id: string };
+  }
+
+  it('broadcasts GUEST_STATE left (no label) for the live session when an invite is revoked (#561)', async () => {
+    const invite = await createInvite('video_in_0', 'Alice');
+    const guestId = 'guest-session-revoked';
+    sessionsStore.set(guestId, {
+      _id: guestId,
+      _rev: '1-x',
+      type: 'guest-session',
+      productionId: 'prod-1',
+      inviteId: invite.id,
+      mixerInput: 'video_in_0',
+      state: 'joined',
+      createdAt: '',
+      updatedAt: '',
+    });
+    broadcasts.length = 0;
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/productions/prod-1/guests/invites/${invite.id}`,
+      headers: AUTH,
+    });
+    expect(res.statusCode).toBe(204);
+    const events = guestStates();
+    expect(events).toHaveLength(1);
+    expect(events[0]!.productionId).toBe('prod-1');
+    expect(events[0]!.message).toMatchObject({
+      type: 'GUEST_STATE',
+      guestId,
+      mixerInput: 'video_in_0',
+      state: 'left',
+    });
+    expect(events[0]!.message).not.toHaveProperty('label');
+  });
+
+  it('still broadcasts GUEST_STATE left with the slot mixerInput when the revoked invite had no session (#561)', async () => {
+    const invite = await createInvite('video_in_2', 'Alice');
+    broadcasts.length = 0;
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/productions/prod-1/guests/invites/${invite.id}`,
+      headers: AUTH,
+    });
+    expect(res.statusCode).toBe(204);
+    const events = guestStates();
+    expect(events).toHaveLength(1);
+    expect(events[0]!.productionId).toBe('prod-1');
+    expect(events[0]!.message).toMatchObject({
+      type: 'GUEST_STATE',
+      guestId: invite.id,
+      mixerInput: 'video_in_2',
+      state: 'left',
+      muted: false,
+    });
+    expect(events[0]!.message).not.toHaveProperty('label');
+  });
+
+  it('does not broadcast when the revoke is refused for a mismatched production (#561)', async () => {
+    const invite = await createInvite('video_in_0');
+    seedProduction('prod-2');
+    broadcasts.length = 0;
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/productions/prod-2/guests/invites/${invite.id}`,
+      headers: AUTH,
+    });
+    expect(res.statusCode).toBe(403);
+    expect(guestStates()).toHaveLength(0);
   });
 });
 
