@@ -78,6 +78,9 @@ GET /api/v1/recordings                (optional: list across all productions)
 GET /api/v1/recordings/:id
   200 → RecordingAsset
   404 → { error: 'Recording not found' }
+
+DELETE /api/v1/recordings/:id         (#550, see "Deleting a recording" below)
+  204 | 404 | 409 { reason } | 502 { reason } | 503
 ```
 
 `playbackUrl` is either a presigned GET URL (when the bucket is private) or a public URL (when
@@ -122,6 +125,32 @@ Amendment for recording end to end from Studio (issue #534). All changes are add
   `upload-error`. Files that failed stay on Strom for the next sweep. No secrets or presigned
   URLs are stored.
 
+### Deleting a recording (#550)
+
+```
+DELETE /api/v1/recordings/:id
+  204 → (no body)  object deleted (or already gone) and RecordingDoc removed
+  404 → { error: 'Recording not found' }
+  409 → { error, reason }  reason ∈ connection-missing | connection-no-bucket | storage-not-configured | bucket-mismatch
+  502 → { error, reason }  reason ∈ storage-denied (403 / auth error) | storage-failed (any other store error)
+  503 → { error: 'Database unavailable' }
+```
+
+- The storage target is resolved exactly as for playback (`resolveRecordingTarget`, shared with
+  `presignRecording`): the recording's `connectionId` + stored bucket, or the `MINIO_*` default
+  when the stored bucket matches `MINIO_BUCKET`. An unresolvable target is refused with 409, the
+  same reason names as `playbackUnavailable`; there is no "remove from list only" in v1.
+- The object is deleted first with a signed DeleteObject (`deleteObject` in
+  `recording-uploader.ts`). A 2xx or a 404 `NoSuchKey` counts as done, so the delete is
+  idempotent; a 404 `NoSuchBucket` is a `storage-failed` (the target may be misconfigured).
+- Then the `RecordingDoc` is destroyed. If that fails the route returns 503 and the retry
+  succeeds, because the object delete is idempotent. Every error leaves the `RecordingDoc` in
+  place.
+- 502 bodies carry a short message only: no S3 response body, credentials or URLs.
+- On success the id, bucket and key are logged at info level.
+- Not in scope: bulk delete, retention, undo, deleting older versions in a versioned bucket
+  (DeleteObject only adds a delete marker there).
+
 ### Error codes
 
 | Code | Condition |
@@ -129,7 +158,8 @@ Amendment for recording end to end from Studio (issue #534). All changes are add
 | 400  | invalid body (zod) |
 | 401  | missing/invalid `API_KEY` bearer (when configured) |
 | 404  | production or recording not found |
-| 409  | recording output already assigned / active conflict |
+| 409  | recording output already assigned / active conflict; recording delete with an unresolvable storage target (#550) |
+| 502  | recording delete refused (`storage-denied`) or failed (`storage-failed`) by the object store (#550) |
 | 503  | CouchDB unreachable (the recordings routes no longer 503 on a missing `MINIO_*` env, #534) |
 
 ## Data Model
@@ -228,6 +258,7 @@ Added to `src/config.ts` (same `process.env` + optional-fallback style used ther
 | `MINIO_USE_SSL` | no | `true` | TLS to endpoint |
 | `RECORDING_KEY_PREFIX` | no | `""` | Optional prefix for all recording keys |
 | `RECORDING_PRESIGN_TTL_S` | no | `3600` | Presigned playback URL TTL |
+| `RECORDING_SEGMENT_SECS` | no | `600` | Length of each recording part in seconds (Strom recorder `max_size_time_secs`); `0` = one file per activation; integer 0-86400 (#553) |
 
 When the MinIO vars are unset, the `recording` output type is rejected at assignment time with
 `400` (recording disabled) so the feature degrades cleanly, matching how the service already
@@ -248,6 +279,12 @@ tolerates optional config (`STROM_URL`, `API_KEY`, etc.).
 4. **Segmentation & final container:** single object per session vs segmented (using
    `recorder.splitNow`), and the container/codec written (bearing on whether the VOD is directly
    web-playable — relates to the CMAF discussion in #171).
+   **Decided (#551 / #553):** time-based parts. The flow generator sets the Strom recorder's
+   `max_size_time_secs` from `RECORDING_SEGMENT_SECS`, default 600 (10 minutes), so a session
+   becomes consecutive `{filename_prefix}_{timestamp}_%05d.mp4` files. Each part is uploaded and
+   listed as its own `RecordingDoc`; there is no concatenation into one object in v1.
+   `RECORDING_SEGMENT_SECS=0` leaves the property unset (one file per activation, the earlier
+   behaviour). Upload still happens at deactivate.
 5. **Retention:** does `open-live` own lifecycle/expiry, or is that left to the bucket policy?
 
 ## Risks
