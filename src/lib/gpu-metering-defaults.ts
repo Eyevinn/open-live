@@ -1,11 +1,13 @@
 /**
  * Platform-hosted Strom detection and default shared-GPU metering
- * (issue #537, part of #526; ADR-005, docs/specs/shared-gpu-usage-metering.md).
+ * (issues #537 and #547, part of #526; ADR-005 Amendments 1 and 2,
+ * docs/specs/shared-gpu-usage-metering.md).
  *
  * An OSC-managed Open Live instance pointed at the platform's shared Strom is
- * metered by default, with no `GPU_POOL` set on the instance, once the platform
- * switch below is on. Everything else (self-hosted, bring-your-own Strom, a
- * tenant's own Strom instance on OSC) stays at zero (open-live#500 AC5).
+ * always metered, with no `GPU_POOL` set on the instance. There is no switch:
+ * nothing a tenant or an operator sets on the instance turns it off (#547).
+ * Everything else (self-hosted, bring-your-own Strom, a tenant's own Strom
+ * instance on OSC, the alternate Strom) stays at zero (open-live#500 AC5).
  *
  * Two signals are required, and neither can be set by a tenant to opt out:
  * - OSC-managed: `OSC_HOSTNAME` is non-empty. It is injected by
@@ -18,25 +20,15 @@
  *   instance domain: a tenant's own Strom lives under a multi-label service
  *   domain and must not match.
  *
- * Explicit `GPU_POOL` / `GPU_CLASS` env values always override the defaults,
- * and `GPU_POOL` alone still enables metering anywhere (the existing opt-in).
- * There is deliberately no tenant off switch.
+ * `GPU_POOL` is internal operator/test configuration: it overrides the pool
+ * label and enables metering anywhere (e.g. a non-platform test instance). It
+ * can never turn metering off. On a platform-hosted Strom the class is always
+ * `shared` (#547): `GPU_CLASS` is ignored there, so it cannot stop the charge.
+ * Off a platform match, `GPU_CLASS` stays a dashboard label.
  *
  * This module is pure (no env reads): `src/config.ts` reads the env and calls
  * {@link resolveGpuMetering}.
  */
-
-/**
- * Platform switch for default metering. Shipped `false`: with it off, metering
- * and the zero-balance start gate stay on only where `GPU_POOL` is set, so
- * merging this changes nothing on any managed instance.
- *
- * DO NOT CHANGE in any PR other than the human flip PR that is step 2a of
- * Eyevinn/open-live-site#205 (opened and merged by a person, never by
- * automation). Flipping it starts production-hour charging and zero-balance
- * gating on every managed shared-Strom instance at its next restart.
- */
-export const PLATFORM_DEFAULT_METERING_ENABLED = false;
 
 /** Host of a platform-hosted shared Strom box: one label directly under `osaas.io`. */
 export const PLATFORM_STROM_HOST_RE = /^strom-se-sto\d{2}\.osaas\.io$/i;
@@ -48,12 +40,10 @@ export const PLATFORM_STROM_HOST_RE = /^strom-se-sto\d{2}\.osaas\.io$/i;
  */
 export const PLATFORM_STROM_PORTS: readonly string[] = ['8080'];
 
-/** Class used for a platform-default match. */
+/** Class used, and forced, whenever `STROM_URL` is a platform-hosted shared Strom. */
 const PLATFORM_GPU_CLASS = 'shared';
 
 export interface ResolveGpuMeteringInput {
-  /** The platform switch; pass {@link PLATFORM_DEFAULT_METERING_ENABLED}. */
-  enabled: boolean;
   /** Trimmed `GPU_POOL` env value, or undefined when unset/empty. */
   gpuPoolEnv?: string;
   /** Trimmed `GPU_CLASS` env value, or undefined when unset/empty. */
@@ -97,14 +87,17 @@ export function platformStromPool(stromUrl: string | undefined): string | undefi
 /**
  * Resolve the metering pool/class for this instance. Returns undefined when
  * metering is off (no explicit `GPU_POOL` and no platform-default match).
+ *
+ * Whenever `stromUrl` is a platform-hosted shared Strom, the class is `shared`
+ * on both branches, whatever `GPU_CLASS` says (#547).
  */
 export function resolveGpuMetering(input: ResolveGpuMeteringInput): GpuMeteringResolution | undefined {
-  const { enabled, gpuPoolEnv, gpuClassEnv, oscHostname, stromUrl } = input;
+  const { gpuPoolEnv, gpuClassEnv, oscHostname, stromUrl } = input;
+  const platformPool = platformStromPool(stromUrl);
+  const gpuClass = platformPool ? PLATFORM_GPU_CLASS : (gpuClassEnv ?? PLATFORM_GPU_CLASS);
   if (gpuPoolEnv) {
-    return { pool: gpuPoolEnv, class: gpuClassEnv ?? PLATFORM_GPU_CLASS, source: 'env' };
+    return { pool: gpuPoolEnv, class: gpuClass, source: 'env' };
   }
-  if (!enabled || !oscHostname) return undefined;
-  const pool = platformStromPool(stromUrl);
-  if (!pool) return undefined;
-  return { pool, class: gpuClassEnv ?? PLATFORM_GPU_CLASS, source: 'platform-default' };
+  if (!oscHostname || !platformPool) return undefined;
+  return { pool: platformPool, class: gpuClass, source: 'platform-default' };
 }
