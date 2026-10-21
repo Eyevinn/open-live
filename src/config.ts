@@ -38,6 +38,20 @@ function parsePositiveIntEnv(name: string, defaultValue: number, max = Number.MA
   return value;
 }
 
+function parseNonNegativeIntEnv(name: string, defaultValue: number, max = Number.MAX_SAFE_INTEGER): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return defaultValue;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0 || value > max) {
+    const limit = max < Number.MAX_SAFE_INTEGER ? ` up to ${max}` : '';
+    throw new Error(`Environment variable ${name} must be a non-negative integer${limit}, got "${raw}"`);
+  }
+  return value;
+}
+
+/** Longest recording part `RECORDING_SEGMENT_SECS` accepts: 24 hours. */
+const MAX_RECORDING_SEGMENT_SECS = 86_400;
+
 /** Longest delay Node's timers accept; a larger one fires after 1 ms. */
 const MAX_TIMER_MS = 2 ** 31 - 1;
 
@@ -288,6 +302,14 @@ export const config = {
   minioUseSsl: parseBoolEnv('MINIO_USE_SSL', true),
   /** Optional prefix prepended to every recording object key. */
   recordingKeyPrefix: process.env['RECORDING_KEY_PREFIX'] ?? '',
+  /**
+   * Length in seconds of each recording part (issue #553). Sets Strom's recorder
+   * `max_size_time_secs`, so a session is cut into consecutive
+   * `{prefix}_{timestamp}_%05d.mp4` files that deactivate uploads one by one.
+   * `0` leaves the property unset: one file per activation. Must be an integer
+   * from 0 to 86400; startup fails otherwise.
+   */
+  recordingSegmentSecs: parseNonNegativeIntEnv('RECORDING_SEGMENT_SECS', 600, MAX_RECORDING_SEGMENT_SECS),
   // --- Storage connections (issue #520, OL-21, docs/specs/storage-connections.md, ADR-009) ---
   /**
    * SSRF allowlist for operator-supplied storage-connection endpoints (ADR-009

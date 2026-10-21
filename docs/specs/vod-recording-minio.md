@@ -228,6 +228,7 @@ Added to `src/config.ts` (same `process.env` + optional-fallback style used ther
 | `MINIO_USE_SSL` | no | `true` | TLS to endpoint |
 | `RECORDING_KEY_PREFIX` | no | `""` | Optional prefix for all recording keys |
 | `RECORDING_PRESIGN_TTL_S` | no | `3600` | Presigned playback URL TTL |
+| `RECORDING_SEGMENT_SECS` | no | `600` | Length of each recording part in seconds (Strom recorder `max_size_time_secs`); `0` = one file per activation; integer 0-86400 (#553) |
 
 When the MinIO vars are unset, the `recording` output type is rejected at assignment time with
 `400` (recording disabled) so the feature degrades cleanly, matching how the service already
@@ -248,6 +249,12 @@ tolerates optional config (`STROM_URL`, `API_KEY`, etc.).
 4. **Segmentation & final container:** single object per session vs segmented (using
    `recorder.splitNow`), and the container/codec written (bearing on whether the VOD is directly
    web-playable — relates to the CMAF discussion in #171).
+   **Decided (#551 / #553):** time-based parts. The flow generator sets the Strom recorder's
+   `max_size_time_secs` from `RECORDING_SEGMENT_SECS`, default 600 (10 minutes), so a session
+   becomes consecutive `{filename_prefix}_{timestamp}_%05d.mp4` files. Each part is uploaded and
+   listed as its own `RecordingDoc`; there is no concatenation into one object in v1.
+   `RECORDING_SEGMENT_SECS=0` leaves the property unset (one file per activation, the earlier
+   behaviour). Upload still happens at deactivate.
 5. **Retention:** does `open-live` own lifecycle/expiry, or is that left to the bucket policy?
 
 ## Risks
