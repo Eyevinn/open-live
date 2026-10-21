@@ -85,6 +85,12 @@ const sessionsDb = {
   })),
 };
 
+// The join's ICE-server lookup goes to Strom, not through the mocked fetch.
+vi.mock('../lib/ice-servers.js', () => ({
+  getIceServers: vi.fn().mockRejectedValue(new Error('Strom unreachable')),
+  resetIceServersCache: vi.fn(),
+}));
+
 vi.mock('../db/index.js', () => ({
   getDb: () => prodDb,
   getGuestInvitesDb: () => invitesDb,
