@@ -129,8 +129,7 @@ in Open Live itself; the service definition is not changed.
 
 ### Decision
 
-1. **Switch constant.** *(Superseded by Amendment 2, 2026-10-20: the constant was removed.)* The
-   switch constant (named in Amendment 2) in `src/lib/gpu-metering-defaults.ts` was
+1. **Switch constant.** `PLATFORM_DEFAULT_METERING_ENABLED` in `src/lib/gpu-metering-defaults.ts` is
    a code constant (not env, not a service option, not tenant-settable). It ships `false`, so
    merging the mechanism changed nothing on any managed instance. Only the human flip PR in
    Eyevinn/open-live-site#205 step 2a may set it to `true`; that flip starts production-hour
