@@ -458,3 +458,15 @@ following top-level box headers and keeping only `moov` (capped at `MOOV_MAX_BYT
 it reports no duration). Strom's media download has no Range support, so the file can only be read
 once, front to back. `new Uint8Array(buffer)` copies; `signedS3Request` passes a view
 (`new Uint8Array(buf.buffer, buf.byteOffset, buf.length)`) so a part is not duplicated in memory.
+
+## Every guest-ending path must broadcast `GUEST_STATE` — including invite revoke
+
+Studio re-fetches `GET /audio` for the authoritative strip label on every `GUEST_STATE`, and
+nothing else tells the *other* connected operator clients that a slot was freed. Leave and kick
+broadcast `left`; revoking an invite (`DELETE .../guests/invites/:inviteId`) did not, so only the
+revoking client reverted its strip (issue #561). Revoke now broadcasts `left` with no `label` per
+live session of the invite, or — when nobody had joined — one event keyed by the invite id that
+still carries the pinned `mixerInput`. A new guest-ending path needs the same broadcast. In
+`guests-routes.test.ts`, seed sessions straight into `sessionsStore` instead of calling
+`POST /guests/:inviteId/join`: that route is rate-limited to 10/min per client and the suite is
+already close to the limit, so extra joins fail with 429 and an undefined `guestId`.
