@@ -318,6 +318,27 @@ export async function putObject(
 }
 
 /**
+ * Deletes one object via a SigV4-signed DeleteObject (issue #550). Idempotent:
+ * a 2xx (S3 answers 204 even for a missing key) and a 404 `NoSuchKey` both
+ * count as done, so a retry after a partial failure succeeds. A 404 for a
+ * missing bucket (`NoSuchBucket`) is not treated as done — the target may be
+ * misconfigured, and the object may still exist elsewhere. Throws
+ * `S3AuthError` when the store rejects the key (401/403 or an auth code), else
+ * `Error` for any other failure. Error messages may carry the S3 response
+ * body; callers must not echo them to API clients.
+ */
+export async function deleteObject(target: MinioTarget, key: string, now: Date = new Date()): Promise<void> {
+  const res = await signedS3Request(target, 'DELETE', key, { now });
+  if (res.status === 404) {
+    const text = await res.text().catch(() => '');
+    if (!text.includes('NoSuchBucket')) return;
+    throw new Error(`S3 DeleteObject ${key} failed: 404 ${text.slice(0, 200)}`);
+  }
+  await assertS3Ok(res, `DeleteObject ${key}`);
+  await res.text().catch(() => undefined);
+}
+
+/**
  * Size of each multipart part, and the threshold above which an object is
  * uploaded multipart instead of with a single PutObject (issue #548). The OSC
  * Silo ingress rejects request bodies over ~64 MiB with 413, so parts stay
