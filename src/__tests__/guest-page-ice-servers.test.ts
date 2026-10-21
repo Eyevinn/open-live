@@ -127,8 +127,8 @@ function runPage(script: string, opts: PageOpts = {}) {
       // a TURN URL without a username and credential an InvalidAccessError.
       for (const server of config?.iceServers ?? []) {
         for (const url of ([] as string[]).concat(server.urls)) {
-          if (!/^(stuns?|turns?):/.test(url)) throw Object.assign(new Error(`bad ICE url ${url}`), { name: 'SyntaxError' });
-          if (/^turns?:/.test(url) && (server.username === undefined || server.credential === undefined)) {
+          if (!/^(stuns?|turns?):/i.test(url)) throw Object.assign(new Error(`bad ICE url ${url}`), { name: 'SyntaxError' });
+          if (/^turns?:/i.test(url) && (server.username === undefined || server.credential === undefined)) {
             throw Object.assign(new Error(`no credentials for ${url}`), { name: 'InvalidAccessError' });
           }
         }
@@ -257,6 +257,14 @@ describe('guest page ICE servers', () => {
     expect(page.els['banner']!.className).toBe('live');
   });
 
+  it('drops an uppercase TURN entry without credentials, as the browser parses the scheme case-insensitively', async () => {
+    const page = await goLive({
+      iceServers: [{ urls: 'stun:stun.example.com:3478' }, { urls: 'TURN:turn.example.com:3478' }],
+    });
+    expect(page.publishPc()!.config).toEqual({ iceServers: [{ urls: 'stun:stun.example.com:3478' }] });
+    expect(page.published()).toBe(true);
+  });
+
   it('falls back to its STUN server when the browser rejects the list, and goes live', async () => {
     const page = await goLive({ iceServers: [{ urls: 'bogus:turn.example.com' }] });
     expect(page.publishPc()!.config).toEqual({ iceServers: [STUN] });
@@ -270,6 +278,12 @@ describe('guest page ICE servers', () => {
       expect(withTurn.published()).toBe(true);
       expect(withTurn.delays).toContain(6000);
     }
+
+    const upperTurn = await goLive({
+      iceServers: [{ urls: 'TURN:turn.example.com:3478', username: 'u', credential: 'p' }],
+      gathering: 'gathering',
+    });
+    expect(upperTurn.delays).toContain(6000);
 
     const stunOnly = await goLive({ gathering: 'gathering' });
     expect(stunOnly.published()).toBe(true);
