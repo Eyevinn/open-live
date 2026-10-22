@@ -68,10 +68,10 @@ const relayRefs = (id: string) => {
   return relayRefCounts.get(id)!;
 };
 vi.mock('../services/meter-relay.js', () => ({
-  startMeterRelay: (id: string) => { relayRefs(id).meter++; },
+  startMeterRelay: (id: string) => { relayRefs(id).meter++; return 1; },
   stopMeterRelay: (id: string) => { if (relayRefs(id).meter > 0) relayRefs(id).meter--; },
   forceStopMeterRelay: (id: string) => { relayRefs(id).meter = 0; },
-  reconcileMeterRelay: (id: string, _flow: string, _block: string, _loud: unknown, count: number) => { if (count > 0) relayRefs(id).meter = count; },
+  reconcileMeterRelay: (id: string, _flow: string, _block: string, _loud: unknown, count: number) => { if (count <= 0) return undefined; relayRefs(id).meter = count; return 1; },
 }));
 vi.mock('../services/clip-relay.js', () => ({
   startClipRelay: (id: string) => { relayRefs(id).clip++; },
@@ -385,17 +385,36 @@ describe('watch-only controller connection', () => {
     operator.ws.close();
   });
 
-  it('does not re-init on reactivation when only watchers are connected', async () => {
+  it('does not re-init on reactivation when only watchers are connected, but keeps their meters', async () => {
     const id = 'prod-watch-reinit';
+    // Connects before the production has a flow, so the connect itself holds no relay refs.
+    productionDocs.set(id, makeProductionDoc(id, { stromFlowId: undefined }));
+    await startApp();
+
+    const watcher = await connect(id, '?mode=watch');
+    expect(relayRefs(id)).toEqual({ meter: 0, clip: 0 });
+
+    productionDocs.set(id, makeProductionDoc(id, { clipPlayerBlockIds: { clip1: 'b-clip-0' } }));
+    await reinitConnectedControllers(id);
+    expect(audioInitWrites()).toHaveLength(0);
+    expect(relayRefs(id)).toEqual({ meter: 1, clip: 0 });
+
+    watcher.ws.close();
+    await waitFor(() => relayRefs(id).meter === 0);
+  });
+
+  it('holds a meter relay ref while only a watcher is connected', async () => {
+    const id = 'prod-watch-meters';
     productionDocs.set(id, makeProductionDoc(id, { clipPlayerBlockIds: { clip1: 'b-clip-0' } }));
     await startApp();
 
     const watcher = await connect(id, '?mode=watch');
-    clearAudioState(id); // deactivate
-    await reinitConnectedControllers(id);
+    await waitFor(() => relayRefs(id).meter === 1);
+    expect(relayRefs(id)).toEqual({ meter: 1, clip: 0 });
     expect(audioInitWrites()).toHaveLength(0);
-    expect(relayRefs(id)).toEqual({ meter: 0, clip: 0 });
+
     watcher.ws.close();
+    await waitFor(() => relayRefs(id).meter === 0);
   });
 
   it('releases relay refs that reactivation took for an operator that stayed open', async () => {
@@ -410,15 +429,16 @@ describe('watch-only controller connection', () => {
 
     productionDocs.set(id, makeProductionDoc(id, { clipPlayerBlockIds: { clip1: 'b-clip-0' } }));
     await reinitConnectedControllers(id);
-    expect(relayRefs(id)).toEqual({ meter: 1, clip: 1 });
+    expect(relayRefs(id)).toEqual({ meter: 2, clip: 1 });
     // A second pass on the same flow does not take another ref.
     await reinitConnectedControllers(id);
-    expect(relayRefs(id)).toEqual({ meter: 1, clip: 1 });
+    expect(relayRefs(id)).toEqual({ meter: 2, clip: 1 });
 
     operator.ws.close();
     await waitFor(() => getSubscriberCount(id) === 0);
-    expect(relayRefs(id)).toEqual({ meter: 0, clip: 0 });
+    expect(relayRefs(id)).toEqual({ meter: 1, clip: 0 });
     watcher.ws.close();
+    await waitFor(() => relayRefs(id).meter === 0);
   });
 
   it('a watcher closing does not release the operator\'s relay refs', async () => {

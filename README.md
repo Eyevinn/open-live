@@ -235,6 +235,28 @@ deployments should use `STROM_AUTH_TOKEN`.)
 
 Leave `STROM_AUTH_TOKEN` unset when running Strom locally without authentication.
 
+### Guests and TURN
+
+Browsers get their ICE servers from Strom's `STROM_SERVER_ICE_SERVERS`: the
+studio through `GET /api/v1/ice-servers`, and guests in their join response.
+A guest whose browser cannot reach Strom's own candidates (Strom behind NAT,
+or in Kubernetes without host networking) connects only through a TURN
+server on that list. A browser takes a TURN server only with a username and
+credential (`turn:user:pass@host` in Strom's list); the guest page leaves out
+a TURN entry without them. With a TURN server on the list, the page waits up
+to 6s for ICE gathering, so a guest who cannot reach it goes live that much
+later.
+
+A TURN server there with long-term credentials (`turn:user:pass@host`) hands
+those credentials to every guest who joins, and an invite link is a bearer
+token that travels through chat and email. Whoever holds a valid invite can
+use the TURN server to relay traffic, for as long as its credentials stay the
+same, after the invite has expired or been revoked. Limit that on the TURN
+server: let it relay only to Strom's addresses (coturn `denied-peer-ip` /
+`allowed-peer-ip`), cap allocations and bandwidth per user, and rotate the
+credentials. Strom cannot mint time-limited TURN credentials (the TURN REST
+API scheme, coturn `use-auth-secret`) yet.
+
 ## OSC deployment
 
 The app is deployed on [Open Source Cloud](https://www.osaas.io). Environment variables are injected at runtime via an OSC parameter store — no `.env` file is needed on the server.

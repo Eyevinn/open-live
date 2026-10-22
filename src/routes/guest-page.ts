@@ -181,10 +181,12 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     var inviteId = parts[parts.length - 1] || "";
     var token = (location.hash || "").replace(/^#/, "");
     var apiBase = location.origin;
-    // A public STUN server for srflx candidate discovery. TURN, when configured,
-    // is negotiated by the WHIP/WHEP server side; this only helps the browser
-    // find its own reflexive address behind NAT.
-    var ICE = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+    // The browser's ICE servers. The join response carries the deployment's
+    // (Strom's STROM_SERVER_ICE_SERVERS, TURN included), which a guest off the
+    // network needs to reach Strom; until then, or without them, a public STUN
+    // server for srflx candidate discovery.
+    var STUN_ONLY = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+    var ICE = STUN_ONLY;
 
     // ---- Elements ----------------------------------------------------------
     var banner = document.getElementById("banner");
@@ -532,6 +534,34 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     }
 
     // ---- WebRTC helpers ----------------------------------------------------
+    // False for an entry the browser would reject, failing the whole
+    // RTCPeerConnection: a TURN URL without a username and credential (Strom
+    // passes "turn:host:port" through without them).
+    function usableIceServer(server) {
+      var urls = [].concat(server.urls || []);
+      return urls.length > 0 && urls.every(function (u) {
+        return !/^turns?:/i.test(u) || (server.username && server.credential);
+      });
+    }
+
+    // A PeerConnection on the ICE servers, or on the STUN server alone if the
+    // browser rejects them, so a bad entry cannot stop the guest going live.
+    function newPeerConnection() {
+      try {
+        return new RTCPeerConnection(ICE);
+      } catch (e) {
+        ICE = STUN_ONLY;
+        return new RTCPeerConnection(ICE);
+      }
+    }
+
+    // True when the ICE servers include a TURN server.
+    function hasTurn() {
+      return ICE.iceServers.some(function (s) {
+        return [].concat(s.urls).some(function (u) { return /^turns?:/i.test(u); });
+      });
+    }
+
     function waitForIce(pc) {
       return new Promise(function (resolve) {
         if (pc.iceGatheringState === "complete") return resolve();
@@ -540,8 +570,10 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         pc.addEventListener("icegatheringstatechange", function () {
           if (pc.iceGatheringState === "complete") finish();
         });
-        // Don't wait forever for a TURN-less environment: cap gathering.
-        setTimeout(finish, 2000);
+        // Don't wait forever: cap gathering. A TURN allocation can take
+        // seconds, and a guest who needs the relay has no other candidate
+        // Strom can reach, so give it longer.
+        setTimeout(finish, hasTurn() ? 6000 : 2000);
       });
     }
 
@@ -611,7 +643,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     }
 
     function whipPublish(url, stream) {
-      var pc = new RTCPeerConnection(ICE);
+      var pc = newPeerConnection();
       senders = {};
       stream.getTracks().forEach(function (t) { senders[t.kind] = pc.addTrack(t, stream); });
       return pc.createOffer().then(function (offer) {
@@ -639,7 +671,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     // Open a recvonly WHEP session and hand its stream to onStream. Resolves
     // with { pc, resource } once the answer is applied.
     function whepPlay(url, withVideo, onStream) {
-      var pc = new RTCPeerConnection(ICE);
+      var pc = newPeerConnection();
       var resource = null;
       if (withVideo) pc.addTransceiver("video", { direction: "recvonly" });
       pc.addTransceiver("audio", { direction: "recvonly" });
@@ -849,6 +881,10 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         });
       }).then(function (data) {
         joinData = data;
+        // The deployment's ICE servers, for the return feeds as well as the
+        // publish, so a return-only slot gets TURN too.
+        var servers = (data.iceServers || []).filter(usableIceServer);
+        if (servers.length) ICE = { iceServers: servers };
         // No whipUrl: the slot is return-only (its source is not WHIP).
         if (!data.whipUrl) {
           closeCamera();

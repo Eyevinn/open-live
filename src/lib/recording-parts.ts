@@ -10,6 +10,30 @@ export interface PartTiming {
 /** `<stem>_<index>.<ext>`: Strom's recorder numbers a session's parts with `%05d`. */
 const PART_NAME = /^(.*)_(\d+)\.[^.]+$/;
 
+/** A recording part's session stem and part index, read from its file name or key. */
+export interface PartName {
+  stem: string;
+  index: number;
+}
+
+/**
+ * Splits `<stem>_<index>.<ext>` into its stem and part index (issue #556).
+ * Returns undefined for a name without a `_<digits>` suffix.
+ */
+export function parsePartName(name: string): PartName | undefined {
+  const m = PART_NAME.exec(name);
+  return m ? { stem: m[1], index: Number(m[2]) } : undefined;
+}
+
+/**
+ * Orders parts by session, then index. Strom stamps the session start into the
+ * stem as `YYYYmmdd_HHMMSS`, so a later session sorts after an earlier one.
+ */
+export function comparePartNames(a: PartName, b: PartName): number {
+  if (a.stem !== b.stem) return a.stem < b.stem ? -1 : 1;
+  return a.index - b.index;
+}
+
 /**
  * Per-part start and end times for uploaded recording parts (issue #553).
  *

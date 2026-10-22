@@ -1,7 +1,7 @@
 # ADR-005: Shared-GPU usage is metered on an allocation basis (wall-clock slot time), exposed as closed hourly buckets reusing the CDN metering pattern
 
 **Date**: 2026-10-13
-**Status**: Proposed (amended 2026-10-18, see Amendment 1)
+**Status**: Proposed (amended 2026-10-18, see Amendment 1; amended 2026-10-20, see Amendment 2)
 
 > Proposed at Phase-1 (architect). Awaiting the team-lead gate. The full spec is in
 > `docs/specs/shared-gpu-usage-metering.md` (issue #500). Two product-level Open Questions
@@ -188,3 +188,57 @@ ungated) until they do. BYO and self-hosted deployments are unaffected.
 - Superseded: the "Infer shared GPU from `STROM_AUTH_MODE=osc`" alternative above remains rejected,
   but its premise that the platform turns metering on by setting `GPU_POOL` no longer holds; the
   default rule above replaces it.
+
+## Amendment 2: no switch, platform-hosted charging is unconditional (2026-10-20)
+
+**Issue**: #547 (part of Eyevinn/open-live-site#198; replaces the "one-line flip PR" of
+Eyevinn/open-live-site#205 step 2a). This amendment supersedes **Amendment 1 decision 1 only**.
+Amendment 1 is not rewritten and its other decisions (rule, `:8080` only, accrual floor, one
+predicate) stand, except that decision 2's `GPU_CLASS` override no longer applies on a platform
+match (point 2 below).
+
+### Context
+
+Amendment 1 decision 1 added the code constant `PLATFORM_DEFAULT_METERING_ENABLED` (PR #538),
+shipped `false`, as a release gate for default metering. Product decision (svensson00, PM decision
+authority, 2026-10-20, #547): GPU time on the platform-hosted shared Strom is charged by default for
+every OSC-managed Open Live instance, and there is no setting that turns it off. The constant is
+history; it no longer exists in the code.
+
+### Decision
+
+1. **No switch.** The constant and the `enabled` input of `resolveGpuMetering` are removed. A
+   managed instance (`OSC_HOSTNAME` non-empty) whose `STROM_URL` matches the Amendment 1 rule
+   (`https`, no userinfo, host `^strom-se-sto\d{2}\.osaas\.io$`, port in
+   `PLATFORM_STROM_PORTS = ['8080']`) is always metered and gated by the zero-balance check from its
+   next restart onto the released image. Nothing a tenant or an operator sets on the instance turns
+   that off. Everything else stays at zero, as before.
+2. **Class forced to `shared` on a platform match.** Whenever `STROM_URL` is a platform match, the
+   resolved class is `shared` on both branches of `resolveGpuMetering` (the `platform-default`
+   branch and the explicit `GPU_POOL` `env` branch), whatever `GPU_CLASS` says. Otherwise a
+   non-`shared` class (only `shared` is metered to tokens) would be a way to stop the charge while
+   the meter still runs. Off a platform match, `GPU_CLASS` stays a dashboard label. This narrows the
+   override documented in Amendment 1 decision 2 and needs @birme's sign-off in review.
+3. **`GPU_POOL` is internal.** It stays operator and test configuration (pool label; enabling
+   metering on a non-platform instance for a test). It can only add metering, never remove it, and
+   it is not part of any customer-facing text.
+4. **Unchanged.** `PLATFORM_STROM_HOST_RE`, `PLATFORM_STROM_PORTS`, `platformStromPool`, the single
+   predicate `isGpuMeteringEnabled() = Boolean(config.gpuPool)`, the accrual floor (#535, PR #540),
+   the `osc-gpu-usage/v1` schema, the rate (40 tokens per hour, open-live#500), the zero-balance
+   gate, and the alternate Strom (`:8082`, not metered).
+
+### Release
+
+Merging #547 to `main` releases to prod through `sync-fork-on-merge.yml`. It is merged by a person
+under Eyevinn/open-live-site#205 step 2a, never by automation. Existing managed shared-Strom
+instances are charged from their next restart onto the released image, with no forced remake; the
+accrual floor is that first restart, so nothing before it is reported and no production is refused
+for a zero balance before it.
+
+### Rollback
+
+With no switch, undoing charging means reverting this change, releasing the revert, and restarting
+the instances. The `gpu-metering-state` `enabledAt` marker keeps the first enablement time, so a
+production that stays live through such an off window would be back-charged for it on re-enable,
+unless the instance's `gpu-metering-state` doc is deleted before the re-enabling restart (PR #540,
+"Risks not covered"). Whether to automate that is out of scope.

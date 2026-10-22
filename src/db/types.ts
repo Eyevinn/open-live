@@ -365,7 +365,7 @@ export interface ProductionOutputAssignment {
  * between upload and persist does not permanently hide an object (spec §Risks).
  */
 export interface RecordingDoc {
-  _id: string;            // "recording-<uuid>"
+  _id: string;            // "recording-<hash of bucket+key>" (#554); older docs: "recording-<uuid>"
   _rev?: string;
   type: 'recording';
   productionId: string;   // references ProductionDoc._id
@@ -384,6 +384,13 @@ export interface RecordingDoc {
   durationMs?: number;
   startedAt: string;      // ISO 8601 — when the recording session began, from the segment's file name
   endedAt?: string;       // ISO 8601 — when the segment was finalized/uploaded
+  /**
+   * The activation that recorded this part: its Strom flow id (issue #556).
+   * Absent on older docs and on leftovers an earlier activation left on Strom.
+   */
+  activationId?: string;
+  /** Part number from the file name's `_%05d` suffix, from 0 (issue #556); absent when the name has none. */
+  partIndex?: number;
   createdAt: string;
   updatedAt: string;
 }

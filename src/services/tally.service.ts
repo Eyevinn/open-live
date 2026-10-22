@@ -97,6 +97,11 @@ export function endSnapshot(ws: WebSocket): void {
   for (const payload of buffered) ws.send(payload);
 }
 
+/** Every socket subscribed to a production, watch-only ones included. */
+export function getSockets(productionId: string): WebSocket[] {
+  return [...subscribers.get(productionId) ?? []];
+}
+
 /** Operator (non-watch-only) sockets for a production. */
 export function getOperatorSockets(productionId: string): WebSocket[] {
   return [...subscribers.get(productionId) ?? []].filter((ws) => !watchOnlySockets.has(ws));
