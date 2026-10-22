@@ -1,23 +1,45 @@
 /**
- * Platform-hosted Strom detection and default GPU metering (issue #537).
+ * Platform-hosted Strom detection and default GPU metering (issues #537, #547).
  *
- * The rule is tested on the pure `resolveGpuMetering` with the switch passed in,
- * so the shipped `PLATFORM_DEFAULT_METERING_ENABLED = false` does not hide it.
- * The config/gate cases load `config.ts` fresh per case (it reads env at import).
+ * There is no switch (#547): an OSC-managed instance on the platform shared
+ * Strom is always metered, and on a platform match the class is always
+ * `shared`. The rule is tested on the pure `resolveGpuMetering`; the
+ * config/gate/reporting cases load `config.ts` fresh per case (it reads env at
+ * import).
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { FastifyBaseLogger } from 'fastify';
-import {
-  PLATFORM_DEFAULT_METERING_ENABLED,
-  PLATFORM_STROM_PORTS,
-  resolveGpuMetering,
-} from '../lib/gpu-metering-defaults.js';
+import { PLATFORM_STROM_PORTS, resolveGpuMetering } from '../lib/gpu-metering-defaults.js';
 
 const SHARED = 'https://strom-se-sto01.osaas.io:8080';
-const MANAGED = { enabled: true, oscHostname: 'acme-myprod.eyevinn-open-live.auto.prod.osaas.io' };
+const OSC_HOSTNAME = 'acme-myprod.eyevinn-open-live.auto.prod.osaas.io';
+const MANAGED = { oscHostname: OSC_HOSTNAME };
+const BYO = 'https://strom.example.com:8080';
+const TENANT_STROM = 'https://acme-mystrom.eyevinn-strom.auto.prod.osaas.io:8080';
 
-describe('resolveGpuMetering: platform default meters', () => {
+// Every STROM_URL that must stay at zero, even on a managed instance.
+const UNMETERED_URLS: Array<[string, string | undefined]> = [
+  ['no port', 'https://strom-se-sto01.osaas.io'],
+  [':443', 'https://strom-se-sto01.osaas.io:443'],
+  [':8082 (alternate, internal)', 'https://strom-se-sto01.osaas.io:8082'],
+  [':8084 (testbed)', 'https://strom-se-sto01.osaas.io:8084'],
+  ['http', 'http://strom-se-sto01.osaas.io:8080'],
+  ['suffix look-alike', 'https://strom-se-sto01.osaas.io.evil.example:8080'],
+  ['suffix look-alike (evil.com)', 'https://strom-se-sto01.osaas.io.evil.com:8080'],
+  ['prefix look-alike', 'https://evil.strom-se-sto01.osaas.io:8080'],
+  ['one digit', 'https://strom-se-sto1.osaas.io:8080'],
+  ['three digits', 'https://strom-se-sto001.osaas.io:8080'],
+  ['userinfo', 'https://user:pass@strom-se-sto01.osaas.io:8080'],
+  ['username only', 'https://strom-se-sto01.osaas.io@evil.com:8080'],
+  ['multi-label tenant Strom on OSC', TENANT_STROM],
+  ['BYO Strom', BYO],
+  ['malformed', 'not a url'],
+  ['empty', ''],
+  ['unset', undefined],
+];
+
+describe('resolveGpuMetering: platform default meters, with no flag or parameter', () => {
   it.each([
     [SHARED, 'se-sto01'],
     ['https://STROM-SE-STO01.OSAAS.IO:8080', 'se-sto01'],
@@ -36,87 +58,112 @@ describe('resolveGpuMetering: platform default meters', () => {
   it('allows only port 8080', () => {
     expect(PLATFORM_STROM_PORTS).toEqual(['8080']);
   });
+
+  it('GPU_CLASS=dedicated on a platform match still resolves class shared', () => {
+    expect(resolveGpuMetering({ ...MANAGED, stromUrl: SHARED, gpuClassEnv: 'dedicated' })).toEqual({
+      pool: 'se-sto01',
+      class: 'shared',
+      source: 'platform-default',
+    });
+  });
 });
 
 describe('resolveGpuMetering: everything else stays at zero', () => {
-  it.each([
-    ['no port', 'https://strom-se-sto01.osaas.io'],
-    [':443', 'https://strom-se-sto01.osaas.io:443'],
-    [':8082 (alternate, internal)', 'https://strom-se-sto01.osaas.io:8082'],
-    [':8084 (testbed)', 'https://strom-se-sto01.osaas.io:8084'],
-    ['http', 'http://strom-se-sto01.osaas.io:8080'],
-    ['suffix look-alike', 'https://strom-se-sto01.osaas.io.evil.example:8080'],
-    ['prefix look-alike', 'https://evil.strom-se-sto01.osaas.io:8080'],
-    ['one digit', 'https://strom-se-sto1.osaas.io:8080'],
-    ['three digits', 'https://strom-se-sto001.osaas.io:8080'],
-    ['userinfo', 'https://user:pass@strom-se-sto01.osaas.io:8080'],
-    ['username only', 'https://strom-se-sto01.osaas.io@evil.com:8080'],
-    ['multi-label tenant Strom on OSC', 'https://acme-mystrom.eyevinn-strom.auto.prod.osaas.io:8080'],
-    ['BYO Strom', 'https://strom.example.com:8080'],
-    ['malformed', 'not a url'],
-    ['empty', ''],
-    ['unset', undefined],
-  ])('%s: %s', (_label, stromUrl) => {
+  it.each(UNMETERED_URLS)('managed instance, %s: %s', (_label, stromUrl) => {
     expect(resolveGpuMetering({ ...MANAGED, stromUrl })).toBeUndefined();
   });
 
-  it('the shared URL with OSC_HOSTNAME unset (self-hosted) is zero', () => {
-    expect(resolveGpuMetering({ enabled: true, stromUrl: SHARED })).toBeUndefined();
-    expect(resolveGpuMetering({ enabled: true, oscHostname: '', stromUrl: SHARED })).toBeUndefined();
+  it.each(UNMETERED_URLS)('no OSC_HOSTNAME, %s: %s', (_label, stromUrl) => {
+    expect(resolveGpuMetering({ stromUrl })).toBeUndefined();
   });
 
-  it('the shared URL with the switch off (enabled=false) is zero', () => {
-    expect(resolveGpuMetering({ ...MANAGED, enabled: false, stromUrl: SHARED })).toBeUndefined();
+  it('the shared URL with OSC_HOSTNAME unset (self-hosted) is zero', () => {
+    expect(resolveGpuMetering({ stromUrl: SHARED })).toBeUndefined();
+    expect(resolveGpuMetering({ oscHostname: '', stromUrl: SHARED })).toBeUndefined();
   });
 
   it('the same managed instance meters on the shared Strom and not on a BYO Strom', () => {
     expect(resolveGpuMetering({ ...MANAGED, stromUrl: SHARED })?.pool).toBe('se-sto01');
     expect(resolveGpuMetering({ ...MANAGED, stromUrl: 'https://gpu.customer.example:8080' })).toBeUndefined();
   });
+
+  it('GPU_CLASS alone does not enable metering', () => {
+    expect(resolveGpuMetering({ ...MANAGED, gpuClassEnv: 'shared', stromUrl: 'http://localhost:7000' })).toBeUndefined();
+    expect(resolveGpuMetering({ gpuClassEnv: 'shared', stromUrl: 'http://localhost:7000' })).toBeUndefined();
+  });
 });
 
-describe('resolveGpuMetering: env override', () => {
-  it('GPU_POOL / GPU_CLASS beat the platform default', () => {
-    expect(resolveGpuMetering({ ...MANAGED, stromUrl: SHARED, gpuPoolEnv: 'fra-1', gpuClassEnv: 'dedicated' })).toEqual({
-      pool: 'fra-1',
-      class: 'dedicated',
-      source: 'env',
-    });
-  });
-
-  it('GPU_CLASS alone overrides the default class on a platform match', () => {
-    expect(resolveGpuMetering({ ...MANAGED, stromUrl: SHARED, gpuClassEnv: 'dedicated' })).toEqual({
-      pool: 'se-sto01',
-      class: 'dedicated',
-      source: 'platform-default',
-    });
-  });
-
-  it('GPU_POOL alone still enables metering anywhere (switch off, no OSC_HOSTNAME, BYO Strom)', () => {
-    expect(resolveGpuMetering({ enabled: false, gpuPoolEnv: 'fra-1', stromUrl: 'http://localhost:7000' })).toEqual({
+describe('resolveGpuMetering: GPU_POOL (internal operator/test configuration)', () => {
+  it.each([
+    ['with OSC_HOSTNAME', MANAGED],
+    ['without OSC_HOSTNAME', {}],
+  ])('on the platform URL %s: source env, metering on', (_label, managed) => {
+    expect(resolveGpuMetering({ ...managed, stromUrl: SHARED, gpuPoolEnv: 'fra-1' })).toEqual({
       pool: 'fra-1',
       class: 'shared',
       source: 'env',
     });
   });
 
-  it('GPU_CLASS alone does not enable metering', () => {
-    expect(resolveGpuMetering({ enabled: true, gpuClassEnv: 'shared', stromUrl: 'http://localhost:7000' })).toBeUndefined();
+  it.each([
+    ['with OSC_HOSTNAME', MANAGED],
+    ['without OSC_HOSTNAME', {}],
+  ])('on the platform URL %s, GPU_CLASS=dedicated still resolves class shared', (_label, managed) => {
+    expect(resolveGpuMetering({ ...managed, stromUrl: SHARED, gpuPoolEnv: 'fra-1', gpuClassEnv: 'dedicated' })).toEqual({
+      pool: 'fra-1',
+      class: 'shared',
+      source: 'env',
+    });
+  });
+
+  it('no GPU_POOL / GPU_CLASS value produces an unmetered or non-shared platform-hosted instance', () => {
+    const pools = [undefined, 'fra-1', 'off', 'none', 'false', '0', 'se-sto01'];
+    const classes = [undefined, 'shared', 'dedicated', 'none', 'off', ''];
+    for (const gpuPoolEnv of pools) {
+      for (const gpuClassEnv of classes) {
+        const r = resolveGpuMetering({ ...MANAGED, stromUrl: SHARED, gpuPoolEnv, gpuClassEnv: gpuClassEnv || undefined });
+        expect(r).toBeDefined();
+        expect(r!.class).toBe('shared');
+      }
+    }
+  });
+
+  it('GPU_POOL enables metering anywhere (no OSC_HOSTNAME, local Strom)', () => {
+    expect(resolveGpuMetering({ gpuPoolEnv: 'fra-1', stromUrl: 'http://localhost:7000' })).toEqual({
+      pool: 'fra-1',
+      class: 'shared',
+      source: 'env',
+    });
+  });
+
+  it.each([
+    ['BYO', BYO],
+    ['tenant Strom', TENANT_STROM],
+    [':8082', 'https://strom-se-sto01.osaas.io:8082'],
+    ['local', 'http://localhost:7000'],
+  ])('off a platform URL (%s), GPU_POOL + GPU_CLASS=dedicated yields dedicated (dashboard label)', (_label, stromUrl) => {
+    expect(resolveGpuMetering({ ...MANAGED, stromUrl, gpuPoolEnv: 'fra-1', gpuClassEnv: 'dedicated' })).toEqual({
+      pool: 'fra-1',
+      class: 'dedicated',
+      source: 'env',
+    });
   });
 });
 
-// --- config wiring and the Z1 gate (one predicate) ---
+// --- config wiring, the Z1 gate and the reporting surfaces (one predicate) ---
 
-const ENV_KEYS = ['GPU_POOL', 'GPU_CLASS', 'OSC_HOSTNAME', 'STROM_URL', 'OSC_ACCESS_TOKEN', 'OSC_PAT'] as const;
+const ENV_KEYS = ['GPU_POOL', 'GPU_CLASS', 'OSC_HOSTNAME', 'STROM_URL', 'OSC_ACCESS_TOKEN', 'OSC_PAT', 'COUCHDB_URL'] as const;
 const savedEnv: Record<string, string | undefined> = {};
 const log = { warn: vi.fn(), error: vi.fn(), info: vi.fn() } as unknown as FastifyBaseLogger;
 
-function setManagedSharedStromEnv(): void {
+function setEnv(opts: { stromUrl?: string; oscHostname?: string; gpuPool?: string; gpuClass?: string }): void {
   for (const k of ENV_KEYS) delete process.env[k];
   process.env['COUCHDB_URL'] = 'http://localhost:5984/db';
-  process.env['OSC_HOSTNAME'] = MANAGED.oscHostname;
-  process.env['STROM_URL'] = SHARED;
   process.env['OSC_ACCESS_TOKEN'] = 'pat-1';
+  if (opts.stromUrl !== undefined) process.env['STROM_URL'] = opts.stromUrl;
+  if (opts.oscHostname !== undefined) process.env['OSC_HOSTNAME'] = opts.oscHostname;
+  if (opts.gpuPool !== undefined) process.env['GPU_POOL'] = opts.gpuPool;
+  if (opts.gpuClass !== undefined) process.env['GPU_CLASS'] = opts.gpuClass;
 }
 
 describe('config + gate wiring', () => {
@@ -131,56 +178,70 @@ describe('config + gate wiring', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
-    vi.doUnmock('../lib/gpu-metering-defaults.js');
     for (const k of ENV_KEYS) {
       if (savedEnv[k] === undefined) delete process.env[k];
       else process.env[k] = savedEnv[k];
     }
   });
 
-  it('ships with the platform switch off', () => {
-    expect(PLATFORM_DEFAULT_METERING_ENABLED).toBe(false);
+  it('a managed shared-Strom instance with no env override is metered (pool se-sto01, platform-default)', async () => {
+    setEnv({ stromUrl: SHARED, oscHostname: OSC_HOSTNAME });
+    const { config, isGpuMeteringEnabled } = await import('../config.js');
+    expect(config.gpuPool).toBe('se-sto01');
+    expect(config.gpuClass).toBe('shared');
+    expect(config.gpuMeteringSource).toBe('platform-default');
+    expect(isGpuMeteringEnabled()).toBe(true);
   });
 
-  it('with the shipped switch, a matching managed config is not metered and not gated', async () => {
-    setManagedSharedStromEnv();
+  it('GPU_CLASS=dedicated on the managed shared-Strom instance is still class shared', async () => {
+    setEnv({ stromUrl: SHARED, oscHostname: OSC_HOSTNAME, gpuClass: 'dedicated' });
+    const { config, isGpuMeteringEnabled } = await import('../config.js');
+    expect(config.gpuClass).toBe('shared');
+    expect(isGpuMeteringEnabled()).toBe(true);
+  });
+
+  it('the gate refuses a new production at zero balance on a managed shared-Strom instance with no override', async () => {
+    setEnv({ stromUrl: SHARED, oscHostname: OSC_HOSTNAME });
+    const gate = await import('../services/production-gate.js');
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ remainingTokens: 0 }), { status: 200 }));
+    const decision = await gate.checkProductionStartAllowed(log);
+    expect(decision.allowed).toBe(false);
+    expect(fetchMock).toHaveBeenCalled();
+  });
+
+  it('explicit GPU_POOL on the managed shared-Strom instance: source env, metering on', async () => {
+    setEnv({ stromUrl: SHARED, oscHostname: OSC_HOSTNAME, gpuPool: 'fra-1', gpuClass: 'dedicated' });
+    const { config, isGpuMeteringEnabled } = await import('../config.js');
+    expect(config.gpuPool).toBe('fra-1');
+    expect(config.gpuClass).toBe('shared');
+    expect(config.gpuMeteringSource).toBe('env');
+    expect(isGpuMeteringEnabled()).toBe(true);
+  });
+
+  const unmeteredConfigs: Array<[string, { stromUrl?: string; oscHostname?: string }]> = [
+    ...UNMETERED_URLS.filter(([, u]) => u !== undefined).flatMap(([label, stromUrl]): Array<[string, { stromUrl?: string; oscHostname?: string }]> => [
+      [`managed, ${label}`, { stromUrl, oscHostname: OSC_HOSTNAME }],
+      [`self-hosted, ${label}`, { stromUrl }],
+    ]),
+    ['platform URL without OSC_HOSTNAME', { stromUrl: SHARED }],
+  ];
+
+  it.each(unmeteredConfigs)('%s: not metered, not gated, reports zero', async (_label, opts) => {
+    setEnv(opts);
     const { config, isGpuMeteringEnabled } = await import('../config.js');
     expect(config.gpuPool).toBeUndefined();
     expect(config.gpuMeteringSource).toBeUndefined();
     expect(isGpuMeteringEnabled()).toBe(false);
 
     const gate = await import('../services/production-gate.js');
-    // Balance zero would refuse a metered instance; this one is not metered.
     fetchMock.mockResolvedValue(new Response(JSON.stringify({ remainingTokens: 0 }), { status: 200 }));
     expect(await gate.checkProductionStartAllowed(log)).toEqual({ allowed: true });
     expect(fetchMock).not.toHaveBeenCalled();
-    expect(gate.renderProductionGateMetrics()).toEqual([]);
-  });
 
-  it('with the switch on, the same config resolves pool se-sto01 from the platform default and is gated', async () => {
-    vi.doMock('../lib/gpu-metering-defaults.js', async (importOriginal) => ({
-      ...(await importOriginal<typeof import('../lib/gpu-metering-defaults.js')>()),
-      PLATFORM_DEFAULT_METERING_ENABLED: true,
-    }));
-    setManagedSharedStromEnv();
-    const { config, isGpuMeteringEnabled } = await import('../config.js');
-    expect(config.gpuPool).toBe('se-sto01');
-    expect(config.gpuClass).toBe('shared');
-    expect(config.gpuMeteringSource).toBe('platform-default');
-    expect(isGpuMeteringEnabled()).toBe(true);
-
-    const gate = await import('../services/production-gate.js');
-    fetchMock.mockResolvedValue(new Response(JSON.stringify({ remainingTokens: 0 }), { status: 200 }));
-    const decision = await gate.checkProductionStartAllowed(log);
-    expect(decision.allowed).toBe(false);
-  });
-
-  it('explicit GPU_POOL still enables metering with the shipped switch (source env)', async () => {
-    setManagedSharedStromEnv();
-    process.env['GPU_POOL'] = 'fra-1';
-    const { config, isGpuMeteringEnabled } = await import('../config.js');
-    expect(config.gpuPool).toBe('fra-1');
-    expect(config.gpuMeteringSource).toBe('env');
-    expect(isGpuMeteringEnabled()).toBe(true);
+    const usage = await import('../services/gpu-usage.js');
+    expect((await usage.buildGpuUsageResponse({}, log)).hours).toEqual([]);
+    const metrics = await usage.buildPrometheusMetrics(log);
+    // No osc_gpu_* sample of any family (HELP/TYPE comment lines start with '#').
+    expect(metrics).not.toMatch(/^osc_gpu_/m);
   });
 });

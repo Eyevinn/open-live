@@ -10,8 +10,8 @@
  * live flow, and nothing may be added that does.
  *
  * Applies only to metered instances (`isGpuMeteringEnabled()`: an explicit
- * `GPU_POOL`, or the platform default for a managed instance on the shared Strom
- * once `PLATFORM_DEFAULT_METERING_ENABLED` is on, issue #537). Self-hosted and
+ * `GPU_POOL`, or the platform default for a managed instance on the shared Strom,
+ * which always applies, issues #537 and #547). Self-hosted and
  * bring-your-own-Strom instances are not metered (open-live#500 AC5, BYO usage is
  * zero-rated) and are never gated.
  *

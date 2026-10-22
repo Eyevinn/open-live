@@ -365,7 +365,7 @@ export interface ProductionOutputAssignment {
  * between upload and persist does not permanently hide an object (spec §Risks).
  */
 export interface RecordingDoc {
-  _id: string;            // "recording-<uuid>"
+  _id: string;            // "recording-<hash of bucket+key>" (#554); older docs: "recording-<uuid>"
   _rev?: string;
   type: 'recording';
   productionId: string;   // references ProductionDoc._id

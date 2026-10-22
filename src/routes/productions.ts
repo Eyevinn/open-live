@@ -17,6 +17,7 @@ import { forceStopClipRelay } from '../services/clip-relay.js';
 import { config, isRecordingEnabled } from '../config.js';
 import { uploadRecordings, type MinioTarget } from '../lib/recording-uploader.js';
 import { recordingPartTimings } from '../lib/recording-parts.js';
+import { upsertRecordingDoc } from '../lib/recording-registry.js';
 import { DEFAULT_CONNECTION_ID, resolveStorageTarget, StorageConnectionNotFoundError } from '../lib/storage-connection.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
@@ -413,8 +414,10 @@ async function uploadProductionRecording(
   for (const [i, seg] of uploadRes.uploaded.entries()) {
     const timing = timings[i];
     try {
-      const recDoc: RecordingDoc = {
-        _id: `recording-${randomUUID()}`,
+      // Keyed by bucket+key and upserted (issue #554): a file whose Strom
+      // delete failed is swept again by the next deactivate and must update
+      // its RecordingDoc, not add a second one.
+      await upsertRecordingDoc(getRecordingsDb(), {
         type: 'recording',
         productionId: doc._id,
         ...(outputId ? { outputId } : {}),
@@ -434,8 +437,7 @@ async function uploadProductionRecording(
         endedAt: timing.endedAt ?? finalizedAt,
         createdAt: finalizedAt,
         updatedAt: finalizedAt,
-      };
-      await getRecordingsDb().insert(recDoc);
+      });
     } catch (persistErr) {
       log.error({ persistErr, productionId: doc._id, key: seg.key }, 'RecordingDoc persist failed — object uploaded but unlisted');
     }

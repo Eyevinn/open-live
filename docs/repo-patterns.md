@@ -415,10 +415,11 @@ Whether an instance is metered (and gated at zero balance, `production-gate.ts`)
 `isGpuMeteringEnabled()` = `Boolean(config.gpuPool)`, and `config.gpuPool` is *resolved*, not
 the raw env: explicit `GPU_POOL` wins, otherwise `resolveGpuMetering()`
 (`src/lib/gpu-metering-defaults.ts`, issue #537) derives a pool for an OSC-managed instance
-(`OSC_HOSTNAME`) on the platform shared Strom (`https://strom-se-stoNN.osaas.io:8080`) when
-`PLATFORM_DEFAULT_METERING_ENABLED` is on. A new check that reads `process.env.GPU_POOL` would
-silently disagree with the meter once the switch is flipped. The constant itself is changed only
-by the human flip PR of open-live-site#205 step 2a. Note that WHATWG `URL` normalises `:443` on
+(`OSC_HOSTNAME`) on the platform shared Strom (`https://strom-se-stoNN.osaas.io:8080`), always
+(there is no switch, #547). A new check that reads `process.env.GPU_POOL` would silently disagree
+with the meter on every managed shared-Strom instance, which has no `GPU_POOL`. On a platform
+match the class is always `shared` (`GPU_CLASS` is ignored there), so never derive "billable"
+from the raw `GPU_CLASS` env either. Note that WHATWG `URL` normalises `:443` on
 an `https` URL to `port === ''`, so the port allowlist treats it like "no port".
 
 ## Shared-GPU accrual never starts from raw `activatedAt` — use `accrualStartMs()`
@@ -470,3 +471,17 @@ still carries the pinned `mixerInput`. A new guest-ending path needs the same br
 `guests-routes.test.ts`, seed sessions straight into `sessionsStore` instead of calling
 `POST /guests/:inviteId/join`: that route is rate-limited to 10/min per client and the suite is
 already close to the limit, so extra joins fail with 429 and an undefined `guestId`.
+
+## Guest PeerConnections take the join's ICE servers — build them with `newPeerConnection()`
+
+The guest join response carries `iceServers`, Strom's `STROM_SERVER_ICE_SERVERS` (issue #563),
+and the page applies them before the return-only check, so the publish and every return use the
+deployment's TURN server. Build any new guest-page `RTCPeerConnection` with `newPeerConnection()`,
+never `new RTCPeerConnection(ICE)`: a browser rejects the *whole* configuration if one entry is bad
+(a TURN URL without a username and credential, which Strom passes through), and the helper falls
+back to the STUN server instead of failing the guest's go-live. The join's lookup
+(`getIceServers({ timeoutMs: JOIN_ICE_SERVERS_TIMEOUT_MS })`) is bounded at 3s; the crew route
+calls it without a deadline. Every test that reaches the real join route must mock
+`../lib/ice-servers.js` (`getIceServers` rejecting, as `guests-return-only.test.ts` does):
+otherwise the join asks `config.stromUrl` for real, so a stubbed `fetch` counts the lookup, and a
+Strom running locally on the default port answers and fills the module-level cache.

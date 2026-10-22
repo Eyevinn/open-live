@@ -79,6 +79,13 @@ vi.mock('../lib/strom-token.js', () => ({
   getStromToken: vi.fn().mockResolvedValue(undefined),
 }));
 
+// The join's ICE-server lookup goes to Strom, not through the mocked fetch,
+// so `fetch` counts only the publish and return calls.
+vi.mock('../lib/ice-servers.js', () => ({
+  getIceServers: vi.fn().mockRejectedValue(new Error('Strom unreachable')),
+  resetIceServersCache: vi.fn(),
+}));
+
 const AUTH = { authorization: `Bearer ${TEST_API_KEY}` };
 let app: FastifyInstance;
 let buildServer: () => Promise<FastifyInstance>;
