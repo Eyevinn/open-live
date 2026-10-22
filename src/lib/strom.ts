@@ -720,6 +720,15 @@ export type FlowEvent =
   // that emits it is not yet merged, so field names follow the issue, not a
   // verified `events.rs` variant.
   | { type: 'PipelineError'; data: { flow_id?: string; source: string; error: string } }
+  // A recorder opened a new file: its first, or the next one after a split
+  // (`max_size_time_secs` or a split request). Opening file N means file N-1 of
+  // the same recorder is closed (issue #556). `filename` is relative to Strom's
+  // media root. `start_running_time_ns` / `start_utc_us` are only sent by newer
+  // Strom builds (Eyevinn/strom#944); the shape matches draft PR #411.
+  | {
+      type: 'RecorderFileChanged'
+      data: { flow_id: string; block_id: string; filename: string; start_running_time_ns?: number; start_utc_us?: number }
+    }
   | { type: 'ping' }
 
 // ---------------------------------------------------------------------------
@@ -1167,9 +1176,10 @@ export class StromClient {
 
   /**
    * Opens a WebSocket connection to /api/ws and calls `onEvent` for each
-   * flow event. Returns a cleanup function that closes the socket.
+   * flow event. `onOpen` runs once the socket is connected. Returns a cleanup
+   * function that closes the socket.
    */
-  connectWebSocket(onEvent: (event: FlowEvent) => void, onClose?: () => void): () => void {
+  connectWebSocket(onEvent: (event: FlowEvent) => void, onClose?: () => void, onOpen?: () => void): () => void {
     const wsUrl = this.baseUrl.replace(/^http/, 'ws') + '/api/ws'
     const headers: Record<string, string> = {}
     if (this.token) headers['Authorization'] = `Bearer ${this.token}`
@@ -1182,6 +1192,8 @@ export class StromClient {
     ws.on('close', (_code, _reason) => {
       onClose?.()
     })
+
+    if (onOpen) ws.on('open', onOpen)
 
     ws.on('message', (data) => {
       try {

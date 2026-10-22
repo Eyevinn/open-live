@@ -36,7 +36,7 @@
  */
 import { createHash, createHmac } from 'crypto';
 import { config } from '../config.js';
-import type { StromClient } from './strom.js';
+import type { MediaEntry, StromClient } from './strom.js';
 import { Mp4DurationScanner } from './mp4-duration.js';
 
 export interface MinioTarget {
@@ -709,6 +709,42 @@ async function* tap(
   }
 }
 
+/** Object key a recorded file is uploaded to: `[RECORDING_KEY_PREFIX/]<productionId>/<fileName>`. */
+export function recordingObjectKey(productionId: string, fileName: string): string {
+  const prefix = config.recordingKeyPrefix
+    ? `${config.recordingKeyPrefix.replace(/\/+$/, '')}/`
+    : '';
+  return `${prefix}${productionId}/${fileName}`;
+}
+
+/**
+ * Streams one recorded file from Strom to the object store and describes the
+ * uploaded object. Shared by the deactivate sweep and the live part upload
+ * (issue #556). Throws on any download or upload failure (an `S3AuthError` for
+ * a credential/permission rejection); the file on Strom is never touched.
+ */
+export async function uploadRecordingFile(
+  args: Pick<UploadRecordingsArgs, 'stromUrl' | 'stromToken' | 'productionId' | 'target'>,
+  entry: Pick<MediaEntry, 'name' | 'path'>,
+): Promise<UploadedSegment> {
+  const download = await downloadFromStrom(args.stromUrl, args.stromToken, entry.path);
+  const key = recordingObjectKey(args.productionId, entry.name);
+  const contentType = contentTypeForFile(entry.name);
+  // Duration is read from the moov box as the bytes stream past (issue
+  // #552); the file itself is never held whole.
+  const scanner = contentType === 'video/mp4' ? new Mp4DurationScanner() : undefined;
+  const sizeBytes = await uploadStream(args.target, key, tap(download, (c) => scanner?.push(c)), contentType);
+  const startedAt = recordingStartFromFileName(entry.name);
+  const durationMs = scanner?.finish();
+  return {
+    key,
+    sizeBytes,
+    stromPath: entry.path,
+    ...(startedAt ? { startedAt } : {}),
+    ...(durationMs !== undefined ? { durationMs } : {}),
+  };
+}
+
 export interface UploadRecordingsArgs {
   strom: StromClient;
   /** Base URL of the Strom instance (for the raw media download). */
@@ -751,28 +787,9 @@ export async function uploadRecordings(args: UploadRecordingsArgs): Promise<Uplo
   const listing = await strom.media.list(outputDir);
   const files = (listing.entries ?? []).filter((e) => !e.is_dir);
 
-  const prefix = config.recordingKeyPrefix
-    ? `${config.recordingKeyPrefix.replace(/\/+$/, '')}/`
-    : '';
-
   for (const entry of files) {
     try {
-      const download = await downloadFromStrom(stromUrl, stromToken, entry.path);
-      const key = `${prefix}${productionId}/${entry.name}`;
-      const contentType = contentTypeForFile(entry.name);
-      // Duration is read from the moov box as the bytes stream past (issue
-      // #552); the file itself is never held whole.
-      const scanner = contentType === 'video/mp4' ? new Mp4DurationScanner() : undefined;
-      const sizeBytes = await uploadStream(target, key, tap(download, (c) => scanner?.push(c)), contentType);
-      const startedAt = recordingStartFromFileName(entry.name);
-      const durationMs = scanner?.finish();
-      result.uploaded.push({
-        key,
-        sizeBytes,
-        stromPath: entry.path,
-        ...(startedAt ? { startedAt } : {}),
-        ...(durationMs !== undefined ? { durationMs } : {}),
-      });
+      result.uploaded.push(await uploadRecordingFile({ stromUrl, stromToken, productionId, target }, entry));
     } catch (err) {
       result.failed.push({
         file: entry.path,
