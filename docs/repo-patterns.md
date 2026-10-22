@@ -485,3 +485,18 @@ calls it without a deadline. Every test that reaches the real join route must mo
 `../lib/ice-servers.js` (`getIceServers` rejecting, as `guests-return-only.test.ts` does):
 otherwise the join asks `config.stromUrl` for real, so a stubbed `fetch` counts the lookup, and a
 Strom running locally on the default port answers and fills the module-level cache.
+
+## Recording parts are uploaded while live — the newest file is never touched
+
+With `RECORDING_SEGMENT_SECS` > 0, `services/live-recording-upload.ts` uploads closed parts during
+the production (issue #556). It listens on the shared recorder-event socket
+(`services/strom-recorder-events.ts`, one Strom WebSocket for every production, reconnecting with
+1 s → 30 s backoff); reuse that listener for any new `RecorderFileChanged` consumer instead of
+opening a socket per production. `RecorderFileChanged` for file N closes every earlier file in
+`recordings/<productionId>`; after a (re)connect the sweep treats everything but the newest file
+(by session stem, then `_%05d` index) as closed. A part is deleted from Strom only after its listed
+size held still for `PART_STABLE_MS`, the uploaded byte count equals that size, and the
+`upsertRecordingDoc` registration succeeded; any failure leaves it for the next event, sweep or
+deactivate. Every stop path (deactivate, idle auto-deactivate, delete, failed activation) must
+`await stopLiveRecordingUpload()` before its own teardown: it waits for the running pass, so the
+deactivate sweep never downloads a file the live pass is deleting.

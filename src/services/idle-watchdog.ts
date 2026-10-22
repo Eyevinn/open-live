@@ -17,6 +17,7 @@ import { getSubscriberCount } from './tally.service.js';
 import { clearProductionPflState } from './pfl-state.js';
 import { clearAudioState, clearPipState, clearFxState } from '../ws/controller.js';
 import { forceStopMeterRelay } from './meter-relay.js';
+import { stopLiveRecordingUpload } from './live-recording-upload.js';
 import { forceStopClipRelay } from './clip-relay.js';
 import { broadcast } from './tally.service.js';
 import { activationAbortControllers, updateProductionDoc, emitProductionStatus } from '../routes/productions.js';
@@ -249,6 +250,8 @@ export async function deactivateProduction(productionId: string, log: FastifyBas
   forceStopMeterRelay(doc._id, doc.stromFlowId);
   forceStopClipRelay(doc._id, doc.stromFlowId);
   broadcast(doc._id, { type: 'GRP_STATE_RESET' });
+  // Stop the live recording part upload with the flow (issue #556).
+  await stopLiveRecordingUpload(doc._id);
 
   if (doc.stromFlowId) {
     try {

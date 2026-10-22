@@ -377,6 +377,17 @@ components:
           type: integer
         durationMs:
           type: integer
+        activationId:
+          type: string
+          description: >-
+            The activation (Strom flow id) that recorded this part. Absent on
+            older recordings and on files an earlier activation left on Strom.
+        partIndex:
+          type: integer
+          description: >-
+            Part number from the file name's `_%05d` suffix, from 0. With
+            RECORDING_SEGMENT_SECS > 0, parts are uploaded and listed while the
+            production is still live.
         startedAt:
           type: string
           format: date-time
