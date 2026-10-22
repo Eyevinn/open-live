@@ -14,11 +14,12 @@ import { clearProductionPflState } from '../services/pfl-state.js';
 import { clearPipState, clearAudioState, clearFxState, clearClipStateForProduction, reinitConnectedControllers } from '../ws/controller.js';
 import { forceStopMeterRelay } from '../services/meter-relay.js';
 import { forceStopClipRelay } from '../services/clip-relay.js';
-import { config, isRecordingEnabled } from '../config.js';
-import { uploadRecordings, type MinioTarget } from '../lib/recording-uploader.js';
-import { recordingPartTimings } from '../lib/recording-parts.js';
+import { config } from '../config.js';
+import { uploadRecordings } from '../lib/recording-uploader.js';
+import { parsePartName, recordingPartTimings } from '../lib/recording-parts.js';
 import { upsertRecordingDoc } from '../lib/recording-registry.js';
-import { DEFAULT_CONNECTION_ID, resolveStorageTarget, StorageConnectionNotFoundError } from '../lib/storage-connection.js';
+import { resolveRecordingUploadTarget } from '../lib/recording-upload-target.js';
+import { startLiveRecordingUpload, stopLiveRecordingUpload, type LiveRecordingSession } from '../services/live-recording-upload.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type OutputStatusEntry } from '../lib/production-health.js';
@@ -318,6 +319,7 @@ async function uploadProductionRecording(
   strom: StromClient,
   stromToken: string | undefined,
   log: FastifyBaseLogger,
+  liveSession?: LiveRecordingSession,
 ): Promise<RecordingUploadSummary> {
   let outputId: string | undefined;
   let connectionId: string | undefined;
@@ -343,28 +345,14 @@ async function uploadProductionRecording(
   };
 
   // Resolve the target. Absent (or "default") connectionId = the env default (MINIO_*).
-  const namedConnection = !!connectionId && connectionId !== DEFAULT_CONNECTION_ID;
-  if (!namedConnection && !isRecordingEnabled()) {
-    return nothingUploaded(
-      'no-storage-target',
-      'No storage connection is set on the recording output and MINIO_* object storage is not configured.',
-    );
-  }
-  let target: MinioTarget | null;
-  try {
-    target = await resolveStorageTarget(connectionId);
-  } catch (err) {
-    if (err instanceof StorageConnectionNotFoundError) {
-      return nothingUploaded('connection-not-found', `Storage connection "${connectionId}" was not found.`);
+  const resolved = await resolveRecordingUploadTarget(connectionId);
+  if ('reason' in resolved) {
+    if (resolved.err !== undefined) {
+      log.error({ err: resolved.err, productionId: doc._id }, 'could not resolve storage target for recording upload');
     }
-    log.error({ err, productionId: doc._id }, 'could not resolve storage target for recording upload');
-    return nothingUploaded('upload-error', 'The storage target could not be resolved.');
+    return nothingUploaded(resolved.reason, resolved.message);
   }
-  if (!target) {
-    return namedConnection
-      ? nothingUploaded('connection-no-bucket', `Storage connection "${connectionId}" has no default bucket.`)
-      : nothingUploaded('no-storage-target', 'MINIO_* object storage is not configured.');
-  }
+  const { target } = resolved;
 
   let uploadRes: Awaited<ReturnType<typeof uploadRecordings>>;
   try {
@@ -413,6 +401,12 @@ async function uploadProductionRecording(
   const timings = recordingPartTimings(uploadRes.uploaded, config.recordingSegmentSecs);
   for (const [i, seg] of uploadRes.uploaded.entries()) {
     const timing = timings[i];
+    const part = parsePartName(seg.key.slice(seg.key.lastIndexOf('/') + 1));
+    // Only parts of the session the live upload saw are this activation's
+    // (issue #556); leftovers of earlier activations get no activationId.
+    const activationId = liveSession?.stem !== undefined && part?.stem === liveSession.stem
+      ? liveSession.activationId
+      : undefined;
     try {
       // Keyed by bucket+key and upserted (issue #554): a file whose Strom
       // delete failed is swept again by the next deactivate and must update
@@ -435,6 +429,8 @@ async function uploadProductionRecording(
         // known, else at deactivate.
         startedAt: timing.startedAt ?? doc.recording?.startedAt ?? doc.updatedAt,
         endedAt: timing.endedAt ?? finalizedAt,
+        ...(activationId ? { activationId } : {}),
+        ...(part ? { partIndex: part.index } : {}),
         createdAt: finalizedAt,
         updatedAt: finalizedAt,
       });
@@ -774,6 +770,12 @@ async function runActivationFlow(
         });
 
         notifyProductionActivated(productionId);
+        // Upload closed recording parts while live (issue #556). Checked and
+        // started in the same tick, so a deactivate that aborts this run either
+        // stops it or prevents it.
+        if (activation.recorderBlockId && !signal.aborted) {
+          startLiveRecordingUpload({ _id: productionId, stromFlowId, recorderBlockId: activation.recorderBlockId, recording }, log);
+        }
         // Emit the PRODUCTION_STATUS lifecycle event for the active transition
         // (spec §3). Flow is playing, so all assigned outputs derive as healthy.
         emitProductionStatus({
@@ -818,6 +820,7 @@ async function runActivationFlow(
     // without this they stay bound to the dead flow and the next successful
     // activation never moves them.
     forceStopRelaysForDyingFlow();
+    await stopLiveRecordingUpload(productionId);
 
     // Best-effort flow cleanup
     if (stromFlowId) {
@@ -1069,6 +1072,9 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         activationAbortControllers.delete(doc._id);
       }
 
+      // Stop the live recording part upload with the production (issue #556).
+      await stopLiveRecordingUpload(doc._id);
+
       // Stop and delete the Strom flow if one is running
       if (doc.stromFlowId) {
         const stromToken = await getStromToken(config.stromToken).catch(() => undefined);
@@ -1255,6 +1261,9 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
     // group assignments — these are live-only and must not survive deactivation.
     broadcast(doc._id, { type: 'GRP_STATE_RESET' });
     broadcast(doc._id, { type: 'PRODUCTION_DEACTIVATED' });
+    // Stop the live part upload and wait for a running pass, so the sweep below
+    // only finds the last part and earlier failures, and never races it (#556).
+    const liveSession = await stopLiveRecordingUpload(doc._id);
     let lastRecordingUpload: RecordingUploadSummary | undefined;
     if (doc.stromFlowId) {
       const stromToken = await getStromToken(config.stromToken).catch((err) => { log.error({ errMsg: err instanceof Error ? err.message : String(err) }, "SAT exchange failed — proceeding without auth"); return undefined; });
@@ -1265,7 +1274,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       // storage. Best-effort: a failed upload must not block teardown. The
       // outcome is stored on the production as `lastRecordingUpload` (#534).
       if (doc.recorderBlockId) {
-        lastRecordingUpload = await uploadProductionRecording(doc, doc.stromFlowId, doc.recorderBlockId, strom, stromToken, log);
+        lastRecordingUpload = await uploadProductionRecording(doc, doc.stromFlowId, doc.recorderBlockId, strom, stromToken, log, liveSession);
       }
 
       await deactivateStromFlow(doc.stromFlowId, strom);
