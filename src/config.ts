@@ -3,7 +3,7 @@
 // time — `isGuestCallingEnabled()` only calls `isGuestSigningKeyAvailable()` at
 // runtime, by which point every module in the cycle is fully initialised.
 import { isGuestSigningKeyAvailable } from './lib/guest-signing-key.js';
-import { PLATFORM_DEFAULT_METERING_ENABLED, resolveGpuMetering } from './lib/gpu-metering-defaults.js';
+import { resolveGpuMetering } from './lib/gpu-metering-defaults.js';
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -127,9 +127,8 @@ export function buildStromPublicUrl(): string | undefined {
   return raw.replace(/\/+$/, '');
 }
 
-// Resolved once at import, like the rest of `config` (issue #537).
+// Resolved once at import, like the rest of `config` (issues #537, #547).
 const gpuMetering = resolveGpuMetering({
-  enabled: PLATFORM_DEFAULT_METERING_ENABLED,
   gpuPoolEnv: optionalEnv('GPU_POOL'),
   gpuClassEnv: optionalEnv('GPU_CLASS'),
   oscHostname: optionalEnv('OSC_HOSTNAME'),
@@ -427,13 +426,14 @@ export const config = {
   /**
    * Shared-GPU pool label (e.g. `se-sto01`) surfaced as the `gpu_pool` label /
    * `gpuPool` field. **Metering is enabled iff this is set.** Resolved by
-   * `resolveGpuMetering` (`src/lib/gpu-metering-defaults.ts`, issue #537):
-   * - an explicit `GPU_POOL` env value always wins and enables metering
-   *   anywhere (source `env`);
-   * - otherwise, when `PLATFORM_DEFAULT_METERING_ENABLED` is on, an
-   *   OSC-managed instance (`OSC_HOSTNAME`, platform-injected) whose
-   *   `STROM_URL` is the platform-hosted shared Strom gets a pool derived from
-   *   the Strom host (source `platform-default`);
+   * `resolveGpuMetering` (`src/lib/gpu-metering-defaults.ts`, issues #537, #547):
+   * - an explicit `GPU_POOL` env value (internal operator/test configuration)
+   *   sets the pool label and enables metering anywhere (source `env`); it
+   *   cannot turn metering off;
+   * - otherwise an OSC-managed instance (`OSC_HOSTNAME`, platform-injected)
+   *   whose `STROM_URL` is the platform-hosted shared Strom always gets a pool
+   *   derived from the Strom host (source `platform-default`). There is no
+   *   switch;
    * - otherwise unset, so self-hosted / BYO-Strom deployments report zero
    *   shared-GPU time (`/api/v1/usage/gpu` → `hours: []`, `/metrics` emits no
    *   `osc_gpu_*` samples).
@@ -442,9 +442,10 @@ export const config = {
    */
   gpuPool: gpuMetering?.pool,
   /**
-   * `gpu_class` label value (default `shared`; `GPU_CLASS` env overrides). Only
-   * the shared class is metered to tokens; a `dedicated` value can be emitted
-   * for dashboards without implying billing.
+   * `gpu_class` label value (default `shared`). Always `shared` when
+   * `STROM_URL` is the platform-hosted shared Strom (#547; `GPU_CLASS` is
+   * ignored there). Elsewhere `GPU_CLASS` overrides it as a dashboard label;
+   * only the shared class is metered to tokens.
    */
   gpuClass: gpuMetering?.class ?? optionalEnv('GPU_CLASS') ?? 'shared',
   /** Where `gpuPool` came from (`env` / `platform-default`); undefined when metering is off. Logged at startup. */
@@ -487,10 +488,10 @@ export function isGuestCallingEnabled(): boolean {
 /**
  * True when shared-GPU usage metering is enabled, i.e. `config.gpuPool` is
  * resolved: from an explicit `GPU_POOL`, or from the platform default for an
- * OSC-managed instance on the platform-hosted shared Strom when
- * `PLATFORM_DEFAULT_METERING_ENABLED` is on (issue #537). When false (every
- * self-hosted / BYO-Strom deployment, and every managed instance while the
- * switch is off and no `GPU_POOL` is set), no GPU-seconds accrue,
+ * OSC-managed instance on the platform-hosted shared Strom (issues #537,
+ * #547; always, there is no switch). When false (every self-hosted /
+ * BYO-Strom deployment, and any instance off the platform shared Strom with
+ * no `GPU_POOL` set), no GPU-seconds accrue,
  * `/api/v1/usage/gpu` returns `hours: []`, and `/metrics` emits no `osc_gpu_*`
  * samples. This is the single predicate for all accrual AND the zero-balance
  * start gate (`production-gate.ts`), so the metered set and the gated set are

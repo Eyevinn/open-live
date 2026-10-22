@@ -611,7 +611,8 @@ export interface AvailableSourcesResponse {
 // --- ICE / WebRTC ---
 
 export interface IceServer {
-  urls: string[]
+  /** Strom sends one URL as a string (strom types/src/whep.rs); RTCIceServer takes either. */
+  urls: string | string[]
   username?: string
   credential?: string
 }
@@ -868,7 +869,8 @@ export class StromClient {
 
   system = {
     version: () => this.get<SystemInfo>('/api/version'),
-    iceServers: () => this.get<IceServersResponse>('/api/ice-servers'),
+    iceServers: (timeoutMs?: number) =>
+      this.request<IceServersResponse>('GET', '/api/ice-servers', undefined, timeoutMs),
     networkInterfaces: () => this.get<NetworkInterfacesResponse>('/api/network/interfaces'),
   }
 

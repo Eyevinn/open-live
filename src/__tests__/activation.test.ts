@@ -6,7 +6,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { buildServer } from '../server.js';
-import { resetIceServersCache } from '../routes/ice-servers.js';
+import { resetIceServersCache } from '../lib/ice-servers.js';
 
 // ---------------------------------------------------------------------------
 // Mock CouchDB
