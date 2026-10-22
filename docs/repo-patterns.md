@@ -471,3 +471,17 @@ still carries the pinned `mixerInput`. A new guest-ending path needs the same br
 `guests-routes.test.ts`, seed sessions straight into `sessionsStore` instead of calling
 `POST /guests/:inviteId/join`: that route is rate-limited to 10/min per client and the suite is
 already close to the limit, so extra joins fail with 429 and an undefined `guestId`.
+
+## Guest PeerConnections take the join's ICE servers — build them with `newPeerConnection()`
+
+The guest join response carries `iceServers`, Strom's `STROM_SERVER_ICE_SERVERS` (issue #563),
+and the page applies them before the return-only check, so the publish and every return use the
+deployment's TURN server. Build any new guest-page `RTCPeerConnection` with `newPeerConnection()`,
+never `new RTCPeerConnection(ICE)`: a browser rejects the *whole* configuration if one entry is bad
+(a TURN URL without a username and credential, which Strom passes through), and the helper falls
+back to the STUN server instead of failing the guest's go-live. The join's lookup
+(`getIceServers({ timeoutMs: JOIN_ICE_SERVERS_TIMEOUT_MS })`) is bounded at 3s; the crew route
+calls it without a deadline. Every test that reaches the real join route must mock
+`../lib/ice-servers.js` (`getIceServers` rejecting, as `guests-return-only.test.ts` does):
+otherwise the join asks `config.stromUrl` for real, so a stubbed `fetch` counts the lookup, and a
+Strom running locally on the default port answers and fills the module-level cache.

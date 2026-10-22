@@ -1136,6 +1136,15 @@ components:
         intercomLine:
           type: object
           description: Present only when an Open Intercom talkback line is provisioned (later sub-issue).
+        iceServers:
+          type: array
+          description: >-
+            The ICE servers for the guest page's PeerConnections: Strom's
+            `STROM_SERVER_ICE_SERVERS`, the same list `GET /api/v1/ice-servers`
+            gives crew, TURN credentials included. Absent when Strom cannot give
+            it within a few seconds; the page then uses a public STUN server.
+          items:
+            $ref: '#/components/schemas/IceServer'
 
 paths:
   # ── Health ──────────────────────────────────────────────────────────────────

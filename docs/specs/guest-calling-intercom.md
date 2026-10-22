@@ -492,8 +492,9 @@ implementation or in a dependent `open-live-studio` ticket.
   (`src/ws/controller.ts:588,637`, `src/routes/audio.ts:79`). With a test source on a lower
   input, mute/AFV act on the wrong strip and a return would close the wrong send. Fix before
   building returns.
-- **Guest token reach:** that guest's WHIP input, return routes and `GET /ice-servers` — never
-  `/whep-proxy?target=`. WHIP PATCH/DELETE accept any `session=` URL on the Strom host
+- **Guest token reach:** that guest's WHIP input and return routes, never
+  `/whep-proxy?target=`; its ICE servers come in the join response (`GET /api/v1/ice-servers`
+  stays crew-only). WHIP PATCH/DELETE accept any `session=` URL on the Strom host
   (`src/routes/whip.ts:9-11`), so sessions must be tied to their endpoint or one guest can tear
   down another's. Strom's `/whip/` and `/whep/` are unauthenticated and endpoint IDs are listed
   publicly, so this only holds where Strom's HTTP API is unreachable or gated — unconfirmed for
