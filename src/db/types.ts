@@ -384,6 +384,13 @@ export interface RecordingDoc {
   durationMs?: number;
   startedAt: string;      // ISO 8601 — when the recording session began, from the segment's file name
   endedAt?: string;       // ISO 8601 — when the segment was finalized/uploaded
+  /**
+   * The activation that recorded this part: its Strom flow id (issue #556).
+   * Absent on older docs and on leftovers an earlier activation left on Strom.
+   */
+  activationId?: string;
+  /** Part number from the file name's `_%05d` suffix, from 0 (issue #556); absent when the name has none. */
+  partIndex?: number;
   createdAt: string;
   updatedAt: string;
 }
