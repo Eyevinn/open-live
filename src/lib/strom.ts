@@ -153,6 +153,23 @@ export interface Flow {
   elements?: FlowElement[]
   blocks?: BlockInstance[]
   links?: FlowLink[]
+  /** Per-block runtime health (Eyevinn/strom#786). Present only while the pipeline runs. */
+  block_health?: BlockHealthReport[]
+}
+
+/**
+ * One block's health from Strom's block health scan (Eyevinn/strom#786): the
+ * `BlockHealthChanged` event payload, and an entry of `Flow.block_health`.
+ * `failed` means the block's element chain stopped passing data while the
+ * pipeline stayed PLAYING. `causes` is Strom's optional list of structured
+ * causes (e.g. which WHIP seat lost which medium); absent when ok or when Strom
+ * has none. Its items are Strom's, so they are typed loosely and passed through.
+ */
+export interface BlockHealthReport {
+  block_id: string
+  status: 'ok' | 'failed'
+  detail?: string | null
+  causes?: unknown
 }
 
 export interface FlowResponse {
@@ -720,6 +737,9 @@ export type FlowEvent =
   // that emits it is not yet merged, so field names follow the issue, not a
   // verified `events.rs` variant.
   | { type: 'PipelineError'; data: { flow_id?: string; source: string; error: string } }
+  // Emitted by Strom's block health scan only when a block's status changes
+  // (Eyevinn/strom#786). Same `{ type, data }` envelope.
+  | { type: 'BlockHealthChanged'; data: BlockHealthReport & { flow_id: string } }
   // A recorder opened a new file: its first, or the next one after a split
   // (`max_size_time_secs` or a split request). Opening file N means file N-1 of
   // the same recorder is closed (issue #556). `filename` is relative to Strom's
@@ -1187,6 +1207,10 @@ export class StromClient {
 
     ws.on('error', (err) => {
       console.error('[strom-ws] Connection error:', err.message)
+    })
+
+    ws.on('open', () => {
+      onOpen?.()
     })
 
     ws.on('close', (_code, _reason) => {
