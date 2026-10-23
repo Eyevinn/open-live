@@ -47,8 +47,25 @@ jobs:
       - name: Restart olivedev service instances
         if: inputs.environment == 'prod'
         env:
-          OSC_ACCESS_TOKEN: unused
-          OSC_API_KEY: ${{ secrets.OSC_OLIVEDEV_PAT }}
+          # `osc restart` authenticates with OSC_ACCESS_TOKEN; it never reads OSC_API_KEY.
+          OSC_ACCESS_TOKEN: ${{ secrets.OSC_OLIVEDEV_PAT }}
         run: |
-          osc --env prod restart eyevinn-open-live openlivedev
-          osc --env prod restart eyevinn-open-live-studio openlivedev
+          set -uo pipefail
+          if [ -z "$OSC_ACCESS_TOKEN" ]; then
+            echo "::error::OSC_OLIVEDEV_PAT secret is empty"
+            exit 1
+          fi
+          # @osaas/cli 4.33.2 `restart` exits 0 even when the restart fails. With --json it
+          # prints {"restarted":true} to stdout only on success ({"error":...} to stderr
+          # otherwise), so check the output. Restart both instances before failing the job.
+          failed=0
+          for service in eyevinn-open-live eyevinn-open-live-studio; do
+            if out=$(osc --env prod --json restart "$service" openlivedev < /dev/null) \
+              && grep -Fq '"restarted":true' <<<"$out"; then
+              echo "Restarted $service/openlivedev"
+            else
+              echo "::error::Failed to restart $service/openlivedev"
+              failed=1
+            fi
+          done
+          exit "$failed"
