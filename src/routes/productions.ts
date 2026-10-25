@@ -3,7 +3,7 @@ import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { getDb, getOutputsDb, getRecordingsDb } from '../db/index.js';
 import { sweepGuestsOnProductionEnd } from '../services/guest-sweep.js';
-import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc, RecordingDoc, ActiveRecording, RecordingUploadSummary } from '../db/types.js';
+import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc, RecordingDoc, ActiveRecording, RecordingUploadSummary, RecorderType } from '../db/types.js';
 import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { stromBrowserBaseUrl } from '../lib/strom-public-url.js';
@@ -16,7 +16,7 @@ import { forceStopMeterRelay } from '../services/meter-relay.js';
 import { forceStopClipRelay } from '../services/clip-relay.js';
 import { config } from '../config.js';
 import { uploadRecordings } from '../lib/recording-uploader.js';
-import { parsePartName, recordingPartTimings } from '../lib/recording-parts.js';
+import { parsePartName, resolvePartTimings } from '../lib/recording-parts.js';
 import { upsertRecordingDoc } from '../lib/recording-registry.js';
 import { resolveRecordingUploadTarget } from '../lib/recording-upload-target.js';
 import { startLiveRecordingUpload, stopLiveRecordingUpload, type LiveRecordingSession } from '../services/live-recording-upload.js';
@@ -218,6 +218,7 @@ function deactivatedDoc(
     audioMixerBlockId: undefined,
     loudnessMainBlockId: undefined,
     recorderBlockId: undefined,
+    recorderType: undefined,
     recording: undefined,
     // Replaced only by a deactivate that had a recording to upload (issue #534).
     ...(lastRecordingUpload ? { lastRecordingUpload } : {}),
@@ -316,6 +317,7 @@ async function uploadProductionRecording(
   doc: ProductionDoc,
   stromFlowId: string,
   recorderBlockId: string,
+  recorderType: RecorderType,
   strom: StromClient,
   stromToken: string | undefined,
   log: FastifyBaseLogger,
@@ -356,7 +358,12 @@ async function uploadProductionRecording(
 
   let uploadRes: Awaited<ReturnType<typeof uploadRecordings>>;
   try {
-    await strom.recorder.splitNow(stromFlowId, recorderBlockId).catch(() => undefined);
+    // builtin.recorder only: close the open part so it is uploaded too. On the
+    // Live Recorder path the caller has already stopped the flow, which
+    // finalises every open file, so there is nothing to split (spec §5.4).
+    if (recorderType === 'recorder') {
+      await strom.recorder.splitNow(stromFlowId, recorderBlockId).catch(() => undefined);
+    }
     uploadRes = await uploadRecordings({
       strom,
       stromUrl: config.stromUrl,
@@ -396,9 +403,14 @@ async function uploadProductionRecording(
   // endpoint can enumerate and presign recordings without round-tripping the
   // bucket. Best-effort: a failed persist must not block teardown.
   const finalizedAt = new Date().toISOString();
-  // Every part of one session shares the session stamp in its name, so offset
-  // each part by its predecessors' durations (issue #553).
-  const timings = recordingPartTimings(uploadRes.uploaded, config.recordingSegmentSecs);
+  // Part start times by the precedence of spec §6 (OL-32a): Strom's own start,
+  // then when the live session saw the file open, then the previous part's
+  // start + duration, then the session stamp in the name offset by the
+  // predecessors' durations (issue #553).
+  const timings = resolvePartTimings(uploadRes.uploaded, {
+    segmentSecs: config.recordingSegmentSecs,
+    ...(liveSession ? { openedAt: liveSession.openedAt, known: liveSession.known } : {}),
+  });
   for (const [i, seg] of uploadRes.uploaded.entries()) {
     const timing = timings[i];
     const part = parsePartName(seg.key.slice(seg.key.lastIndexOf('/') + 1));
@@ -428,9 +440,14 @@ async function uploadProductionRecording(
         // the legacy doc.updatedAt. A part ends after its own duration when
         // known, else at deactivate.
         startedAt: timing.startedAt ?? doc.recording?.startedAt ?? doc.updatedAt,
+        ...(timing.startedAtSource ? { startedAtSource: timing.startedAtSource } : {}),
         endedAt: timing.endedAt ?? finalizedAt,
         ...(activationId ? { activationId } : {}),
         ...(part ? { partIndex: part.index } : {}),
+        kind: 'program',
+        // Only this activation's parts are known to come from this block; a
+        // leftover of an earlier activation may have been written by either.
+        ...(activationId ? { recorderType } : {}),
         createdAt: finalizedAt,
         updatedAt: finalizedAt,
       });
@@ -608,6 +625,9 @@ async function runActivationFlow(
       ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
       ...(loudnessMainBlockId !== undefined && { loudnessMainBlockId }),
       ...(activation.recorderBlockId !== undefined && { recorderBlockId: activation.recorderBlockId }),
+      // Written with recorderBlockId, as undefined without a recorder so a
+      // stale value from an earlier activation never leaks into this one.
+      recorderType: activation.recorderBlockId !== undefined ? activation.recorderType ?? 'recorder' : undefined,
       ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
       ...(Object.keys(activation.sourceAudioOffsetBlockIds).length > 0 && { sourceAudioOffsetBlockIds: activation.sourceAudioOffsetBlockIds }),
       ...(Object.keys(activation.clipPlayerBlockIds).length > 0 && { clipPlayerBlockIds: activation.clipPlayerBlockIds }),
@@ -774,7 +794,13 @@ async function runActivationFlow(
         // started in the same tick, so a deactivate that aborts this run either
         // stops it or prevents it.
         if (activation.recorderBlockId && !signal.aborted) {
-          startLiveRecordingUpload({ _id: productionId, stromFlowId, recorderBlockId: activation.recorderBlockId, recording }, log);
+          startLiveRecordingUpload({
+            _id: productionId,
+            stromFlowId,
+            recorderBlockId: activation.recorderBlockId,
+            recorderType: activation.recorderType ?? 'recorder',
+            recording,
+          }, log);
         }
         // Emit the PRODUCTION_STATUS lifecycle event for the active transition
         // (spec §3). Flow is playing, so all assigned outputs derive as healthy.
@@ -1274,7 +1300,21 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       // storage. Best-effort: a failed upload must not block teardown. The
       // outcome is stored on the production as `lastRecordingUpload` (#534).
       if (doc.recorderBlockId) {
-        lastRecordingUpload = await uploadProductionRecording(doc, doc.stromFlowId, doc.recorderBlockId, strom, stromToken, log, liveSession);
+        // Absent on a production activated before OL-32a: that one runs builtin.recorder.
+        const recorderType: RecorderType = doc.recorderType ?? 'recorder';
+        if (recorderType === 'liverecorder') {
+          // Live Recorder finalises every open file inside the flow stop, so
+          // stop first and then upload everything; no split-now (spec §5.4).
+          // deactivateStromFlow's own stop below is then a no-op.
+          try {
+            await strom.flows.stop(doc.stromFlowId);
+          } catch (err) {
+            log.warn({ err, productionId: doc._id }, 'Strom flow stop before the recording upload failed — uploading what is on Strom');
+          }
+        }
+        lastRecordingUpload = await uploadProductionRecording(
+          doc, doc.stromFlowId, doc.recorderBlockId, recorderType, strom, stromToken, log, liveSession,
+        );
       }
 
       await deactivateStromFlow(doc.stromFlowId, strom);

@@ -500,3 +500,13 @@ size held still for `PART_STABLE_MS`, the uploaded byte count equals that size, 
 deactivate. Every stop path (deactivate, idle auto-deactivate, delete, failed activation) must
 `await stopLiveRecordingUpload()` before its own teardown: it waits for the running pass, so the
 deactivate sweep never downloads a file the live pass is deleting.
+
+Recorder events are matched to a session by **exact directory** (`isFileInDir`: the file's
+directory, after any media-root prefix, equals the session's `outputDir`) or by block id — never by
+path prefix. OL-32 nests input recordings under `recordings/<productionId>/<mixerInput>/`, and a
+prefix match would let every input event move the program session's open file. The session also
+records each file's first-seen time (`openedAt`, part start rule 2 of
+`docs/specs/iso-input-recording.md` §6), so it subscribes even with `RECORDING_SEGMENT_SECS=0`
+(then only the upload passes are skipped). On the Live Recorder path (`recorderType:
+'liverecorder'`) deactivate stops the flow before the upload sweep and never calls split-now:
+the block finalises its open file inside the stop.

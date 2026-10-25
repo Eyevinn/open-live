@@ -24,14 +24,28 @@
  * but the newest (by session stem, then part index) as closed. The newest file
  * may be the one the recorder is writing and is never touched.
  *
+ * Files are matched to the session by exact directory (spec
+ * iso-input-recording.md §5.3): a file counts when its directory, after any
+ * media-root prefix Strom adds, equals the recorder's output directory (or the
+ * event names the recorder block). A file in a subdirectory — the per-input
+ * recordings of OL-32 — never counts for the program session.
+ *
+ * Each session also records when open-live first saw each file open (spec §6):
+ * that is the part's start time when it is registered, here or by the
+ * deactivate sweep. The subscription is kept for this even with
+ * `RECORDING_SEGMENT_SECS=0`; only the upload passes are skipped then.
+ *
  * Passes run one at a time per production. Deactivate and production delete
  * call {@link stopLiveRecordingUpload} before their own teardown, which waits
  * for the running pass so the deactivate sweep never races it.
  */
 import { config } from '../config.js';
 import { getDb, getRecordingsDb } from '../db/index.js';
-import type { ActiveRecording, ProductionDoc } from '../db/types.js';
-import { comparePartNames, parsePartName, recordingPartTimings, type PartName } from '../lib/recording-parts.js';
+import type { ActiveRecording, ProductionDoc, RecorderType } from '../db/types.js';
+import {
+  comparePartNames, parsePartName, resolvePartTimings,
+  type KnownPartStart, type PartName, type PartOpenTime,
+} from '../lib/recording-parts.js';
 import { upsertRecordingDoc } from '../lib/recording-registry.js';
 import { resolveRecordingUploadTarget } from '../lib/recording-upload-target.js';
 import { S3AuthError, uploadRecordingFile, type UploadedSegment } from '../lib/recording-uploader.js';
@@ -54,6 +68,10 @@ export interface LiveRecordingSession {
   activationId: string;
   /** Session stem of this activation's files, once one has been seen. */
   stem?: string;
+  /** When each file of the recorder was seen opening, by file base name (spec §6). */
+  openedAt: Map<string, PartOpenTime>;
+  /** Start (and duration) of every part registered while live, by `partKey` — for chaining (spec §6 rule 3). */
+  known: Map<string, KnownPartStart>;
 }
 
 interface LiveRecording {
@@ -61,7 +79,14 @@ interface LiveRecording {
   flowId: string;
   recorderBlockId: string;
   outputDir: string;
+  recorderType: RecorderType;
   recording?: ActiveRecording;
+  /** False with `RECORDING_SEGMENT_SECS=0`: the session only records open times. */
+  uploadsLive: boolean;
+  /** See {@link LiveRecordingSession.openedAt}. */
+  openedAt: Map<string, PartOpenTime>;
+  /** See {@link LiveRecordingSession.known}. */
+  known: Map<string, KnownPartStart>;
   log: Log;
   /** The newest file a recorder event announced: it is open, everything before it is closed. */
   openFile?: PartName;
@@ -88,6 +113,20 @@ function baseName(path: string): string {
   return path.slice(path.lastIndexOf('/') + 1);
 }
 
+/**
+ * Whether a recorder event's file lies directly in `outputDir` (spec §5.3).
+ * Strom reports media paths relative to its media root, but may prefix the
+ * root itself, so a directory that ends in `/<outputDir>` matches too. A file
+ * in a subdirectory of `outputDir` does not.
+ */
+export function isFileInDir(filename: string, outputDir: string): boolean {
+  const slash = filename.lastIndexOf('/');
+  if (slash < 0) return false;
+  const dir = filename.slice(0, slash).replace(/\/+$/, '');
+  const want = outputDir.replace(/^\/+|\/+$/g, '');
+  return dir === want || dir.endsWith(`/${want}`);
+}
+
 async function stromClient(): Promise<{ strom: StromClient; token: string | undefined }> {
   const token = await getStromToken(config.stromToken);
   return { strom: new StromClient({ baseUrl: config.stromUrl, token }), token };
@@ -95,15 +134,16 @@ async function stromClient(): Promise<{ strom: StromClient; token: string | unde
 
 /**
  * Starts uploading closed parts for a production that has just gone live with
- * a recorder (or was found live after a restart). A no-op with
+ * a recorder (or was found live after a restart). With
  * `RECORDING_SEGMENT_SECS=0` (one file per activation, uploaded at deactivate)
- * or without a recorder. Replaces any session already running for it.
+ * the session only records file open times (spec §6). A no-op without a
+ * recorder. Replaces any session already running for it.
  */
 export function startLiveRecordingUpload(
-  doc: Pick<ProductionDoc, '_id' | 'stromFlowId' | 'recorderBlockId' | 'recording'>,
+  doc: Pick<ProductionDoc, '_id' | 'stromFlowId' | 'recorderBlockId' | 'recorderType' | 'recording'>,
   log: Log,
 ): void {
-  if (config.recordingSegmentSecs <= 0 || !doc.stromFlowId || !doc.recorderBlockId) return;
+  if (!doc.stromFlowId || !doc.recorderBlockId) return;
   const previous = live.get(doc._id);
   if (previous) void stopSession(previous);
 
@@ -112,7 +152,11 @@ export function startLiveRecordingUpload(
     flowId: doc.stromFlowId,
     recorderBlockId: doc.recorderBlockId,
     outputDir: recordingOutputDir(doc._id),
+    recorderType: doc.recorderType ?? 'recorder',
     ...(doc.recording ? { recording: doc.recording } : {}),
+    uploadsLive: config.recordingSegmentSecs > 0,
+    openedAt: new Map(),
+    known: new Map(),
     log,
     uploaded: [],
     stopped: false,
@@ -127,7 +171,10 @@ export function startLiveRecordingUpload(
     // Events sent while the socket was down are lost: sweep everything but the newest file.
     onConnected: () => trigger(rec),
   });
-  log.info({ productionId: rec.productionId, flowId: rec.flowId }, 'live recording part upload started');
+  log.info(
+    { productionId: rec.productionId, flowId: rec.flowId, recorderType: rec.recorderType, uploadsLive: rec.uploadsLive },
+    rec.uploadsLive ? 'live recording part upload started' : 'live recording session started (open times only, RECORDING_SEGMENT_SECS=0)',
+  );
 }
 
 /**
@@ -147,7 +194,12 @@ async function stopSession(rec: LiveRecording): Promise<LiveRecordingSession> {
   rec.unsubscribe();
   rec.wake?.();
   await rec.running?.catch(() => undefined);
-  return { activationId: rec.flowId, ...(rec.openFile ? { stem: rec.openFile.stem } : {}) };
+  return {
+    activationId: rec.flowId,
+    ...(rec.openFile ? { stem: rec.openFile.stem } : {}),
+    openedAt: rec.openedAt,
+    known: rec.known,
+  };
 }
 
 /** True while a live part upload runs for the production. */
@@ -161,7 +213,6 @@ export function isLiveRecordingUploadActive(productionId: string): boolean {
  * open-live was down. Best-effort: a failure is logged and skipped.
  */
 export async function resumeLiveRecordingUploads(log: Log): Promise<void> {
-  if (config.recordingSegmentSecs <= 0) return;
   try {
     const result = await getDb().find({ selector: { type: 'production', status: 'active' } });
     for (const doc of result.docs as ProductionDoc[]) {
@@ -174,18 +225,27 @@ export async function resumeLiveRecordingUploads(log: Log): Promise<void> {
 
 function onFileChanged(rec: LiveRecording, event: RecorderFileEvent): void {
   if (rec.stopped || event.flowId !== rec.flowId) return;
-  // Strom may rename blocks it is given, so a file in our output directory counts too.
-  const inOutputDir = event.filename.startsWith(`${rec.outputDir}/`) || event.filename.includes(`/${rec.outputDir}/`);
-  if (event.blockId !== rec.recorderBlockId && !inOutputDir) return;
-  const part = parsePartName(baseName(event.filename));
+  // Strom may rename blocks it is given, so a file directly in our output
+  // directory counts too — by exact directory, never by prefix (spec §5.3):
+  // input recordings nest under the program directory.
+  if (event.blockId !== rec.recorderBlockId && !isFileInDir(event.filename, rec.outputDir)) return;
+  const name = baseName(event.filename);
+  const part = parsePartName(name);
   if (!part) return;
+  // First sighting of the file is its open time (spec §6 rule 2).
+  if (!rec.openedAt.has(name)) {
+    rec.openedAt.set(name, {
+      openedAtMs: Date.now(),
+      ...(event.startUtcUs !== undefined ? { startUtcUs: event.startUtcUs } : {}),
+    });
+  }
   if (!rec.openFile || comparePartNames(part, rec.openFile) > 0) rec.openFile = part;
   trigger(rec);
 }
 
 /** Runs a pass now, or once more after the running one. */
 function trigger(rec: LiveRecording): void {
-  if (rec.stopped) return;
+  if (rec.stopped || !rec.uploadsLive) return;
   if (rec.running) {
     rec.rerun = true;
     return;
@@ -304,7 +364,11 @@ async function runPass(rec: LiveRecording): Promise<void> {
     }
 
     const ofThisActivation = rec.openFile ? part.stem === rec.openFile.stem : undefined;
-    const timings = recordingPartTimings([...rec.uploaded, seg], config.recordingSegmentSecs);
+    const timings = resolvePartTimings([...rec.uploaded, seg], {
+      segmentSecs: config.recordingSegmentSecs,
+      openedAt: rec.openedAt,
+      known: rec.known,
+    });
     const timing = timings[timings.length - 1]!;
     const finishedAt = new Date().toISOString();
     try {
@@ -318,9 +382,14 @@ async function runPass(rec: LiveRecording): Promise<void> {
         sizeBytes: seg.sizeBytes,
         ...(seg.durationMs !== undefined ? { durationMs: seg.durationMs } : {}),
         startedAt: timing.startedAt ?? rec.recording?.startedAt ?? finishedAt,
+        ...(timing.startedAtSource ? { startedAtSource: timing.startedAtSource } : {}),
         endedAt: timing.endedAt ?? finishedAt,
         ...(ofThisActivation ? { activationId: rec.flowId } : {}),
         partIndex: part.index,
+        kind: 'program',
+        // A leftover of an earlier activation may come from either block; only
+        // this activation's parts are known to come from this recorder.
+        ...(ofThisActivation ? { recorderType: rec.recorderType } : {}),
         createdAt: finishedAt,
         updatedAt: finishedAt,
       });

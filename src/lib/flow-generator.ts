@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import type {
   ProductionDoc, SourceDoc, GraphicDoc, OutputDoc, ClipReference, ActivationWarning, AudioStreamNotAppliedReason,
+  RecorderType,
 } from '../db/types.js';
 import { getSourcesDb, getGraphicsDb } from '../db/index.js';
 import { deserializeClipReference } from './clip-reference.js';
@@ -34,11 +35,14 @@ export interface ActivationResult {
   whepOutputEntries?: Array<{ outputId: string; endpointId: string }>;
   pgmWhepEndpointId?: string;
   /**
-   * ID of the builtin.recorder block wired into the flow — set only when a
+   * ID of the recorder block wired into the flow — set only when a
    * 'recording' output is assigned. The block records local segments in Strom;
-   * open-live uploads them to MinIO after deactivate (see recording-uploader.ts).
+   * open-live uploads them to MinIO while live and after deactivate (see
+   * recording-uploader.ts, services/live-recording-upload.ts).
    */
   recorderBlockId?: string;
+  /** Which block {@link recorderBlockId} is (OL-32a, ADR-011); set with it. */
+  recorderType?: RecorderType;
   /** ID of the 'recording' OutputDoc the recorder block was built for (issue #534). */
   recorderOutputId?: string;
   /**
@@ -133,17 +137,43 @@ const AUDIO_STREAM_REASON_TEXT: Record<AudioStreamNotAppliedReason, string> = {
 };
 
 /**
+ * The block definition ids Strom offers, or `null` when the list cannot be
+ * read. Fetched once per activation that wires a recorder (OL-32a, spec §4.1).
+ */
+async function readStromBlockIds(strom: Pick<StromClient, 'blocks'>): Promise<ReadonlySet<string> | null> {
+  try {
+    const { blocks } = await strom.blocks.list();
+    return new Set(blocks.map((b) => b.id));
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Whether Strom has the builtin.audioenc block (added in Strom 0.6.9). If the
  * block list can't be read, assume it does: the flow create/start that follows
  * reports an unreachable Strom better than a guess here would.
  */
-async function stromHasAudioEncoder(strom: StromClient): Promise<boolean> {
-  try {
-    const { blocks } = await strom.blocks.list();
-    return blocks.some((b) => b.id === 'builtin.audioenc');
-  } catch {
-    return true;
-  }
+function stromHasAudioEncoder(blockIds: ReadonlySet<string> | null): boolean {
+  return blockIds ? blockIds.has('builtin.audioenc') : true;
+}
+
+/**
+ * Which block records this activation (OL-32a, spec iso-input-recording.md
+ * §4.1, ADR-011): `liverecorder` when `RECORDING_BLOCK` is `auto` and Strom's
+ * block list (`blockIds`) has `builtin.liverecorder`, else `recorder`.
+ * Detection is by capability, not version. If the block list could not be
+ * read (`null`) the answer is `recorder` — the opposite default to
+ * {@link stromHasAudioEncoder}, on purpose: every supported Strom has
+ * `builtin.recorder`, while naming a block Strom does not have makes it refuse
+ * the whole flow, so program recording is never lost to a guess.
+ */
+export function chooseRecorderType(
+  blockIds: ReadonlySet<string> | null,
+  setting: 'auto' | 'recorder' = config.recordingBlock,
+): RecorderType {
+  if (setting === 'recorder' || !blockIds) return 'recorder';
+  return blockIds.has('builtin.liverecorder') ? 'liverecorder' : 'recorder';
 }
 
 /** `builtin.mixer`'s own `min_upstream_latency` default (strom `types/src/mixer.rs`). */
@@ -1111,6 +1141,7 @@ export async function activateStromFlow(
   // Inject output blocks for each assigned OutputDoc
   const whepOutputEntries: Array<{ outputId: string; endpointId: string }> = [];
   let recorderBlockId: string | undefined;
+  let recorderType: RecorderType | undefined;
   let recorderOutputId: string | undefined;
   let recorderOutputDir: string | undefined;
   let outputBlockIndex = 0;
@@ -1122,15 +1153,53 @@ export async function activateStromFlow(
       const idSlug = outputDoc._id.replace(/[^a-z0-9]/gi, '').slice(-8) || 'out';
       const blockId = `b-out-${idSlug}-${endpointSuffix}`;
       if (outputDoc.outputType === 'recording') {
-        // VOD recording: emit a single builtin.recorder block that writes local
-        // segments in Strom. open-live uploads them to MinIO after deactivate
-        // (recording-uploader.ts). Only one recorder is wired per production —
+        // VOD recording: emit a single recorder block that writes local
+        // segments in Strom. open-live uploads them to object storage while
+        // live and after deactivate (live-recording-upload.ts,
+        // recording-uploader.ts). Only one recorder is wired per production —
         // extra 'recording' assignments are ignored so we never fan-out writes.
         if (recorderBlockId) continue;
         // Per-production output directory: recorder writes
         // {media_path}/{output_dir}/{filename_prefix}_{timestamp}_%05d.{ext} (Strom recorder.rs). We key
         // it by production id so segments are trivially locatable + uploadable.
         const outputDir = `recordings/${production._id}`;
+        // Cut the recording into time-based parts (RECORDING_SEGMENT_SECS,
+        // #553). 0 leaves it unset: one file per activation.
+        const segmentProps = config.recordingSegmentSecs > 0
+          ? { max_size_time_secs: config.recordingSegmentSecs }
+          : {};
+        // Live Recorder or Recorder, chosen once per activation (OL-32a, spec §4.1).
+        const blockIds = await readStromBlockIds(strom);
+        const useType = chooseRecorderType(blockIds);
+        if (useType === 'liverecorder') {
+          // Live Recorder (spec §4.2): fragmented MP4 through a live muxer, so a
+          // quiet track never stalls the recording. It encodes raw audio to AAC
+          // itself, so main_out is linked raw — no builtin.audioenc, and no
+          // recording-no-audio case. Video arrives H.264 from Enc PGM.
+          flow.blocks.push({
+            id: blockId,
+            block_definition_id: 'builtin.liverecorder',
+            name: outputDoc.name,
+            properties: {
+              output_dir: outputDir,
+              filename_prefix: production._id,
+              ...segmentProps,
+              num_video_tracks: 1,
+              num_audio_tracks: mainAudioSource ? 1 : 0,
+            },
+            position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
+          });
+          if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in_0` });
+          if (mainAudioSource) flow.links.push({ from: mainAudioSource, to: `${blockId}:audio_in_0` });
+          recorderBlockId = blockId;
+          recorderType = 'liverecorder';
+          recorderOutputId = outputDoc._id;
+          recorderOutputDir = outputDir;
+          outputBlockIndex++;
+          continue;
+        }
+        // Fallback (no Live Recorder, unreadable block list, RECORDING_BLOCK=recorder):
+        // builtin.recorder exactly as before OL-32a.
         flow.blocks.push({
           id: blockId,
           block_definition_id: 'builtin.recorder',
@@ -1138,11 +1207,7 @@ export async function activateStromFlow(
           properties: {
             output_dir: outputDir,
             filename_prefix: production._id,
-            // Cut the recording into time-based parts (RECORDING_SEGMENT_SECS,
-            // #553). 0 leaves it unset: one file per activation.
-            ...(config.recordingSegmentSecs > 0
-              ? { max_size_time_secs: config.recordingSegmentSecs }
-              : {}),
+            ...segmentProps,
           },
           position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
         });
@@ -1151,7 +1216,7 @@ export async function activateStromFlow(
         // so audio needs builtin.audioenc. Strom older than 0.6.9 lacks it and
         // refuses to start the whole flow if it is referenced; record picture
         // only rather than keep the production off air.
-        if (mainAudioSource && !(await stromHasAudioEncoder(strom))) {
+        if (mainAudioSource && !stromHasAudioEncoder(blockIds)) {
           warnings.push({
             type: 'recording-no-audio',
             message:
@@ -1171,6 +1236,7 @@ export async function activateStromFlow(
           flow.links.push({ from: `${audioEncId}:encoded_out`, to: `${blockId}:audio_in_0` });
         }
         recorderBlockId = blockId;
+        recorderType = 'recorder';
         recorderOutputId = outputDoc._id;
         recorderOutputDir = outputDir;
         outputBlockIndex++;
@@ -1393,6 +1459,7 @@ export async function activateStromFlow(
     whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined,
     pgmWhepEndpointId,
     recorderBlockId,
+    ...(recorderType ? { recorderType } : {}),
     recorderOutputId,
     recorderOutputDir,
     warnings,

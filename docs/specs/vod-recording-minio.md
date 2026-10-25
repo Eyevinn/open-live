@@ -259,6 +259,7 @@ Added to `src/config.ts` (same `process.env` + optional-fallback style used ther
 | `RECORDING_KEY_PREFIX` | no | `""` | Optional prefix for all recording keys |
 | `RECORDING_PRESIGN_TTL_S` | no | `3600` | Presigned playback URL TTL |
 | `RECORDING_SEGMENT_SECS` | no | `600` | Length of each recording part in seconds (Strom recorder `max_size_time_secs`); `0` = one file per activation; integer 0-86400 (#553) |
+| `RECORDING_BLOCK` | no | `auto` | Which Strom block records program: `auto` = `builtin.liverecorder` (Live Recorder, fragmented MP4) when the Strom's block list has it, else `builtin.recorder`; `recorder` = always `builtin.recorder`. Any other value fails startup (OL-32a, [`iso-input-recording.md`](iso-input-recording.md) §4.1, ADR-011) |
 
 When the MinIO vars are unset, the `recording` output type is rejected at assignment time with
 `400` (recording disabled) so the feature degrades cleanly, matching how the service already

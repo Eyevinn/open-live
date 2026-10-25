@@ -67,7 +67,9 @@ async function toApi(
   log: FastifyBaseLogger,
 ): Promise<Record<string, unknown>> {
   const { _id, _rev, type, ...rest } = doc;
-  const api: Record<string, unknown> = { id: _id, ...rest };
+  // A doc written before `kind` existed is a program recording (OL-32a, spec
+  // §3.4); the startup migration backfills it, this covers the meantime.
+  const api: Record<string, unknown> = { id: _id, ...rest, kind: rest.kind ?? 'program' };
   const signed = await presignRecording(doc, defaultTarget, log);
   if ('reason' in signed) {
     api['playbackUnavailable'] = signed.reason;

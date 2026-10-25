@@ -388,6 +388,32 @@ components:
             Part number from the file name's `_%05d` suffix, from 0. With
             RECORDING_SEGMENT_SECS > 0, parts are uploaded and listed while the
             production is still live.
+        kind:
+          type: string
+          enum: [program, input]
+          description: >-
+            Program recording or one input's own recording (OL-32). Always
+            `program` today; recordings stored before the field existed are
+            backfilled to and read as `program`. Clients must accept other
+            values added later.
+        recorderType:
+          type: string
+          enum: [liverecorder, recorder]
+          description: >-
+            The Strom block that wrote the file: `liverecorder`
+            (`builtin.liverecorder`, fragmented MP4) or `recorder`
+            (`builtin.recorder`). Set on parts of the activation that recorded
+            them; absent on older recordings and on leftovers of earlier
+            activations.
+        startedAtSource:
+          type: string
+          enum: [strom, event, chained, filename]
+          description: >-
+            How `startedAt` was derived, best first: `strom` (the file's own
+            start reported by Strom), `event` (when open-live received the
+            recorder's file-opened event), `chained` (the previous part's start
+            + duration), `filename` (the session stamp in the file name +
+            earlier parts' durations). Absent on older recordings (= `filename`).
         startedAt:
           type: string
           format: date-time
@@ -878,6 +904,14 @@ components:
             $ref: '#/components/schemas/Macro'
         tally:
           $ref: '#/components/schemas/Tally'
+        recorderType:
+          type: string
+          enum: [liverecorder, recorder]
+          description: >-
+            Which Strom block records program in the running activation (OL-32a):
+            `liverecorder` when the Strom has `builtin.liverecorder` and
+            RECORDING_BLOCK is `auto`, else `recorder`. Set on activate when a
+            `recording` output is assigned, cleared on deactivate.
         activationWarnings:
           type: array
           description: >-
