@@ -8,6 +8,7 @@ import { ensureGuestSigningKey } from './lib/guest-signing-key.js';
 import { ensureCredentialEncryptionKey } from './lib/credential-encryption-key.js';
 import { ensureRtmpCredentialKey } from './lib/rtmp-credential-key.js';
 import { migrateAudioChannelOrder } from './services/migrate-audio-channel-order.js';
+import { migrateRecordingKind } from './services/migrate-recording-kind.js';
 import { buildServer } from './server.js';
 import { reconcileProductionStatuses } from './services/reconcile.js';
 import { resumeLiveRecordingUploads } from './services/live-recording-upload.js';
@@ -139,6 +140,14 @@ async function main() {
       await migrateAudioChannelOrder(app.log);
     } catch (err: any) {
       app.log.error('[migrate:audio-channel-order] Migration errored — will retry next start (reason: %s)', err?.statusCode ?? err?.message ?? 'unknown');
+    }
+    // One-time migration (OL-32a): backfill `kind: 'program'` on recordings
+    // written before the field existed. Best-effort; an interrupted run resumes
+    // on the next start.
+    try {
+      await migrateRecordingKind(app.log);
+    } catch (err: any) {
+      app.log.error('[migrate:recording-kind] Migration errored — will retry next start (reason: %s)', err?.statusCode ?? err?.message ?? 'unknown');
     }
     await reconcileProductionStatuses(app.log);
     // Productions still live after a restart: upload the recording parts that

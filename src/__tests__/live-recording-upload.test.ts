@@ -85,7 +85,7 @@ const doc = {
 let socket: RecorderSocketHandlers | undefined;
 let segmentSecs: number;
 
-function fileChanged(i: number, over: Partial<{ flow_id: string; block_id: string }> = {}) {
+function fileChanged(i: number, over: Partial<{ flow_id: string; block_id: string; filename: string; start_utc_us: number }> = {}) {
   socket!.onEvent({
     type: 'RecorderFileChanged',
     data: { flow_id: 'flow-1', block_id: 'rec-1', filename: `${DIR}/${name(i)}`, ...over },
@@ -165,21 +165,65 @@ describe('live recording part upload — event to upload mapping', () => {
       activationId: 'flow-1',
       partIndex: 0,
       startedAt: '2026-10-22T08:00:00.000Z',
+      // Part 0 opened before the session subscribed: the name stamp (spec §6 rule 4).
+      startedAtSource: 'filename',
       endedAt: '2026-10-22T08:01:00.000Z',
+      kind: 'program',
+      recorderType: 'recorder',
     });
     expect(listing.map((e) => e.name)).toEqual([name(1)]);
   });
 
-  it('offsets later parts by the earlier parts already uploaded', async () => {
+  it('chains a part no event was seen for from its predecessor (spec §6 rule 3)', async () => {
+    listing = [entry(0), entry(1), entry(2)];
+    await started();
+    socket!.onOpen();
+    await waitForLiveRecordingPass(PROD);
+    expect(recordingDocs.get(recordingDocId('vod', `${PROD}/${name(0)}`))).toMatchObject({
+      startedAt: '2026-10-22T08:00:00.000Z', startedAtSource: 'filename',
+    });
+    expect(recordingDocs.get(recordingDocId('vod', `${PROD}/${name(1)}`))).toMatchObject({
+      partIndex: 1, startedAt: '2026-10-22T08:01:00.000Z', startedAtSource: 'chained', endedAt: '2026-10-22T08:02:00.000Z',
+    });
+  });
+
+  it('starts a part at the time its RecorderFileChanged arrived (spec §6 rule 2)', async () => {
+    const opened = Date.parse('2026-10-22T08:01:00.250Z');
+    const now = vi.spyOn(Date, 'now').mockReturnValue(opened);
     listing = [entry(0), entry(1)];
     await started();
     fileChanged(1);
     await waitForLiveRecordingPass(PROD);
+    now.mockRestore();
     listing.push(entry(2));
     fileChanged(2);
     await waitForLiveRecordingPass(PROD);
-    const reg = recordingDocs.get(recordingDocId('vod', `${PROD}/${name(1)}`));
-    expect(reg).toMatchObject({ partIndex: 1, startedAt: '2026-10-22T08:01:00.000Z', endedAt: '2026-10-22T08:02:00.000Z' });
+    expect(recordingDocs.get(recordingDocId('vod', `${PROD}/${name(1)}`))).toMatchObject({
+      partIndex: 1, startedAt: '2026-10-22T08:01:00.250Z', startedAtSource: 'event', endedAt: '2026-10-22T08:02:00.250Z',
+    });
+  });
+
+  it("prefers Strom's start_utc_us over the receipt time (spec §6 rule 1)", async () => {
+    listing = [entry(0), entry(1)];
+    await started();
+    fileChanged(1, { start_utc_us: Date.parse('2026-10-22T08:01:00.004Z') * 1000 });
+    listing.push(entry(2));
+    fileChanged(2);
+    await waitForLiveRecordingPass(PROD);
+    expect(recordingDocs.get(recordingDocId('vod', `${PROD}/${name(1)}`))).toMatchObject({
+      startedAt: '2026-10-22T08:01:00.004Z', startedAtSource: 'strom',
+    });
+  });
+
+  it('stamps recorderType from the activation (Live Recorder)', async () => {
+    listing = [entry(0), entry(1)];
+    startLiveRecordingUpload({ ...doc, recorderType: 'liverecorder' }, log);
+    await vi.waitFor(() => expect(socket).toBeDefined());
+    fileChanged(1);
+    await waitForLiveRecordingPass(PROD);
+    expect(recordingDocs.get(recordingDocId('vod', `${PROD}/${name(0)}`))).toMatchObject({
+      kind: 'program', recorderType: 'liverecorder',
+    });
   });
 
   it('treats N-1 as closed even before the listing shows file N', async () => {
@@ -203,10 +247,47 @@ describe('live recording part upload — event to upload mapping', () => {
     expect(mockUploadFile).not.toHaveBeenCalled();
   });
 
-  it('does nothing with RECORDING_SEGMENT_SECS=0', () => {
+  it('matches files by exact directory: an event from a nested input directory is ignored (spec §5.3)', async () => {
+    listing = [entry(0), entry(1)];
+    await started();
+    // An input recorder's file under the program directory, from another block.
+    socket!.onEvent({
+      type: 'RecorderFileChanged',
+      data: {
+        flow_id: 'flow-1',
+        block_id: 'b-inrec-2',
+        filename: `${DIR}/video_in_2/${PROD}_video_in_2_20261022_080000_00007.mp4`,
+      },
+    });
+    await waitForLiveRecordingPass(PROD);
+    expect(mockList).not.toHaveBeenCalled();
+    const session = await stopLiveRecordingUpload(PROD);
+    expect(session?.stem).toBeUndefined();
+    expect(session?.openedAt.size).toBe(0);
+  });
+
+  it('matches a file in the output directory behind a media-root prefix, whatever the block id', async () => {
+    listing = [entry(0), entry(1)];
+    await started();
+    fileChanged(1, { block_id: 'renamed-by-strom', filename: `/data/media/${DIR}/${name(1)}` });
+    await waitForLiveRecordingPass(PROD);
+    expect(uploadedPaths()).toEqual([`${DIR}/${name(0)}`]);
+  });
+
+  it('with RECORDING_SEGMENT_SECS=0 keeps the subscription for open times but never uploads', async () => {
     config.recordingSegmentSecs = 0;
-    startLiveRecordingUpload(doc, log);
-    expect(isLiveRecordingUploadActive(PROD)).toBe(false);
+    listing = [entry(0)];
+    await started();
+    expect(isLiveRecordingUploadActive(PROD)).toBe(true);
+    expect(recorderEventSubscriberCount()).toBe(1);
+    socket!.onOpen();
+    fileChanged(0);
+    await waitForLiveRecordingPass(PROD);
+    expect(mockList).not.toHaveBeenCalled();
+    expect(mockUploadFile).not.toHaveBeenCalled();
+    const session = await stopLiveRecordingUpload(PROD);
+    expect(session?.stem).toBe(STEM);
+    expect(session?.openedAt.get(name(0))?.openedAtMs).toEqual(expect.any(Number));
     expect(recorderEventSubscriberCount()).toBe(0);
   });
 });
@@ -348,7 +429,8 @@ describe('live recording part upload — teardown', () => {
     await waitForLiveRecordingPass(PROD);
     expect(recorderEventSubscriberCount()).toBe(1);
     const session = await stopLiveRecordingUpload(PROD);
-    expect(session).toEqual({ activationId: 'flow-1', stem: STEM });
+    expect(session).toMatchObject({ activationId: 'flow-1', stem: STEM });
+    expect([...session!.openedAt.keys()]).toEqual([name(0)]);
     expect(recorderEventSubscriberCount()).toBe(0);
     expect(isLiveRecordingUploadActive(PROD)).toBe(false);
     // Events after stop do nothing.

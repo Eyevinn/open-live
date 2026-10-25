@@ -391,9 +391,35 @@ export interface RecordingDoc {
   activationId?: string;
   /** Part number from the file name's `_%05d` suffix, from 0 (issue #556); absent when the name has none. */
   partIndex?: number;
+  /**
+   * Program or one input's own recording (OL-32, spec iso-input-recording.md
+   * §3.1). Set on every new doc; docs written before it are backfilled to
+   * `program` by `migration:recording-kind-v1`, and readers treat a missing
+   * value as `program`.
+   */
+  kind?: RecordingKind;
+  /** Which Strom block wrote the file (OL-32a). Absent on older docs (= `recorder`). */
+  recorderType?: RecorderType;
+  /** How `startedAt` was derived (OL-32a, spec §6). Absent on older docs (= `filename`). */
+  startedAtSource?: RecordingStartSource;
   createdAt: string;
   updatedAt: string;
 }
+
+/** `RecordingDoc.kind`: the program recording, or one input's own recording (OL-32). */
+export type RecordingKind = 'program' | 'input';
+
+/** The Strom block that records: Live Recorder (`builtin.liverecorder`) or Recorder (`builtin.recorder`). */
+export type RecorderType = 'liverecorder' | 'recorder';
+
+/**
+ * Where a recording part's `startedAt` came from, best first (spec §6):
+ *  - `strom`: the file's t=0 reported by Strom (`RecorderFileChanged.start_utc_us`);
+ *  - `event`: when open-live received `RecorderFileChanged` for the file;
+ *  - `chained`: the previous part's start + duration;
+ *  - `filename`: the session stamp in the file name + earlier parts' durations.
+ */
+export type RecordingStartSource = 'strom' | 'event' | 'chained' | 'filename';
 
 /**
  * The recording output a production's recorder block was wired for, captured
@@ -850,8 +876,14 @@ export interface ProductionDoc {
   pipConfigs?: PipConfig[];
   /** ID of the running Strom flow (set on activate, cleared on deactivate) */
   stromFlowId?: string;
-  /** ID of the builtin.recorder block — set on activate when a 'recording' output is assigned, cleared on deactivate */
+  /** ID of the recorder block (builtin.liverecorder or builtin.recorder) — set on activate when a 'recording' output is assigned, cleared on deactivate */
   recorderBlockId?: string;
+  /**
+   * Which block {@link recorderBlockId} is (OL-32a, ADR-011): `liverecorder`
+   * or `recorder`. Set with it on activate, cleared on deactivate. Absent on a
+   * production activated before OL-32a = `recorder`.
+   */
+  recorderType?: RecorderType;
   /**
    * Upload target of the running recording, snapshotted at activation next to
    * {@link recorderBlockId} (issue #534). Deactivate uploads to this target

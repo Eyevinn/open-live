@@ -49,6 +49,22 @@ function parseNonNegativeIntEnv(name: string, defaultValue: number, max = Number
   return value;
 }
 
+/** Values `RECORDING_BLOCK` accepts (OL-32a, spec iso-input-recording.md §10.1). */
+export type RecordingBlockSetting = 'auto' | 'recorder';
+
+/**
+ * Parses `RECORDING_BLOCK`: `auto` (default) records with Strom's
+ * `builtin.liverecorder` when the Strom has it, else `builtin.recorder`;
+ * `recorder` always uses `builtin.recorder`. Anything else fails startup.
+ */
+function parseRecordingBlockEnv(name: string): RecordingBlockSetting {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return 'auto';
+  const value = raw.trim().toLowerCase();
+  if (value === 'auto' || value === 'recorder') return value;
+  throw new Error(`Environment variable ${name} must be "auto" or "recorder", got "${raw}"`);
+}
+
 /** Longest recording part `RECORDING_SEGMENT_SECS` accepts: 24 hours. */
 const MAX_RECORDING_SEGMENT_SECS = 86_400;
 
@@ -309,6 +325,13 @@ export const config = {
    * from 0 to 86400; startup fails otherwise.
    */
   recordingSegmentSecs: parseNonNegativeIntEnv('RECORDING_SEGMENT_SECS', 600, MAX_RECORDING_SEGMENT_SECS),
+  /**
+   * Which Strom block records program (OL-32a, ADR-011). `auto`: Live Recorder
+   * (`builtin.liverecorder`) when the Strom's block list has it, else
+   * `builtin.recorder`. `recorder`: always `builtin.recorder` — an operator
+   * escape hatch if Live Recorder misbehaves, without a rollback.
+   */
+  recordingBlock: parseRecordingBlockEnv('RECORDING_BLOCK'),
   // --- Storage connections (issue #520, OL-21, docs/specs/storage-connections.md, ADR-009) ---
   /**
    * SSRF allowlist for operator-supplied storage-connection endpoints (ADR-009

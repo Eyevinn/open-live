@@ -178,6 +178,31 @@ afterAll(() => {
   delete process.env['STORAGE_CONNECTION_KEY'];
 });
 
+describe('recorderType on the production (OL-32a)', () => {
+  it('persists the activation recorder type with the recorder block and clears it on deactivate', async () => {
+    productions.set('prod-1', production());
+    mockActivateStromFlow.mockResolvedValue({ ...activationResult(), recorderType: 'liverecorder' });
+    mockUploadRecordings.mockResolvedValue({ uploaded: [], failed: [] });
+    const app = await buildServer();
+    await app.inject({ method: 'POST', url: '/api/v1/productions/prod-1/activate' });
+    await vi.waitFor(() => expect(productions.get('prod-1')?.status).toBe('active'));
+    expect(productions.get('prod-1')).toMatchObject({ recorderBlockId: 'b-out-rec', recorderType: 'liverecorder' });
+
+    const res = await app.inject({ method: 'POST', url: '/api/v1/productions/prod-1/deactivate' });
+    expect(res.statusCode).toBe(200);
+    expect(productions.get('prod-1')?.recorderType).toBeUndefined();
+  });
+
+  it('writes no recorderType without a recorder block', async () => {
+    productions.set('prod-1', production({ recorderType: 'recorder' } as Partial<ProductionDoc>));
+    mockActivateStromFlow.mockResolvedValue({ ...activationResult(), recorderBlockId: undefined, recorderOutputId: undefined });
+    const app = await buildServer();
+    await app.inject({ method: 'POST', url: '/api/v1/productions/prod-1/activate' });
+    await vi.waitFor(() => expect(productions.get('prod-1')?.status).toBe('active'));
+    expect(productions.get('prod-1')?.recorderType).toBeUndefined();
+  });
+});
+
 describe('recording upload target snapshot (issue #534)', () => {
   it('uploads to the activation-time connection after the output is removed from the live production', async () => {
     productions.set('prod-1', production());

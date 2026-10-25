@@ -136,6 +136,7 @@ and fill in the values:
 | `INTERCOM_MANAGER_URL` | Base URL of the Open Intercom manager ([`Eyevinn/intercom-manager`](https://github.com/Eyevinn/intercom-manager)) for operator↔guest talkback. Optional: when unset, guest calling still works with WHIP video + WHEP return but no talkback line | _(empty — talkback disabled)_ |
 | `INTERCOM_MANAGER_TOKEN` | Auth token for the Open Intercom manager. Optional; held server-side only and redacted from logs | _(empty)_ |
 | `RECORDING_SEGMENT_SECS` | Length in seconds of each recording part. Strom's recorder cuts a recording into consecutive `<productionId>_<timestamp>_0000N.mp4` files of this length (its `max_size_time_secs`); deactivate uploads every part as its own recording. `0` turns cutting off: one file per activation. Must be an integer from 0 to 86400; startup fails otherwise. See [`docs/specs/vod-recording-minio.md`](docs/specs/vod-recording-minio.md) | `600` |
+| `RECORDING_BLOCK` | Which Strom block records program. `auto`: Strom's Live Recorder (`builtin.liverecorder`, a live fragmented-MP4 muxer that does not stall when a track goes quiet) when the Strom has it, else `builtin.recorder`. `recorder`: always `builtin.recorder` — an escape hatch if Live Recorder misbehaves. Any other value fails startup. See [`docs/specs/iso-input-recording.md`](docs/specs/iso-input-recording.md) | `auto` |
 
 > **Never commit `.env`** — it is gitignored. Use `.env.example` as the reference.
 

@@ -1,4 +1,5 @@
 import type { UploadedSegment } from './recording-uploader.js';
+import type { RecordingStartSource } from '../db/types.js';
 
 /** Start and end of one uploaded recording part (ISO 8601). */
 export interface PartTiming {
@@ -77,4 +78,105 @@ export function recordingPartTimings(segments: UploadedSegment[], segmentSecs: n
       ...(seg.durationMs !== undefined ? { endedAt: new Date(startMs + seg.durationMs).toISOString() } : {}),
     };
   });
+}
+
+/** When open-live saw a recorder open a file (spec iso-input-recording.md §6). */
+export interface PartOpenTime {
+  /** Wall-clock ms when open-live received `RecorderFileChanged` for the file (rule 2). */
+  openedAtMs: number;
+  /** The file's t=0 on the flow's UTC anchor, in µs, when Strom reports it (rule 1, strom#1057). */
+  startUtcUs?: number;
+}
+
+/** A part whose start is already known, so the next part can chain from it (rule 3). */
+export interface KnownPartStart {
+  startedAtMs: number;
+  durationMs?: number;
+}
+
+/** {@link PartTiming} plus which rule of spec §6 produced `startedAt`. */
+export interface ResolvedPartTiming extends PartTiming {
+  /** Absent when no rule applied (no event, no predecessor, no stamp in the name). */
+  startedAtSource?: RecordingStartSource;
+}
+
+/** Key of one part in a `KnownPartStart` index: session stem + part index. */
+export function partKey(part: PartName): string {
+  return `${part.stem}\0${part.index}`;
+}
+
+function baseName(path: string): string {
+  return path.slice(path.lastIndexOf('/') + 1);
+}
+
+/**
+ * Per-part start and end times with the start-time precedence of spec §6
+ * (OL-32a), best first:
+ *  1. `strom` — the file's own `start_utc_us` from `RecorderFileChanged`;
+ *  2. `event` — when open-live received `RecorderFileChanged` for the file;
+ *  3. `chained` — the previous part of the same session (stem): its start +
+ *     duration, when both are known;
+ *  4. `filename` — the session stamp in the name + earlier parts' durations
+ *     ({@link recordingPartTimings}).
+ *
+ * `openedAt` is keyed by file base name. `known` holds parts resolved earlier
+ * (e.g. uploaded while live) by {@link partKey}; it is updated with every part
+ * resolved here, so a batch chains within itself too. `endedAt` is
+ * `startedAt + durationMs` when the duration is known, else left unset for the
+ * caller's fallback. Returns one entry per segment, in input order.
+ */
+export function resolvePartTimings(
+  segments: UploadedSegment[],
+  opts: {
+    segmentSecs: number;
+    openedAt?: ReadonlyMap<string, PartOpenTime>;
+    known?: Map<string, KnownPartStart>;
+  },
+): ResolvedPartTiming[] {
+  const byName = recordingPartTimings(segments, opts.segmentSecs);
+  const known = opts.known ?? new Map<string, KnownPartStart>();
+  const out: ResolvedPartTiming[] = new Array(segments.length);
+  const order = segments
+    .map((seg, i) => ({ i, name: baseName(seg.key), part: parsePartName(baseName(seg.key)) }))
+    .sort((a, b) => {
+      if (a.part && b.part) return comparePartNames(a.part, b.part);
+      return a.part ? -1 : b.part ? 1 : 0;
+    });
+
+  for (const { i, name, part } of order) {
+    const seg = segments[i]!;
+    const open = opts.openedAt?.get(name);
+    let startMs: number | undefined;
+    let source: RecordingStartSource | undefined;
+    if (open?.startUtcUs !== undefined && Number.isFinite(open.startUtcUs)) {
+      startMs = Math.round(open.startUtcUs / 1000);
+      source = 'strom';
+    } else if (open && Number.isFinite(open.openedAtMs)) {
+      startMs = open.openedAtMs;
+      source = 'event';
+    } else {
+      const prev = part && part.index > 0 ? known.get(partKey({ stem: part.stem, index: part.index - 1 })) : undefined;
+      if (prev && prev.durationMs !== undefined) {
+        startMs = prev.startedAtMs + prev.durationMs;
+        source = 'chained';
+      } else {
+        const fromName = byName[i]?.startedAt;
+        if (fromName) {
+          startMs = Date.parse(fromName);
+          source = 'filename';
+        }
+      }
+    }
+    if (startMs === undefined || !Number.isFinite(startMs)) {
+      out[i] = {};
+      continue;
+    }
+    if (part) known.set(partKey(part), { startedAtMs: startMs, ...(seg.durationMs !== undefined ? { durationMs: seg.durationMs } : {}) });
+    out[i] = {
+      startedAt: new Date(startMs).toISOString(),
+      ...(seg.durationMs !== undefined ? { endedAt: new Date(startMs + seg.durationMs).toISOString() } : {}),
+      startedAtSource: source,
+    };
+  }
+  return out;
 }

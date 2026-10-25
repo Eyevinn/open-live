@@ -5,7 +5,7 @@
  * the earlier parts' durations are what make the start times consecutive.
  */
 import { describe, it, expect } from 'vitest';
-import { recordingPartTimings } from '../lib/recording-parts.js';
+import { recordingPartTimings, resolvePartTimings, partKey, type PartOpenTime, type KnownPartStart } from '../lib/recording-parts.js';
 import type { UploadedSegment } from '../lib/recording-uploader.js';
 
 const SESSION_START = '2026-10-19T10:00:00.000Z';
@@ -71,5 +71,59 @@ describe('recordingPartTimings (#553)', () => {
     const noStamp = part('prod-1_20261019_100000', 3, 1_000, null);
     const noIndex: UploadedSegment = { key: 'prod-1/seg.mp4', sizeBytes: 1, stromPath: 'recordings/prod-1/seg.mp4', startedAt: SESSION_START };
     expect(recordingPartTimings([noStamp, noIndex], 60)).toEqual([{}, { startedAt: SESSION_START }]);
+  });
+});
+
+describe('resolvePartTimings — start-time precedence (OL-32a, spec §6)', () => {
+  const STEM = 'prod-1_20261019_100000';
+  const nameOf = (i: number) => `${STEM}_${String(i).padStart(5, '0')}.mp4`;
+  const at = (iso: string) => Date.parse(iso);
+
+  it('rule 1: Strom start_utc_us wins over the receipt time', () => {
+    const openedAt = new Map<string, PartOpenTime>([
+      [nameOf(0), { openedAtMs: at('2026-10-19T10:00:00.080Z'), startUtcUs: at('2026-10-19T10:00:00.003Z') * 1000 }],
+    ]);
+    const [t] = resolvePartTimings([part(STEM, 0, 60_000)], { segmentSecs: 600, openedAt });
+    expect(t).toEqual({ startedAt: '2026-10-19T10:00:00.003Z', endedAt: '2026-10-19T10:01:00.003Z', startedAtSource: 'strom' });
+  });
+
+  it('rule 2: the receipt time of RecorderFileChanged', () => {
+    const openedAt = new Map<string, PartOpenTime>([[nameOf(1), { openedAtMs: at('2026-10-19T10:10:00.064Z') }]]);
+    const [t] = resolvePartTimings([part(STEM, 1, 600_000)], { segmentSecs: 600, openedAt });
+    expect(t).toMatchObject({ startedAt: '2026-10-19T10:10:00.064Z', startedAtSource: 'event' });
+  });
+
+  it('rule 3: chains from the previous part of the same session, within a batch and from `known`', () => {
+    const openedAt = new Map<string, PartOpenTime>([[nameOf(0), { openedAtMs: at('2026-10-19T10:00:00.050Z') }]]);
+    const timings = resolvePartTimings([part(STEM, 1, 600_000), part(STEM, 0, 599_990)], { segmentSecs: 600, openedAt });
+    // Input order is kept; part 1 starts where part 0 (event) ended.
+    expect(timings[1]).toMatchObject({ startedAt: '2026-10-19T10:00:00.050Z', startedAtSource: 'event' });
+    expect(timings[0]).toMatchObject({ startedAt: '2026-10-19T10:10:00.040Z', startedAtSource: 'chained' });
+
+    const known = new Map<string, KnownPartStart>([
+      [partKey({ stem: STEM, index: 4 }), { startedAtMs: at('2026-10-19T10:40:00.100Z'), durationMs: 600_000 }],
+    ]);
+    const [t] = resolvePartTimings([part(STEM, 5, 1_000)], { segmentSecs: 600, known });
+    expect(t).toMatchObject({ startedAt: '2026-10-19T10:50:00.100Z', startedAtSource: 'chained' });
+    // The resolved part is recorded for the next one.
+    expect(known.get(partKey({ stem: STEM, index: 5 }))).toEqual({ startedAtMs: at('2026-10-19T10:50:00.100Z'), durationMs: 1_000 });
+  });
+
+  it('rule 3 needs the predecessor duration; otherwise rule 4 (file name) applies', () => {
+    const known = new Map<string, KnownPartStart>([[partKey({ stem: STEM, index: 0 }), { startedAtMs: at('2026-10-19T10:00:00.100Z') }]]);
+    const [t] = resolvePartTimings([part(STEM, 1, 600_000)], { segmentSecs: 600, known });
+    // Name stamp + RECORDING_SEGMENT_SECS for the unknown part 0.
+    expect(t).toMatchObject({ startedAt: '2026-10-19T10:10:00.000Z', startedAtSource: 'filename' });
+  });
+
+  it('rule 4: the name stamp offset by earlier parts, as before OL-32a', () => {
+    const timings = resolvePartTimings([part(STEM, 0, 60_000), part(STEM, 1)], { segmentSecs: 600 });
+    expect(timings[0]).toEqual({ startedAt: SESSION_START, endedAt: '2026-10-19T10:01:00.000Z', startedAtSource: 'filename' });
+    // Part 1 chains from part 0 (whose start is known from its name and duration).
+    expect(timings[1]).toEqual({ startedAt: '2026-10-19T10:01:00.000Z', startedAtSource: 'chained' });
+  });
+
+  it('leaves startedAt unset when no rule applies', () => {
+    expect(resolvePartTimings([part(STEM, 0, 1_000, null)], { segmentSecs: 600 })).toEqual([{}]);
   });
 });
