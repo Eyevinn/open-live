@@ -709,12 +709,16 @@ async function* tap(
   }
 }
 
-/** Object key a recorded file is uploaded to: `[RECORDING_KEY_PREFIX/]<productionId>/<fileName>`. */
-export function recordingObjectKey(productionId: string, fileName: string): string {
+/**
+ * Object key a recorded file is uploaded to: `[RECORDING_KEY_PREFIX/]<productionId>/<fileName>`
+ * for program, `[RECORDING_KEY_PREFIX/]<productionId>/<mixerInput>/<fileName>` for an
+ * input's own recording (OL-32, spec iso-input-recording.md §5.2).
+ */
+export function recordingObjectKey(productionId: string, fileName: string, mixerInput?: string): string {
   const prefix = config.recordingKeyPrefix
     ? `${config.recordingKeyPrefix.replace(/\/+$/, '')}/`
     : '';
-  return `${prefix}${productionId}/${fileName}`;
+  return mixerInput ? `${prefix}${productionId}/${mixerInput}/${fileName}` : `${prefix}${productionId}/${fileName}`;
 }
 
 /**
@@ -724,11 +728,11 @@ export function recordingObjectKey(productionId: string, fileName: string): stri
  * a credential/permission rejection); the file on Strom is never touched.
  */
 export async function uploadRecordingFile(
-  args: Pick<UploadRecordingsArgs, 'stromUrl' | 'stromToken' | 'productionId' | 'target'>,
+  args: Pick<UploadRecordingsArgs, 'stromUrl' | 'stromToken' | 'productionId' | 'target' | 'mixerInput'>,
   entry: Pick<MediaEntry, 'name' | 'path'>,
 ): Promise<UploadedSegment> {
   const download = await downloadFromStrom(args.stromUrl, args.stromToken, entry.path);
-  const key = recordingObjectKey(args.productionId, entry.name);
+  const key = recordingObjectKey(args.productionId, entry.name, args.mixerInput);
   const contentType = contentTypeForFile(entry.name);
   // Duration is read from the moov box as the bytes stream past (issue
   // #552); the file itself is never held whole.
@@ -754,6 +758,8 @@ export interface UploadRecordingsArgs {
   /** The recorder block's output_dir (relative media path) from activation. */
   outputDir: string;
   productionId: string;
+  /** Set when `outputDir` is an input's own recording directory (OL-32): keys get the `<mixerInput>/` level. */
+  mixerInput?: string;
   target: MinioTarget;
   /**
    * Checked once, immediately before the delete-after-upload pass (issue
@@ -781,7 +787,7 @@ export interface UploadRecordingsArgs {
  * sweep retries them.
  */
 export async function uploadRecordings(args: UploadRecordingsArgs): Promise<UploadResult> {
-  const { strom, stromUrl, stromToken, outputDir, productionId, target, isStillRecording } = args;
+  const { strom, stromUrl, stromToken, outputDir, productionId, mixerInput, target, isStillRecording } = args;
   const result: UploadResult = { uploaded: [], failed: [] };
 
   const listing = await strom.media.list(outputDir);
@@ -789,7 +795,7 @@ export async function uploadRecordings(args: UploadRecordingsArgs): Promise<Uplo
 
   for (const entry of files) {
     try {
-      result.uploaded.push(await uploadRecordingFile({ stromUrl, stromToken, productionId, target }, entry));
+      result.uploaded.push(await uploadRecordingFile({ stromUrl, stromToken, productionId, mixerInput, target }, entry));
     } catch (err) {
       result.failed.push({
         file: entry.path,

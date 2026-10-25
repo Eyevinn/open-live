@@ -13,6 +13,7 @@ import { isDbConnected, getDb } from '../db/index.js';
 import { StromClient } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { deactivateStromFlow } from '../lib/flow-generator.js';
+import { recordingStateMessage } from '../lib/input-recording.js';
 import { getSubscriberCount } from './tally.service.js';
 import { clearProductionPflState } from './pfl-state.js';
 import { clearAudioState, clearPipState, clearFxState } from '../ws/controller.js';
@@ -290,8 +291,11 @@ export async function deactivateProduction(productionId: string, log: FastifyBas
     whipEndpoints: undefined,
     srtOutputUri: undefined,
     whepOutputUrls: undefined,
+    inputRecordings: undefined,
     tally: { pgm: null, pvw: null },
   });
+  // Nothing records any more (OL-32, spec §2.8), before PRODUCTION_DEACTIVATED.
+  broadcast(doc._id, recordingStateMessage(undefined));
   broadcast(doc._id, { type: 'PRODUCTION_DEACTIVATED' });
   // Emit the typed lifecycle event (spec §3). Flow is torn down, so all assigned
   // outputs derive as down.

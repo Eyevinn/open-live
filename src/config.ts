@@ -65,6 +65,17 @@ function parseRecordingBlockEnv(name: string): RecordingBlockSetting {
   throw new Error(`Environment variable ${name} must be "auto" or "recorder", got "${raw}"`);
 }
 
+/** Parses an optional integer env var that must lie in `[min, max]`; anything else fails startup. */
+function parseIntRangeEnv(name: string, defaultValue: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return defaultValue;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new Error(`Environment variable ${name} must be an integer from ${min} to ${max}, got "${raw}"`);
+  }
+  return value;
+}
+
 /** Longest recording part `RECORDING_SEGMENT_SECS` accepts: 24 hours. */
 const MAX_RECORDING_SEGMENT_SECS = 86_400;
 
@@ -332,6 +343,14 @@ export const config = {
    * escape hatch if Live Recorder misbehaves, without a rollback.
    */
   recordingBlock: parseRecordingBlockEnv('RECORDING_BLOCK'),
+  /**
+   * Most inputs one production may record to their own files (OL-32, spec
+   * iso-input-recording.md §10.1, Q3). Integer 0-16, default 4; `0` turns input
+   * recording off. Each recorded input adds one H.264 encode on Strom.
+   */
+  recordingMaxInputs: parseIntRangeEnv('RECORDING_MAX_INPUTS', 4, 0, 16),
+  /** `bitrate` (kbit/s) of each input recorder's H.264 encode (OL-32). Integer 500-50000, default 4000. */
+  recordingInputVideoBitrateKbps: parseIntRangeEnv('RECORDING_INPUT_VIDEO_BITRATE_KBPS', 4000, 500, 50_000),
   // --- Storage connections (issue #520, OL-21, docs/specs/storage-connections.md, ADR-009) ---
   /**
    * SSRF allowlist for operator-supplied storage-connection endpoints (ADR-009

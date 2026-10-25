@@ -2,6 +2,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import type { WebSocket } from '@fastify/websocket';
 import { z } from 'zod';
 import { getDb, getSourcesDb, getGuestSessionsDb, getGuestInvitesDb } from '../db/index.js';
+import { recordingStateMessage } from '../lib/input-recording.js';
 import { updateProductionDoc } from '../routes/productions.js';
 import type { ProductionDoc, ClipState, SourceDoc, GuestSessionState } from '../db/types.js';
 import { getTally, setTally, subscribe, unsubscribe, broadcast, nextSeq, currentSeq, getOperatorSockets, getSockets, beginSnapshot, endSnapshot } from '../services/tally.service.js';
@@ -3960,6 +3961,8 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
         for (const w of connectDoc.activationWarnings ?? []) {
           socket.send(JSON.stringify({ type: 'ERROR', error: w.message }));
         }
+        // What the running activation records (OL-32, spec §2.8), after the warnings.
+        socket.send(JSON.stringify(recordingStateMessage(connectDoc)));
       }
 
       // -----------------------------------------------------------------------

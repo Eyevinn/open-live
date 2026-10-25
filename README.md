@@ -137,6 +137,8 @@ and fill in the values:
 | `INTERCOM_MANAGER_TOKEN` | Auth token for the Open Intercom manager. Optional; held server-side only and redacted from logs | _(empty)_ |
 | `RECORDING_SEGMENT_SECS` | Length in seconds of each recording part. Strom's recorder cuts a recording into consecutive `<productionId>_<timestamp>_0000N.mp4` files of this length (its `max_size_time_secs`); deactivate uploads every part as its own recording. `0` turns cutting off: one file per activation. Must be an integer from 0 to 86400; startup fails otherwise. See [`docs/specs/vod-recording-minio.md`](docs/specs/vod-recording-minio.md) | `600` |
 | `RECORDING_BLOCK` | Which Strom block records program. `auto`: Strom's Live Recorder (`builtin.liverecorder`, a live fragmented-MP4 muxer that does not stall when a track goes quiet) when the Strom has it, else `builtin.recorder`. `recorder`: always `builtin.recorder` — an escape hatch if Live Recorder misbehaves. Any other value fails startup. See [`docs/specs/iso-input-recording.md`](docs/specs/iso-input-recording.md) | `auto` |
+| `RECORDING_MAX_INPUTS` | Most inputs one production may record to their own files (ISO recording, `record: "transcode"` on a source assignment). Integer 0-16; `0` turns input recording off. Each recorded input adds one H.264 encode on Strom. See [`docs/specs/iso-input-recording.md`](docs/specs/iso-input-recording.md) | `4` |
+| `RECORDING_INPUT_VIDEO_BITRATE_KBPS` | Video bitrate (kbit/s) of each recorded input's H.264 encode. Integer 500-50000 | `4000` |
 
 > **Never commit `.env`** — it is gitignored. Use `.env.example` as the reference.
 

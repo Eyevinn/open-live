@@ -225,6 +225,7 @@ are emitted from `src/ws/controller.ts` and `src/services/meter-relay.ts`:
 | `IDLE_WARNING_CLEARED` | `productionId: string` | A pending idle warning was cancelled because activity reset the idle timer (a subscriber joined or a `KEEP_ALIVE` was received). |
 | `RETURN_STATE` | `mixerInput: string`, `mode: 'program' \| 'program-minus'` | A per-guest return feed's mix-minus mode changed on `mixerInput` (crew via `PUT .../returns/{mixerInput}/mode`, the `RETURN_SET` WS command, or the guest via `PUT /api/v1/guests/{inviteId}/session/return`). `program-minus` closes that guest's own send; `program` opens it (epic #208, issue #300). Also emitted once per configured return during the connect-time snapshot. |
 | `GUEST_STATE` | `guestId: string`, `mixerInput: string`, `state: 'invited' \| 'joined' \| 'previewing' \| 'on-air' \| 'left' \| 'error'`, `label?`, `intercomLine?` | A guest's lifecycle state changed (epic #208, issue #301). Broadcast on the persisted join/leave/kick transitions, as `left` (no `label`) when an invite is revoked (issue #561; one per live session of the invite, or one keyed by the invite id carrying the pinned `mixerInput` when nobody had joined), and emitted once per live guest in the connect-time snapshot. `previewing`/`on-air` are **derived** from the live vision-mixer contribution set (#209); a guest composited only as a PiP *inset* reads `joined` until the PiP-inset tally gap #209 raises is closed. |
+| `RECORDING_STATE` | `program: boolean`, `inputs: Array<{ mixerInput: string; sourceId: string; sourceName: string }>` | What the running activation records (OL-32, [`docs/specs/iso-input-recording.md`](specs/iso-input-recording.md) §2.8). `program` is true when program is recorded; `inputs` lists the inputs recorded to their own files (`ProductionDoc.inputRecordings`), keyed by the **stored** `mixerInput`, never the compacted Strom pad. Broadcast when the production goes active (after the activation-warning `ERROR` frames), sent to each client that connects while it is active, and broadcast once with `program: false, inputs: []` on deactivate (explicit or idle), before `PRODUCTION_DEACTIVATED`. A `record` change applies from the next activation, so this does not change while live. |
 | `ERROR` | `error: string` | An inbound frame was invalid or an operation failed (sent to originating socket). Also carries each activation warning (`ProductionDoc.activationWarnings`, e.g. a recording with no sound): broadcast when the production goes active, and sent to each client that connects while it is active. Not a response to any command. |
 
 `pgmBg` is the mixer input a PiP on program is composited over. It is `null` unless
@@ -256,7 +257,8 @@ stage that differs from default — issue #527), `AFV_STATE`, `PFL_STATE` / `AFL
 `HTML_SOURCE_STATE` (per HTML source with forwarded params), `CLIP_STATE` (one per
 clip source — a `mixerInput` present in `clipPlayerBlockIds`), `GUEST_STATE` (one per
 live guest session, `left` excluded) and `RETURN_STATE` (one per configured return
-feed — epic #208, issue #301).
+feed — epic #208, issue #301). While the production is active, the activation-warning
+`ERROR` frames and `RECORDING_STATE` (OL-32) follow.
 This lets a freshly-connected client rebuild the full control state without sending
 any inbound messages. See the connect handler in `src/ws/controller.ts` for the exact
 ordering.

@@ -392,10 +392,54 @@ components:
           type: string
           enum: [program, input]
           description: >-
-            Program recording or one input's own recording (OL-32). Always
-            `program` today; recordings stored before the field existed are
-            backfilled to and read as `program`. Clients must accept other
-            values added later.
+            Program recording or one input's own recording (OL-32). Recordings
+            stored before the field existed are backfilled to and read as
+            `program`. Clients must accept other values added later.
+        mixerInput:
+          type: string
+          pattern: '^video_in_\d{1,2}$'
+          description: >-
+            Input recordings only: the stored assignment key of the recorded
+            input (never the compacted Strom pad). Its files are keyed
+            `<productionId>/<mixerInput>/<file>`.
+        sourceId:
+          type: string
+          description: >-
+            Input recordings only: the recorded source (`Whip` for a WHIP
+            input). Absent on a leftover file of an earlier activation.
+        sourceName:
+          type: string
+          description: >-
+            Input recordings only: the label the multiviewer showed at
+            activation (`Guest N · In M` for a WHIP guest slot, else the source
+            name). A snapshot; a later rename does not change it.
+        streamType:
+          type: string
+          enum: [whip, srt, efp]
+          description: "Input recordings only: the source's type at activation."
+        guests:
+          type: array
+          description: >-
+            WHIP inputs only: the guest sessions on this input that overlap the
+            part, joined at the session start and left when the session ended
+            (absent while still joined).
+          items:
+            type: object
+            required: [inviteId, joinedAt]
+            properties:
+              inviteId:
+                type: string
+              label:
+                type: string
+              joinedAt:
+                type: string
+                format: date-time
+              leftAt:
+                type: string
+                format: date-time
+        guestLabel:
+          type: string
+          description: The first of `guests` with a label.
         recorderType:
           type: string
           enum: [liverecorder, recorder]
@@ -633,6 +677,91 @@ components:
               type: boolean
               enum: [false]
               default: false
+        record:
+          type: string
+          enum: ['off', transcode, passthrough]
+          description: >-
+            Record this input to its own files beside the program recording
+            (OL-32): `transcode` re-encodes the input as it arrived (before the
+            lipsync offset) to H.264 + AAC. Absent = `off`; `off` is stored as
+            absent. `passthrough` is reserved and refused with 400
+            `record-mode-unsupported`. Only WHIP, SRT and EFP sources can be
+            recorded. Read at activation: a change applies from the next
+            activation. Needs a `recording` output on the production and a
+            Strom with Live Recorder (`builtin.liverecorder`); otherwise the
+            activation raises `input-recording-no-output` or
+            `input-recording-unavailable`.
+
+    InputRecordingState:
+      type: object
+      description: One input the running activation records to its own files (OL-32).
+      required: [mixerInput, sourceId, sourceName, streamType]
+      properties:
+        mixerInput:
+          type: string
+          description: Stored assignment key, never the compacted Strom pad.
+        sourceId:
+          type: string
+        sourceName:
+          type: string
+          description: The multiviewer label at activation.
+        streamType:
+          type: string
+          enum: [whip, srt, efp]
+
+    SourceRecordInput:
+      type: object
+      required: [record]
+      properties:
+        record:
+          type: string
+          enum: ['off', transcode, passthrough]
+          description: '`passthrough` is reserved and refused with 400 `record-mode-unsupported`.'
+
+    SourceRecordResult:
+      type: object
+      required: [mixerInput, sourceId, record, appliesFrom, currentlyRecording, recordingOutputAssigned, _rev]
+      properties:
+        mixerInput:
+          type: string
+        sourceId:
+          type: string
+        record:
+          type: string
+          enum: ['off', transcode]
+        appliesFrom:
+          type: string
+          enum: [next-activation]
+          description: Always `next-activation` in v1; a running production keeps recording what it was activated with.
+        currentlyRecording:
+          type: boolean
+          description: Whether the running activation records this input. `false` when the production is not live.
+        recordingOutputAssigned:
+          type: boolean
+          description: >-
+            Whether the production has a `recording` output now. `false` with
+            `record: transcode` means the next activation records nothing for
+            this input and raises `input-recording-no-output`.
+        _rev:
+          type: string
+
+    InputRecordingError:
+      type: object
+      description: A refused `record` setting (OL-32).
+      required: [error, statusCode, reason]
+      properties:
+        error:
+          type: string
+        statusCode:
+          type: integer
+        reason:
+          type: string
+          enum: [record-mode-unsupported, record-source-unsupported, record-cap-reached]
+          description: >-
+            `record-mode-unsupported` (400): `passthrough`.
+            `record-source-unsupported` (400): the source is not WHIP, SRT or EFP.
+            `record-cap-reached` (409): more than RECORDING_MAX_INPUTS recorded
+            inputs on this production, or RECORDING_MAX_INPUTS is 0.
 
     ProductionGraphicAssignment:
       type: object
@@ -766,11 +895,56 @@ components:
       oneOf:
         - $ref: '#/components/schemas/RecordingNoAudioWarning'
         - $ref: '#/components/schemas/AudioStreamNotAppliedWarning'
+        - $ref: '#/components/schemas/InputRecordingInputsWarning'
+        - $ref: '#/components/schemas/InputRecordingUnsupportedSourceWarning'
       discriminator:
         propertyName: type
         mapping:
           recording-no-audio: '#/components/schemas/RecordingNoAudioWarning'
           audio-stream-not-applied: '#/components/schemas/AudioStreamNotAppliedWarning'
+          input-recording-unavailable: '#/components/schemas/InputRecordingInputsWarning'
+          input-recording-no-output: '#/components/schemas/InputRecordingInputsWarning'
+          input-recording-capped: '#/components/schemas/InputRecordingInputsWarning'
+          input-recording-unsupported-source: '#/components/schemas/InputRecordingUnsupportedSourceWarning'
+
+    InputRecordingInputsWarning:
+      type: object
+      description: >-
+        Inputs set to record that this activation does not record (OL-32).
+        `input-recording-unavailable`: this Strom has no Live Recorder (or
+        RECORDING_BLOCK=recorder); program still records. `input-recording-no-output`:
+        the production has no `recording` output. `input-recording-capped`: more
+        recorded inputs than RECORDING_MAX_INPUTS; `mixerInputs` lists the ones
+        skipped (the first N by pad number record). Never raised for a
+        production that records no inputs.
+      required: [type, mixerInputs, message]
+      properties:
+        type:
+          type: string
+          enum: [input-recording-unavailable, input-recording-no-output, input-recording-capped]
+        mixerInputs:
+          type: array
+          items:
+            type: string
+        message:
+          type: string
+
+    InputRecordingUnsupportedSourceWarning:
+      type: object
+      description: >-
+        An input set to record whose source is no longer WHIP, SRT or EFP (the
+        source was edited after the setting); that input is not recorded (OL-32).
+      required: [type, mixerInput, sourceId, message]
+      properties:
+        type:
+          type: string
+          enum: [input-recording-unsupported-source]
+        mixerInput:
+          type: string
+        sourceId:
+          type: string
+        message:
+          type: string
 
     RecordingNoAudioWarning:
       type: object
@@ -911,7 +1085,15 @@ components:
             Which Strom block records program in the running activation (OL-32a):
             `liverecorder` when the Strom has `builtin.liverecorder` and
             RECORDING_BLOCK is `auto`, else `recorder`. Set on activate when a
-            `recording` output is assigned, cleared on deactivate.
+            `recording` output is assigned, cleared on deactivate. Input
+            recordings use the same block.
+        inputRecordings:
+          type: array
+          description: >-
+            The inputs the running activation records to their own files
+            (OL-32). Set on activate, cleared on deactivate; absent when none.
+          items:
+            $ref: '#/components/schemas/InputRecordingState'
         activationWarnings:
           type: array
           description: >-
@@ -1731,6 +1913,27 @@ paths:
       summary: List a production's recordings
       operationId: listProductionRecordings
       tags: [Recordings]
+      description: >-
+        Optional filters (OL-32) are exact-match and combined with AND; unknown
+        parameters are ignored. Sorted by `startedAt`, then program before
+        inputs, then `mixerInput` by pad number, then `partIndex`. At most 500.
+      parameters:
+        - name: activationId
+          in: query
+          schema: { type: string, minLength: 1, maxLength: 128 }
+          description: Only parts of this activation (Strom flow id).
+        - name: kind
+          in: query
+          schema: { type: string, enum: [program, input] }
+          description: Program or input recordings. `program` includes recordings stored before `kind` existed.
+        - name: mixerInput
+          in: query
+          schema: { type: string, pattern: '^video_in_\d{1,2}$' }
+          description: Only this input's own recordings (implies `kind=input`).
+        - name: sourceId
+          in: query
+          schema: { type: string, minLength: 1, maxLength: 128 }
+          description: Only input recordings of this source.
       responses:
         '200':
           description: Array of recording assets, each with a presigned playbackUrl
@@ -1740,6 +1943,12 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/RecordingAsset'
+        '400':
+          description: Invalid filter value
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: Production not found
           content:
@@ -1758,6 +1967,32 @@ paths:
       summary: List recordings across all productions
       operationId: listRecordings
       tags: [Recordings]
+      description: >-
+        Optional filters (OL-32) are exact-match and combined with AND; unknown
+        parameters are ignored. Sorted by `startedAt`, then program before
+        inputs, then `mixerInput` by pad number, then `partIndex`, so a client
+        can group by `activationId`. At most 500.
+      parameters:
+        - name: productionId
+          in: query
+          schema: { type: string, minLength: 1, maxLength: 128 }
+          description: Only recordings of this production.
+        - name: activationId
+          in: query
+          schema: { type: string, minLength: 1, maxLength: 128 }
+          description: Only parts of this activation (Strom flow id).
+        - name: kind
+          in: query
+          schema: { type: string, enum: [program, input] }
+          description: Program or input recordings. `program` includes recordings stored before `kind` existed.
+        - name: mixerInput
+          in: query
+          schema: { type: string, pattern: '^video_in_\d{1,2}$' }
+          description: Only this input's own recordings (implies `kind=input`).
+        - name: sourceId
+          in: query
+          schema: { type: string, minLength: 1, maxLength: 128 }
+          description: Only input recordings of this source.
       responses:
         '200':
           description: Array of recording assets
@@ -1767,6 +2002,12 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/RecordingAsset'
+        '400':
+          description: Invalid filter value
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503':
           description: Object storage or database unavailable
           content:
@@ -2115,6 +2356,9 @@ paths:
         input. Include `returnFeed` to declare the assignment as a guest slot
         (issue #381): a mix-minus return reserved for a guest and built into the
         flow at activation. Guest invites may only target a declared guest slot.
+        Replaces any assignment on the same `mixerInput`: a request without
+        `returnFeed` or `record` turns those off for the input. To toggle
+        recording alone, use `PUT .../sources/{mixerInput}/record`.
       operationId: assignSource
       tags: [Productions]
       requestBody:
@@ -2145,13 +2389,35 @@ paths:
                       type: boolean
                       enum: [false]
                       default: false
+                record:
+                  type: string
+                  enum: ['off', transcode, passthrough]
+                  description: >-
+                    Record this input to its own files (OL-32). Absent or `off`
+                    = not recorded. See ProductionSourceAssignment.record.
       responses:
-        '200':
-          description: Assignment created
+        '201':
+          description: Assignment created; the stored assignment plus `_rev`.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ProductionSourceAssignment'
+        '400':
+          description: >-
+            Invalid body, or a refused `record` (`record-mode-unsupported`,
+            `record-source-unsupported`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InputRecordingError'
+        '404':
+          description: Production not found
+        '409':
+          description: '`record-cap-reached`: over RECORDING_MAX_INPUTS recorded inputs.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InputRecordingError'
 
   /api/v1/productions/{id}/sources/{mixerInput}:
     parameters:
@@ -2175,6 +2441,68 @@ paths:
           description: Removed
         '404':
           description: Not found
+
+  /api/v1/productions/{id}/sources/{mixerInput}/record:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^video_in_\d{1,2}$'
+    put:
+      summary: Record one input to its own files, or stop
+      description: >-
+        Sets or clears `record` on one assignment without touching the rest of
+        it (OL-32). Read at activation: a running production keeps recording
+        exactly the inputs it was activated with. Setting `off` never fails for
+        the cap or the source type.
+      operationId: setSourceRecord
+      tags: [Productions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SourceRecordInput'
+      responses:
+        '200':
+          description: Stored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SourceRecordResult'
+        '400':
+          description: >-
+            Invalid body or mixerInput, or a refused `record`
+            (`record-mode-unsupported`, `record-source-unsupported`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InputRecordingError'
+        '404':
+          description: Production not found, or no assignment on `mixerInput` (`Source assignment not found`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: '`record-cap-reached`: over RECORDING_MAX_INPUTS recorded inputs.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InputRecordingError'
+        '503':
+          description: Database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   # Production — Clip cue/play control (epic #206, issue #277)
 

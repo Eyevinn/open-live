@@ -24,6 +24,7 @@
  * `playbackUnavailable` says why instead.
  */
 import type { FastifyBaseLogger, FastifyPluginAsync } from 'fastify';
+import { z } from 'zod';
 import { getDb, getRecordingsDb } from '../db/index.js';
 import type { RecordingDoc } from '../db/types.js';
 import { config } from '../config.js';
@@ -138,11 +139,70 @@ async function presignRecording(
   }
 }
 
+/**
+ * Listing filters (OL-32, spec iso-input-recording.md §2.4): all optional,
+ * exact-match, combined with AND. Unknown parameters are ignored.
+ */
+const ListFilters = z.object({
+  productionId: z.string().min(1).max(128).optional(),
+  activationId: z.string().min(1).max(128).optional(),
+  kind: z.enum(['program', 'input']).optional(),
+  mixerInput: z.string().regex(/^video_in_\d{1,2}$/, 'mixerInput must match video_in_N format').optional(),
+  sourceId: z.string().min(1).max(128).optional(),
+});
+type ListFilters = z.infer<typeof ListFilters>;
+
+/**
+ * The Mango selector for a listing: plain equality on validated strings, run
+ * through the guarded `find()` (never `findTrusted`, #257). `kind=program` is
+ * matched in memory instead, because docs written before `kind` existed count
+ * as program until the startup migration has backfilled them.
+ */
+function listSelector(filters: ListFilters): Record<string, string> {
+  const selector: Record<string, string> = { type: 'recording' };
+  if (filters.productionId) selector['productionId'] = filters.productionId;
+  if (filters.activationId) selector['activationId'] = filters.activationId;
+  if (filters.kind === 'input') selector['kind'] = 'input';
+  if (filters.mixerInput) selector['mixerInput'] = filters.mixerInput;
+  if (filters.sourceId) selector['sourceId'] = filters.sourceId;
+  return selector;
+}
+
+/**
+ * Listing order (spec §2.4): `startedAt` ascending, then program before
+ * inputs, then `mixerInput` by pad number, then `partIndex` — so a client can
+ * group by `activationId` without re-sorting.
+ */
+export function compareRecordings(a: RecordingDoc, b: RecordingDoc): number {
+  if (a.startedAt !== b.startedAt) return a.startedAt < b.startedAt ? -1 : 1;
+  const kindA = a.kind === 'input' ? 1 : 0;
+  const kindB = b.kind === 'input' ? 1 : 0;
+  if (kindA !== kindB) return kindA - kindB;
+  const pad = (m: string | undefined) => (m ? Number(/(\d+)$/.exec(m)?.[1] ?? Number.POSITIVE_INFINITY) : -1);
+  const padA = pad(a.mixerInput);
+  const padB = pad(b.mixerInput);
+  if (padA !== padB) return padA - padB;
+  return (a.partIndex ?? 0) - (b.partIndex ?? 0);
+}
+
+/** The listing's docs, filtered and sorted (spec §2.4). */
+function listed(docs: RecordingDoc[] | undefined, filters: ListFilters): RecordingDoc[] {
+  const all = Array.isArray(docs) ? docs : [];
+  const kept = filters.kind === 'program' ? all.filter((d) => (d.kind ?? 'program') === 'program') : all;
+  return [...kept].sort(compareRecordings);
+}
+
 const recordingsRoutes: FastifyPluginAsync = async (fastify) => {
   // List recordings for a specific production.
   fastify.get<{ Params: { id: string } }>(
     '/api/v1/productions/:id/recordings',
     async (req, reply) => {
+      const parsed = ListFilters.safeParse(req.query ?? {});
+      if (!parsed.success) {
+        return reply.status(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid query', statusCode: 400 });
+      }
+      // This route fixes the production; a productionId parameter is ignored.
+      const filters: ListFilters = { ...parsed.data, productionId: req.params.id };
       // 404 when the production itself does not exist, matching the other
       // production sub-resource routes.
       // Any other lookup failure is the database being unavailable (503).
@@ -158,36 +218,34 @@ const recordingsRoutes: FastifyPluginAsync = async (fastify) => {
       const defaultTarget = minioTargetFromConfig();
       let result: Awaited<ReturnType<ReturnType<typeof getRecordingsDb>['find']>>;
       try {
-        result = await getRecordingsDb().find({
-          selector: { type: 'recording', productionId: req.params.id },
-          limit: 500,
-        });
+        result = await getRecordingsDb().find({ selector: listSelector(filters), limit: 500 });
       } catch (err) {
         fastify.log.warn({ err }, 'GET /api/v1/productions/:id/recordings — DB query failed');
         return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
       }
       return reply.send(
-        await Promise.all(
-          (Array.isArray(result?.docs) ? result.docs : []).map((doc) => toApi(doc, defaultTarget, fastify.log)),
-        ),
+        await Promise.all(listed(result?.docs, filters).map((doc) => toApi(doc, defaultTarget, fastify.log))),
       );
     },
   );
 
   // List recordings across all productions.
-  fastify.get('/api/v1/recordings', async (_req, reply) => {
+  fastify.get('/api/v1/recordings', async (req, reply) => {
+    const parsed = ListFilters.safeParse(req.query ?? {});
+    if (!parsed.success) {
+      return reply.status(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid query', statusCode: 400 });
+    }
+    const filters = parsed.data;
     const defaultTarget = minioTargetFromConfig();
     let result: Awaited<ReturnType<ReturnType<typeof getRecordingsDb>['find']>>;
     try {
-      result = await getRecordingsDb().find({ selector: { type: 'recording' }, limit: 500 });
+      result = await getRecordingsDb().find({ selector: listSelector(filters), limit: 500 });
     } catch (err) {
       fastify.log.warn({ err }, 'GET /api/v1/recordings — DB query failed');
       return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
     }
     return reply.send(
-      await Promise.all(
-        (Array.isArray(result?.docs) ? result.docs : []).map((doc) => toApi(doc, defaultTarget, fastify.log)),
-      ),
+      await Promise.all(listed(result?.docs, filters).map((doc) => toApi(doc, defaultTarget, fastify.log))),
     );
   });
 
