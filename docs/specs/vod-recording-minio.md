@@ -230,9 +230,39 @@ sequenceDiagram
     OpenLive-->>Client: 200 [ RecordingAsset w/ playbackUrl ]
 ```
 
+### Input recordings (OL-32)
+
+An assignment with `record: "transcode"` (WHIP, SRT and EFP sources only) gets its own
+`builtin.liverecorder`, tapped before the input's lipsync offset, on the Live Recorder path
+only and only beside a program recording (see [`iso-input-recording.md`](iso-input-recording.md)).
+Layout on Strom and in the bucket:
+
+```
+recordings/<productionId>/                 program: <productionId>_<YYYYmmdd_HHMMSS>_<nnnnn>.mp4
+recordings/<productionId>/<mixerInput>/    input:   <productionId>_<mixerInput>_<YYYYmmdd_HHMMSS>_<nnnnn>.mp4
+
+[RECORDING_KEY_PREFIX/]<productionId>/<fileName>                program key
+[RECORDING_KEY_PREFIX/]<productionId>/<mixerInput>/<fileName>   input key
+```
+
+Input parts use the same storage target (the activation's `recording` snapshot), the same live
+part upload (one session per recorder, events matched by exact directory) and the same
+idempotent registration as program. Their `RecordingDoc`s carry `kind: "input"`, `mixerInput`,
+`sourceId`, `sourceName`, `streamType` and, for WHIP inputs, `guests` / `guestLabel`.
+Deactivate sweeps every `<mixerInput>` directory first (leftovers of earlier activations too),
+then the program directory, so the program directory is empty when its sweep deletes it.
+Each recorded input adds roughly `RECORDING_INPUT_VIDEO_BITRATE_KBPS` + 128 kbit/s of AAC
+(about 1.9 GB/h at the default) to the Strom host's disk until its parts are uploaded.
+
+`GET /api/v1/recordings` and `GET /api/v1/productions/:id/recordings` take optional
+exact-match filters `productionId` (first route only), `activationId`, `kind`, `mixerInput`
+and `sourceId`, and return the list sorted by `startedAt`, program before inputs, then
+`mixerInput`, then `partIndex`.
+
 ### Segments left on Strom
 
-Deactivate uploads every file under Strom's `recordings/<productionId>/`, not only the
+Deactivate uploads every file under Strom's `recordings/<productionId>/` (and, since OL-32,
+under each `recordings/<productionId>/<mixerInput>/`), not only the
 segments the ending session wrote. Files earlier sessions left there (a failed upload, or a
 session recorded before object storage was configured) are uploaded by the next deactivate
 that has storage, then deleted from Strom like the rest. The first deactivate after storage is
@@ -260,6 +290,8 @@ Added to `src/config.ts` (same `process.env` + optional-fallback style used ther
 | `RECORDING_PRESIGN_TTL_S` | no | `3600` | Presigned playback URL TTL |
 | `RECORDING_SEGMENT_SECS` | no | `600` | Length of each recording part in seconds (Strom recorder `max_size_time_secs`); `0` = one file per activation; integer 0-86400 (#553) |
 | `RECORDING_BLOCK` | no | `auto` | Which Strom block records program: `auto` = `builtin.liverecorder` (Live Recorder, fragmented MP4) when the Strom's block list has it, else `builtin.recorder`; `recorder` = always `builtin.recorder`. Any other value fails startup (OL-32a, [`iso-input-recording.md`](iso-input-recording.md) §4.1, ADR-011) |
+| `RECORDING_MAX_INPUTS` | no | `4` | Most inputs one production may record to their own files (OL-32, [`iso-input-recording.md`](iso-input-recording.md) §10.1); integer 0-16; `0` turns input recording off (every enable returns 409 `record-cap-reached`). Provisional until the load measurement (OL-32c) |
+| `RECORDING_INPUT_VIDEO_BITRATE_KBPS` | no | `4000` | `bitrate` of each input recorder's H.264 encode (`builtin.videoenc`); integer 500-50000 |
 
 When the MinIO vars are unset, the `recording` output type is rejected at assignment time with
 `400` (recording disabled) so the feature degrades cleanly, matching how the service already

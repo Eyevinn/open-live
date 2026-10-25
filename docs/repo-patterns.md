@@ -504,9 +504,34 @@ deactivate sweep never downloads a file the live pass is deleting.
 Recorder events are matched to a session by **exact directory** (`isFileInDir`: the file's
 directory, after any media-root prefix, equals the session's `outputDir`) or by block id — never by
 path prefix. OL-32 nests input recordings under `recordings/<productionId>/<mixerInput>/`, and a
-prefix match would let every input event move the program session's open file. The session also
+prefix match would let every input event move the program session's open file. (Since OL-32 there is one session per recorder; see "Input recordings" below.) The session also
 records each file's first-seen time (`openedAt`, part start rule 2 of
 `docs/specs/iso-input-recording.md` §6), so it subscribes even with `RECORDING_SEGMENT_SECS=0`
 (then only the upload passes are skipped). On the Live Recorder path (`recorderType:
 'liverecorder'`) deactivate stops the flow before the upload sweep and never calls split-now:
 the block finalises its open file inside the stop.
+
+Part 0 opens at `flows.start`, before activation reaches `active` and starts the sessions. So
+`runActivationFlow` takes `holdRecorderEvents()` before `activateStromFlow` (when a `recording`
+output is assigned; waits ≤ 2 s for the socket, never fails activation) and releases it in its
+`finally`; the socket keeps a short per-flow buffer (`RECENT_EVENT_TTL_MS`), and each session
+subscribes with `replayFlowId` so part 0 keeps its original receipt time (`startedAtSource:
+'event'`) instead of falling back to the file name. Any new early consumer must replay the same way:
+an event's time is `RecorderFileEvent.receivedAtMs`, never `Date.now()` in the subscriber.
+
+## Input recordings: one live session per recorder, input directories swept before program
+
+OL-32 records chosen inputs to `recordings/<productionId>/<mixerInput>/`, nested under the program
+directory. Three rules follow. (1) `services/live-recording-upload.ts` runs one session per
+recorder (program plus one per `ProductionDoc.inputRecordings` entry), each matched to recorder
+events by exact directory; `stopLiveRecordingUpload()` stops all of them and returns the program
+session with the input sessions under `inputs` (by stored `mixerInput`) — pass each one to its own
+directory's sweep, or that input's last part loses its event start time and `activationId`.
+(2) Deactivate sweeps every `<mixerInput>` directory Strom lists (leftovers of earlier activations
+too) **before** the program directory: `uploadRecordings` lists one directory non-recursively and
+deletes it only when empty, so a program sweep run first would leave `recordings/<productionId>`
+behind. (3) Input recorders exist only on the Live Recorder path and only beside a program
+recorder (they share the `recording` snapshot); `inputRecordings` entries carry internal
+`recorderBlockId` / `outputDir`, which `toProductionView()` strips — keep any new production
+response on that projection. A leftover input file only knows its directory, so its
+`RecordingDoc` gets `kind: 'input'` and `mixerInput` but no `sourceId` / `sourceName`.

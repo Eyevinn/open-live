@@ -32,16 +32,26 @@
  *
  * Each session also records when open-live first saw each file open (spec §6):
  * that is the part's start time when it is registered, here or by the
- * deactivate sweep. The subscription is kept for this even with
+ * deactivate sweep. Part 0 opens before the session starts (the flow starts
+ * before the production is `active`), so a session first replays its flow's
+ * buffered events, which activation keeps the socket open for. The subscription is kept for this even with
  * `RECORDING_SEGMENT_SECS=0`; only the upload passes are skipped then.
  *
- * Passes run one at a time per production. Deactivate and production delete
- * call {@link stopLiveRecordingUpload} before their own teardown, which waits
- * for the running pass so the deactivate sweep never races it.
+ * One session runs per recorder (spec §5.3): program, and one per input the
+ * activation records to its own files (OL-32, `ProductionDoc.inputRecordings`)
+ * in `recordings/<productionId>/<mixerInput>/`. Input parts are uploaded to
+ * `<productionId>/<mixerInput>/<file>` and registered with `kind: 'input'` and
+ * the input's metadata.
+ *
+ * Passes run one at a time per recorder. Deactivate and production delete
+ * call {@link stopLiveRecordingUpload} before their own teardown, which stops
+ * every session of the production and waits for their running passes, so the
+ * deactivate sweep never races them.
  */
 import { config } from '../config.js';
 import { getDb, getRecordingsDb } from '../db/index.js';
-import type { ActiveRecording, ProductionDoc, RecorderType } from '../db/types.js';
+import type { ActiveInputRecording, ActiveRecording, ProductionDoc, RecorderType } from '../db/types.js';
+import { inputRecordingFields } from '../lib/input-recording-metadata.js';
 import {
   comparePartNames, parsePartName, resolvePartTimings,
   type KnownPartStart, type PartName, type PartOpenTime,
@@ -72,6 +82,11 @@ export interface LiveRecordingSession {
   openedAt: Map<string, PartOpenTime>;
   /** Start (and duration) of every part registered while live, by `partKey` — for chaining (spec §6 rule 3). */
   known: Map<string, KnownPartStart>;
+  /**
+   * On the program session: the session of each input recorder of the
+   * activation (OL-32), by stored mixerInput. Absent when no input recorded.
+   */
+  inputs?: Map<string, LiveRecordingSession>;
 }
 
 interface LiveRecording {
@@ -81,6 +96,8 @@ interface LiveRecording {
   outputDir: string;
   recorderType: RecorderType;
   recording?: ActiveRecording;
+  /** Set on an input recorder's session (OL-32): the input it records. Absent for program. */
+  input?: ActiveInputRecording;
   /** False with `RECORDING_SEGMENT_SECS=0`: the session only records open times. */
   uploadsLive: boolean;
   /** See {@link LiveRecordingSession.openedAt}. */
@@ -101,7 +118,13 @@ interface LiveRecording {
   unsubscribe: () => void;
 }
 
-const live = new Map<string, LiveRecording>();
+/** Every recorder session of one production: program, then its inputs. */
+interface ProductionSessions {
+  program: LiveRecording;
+  inputs: LiveRecording[];
+}
+
+const live = new Map<string, ProductionSessions>();
 let stableMs = PART_STABLE_MS;
 
 /** The recorder's output directory, as the flow generator sets it. */
@@ -140,20 +163,21 @@ async function stromClient(): Promise<{ strom: StromClient; token: string | unde
  * recorder. Replaces any session already running for it.
  */
 export function startLiveRecordingUpload(
-  doc: Pick<ProductionDoc, '_id' | 'stromFlowId' | 'recorderBlockId' | 'recorderType' | 'recording'>,
+  doc: Pick<ProductionDoc, '_id' | 'stromFlowId' | 'recorderBlockId' | 'recorderType' | 'recording' | 'inputRecordings'>,
   log: Log,
 ): void {
   if (!doc.stromFlowId || !doc.recorderBlockId) return;
   const previous = live.get(doc._id);
-  if (previous) void stopSession(previous);
+  if (previous) void stopProduction(doc._id, previous);
 
-  const rec: LiveRecording = {
+  const newSession = (recorderBlockId: string, outputDir: string, input?: ActiveInputRecording): LiveRecording => ({
     productionId: doc._id,
-    flowId: doc.stromFlowId,
-    recorderBlockId: doc.recorderBlockId,
-    outputDir: recordingOutputDir(doc._id),
+    flowId: doc.stromFlowId!,
+    recorderBlockId,
+    outputDir,
     recorderType: doc.recorderType ?? 'recorder',
     ...(doc.recording ? { recording: doc.recording } : {}),
+    ...(input ? { input } : {}),
     uploadsLive: config.recordingSegmentSecs > 0,
     openedAt: new Map(),
     known: new Map(),
@@ -164,15 +188,27 @@ export function startLiveRecordingUpload(
     rerun: false,
     wake: undefined,
     unsubscribe: () => {},
-  };
-  live.set(doc._id, rec);
-  rec.unsubscribe = subscribeRecorderEvents({
-    onFileChanged: (event) => onFileChanged(rec, event),
-    // Events sent while the socket was down are lost: sweep everything but the newest file.
-    onConnected: () => trigger(rec),
   });
+  const sessions: ProductionSessions = {
+    program: newSession(doc.recorderBlockId, recordingOutputDir(doc._id)),
+    inputs: (doc.inputRecordings ?? []).map((input) => newSession(input.recorderBlockId, input.outputDir, input)),
+  };
+  live.set(doc._id, sessions);
+  for (const rec of [sessions.program, ...sessions.inputs]) {
+    rec.unsubscribe = subscribeRecorderEvents({
+      onFileChanged: (event) => onFileChanged(rec, event),
+      // Events sent while the socket was down are lost: sweep everything but the newest file.
+      onConnected: () => trigger(rec),
+    // Part 0 opened before this session existed (the flow starts before the
+    // production is active): take this flow's buffered events first (spec §6).
+    }, { replayFlowId: rec.flowId });
+  }
+  const rec = sessions.program;
   log.info(
-    { productionId: rec.productionId, flowId: rec.flowId, recorderType: rec.recorderType, uploadsLive: rec.uploadsLive },
+    {
+      productionId: rec.productionId, flowId: rec.flowId, recorderType: rec.recorderType, uploadsLive: rec.uploadsLive,
+      inputs: sessions.inputs.map((r) => r.input!.mixerInput),
+    },
     rec.uploadsLive ? 'live recording part upload started' : 'live recording session started (open times only, RECORDING_SEGMENT_SECS=0)',
   );
 }
@@ -183,13 +219,23 @@ export function startLiveRecordingUpload(
  * knew about this activation's files, or undefined when none was running.
  */
 export async function stopLiveRecordingUpload(productionId: string): Promise<LiveRecordingSession | undefined> {
-  const rec = live.get(productionId);
-  if (!rec) return undefined;
-  return stopSession(rec);
+  const sessions = live.get(productionId);
+  if (!sessions) return undefined;
+  return stopProduction(productionId, sessions);
+}
+
+/** Stops every session of a production; returns the program session with its inputs'. */
+async function stopProduction(productionId: string, sessions: ProductionSessions): Promise<LiveRecordingSession> {
+  if (live.get(productionId) === sessions) live.delete(productionId);
+  const [program, ...inputs] = await Promise.all([sessions.program, ...sessions.inputs].map(stopSession));
+  if (inputs.length === 0) return program!;
+  return {
+    ...program!,
+    inputs: new Map(inputs.map((session, i) => [sessions.inputs[i]!.input!.mixerInput, session])),
+  };
 }
 
 async function stopSession(rec: LiveRecording): Promise<LiveRecordingSession> {
-  if (live.get(rec.productionId) === rec) live.delete(rec.productionId);
   rec.stopped = true;
   rec.unsubscribe();
   rec.wake?.();
@@ -232,10 +278,11 @@ function onFileChanged(rec: LiveRecording, event: RecorderFileEvent): void {
   const name = baseName(event.filename);
   const part = parsePartName(name);
   if (!part) return;
-  // First sighting of the file is its open time (spec §6 rule 2).
+  // First sighting of the file is its open time (spec §6 rule 2): when the
+  // event was received, which for a replayed event is before this session.
   if (!rec.openedAt.has(name)) {
     rec.openedAt.set(name, {
-      openedAtMs: Date.now(),
+      openedAtMs: event.receivedAtMs,
       ...(event.startUtcUs !== undefined ? { startUtcUs: event.startUtcUs } : {}),
     });
   }
@@ -345,10 +392,13 @@ async function runPass(rec: LiveRecording): Promise<void> {
 
   for (const { entry, part } of stable) {
     if (rec.stopped) return;
-    const logCtx = { productionId: rec.productionId, file: entry.path };
+    const logCtx = { productionId: rec.productionId, file: entry.path, ...(rec.input ? { mixerInput: rec.input.mixerInput } : {}) };
     let seg: UploadedSegment;
     try {
-      seg = await uploadRecordingFile({ stromUrl: config.stromUrl, stromToken: token, productionId: rec.productionId, target }, entry);
+      seg = await uploadRecordingFile({
+        stromUrl: config.stromUrl, stromToken: token, productionId: rec.productionId, target,
+        ...(rec.input ? { mixerInput: rec.input.mixerInput } : {}),
+      }, entry);
     } catch (err) {
       rec.log.warn({ ...logCtx, err }, 'recording part upload failed — left on Strom for retry');
       // A rejected credential fails every other part the same way.
@@ -371,7 +421,14 @@ async function runPass(rec: LiveRecording): Promise<void> {
     });
     const timing = timings[timings.length - 1]!;
     const finishedAt = new Date().toISOString();
+    const startedAt = timing.startedAt ?? rec.recording?.startedAt ?? finishedAt;
+    const endedAt = timing.endedAt ?? finishedAt;
     try {
+      // Program, or one input's own recording (OL-32): only this activation's
+      // parts are known to hold this activation's source.
+      const kindFields = rec.input
+        ? await inputRecordingFields(rec.productionId, rec.input.mixerInput, ofThisActivation ? rec.input : undefined, { startedAt, endedAt })
+        : { kind: 'program' as const };
       await upsertRecordingDoc(getRecordingsDb(), {
         type: 'recording',
         productionId: rec.productionId,
@@ -381,12 +438,12 @@ async function runPass(rec: LiveRecording): Promise<void> {
         key: seg.key,
         sizeBytes: seg.sizeBytes,
         ...(seg.durationMs !== undefined ? { durationMs: seg.durationMs } : {}),
-        startedAt: timing.startedAt ?? rec.recording?.startedAt ?? finishedAt,
+        startedAt,
         ...(timing.startedAtSource ? { startedAtSource: timing.startedAtSource } : {}),
-        endedAt: timing.endedAt ?? finishedAt,
+        endedAt,
         ...(ofThisActivation ? { activationId: rec.flowId } : {}),
         partIndex: part.index,
-        kind: 'program',
+        ...kindFields,
         // A leftover of an earlier activation may come from either block; only
         // this activation's parts are known to come from this recorder.
         ...(ofThisActivation ? { recorderType: rec.recorderType } : {}),
@@ -418,13 +475,16 @@ export function setPartStableMsForTests(ms: number | undefined): void {
 
 /** Stops every session without waiting. Tests only. */
 export function resetLiveRecordingUploads(): void {
-  for (const rec of [...live.values()]) void stopSession(rec);
+  for (const [productionId, sessions] of [...live.entries()]) void stopProduction(productionId, sessions);
   live.clear();
 }
 
 /** Resolves once the production's running pass (and any queued rerun) is done. Tests only. */
 export async function waitForLiveRecordingPass(productionId: string): Promise<void> {
-  for (let rec = live.get(productionId); rec?.running; rec = live.get(productionId)) {
-    await rec.running.catch(() => undefined);
+  for (;;) {
+    const sessions = live.get(productionId);
+    const running = sessions ? [sessions.program, ...sessions.inputs].filter((r) => r.running) : [];
+    if (running.length === 0) return;
+    await Promise.all(running.map((r) => r.running!.catch(() => undefined)));
   }
 }

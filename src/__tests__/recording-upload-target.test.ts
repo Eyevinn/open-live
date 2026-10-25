@@ -114,7 +114,20 @@ vi.mock('../lib/recording-uploader.js', async (importOriginal) => {
   return { ...actual, uploadRecordings: (...args: unknown[]) => mockUploadRecordings(...args) };
 });
 
+const broadcasts: Array<Record<string, unknown>> = [];
+vi.mock('../services/tally.service.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../services/tally.service.js')>();
+  return {
+    ...actual,
+    broadcast: (id: string, msg: Record<string, unknown>) => {
+      broadcasts.push(msg);
+      return actual.broadcast(id, msg as never);
+    },
+  };
+});
+
 const { buildServer } = await import('../server.js');
+const { stopLiveRecordingUpload } = await import('../services/live-recording-upload.js');
 const { encryptStorageSecret } = await import('../lib/storage-connection-crypto.js');
 
 const NOW = '2026-10-19T10:00:00.000Z';
@@ -200,6 +213,50 @@ describe('recorderType on the production (OL-32a)', () => {
     await app.inject({ method: 'POST', url: '/api/v1/productions/prod-1/activate' });
     await vi.waitFor(() => expect(productions.get('prod-1')?.status).toBe('active'));
     expect(productions.get('prod-1')?.recorderType).toBeUndefined();
+  });
+});
+
+describe('input recordings on the production (OL-32, spec §3.2, §2.8)', () => {
+  const inputRecorder = {
+    mixerInput: 'video_in_2', sourceId: 'src-srt', sourceName: 'Camera 2', streamType: 'srt' as const,
+    recorderBlockId: 'b-inrec-2-x', outputDir: 'recordings/prod-1/video_in_2',
+  };
+
+  it('persists inputRecordings, starts a live session per input and broadcasts RECORDING_STATE after the warnings', async () => {
+    broadcasts.length = 0;
+    productions.set('prod-1', production());
+    mockActivateStromFlow.mockResolvedValue({
+      ...activationResult(),
+      recorderType: 'liverecorder',
+      inputRecorders: [inputRecorder],
+      warnings: [{ type: 'input-recording-capped', mixerInputs: ['video_in_9'], message: 'capped' }],
+    });
+    const app = await buildServer();
+    await app.inject({ method: 'POST', url: '/api/v1/productions/prod-1/activate' });
+    await vi.waitFor(() => expect(productions.get('prod-1')?.status).toBe('active'));
+    expect(productions.get('prod-1')?.inputRecordings).toEqual([inputRecorder]);
+
+    const types = broadcasts.map((b) => b['type']);
+    expect(types.indexOf('ERROR')).toBeLessThan(types.indexOf('RECORDING_STATE'));
+    expect(broadcasts.find((b) => b['type'] === 'RECORDING_STATE')).toMatchObject({
+      program: true,
+      inputs: [{ mixerInput: 'video_in_2', sourceId: 'src-srt', sourceName: 'Camera 2' }],
+    });
+
+    const session = await stopLiveRecordingUpload('prod-1');
+    expect([...(session?.inputs?.keys() ?? [])]).toEqual(['video_in_2']);
+  });
+
+  it('writes no inputRecordings when none are recorded, clearing a stale list', async () => {
+    broadcasts.length = 0;
+    productions.set('prod-1', production({ inputRecordings: [inputRecorder] }));
+    mockActivateStromFlow.mockResolvedValue(activationResult());
+    const app = await buildServer();
+    await app.inject({ method: 'POST', url: '/api/v1/productions/prod-1/activate' });
+    await vi.waitFor(() => expect(productions.get('prod-1')?.status).toBe('active'));
+    expect(productions.get('prod-1')?.inputRecordings).toBeUndefined();
+    expect(broadcasts.find((b) => b['type'] === 'RECORDING_STATE')).toMatchObject({ program: true, inputs: [] });
+    await stopLiveRecordingUpload('prod-1');
   });
 });
 

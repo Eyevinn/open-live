@@ -133,7 +133,8 @@ describe('deactivate — Live Recorder path (OL-32a, spec §5.4)', () => {
     expect(await deactivate()).toBe(200);
     expect(mockSplitNow).not.toHaveBeenCalled();
     expect(mockFlowStop).toHaveBeenCalledWith('flow-lr');
-    expect(calls).toEqual(['flows.stop', 'media.list', 'deactivateStromFlow']);
+    // The first listing looks for input recording directories (OL-32), the second sweeps program.
+    expect(calls).toEqual(['flows.stop', 'media.list', 'media.list', 'deactivateStromFlow']);
   });
 
   it('registers a leftover part (no live session) as program, from its file-name stamp', async () => {
@@ -201,7 +202,7 @@ describe('deactivate — builtin.recorder path is unchanged (OL-32a, AC 8)', () 
     expect(await deactivate()).toBe(200);
     expect(mockSplitNow).toHaveBeenCalledWith('flow-lr', 'b-out-rec-1');
     expect(mockFlowStop).not.toHaveBeenCalled();
-    expect(calls).toEqual(['splitNow', 'media.list', 'deactivateStromFlow']);
+    expect(calls).toEqual(['splitNow', 'media.list', 'media.list', 'deactivateStromFlow']);
     expect(mockRecordingInsert).toHaveBeenCalledWith(expect.objectContaining({ kind: 'program' }));
   });
 

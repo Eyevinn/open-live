@@ -402,8 +402,62 @@ export interface RecordingDoc {
   recorderType?: RecorderType;
   /** How `startedAt` was derived (OL-32a, spec §6). Absent on older docs (= `filename`). */
   startedAtSource?: RecordingStartSource;
+  /** Input recordings only (OL-32): the stored assignment key, e.g. `video_in_2`. */
+  mixerInput?: string;
+  /** Input recordings only: the recorded `SourceDoc._id` (or the virtual `Whip` id). */
+  sourceId?: string;
+  /**
+   * Input recordings only: the label the multiviewer showed at activation
+   * (`Guest N · In M` for a WHIP guest slot, else `SourceDoc.name`). A snapshot:
+   * a later rename does not change it.
+   */
+  sourceName?: string;
+  /** Input recordings only: the source's `streamType` at activation. */
+  streamType?: RecordableStreamType;
+  /** WHIP inputs only: the guest sessions on this `mixerInput` that overlap the part. */
+  guests?: RecordingGuest[];
+  /** The first of {@link guests} with a label — a ready list column. */
+  guestLabel?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+/** A guest session that overlaps an input recording part (OL-32, spec §3.1). */
+export interface RecordingGuest {
+  inviteId: string;
+  /** The invite's label, when it has one. */
+  label?: string;
+  /** ISO 8601 — the session's `createdAt`. */
+  joinedAt: string;
+  /** ISO 8601 — the session's `updatedAt` once it is `left`; absent while joined. */
+  leftAt?: string;
+}
+
+/** Source types whose input can be recorded to its own files (OL-32, spec Q6). */
+export type RecordableStreamType = 'whip' | 'srt' | 'efp';
+
+/**
+ * `ProductionSourceAssignment.record`: whether to record the input to its own
+ * files (OL-32). `passthrough` is reserved and refused in v1.
+ */
+export type InputRecordMode = 'off' | 'transcode';
+
+/**
+ * One input the running activation records (OL-32, spec §3.2). Written on
+ * activate with `recorderBlockId`, cleared on deactivate. `recorderBlockId` and
+ * `outputDir` are internal and stripped from production responses.
+ */
+export interface ActiveInputRecording {
+  /** Stored assignment key, never the compacted Strom pad. */
+  mixerInput: string;
+  sourceId: string;
+  /** Multiviewer label at activation (see {@link RecordingDoc.sourceName}). */
+  sourceName: string;
+  streamType: RecordableStreamType;
+  /** The input's `builtin.liverecorder` block id. Internal. */
+  recorderBlockId: string;
+  /** `recordings/<productionId>/<mixerInput>`. Internal. */
+  outputDir: string;
 }
 
 /** `RecordingDoc.kind`: the program recording, or one input's own recording (OL-32). */
@@ -772,6 +826,12 @@ export interface ProductionSourceAssignment {
    * v1 accepts `lowLatency: false` only.
    */
   returnFeed?: { synced: 'program' | 'program-minus'; lowLatency?: boolean };
+  /**
+   * Record this input to its own files (OL-32, `docs/specs/iso-input-recording.md`
+   * §2.1). Absent = `off`; stored only when `transcode`. Read at activation, so
+   * a change applies from the next activation.
+   */
+  record?: InputRecordMode;
 }
 
 /**
@@ -838,6 +898,14 @@ export type AudioStreamNotAppliedReason =
  */
 export type ActivationWarning =
   | { type: 'recording-no-audio'; message: string }
+  /** Inputs asked to record, but this Strom has no Live Recorder (or `RECORDING_BLOCK=recorder`). */
+  | { type: 'input-recording-unavailable'; mixerInputs: string[]; message: string }
+  /** Inputs asked to record, but the production has no `recording` output. */
+  | { type: 'input-recording-no-output'; mixerInputs: string[]; message: string }
+  /** More inputs asked to record than `RECORDING_MAX_INPUTS`; lists the ones skipped. */
+  | { type: 'input-recording-capped'; mixerInputs: string[]; message: string }
+  /** An input asked to record a source whose type cannot be recorded. */
+  | { type: 'input-recording-unsupported-source'; mixerInput: string; sourceId: string; message: string }
   | {
       type: 'audio-stream-not-applied';
       /** SourceDoc._id */
@@ -893,6 +961,12 @@ export interface ProductionDoc {
    * deactivate.
    */
   recording?: ActiveRecording;
+  /**
+   * The inputs the running activation records to their own files (OL-32, spec
+   * §3.2). Set on activate, cleared on deactivate. They share {@link recording}
+   * as their upload target.
+   */
+  inputRecordings?: ActiveInputRecording[];
   /**
    * Outcome of the most recent deactivate that had a recording to upload (issue
    * #534). Kept until the next such deactivate replaces it. Never holds secrets

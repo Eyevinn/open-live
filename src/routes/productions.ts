@@ -1,9 +1,11 @@
-import type { FastifyBaseLogger, FastifyPluginAsync } from 'fastify';
+import type { FastifyBaseLogger, FastifyPluginAsync, FastifyReply } from 'fastify';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
-import { getDb, getOutputsDb, getRecordingsDb } from '../db/index.js';
+import { getDb, getOutputsDb, getRecordingsDb, getSourcesDb } from '../db/index.js';
+import { isDocNotFoundError } from '../lib/db-errors.js';
+import { VIRTUAL_SOURCES } from '../lib/audio-channels.js';
 import { sweepGuestsOnProductionEnd } from '../services/guest-sweep.js';
-import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc, RecordingDoc, ActiveRecording, RecordingUploadSummary, RecorderType } from '../db/types.js';
+import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc, RecordingDoc, ActiveRecording, RecordingUploadSummary, RecorderType, ActiveInputRecording } from '../db/types.js';
 import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { stromBrowserBaseUrl } from '../lib/strom-public-url.js';
@@ -15,11 +17,17 @@ import { clearPipState, clearAudioState, clearFxState, clearClipStateForProducti
 import { forceStopMeterRelay } from '../services/meter-relay.js';
 import { forceStopClipRelay } from '../services/clip-relay.js';
 import { config } from '../config.js';
-import { uploadRecordings } from '../lib/recording-uploader.js';
+import { uploadRecordings, type MinioTarget } from '../lib/recording-uploader.js';
+import {
+  MIXER_INPUT_RE, inputRecordingDir, isRecordableStreamType, publicInputRecordings, recordedAssignments,
+  recordingStateMessage, storedPadIndex,
+} from '../lib/input-recording.js';
+import { inputRecordingFields } from '../lib/input-recording-metadata.js';
 import { parsePartName, resolvePartTimings } from '../lib/recording-parts.js';
 import { upsertRecordingDoc } from '../lib/recording-registry.js';
 import { resolveRecordingUploadTarget } from '../lib/recording-upload-target.js';
 import { startLiveRecordingUpload, stopLiveRecordingUpload, type LiveRecordingSession } from '../services/live-recording-upload.js';
+import { holdRecorderEvents, type RecorderEventsHold } from '../services/strom-recorder-events.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type OutputStatusEntry } from '../lib/production-health.js';
@@ -32,6 +40,8 @@ import { checkProductionStartAllowed } from '../services/production-gate.js';
 
 const FLOW_POLL_INTERVAL_MS = 500;
 const FLOW_POLL_TIMEOUT_MS = 30_000;
+/** Longest an activation waits for the recorder-event socket before `flows.start` (spec §6). */
+const RECORDER_EVENTS_READY_MS = 2000;
 const MAX_DB_WRITE_RETRIES = 3;
 
 // ---------------------------------------------------------------------------
@@ -177,6 +187,10 @@ export async function updateProductionDoc(
  */
 export function toProductionView<T extends ProductionDoc>(doc: T): Omit<T, 'activatedAt' | 'gpuHours'> {
   const { activatedAt: _activatedAt, gpuHours: _gpuHours, ...rest } = doc;
+  // Each input recorder's block id and Strom directory are internal (OL-32, spec §3.2).
+  if (rest.inputRecordings) {
+    return { ...rest, inputRecordings: publicInputRecordings(rest.inputRecordings) as ActiveInputRecording[] };
+  }
   return rest;
 }
 
@@ -220,6 +234,7 @@ function deactivatedDoc(
     recorderBlockId: undefined,
     recorderType: undefined,
     recording: undefined,
+    inputRecordings: undefined,
     // Replaced only by a deactivate that had a recording to upload (issue #534).
     ...(lastRecordingUpload ? { lastRecordingUpload } : {}),
     sourceOffsetBlockIds: undefined,
@@ -356,48 +371,163 @@ async function uploadProductionRecording(
   }
   const { target } = resolved;
 
-  let uploadRes: Awaited<ReturnType<typeof uploadRecordings>>;
-  try {
-    // builtin.recorder only: close the open part so it is uploaded too. On the
-    // Live Recorder path the caller has already stopped the flow, which
-    // finalises every open file, so there is nothing to split (spec §5.4).
-    if (recorderType === 'recorder') {
-      await strom.recorder.splitNow(stromFlowId, recorderBlockId).catch(() => undefined);
+  // Guard (issue #366): re-check the production doc immediately before each
+  // uploadRecordings' delete-after-upload pass. Nothing else in the deactivate
+  // handler writes to the production doc before its own final status update,
+  // which runs after this — so `doc._rev` cannot legitimately change between
+  // the read at the top of the handler and here. A different _rev means
+  // something else (most plausibly a reactivation) touched the doc while the
+  // upload was in flight; treat the activation as still live and skip deletion
+  // rather than risk deleting recordings it still needs.
+  const isStillRecording = async (): Promise<boolean> => {
+    try {
+      const current = await getDb().get(doc._id);
+      return current._rev !== doc._rev;
+    } catch {
+      // Doc gone entirely — nothing left to protect.
+      return false;
     }
-    uploadRes = await uploadRecordings({
-      strom,
-      stromUrl: config.stromUrl,
-      stromToken,
-      outputDir: `recordings/${doc._id}`,
-      productionId: doc._id,
-      target,
-      // Guard (issue #366): re-check the production doc immediately before
-      // uploadRecordings' delete-after-upload pass. Nothing else in the
-      // deactivate handler writes to the production doc before its own final
-      // status update, which runs after this — so `doc._rev` cannot
-      // legitimately change between the read at the top of the handler and
-      // here. A different _rev means something else (most plausibly a
-      // reactivation) touched the doc while the upload was in flight; treat
-      // the activation as still live and skip deletion rather than risk
-      // deleting recordings it still needs.
-      isStillRecording: async () => {
-        try {
-          const current = await getDb().get(doc._id);
-          return current._rev !== doc._rev;
-        } catch {
-          // Doc gone entirely — nothing left to protect.
-          return false;
-        }
-      },
-    });
-  } catch (err) {
-    log.error({ err, productionId: doc._id }, 'VOD recording upload failed — continuing deactivation');
-    return summarise({
-      bucket: target.bucket,
-      reason: 'upload-error',
-      message: `The recording upload failed: ${err instanceof Error ? err.message : String(err)}. The recording stays on Strom.`,
-    });
+  };
+
+  // builtin.recorder only: close the open part so it is uploaded too. On the
+  // Live Recorder path the caller has already stopped the flow, which
+  // finalises every open file, so there is nothing to split (spec §5.4).
+  if (recorderType === 'recorder') {
+    await strom.recorder.splitNow(stromFlowId, recorderBlockId).catch(() => undefined);
   }
+
+  let uploaded = 0;
+  const failed: RecordingUploadSummary['failed'] = [];
+  let abortedOnAuthError: { file: string; code: string } | undefined;
+
+  // Input directories first (OL-32, spec §5.4): uploadRecordings deletes a
+  // directory only once it is empty, and the program directory holds the input
+  // directories. Every <mixerInput> directory that exists is swept — leftovers
+  // of earlier activations too — not only the ones this activation recorded.
+  for (const mixerInput of await inputRecordingDirs(strom, doc, log)) {
+    const input = doc.inputRecordings?.find((r) => r.mixerInput === mixerInput);
+    try {
+      const res = await sweepRecordingDir({
+        doc, strom, stromToken, target, outputId, connectionId, recorderType, isStillRecording, log,
+        outputDir: inputRecordingDir(doc._id, mixerInput),
+        mixerInput,
+        ...(input ? { input } : {}),
+        ...(liveSession?.inputs?.get(mixerInput) ? { liveSession: liveSession.inputs.get(mixerInput) } : {}),
+      });
+      uploaded += res.uploaded;
+      failed.push(...res.failed);
+      if (res.abortedOnAuthError) {
+        abortedOnAuthError = res.abortedOnAuthError;
+        break;
+      }
+    } catch (err) {
+      log.error({ err, productionId: doc._id, mixerInput }, 'Input recording upload failed — continuing with the next directory');
+      failed.push({ file: inputRecordingDir(doc._id, mixerInput), error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  if (!abortedOnAuthError) {
+    try {
+      const res = await sweepRecordingDir({
+        doc, strom, stromToken, target, outputId, connectionId, recorderType, isStillRecording, log,
+        outputDir: `recordings/${doc._id}`,
+        ...(liveSession ? { liveSession } : {}),
+      });
+      uploaded += res.uploaded;
+      failed.push(...res.failed);
+      abortedOnAuthError = res.abortedOnAuthError;
+    } catch (err) {
+      log.error({ err, productionId: doc._id }, 'VOD recording upload failed — continuing deactivation');
+      return summarise({
+        bucket: target.bucket,
+        uploaded,
+        failed,
+        reason: 'upload-error',
+        message: `The recording upload failed: ${err instanceof Error ? err.message : String(err)}. The recording stays on Strom.`,
+      });
+    }
+  }
+
+  let reason: RecordingUploadSummary['reason'];
+  let message: string | undefined;
+  if (abortedOnAuthError) {
+    // The store rejected our credentials, so the sweep stopped after the first
+    // rejection instead of grinding through every segment (#465).
+    reason = 'auth-error';
+    message =
+      `The object store rejected the credentials or permission (${abortedOnAuthError.code}); ` +
+      'the upload stopped and the remaining files stay on Strom.';
+    log.warn(
+      { productionId: doc._id, code: abortedOnAuthError.code, file: abortedOnAuthError.file },
+      'VOD recording upload sweep aborted on object-store auth/permission error — skipping remaining segments; deactivation continues',
+    );
+  }
+  log.info(
+    { productionId: doc._id, uploaded, failed: failed.length },
+    'VOD recordings uploaded to object storage',
+  );
+  return summarise({
+    bucket: target.bucket,
+    uploaded,
+    failed,
+    ...(reason ? { reason } : {}),
+    ...(message ? { message } : {}),
+  });
+}
+
+/**
+ * The input recording directories under `recordings/<productionId>/` (OL-32,
+ * spec §5.4), by numeric pad index: every `<mixerInput>` subdirectory Strom
+ * lists, plus the ones this activation recorded in case the listing fails.
+ */
+async function inputRecordingDirs(
+  strom: StromClient,
+  doc: ProductionDoc,
+  log: FastifyBaseLogger,
+): Promise<string[]> {
+  const dirs = new Set((doc.inputRecordings ?? []).map((r) => r.mixerInput));
+  try {
+    const listing = await strom.media.list(`recordings/${doc._id}`);
+    for (const e of listing.entries ?? []) {
+      if (e.is_dir && MIXER_INPUT_RE.test(e.name)) dirs.add(e.name);
+    }
+  } catch (err) {
+    log.warn({ err, productionId: doc._id }, 'Could not list input recording directories — sweeping the ones this activation recorded');
+  }
+  return [...dirs].sort((a, b) => storedPadIndex(a) - storedPadIndex(b));
+}
+
+/**
+ * Uploads every file in one recorder directory and registers it (issue #41,
+ * #554): program (`mixerInput` absent) or one input's own recording (OL-32).
+ * Throws when the directory cannot be listed; per-file failures are returned.
+ */
+async function sweepRecordingDir(args: {
+  doc: ProductionDoc;
+  strom: StromClient;
+  stromToken: string | undefined;
+  target: MinioTarget;
+  outputId: string | undefined;
+  connectionId: string | undefined;
+  recorderType: RecorderType;
+  isStillRecording: () => Promise<boolean>;
+  log: FastifyBaseLogger;
+  outputDir: string;
+  mixerInput?: string;
+  input?: ActiveInputRecording;
+  liveSession?: LiveRecordingSession;
+}): Promise<{ uploaded: number; failed: RecordingUploadSummary['failed']; abortedOnAuthError?: { file: string; code: string } }> {
+  const { doc, target, outputId, connectionId, recorderType, liveSession, mixerInput, log } = args;
+  const uploadRes = await uploadRecordings({
+    strom: args.strom,
+    stromUrl: config.stromUrl,
+    stromToken: args.stromToken,
+    outputDir: args.outputDir,
+    productionId: doc._id,
+    ...(mixerInput ? { mixerInput } : {}),
+    target,
+    isStillRecording: args.isStillRecording,
+  });
 
   // Persist one RecordingDoc per uploaded object so #42's listing/playback
   // endpoint can enumerate and presign recordings without round-tripping the
@@ -419,7 +549,19 @@ async function uploadProductionRecording(
     const activationId = liveSession?.stem !== undefined && part?.stem === liveSession.stem
       ? liveSession.activationId
       : undefined;
+    // The sweep also uploads segments earlier sessions left on Strom, so
+    // take the start from each segment's own name, offset by its part
+    // index (#553); otherwise this activation's start (issue #534), then
+    // the legacy doc.updatedAt. A part ends after its own duration when
+    // known, else at deactivate.
+    const startedAt = timing.startedAt ?? doc.recording?.startedAt ?? doc.updatedAt;
+    const endedAt = timing.endedAt ?? finalizedAt;
     try {
+      // Program, or one input's own recording (OL-32). Only this activation's
+      // parts are known to hold this activation's source.
+      const kindFields = mixerInput
+        ? await inputRecordingFields(doc._id, mixerInput, activationId ? args.input : undefined, { startedAt, endedAt })
+        : { kind: 'program' as const };
       // Keyed by bucket+key and upserted (issue #554): a file whose Strom
       // delete failed is swept again by the next deactivate and must update
       // its RecordingDoc, not add a second one.
@@ -434,17 +576,12 @@ async function uploadProductionRecording(
         key: seg.key,
         sizeBytes: seg.sizeBytes,
         ...(seg.durationMs !== undefined ? { durationMs: seg.durationMs } : {}),
-        // The sweep also uploads segments earlier sessions left on Strom, so
-        // take the start from each segment's own name, offset by its part
-        // index (#553); otherwise this activation's start (issue #534), then
-        // the legacy doc.updatedAt. A part ends after its own duration when
-        // known, else at deactivate.
-        startedAt: timing.startedAt ?? doc.recording?.startedAt ?? doc.updatedAt,
+        startedAt,
         ...(timing.startedAtSource ? { startedAtSource: timing.startedAtSource } : {}),
-        endedAt: timing.endedAt ?? finalizedAt,
+        endedAt,
         ...(activationId ? { activationId } : {}),
         ...(part ? { partIndex: part.index } : {}),
-        kind: 'program',
+        ...kindFields,
         // Only this activation's parts are known to come from this block; a
         // leftover of an earlier activation may have been written by either.
         ...(activationId ? { recorderType } : {}),
@@ -455,32 +592,11 @@ async function uploadProductionRecording(
       log.error({ persistErr, productionId: doc._id, key: seg.key }, 'RecordingDoc persist failed — object uploaded but unlisted');
     }
   }
-
-  let reason: RecordingUploadSummary['reason'];
-  let message: string | undefined;
-  if (uploadRes.abortedOnAuthError) {
-    // The store rejected our credentials, so the sweep stopped after the first
-    // rejection instead of grinding through every segment (#465).
-    reason = 'auth-error';
-    message =
-      `The object store rejected the credentials or permission (${uploadRes.abortedOnAuthError.code}); ` +
-      'the upload stopped and the remaining files stay on Strom.';
-    log.warn(
-      { productionId: doc._id, code: uploadRes.abortedOnAuthError.code, file: uploadRes.abortedOnAuthError.file },
-      'VOD recording upload sweep aborted on object-store auth/permission error — skipping remaining segments; deactivation continues',
-    );
-  }
-  log.info(
-    { productionId: doc._id, uploaded: uploadRes.uploaded.length, failed: uploadRes.failed.length },
-    'VOD recordings uploaded to object storage',
-  );
-  return summarise({
-    bucket: target.bucket,
+  return {
     uploaded: uploadRes.uploaded.length,
     failed: uploadRes.failed,
-    ...(reason ? { reason } : {}),
-    ...(message ? { message } : {}),
-  });
+    ...(uploadRes.abortedOnAuthError ? { abortedOnAuthError: uploadRes.abortedOnAuthError } : {}),
+  };
 }
 
 /**
@@ -545,6 +661,9 @@ async function runActivationFlow(
   let loudnessMainBlockId: string | undefined;
   let whepOutputEntries: Array<{ outputId: string; endpointId: string }> | undefined;
   let pgmWhepEndpointId: string | undefined;
+  // Keeps the recorder-event socket open from before flows.start until the
+  // live sessions subscribe (spec §6): released in `finally` on every path.
+  let recorderEventsHold: RecorderEventsHold | undefined;
 
   // Force-stop the meter and clip relays bound to this run's (dying) flow,
   // mirroring deactivate (issue #435). A controller connecting while status is
@@ -583,6 +702,17 @@ async function runActivationFlow(
     const stromToken = await getStromToken(config.stromToken);
     const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
 
+    // Part 0 of program and of every input opens as soon as the flow starts,
+    // before this run reaches 'active' and starts the live sessions. Open the
+    // recorder-event socket first, so those events are received and buffered
+    // for the sessions to replay with their receipt times (spec §6, AC 3).
+    // Best effort: if the socket is not up in time, part 0 falls back to the
+    // later rules as before.
+    if (outputDocs.some((o) => o.outputType === 'recording')) {
+      recorderEventsHold = holdRecorderEvents();
+      await recorderEventsHold.ready(RECORDER_EVENTS_READY_MS);
+    }
+
     // Step 1: Start the Strom flow
     if (signal.aborted) return;
     // When the recorder block (if any) starts recording — the flow is created
@@ -611,6 +741,8 @@ async function runActivationFlow(
     const recordingOutput = activation.recorderOutputId
       ? outputDocs.find((o) => o._id === activation.recorderOutputId)
       : undefined;
+    // Input recorders only exist beside a program recorder (spec Q1).
+    const inputRecordings = activation.recorderBlockId ? activation.inputRecorders ?? [] : [];
     const recording: ActiveRecording | undefined = activation.recorderBlockId && recordingOutput
       ? {
           outputId: recordingOutput._id,
@@ -628,6 +760,9 @@ async function runActivationFlow(
       // Written with recorderBlockId, as undefined without a recorder so a
       // stale value from an earlier activation never leaks into this one.
       recorderType: activation.recorderBlockId !== undefined ? activation.recorderType ?? 'recorder' : undefined,
+      // The inputs recorded to their own files (OL-32); undefined when none, so
+      // a stale list from an earlier activation never leaks into this one.
+      inputRecordings: inputRecordings.length > 0 ? inputRecordings : undefined,
       ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
       ...(Object.keys(activation.sourceAudioOffsetBlockIds).length > 0 && { sourceAudioOffsetBlockIds: activation.sourceAudioOffsetBlockIds }),
       ...(Object.keys(activation.clipPlayerBlockIds).length > 0 && { clipPlayerBlockIds: activation.clipPlayerBlockIds }),
@@ -800,6 +935,7 @@ async function runActivationFlow(
             recorderBlockId: activation.recorderBlockId,
             recorderType: activation.recorderType ?? 'recorder',
             recording,
+            ...(inputRecordings.length > 0 ? { inputRecordings } : {}),
           }, log);
         }
         // Emit the PRODUCTION_STATUS lifecycle event for the active transition
@@ -814,6 +950,11 @@ async function runActivationFlow(
         // the same frame from the connect-time snapshot in ws/controller.ts.
         if (!signal.aborted) {
           for (const w of activation.warnings) broadcast(productionId, { type: 'ERROR', error: w.message });
+          // What this activation records (OL-32, spec §2.8), after the warnings.
+          broadcast(productionId, recordingStateMessage({
+            ...(activation.recorderBlockId ? { recorderBlockId: activation.recorderBlockId } : {}),
+            inputRecordings,
+          }));
         }
         log.info({ productionId, stromFlowId, whepEndpoint, initialTally, audioMixerBlockId }, 'Production activated — flow playing');
 
@@ -873,12 +1014,15 @@ async function runActivationFlow(
       pgmWhepEndpoint: undefined,
       whipEndpoints: undefined,
       activationWarnings: undefined,
+      inputRecordings: undefined,
     }).catch((resetErr) => {
       log.error({ resetErr, productionId }, 'Failed to reset production to inactive after activation failure');
     });
 
     notifyProductionDeactivated(productionId);
   } finally {
+    // The live sessions (if started) hold their own subscriptions by now.
+    recorderEventsHold?.release();
     // Only remove the entry if it still points to *this* run's controller.
     // A slow aborted run can otherwise finish after a newer activation has
     // registered its own controller and delete that entry, leaving the newer
@@ -978,11 +1122,76 @@ const ReturnFeedInput = z
   })
   .optional();
 
+/**
+ * Record an input to its own files (OL-32, spec iso-input-recording.md §2.1).
+ * `passthrough` is reserved: parsed so it can be refused with its own reason.
+ */
+const RecordModeInput = z.enum(['off', 'transcode', 'passthrough']);
+
 const SourceAssignmentInput = z.object({
   sourceId: z.string().min(1).max(128),
   mixerInput: mixerInputSchema,
   returnFeed: ReturnFeedInput,
+  record: RecordModeInput.optional(),
 });
+
+const RecordInput = z.object({ record: RecordModeInput });
+
+type RecordRefusal = { status: 400 | 409 | 503; error: string; reason?: string };
+
+const RECORD_MODE_UNSUPPORTED: RecordRefusal = {
+  status: 400,
+  reason: 'record-mode-unsupported',
+  error: 'record "passthrough" is not supported yet; use "transcode"',
+};
+
+/**
+ * Whether `record: 'transcode'` may be set on an assignment of `sourceId` at
+ * `mixerInput` (spec §2.2, §2.3): the source must be WHIP, SRT or EFP (Q6) and
+ * the production must stay within `RECORDING_MAX_INPUTS` recorded inputs (Q3).
+ * Returns the refusal, or undefined when allowed. A source that does not exist
+ * counts as unsupported.
+ */
+async function checkInputRecordable(
+  production: ProductionDoc,
+  sourceId: string,
+  mixerInput: string,
+): Promise<RecordRefusal | undefined> {
+  let streamType: string | undefined = VIRTUAL_SOURCES[sourceId]?.streamType;
+  if (streamType === undefined) {
+    try {
+      streamType = (await getSourcesDb().get(sourceId)).streamType;
+    } catch (err) {
+      if (!isDocNotFoundError(err)) return { status: 503, error: 'Database unavailable' };
+    }
+  }
+  if (!isRecordableStreamType(streamType)) {
+    return {
+      status: 400,
+      reason: 'record-source-unsupported',
+      error: 'Only WHIP, SRT and EFP sources can be recorded to their own files',
+    };
+  }
+  const others = recordedAssignments(production.sources).filter((s) => s.mixerInput !== mixerInput).length;
+  if (others + 1 > config.recordingMaxInputs) {
+    return {
+      status: 409,
+      reason: 'record-cap-reached',
+      error: config.recordingMaxInputs === 0
+        ? 'Input recording is turned off on this instance (RECORDING_MAX_INPUTS=0)'
+        : `At most ${config.recordingMaxInputs} inputs can be recorded per production (RECORDING_MAX_INPUTS)`,
+    };
+  }
+  return undefined;
+}
+
+function sendRecordRefusal(reply: FastifyReply, refusal: RecordRefusal): FastifyReply {
+  return reply.status(refusal.status).send({
+    error: refusal.error,
+    statusCode: refusal.status,
+    ...(refusal.reason ? { reason: refusal.reason } : {}),
+  });
+}
 
 const GraphicAssignmentInput = z.object({
   graphicId: z.string().min(1),
@@ -1286,6 +1495,8 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
     // Broadcast group-state reset so all connected clients clear their ephemeral
     // group assignments — these are live-only and must not survive deactivation.
     broadcast(doc._id, { type: 'GRP_STATE_RESET' });
+    // Nothing records any more (OL-32, spec §2.8), before PRODUCTION_DEACTIVATED.
+    broadcast(doc._id, recordingStateMessage(undefined));
     broadcast(doc._id, { type: 'PRODUCTION_DEACTIVATED' });
     // Stop the live part upload and wait for a running pass, so the sweep below
     // only finds the last part and earlier failures, and never races it (#556).
@@ -1347,6 +1558,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
   // Assign a source to a mixer input
   fastify.post<{ Params: { id: string } }>('/api/v1/productions/:id/sources', async (req, reply) => {
     const body = SourceAssignmentInput.parse(req.body);
+    if (body.record === 'passthrough') return sendRecordRefusal(reply, RECORD_MODE_UNSUPPORTED);
     const assignment: ProductionSourceAssignment = {
       sourceId: body.sourceId,
       mixerInput: body.mixerInput,
@@ -1355,10 +1567,17 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       ...(body.returnFeed
         ? { returnFeed: { synced: body.returnFeed.synced, lowLatency: false as const } }
         : {}),
+      // Replace semantics, like returnFeed: absent (or 'off') turns recording
+      // off for this input. 'off' is stored as absent (OL-32, spec §2.1).
+      ...(body.record === 'transcode' ? { record: 'transcode' as const } : {}),
     };
     for (let attempt = 0; attempt < MAX_DB_WRITE_RETRIES; attempt++) {
       try {
         const doc = await getDb().get(req.params.id);
+        if (assignment.record === 'transcode') {
+          const refusal = await checkInputRecordable(doc, assignment.sourceId, assignment.mixerInput);
+          if (refusal) return sendRecordRefusal(reply, refusal);
+        }
         // Replace existing assignment for the same mixerInput, or add new
         const existing = doc.sources.findIndex((s) => s.mixerInput === body.mixerInput);
         const unsorted = existing !== -1
@@ -1405,6 +1624,64 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         }
       }
     }
+  );
+
+  // Turn recording of one input on or off without touching the rest of its
+  // assignment (OL-32, spec iso-input-recording.md §2.3). Read at activation:
+  // a running production keeps recording what it was activated with.
+  fastify.put<{ Params: { id: string; mixerInput: string } }>(
+    '/api/v1/productions/:id/sources/:mixerInput/record',
+    async (req, reply) => {
+      const mixerInputParsed = mixerInputSchema.safeParse(req.params.mixerInput);
+      if (!mixerInputParsed.success) {
+        return reply.status(400).send({ error: 'Invalid mixerInput format', statusCode: 400 });
+      }
+      const mixerInput = mixerInputParsed.data;
+      const body = RecordInput.parse(req.body);
+      if (body.record === 'passthrough') return sendRecordRefusal(reply, RECORD_MODE_UNSUPPORTED);
+      for (let attempt = 0; attempt < MAX_DB_WRITE_RETRIES; attempt++) {
+        let doc: ProductionDoc;
+        try {
+          doc = await getDb().get(req.params.id);
+        } catch (err) {
+          if (isDocNotFoundError(err)) return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+          req.log.warn({ err }, 'PUT /sources/:mixerInput/record — DB read failed');
+          return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
+        }
+        const current = doc.sources.find((s) => s.mixerInput === mixerInput);
+        if (!current) return reply.status(404).send({ error: 'Source assignment not found', statusCode: 404 });
+        if (body.record === 'transcode') {
+          const refusal = await checkInputRecordable(doc, current.sourceId, mixerInput);
+          if (refusal) return sendRecordRefusal(reply, refusal);
+        }
+        const { record: _previous, ...rest } = current;
+        const updatedAssignment: ProductionSourceAssignment = body.record === 'transcode' ? { ...rest, record: 'transcode' } : rest;
+        const updated: ProductionDoc = {
+          ...doc,
+          sources: doc.sources.map((s) => (s.mixerInput === mixerInput ? updatedAssignment : s)),
+          updatedAt: new Date().toISOString(),
+        };
+        let rev: string;
+        try {
+          rev = (await getDb().insert(updated)).rev;
+        } catch (err) {
+          if (isConflict(err) && attempt < MAX_DB_WRITE_RETRIES - 1) continue;
+          req.log.warn({ err }, 'PUT /sources/:mixerInput/record — DB write failed');
+          return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
+        }
+        const recordingOutputAssigned = !!(await firstRecordingOutput(doc, req.log));
+        return reply.send({
+          mixerInput,
+          sourceId: current.sourceId,
+          record: body.record,
+          appliesFrom: 'next-activation',
+          currentlyRecording: doc.status === 'active' && (doc.inputRecordings ?? []).some((r) => r.mixerInput === mixerInput),
+          recordingOutputAssigned,
+          _rev: rev,
+        });
+      }
+      return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
+    },
   );
 
   // Assign a graphic to a DSK pad
