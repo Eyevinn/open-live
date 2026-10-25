@@ -32,7 +32,9 @@
  *
  * Each session also records when open-live first saw each file open (spec §6):
  * that is the part's start time when it is registered, here or by the
- * deactivate sweep. The subscription is kept for this even with
+ * deactivate sweep. Part 0 opens before the session starts (the flow starts
+ * before the production is `active`), so a session first replays its flow's
+ * buffered events, which activation keeps the socket open for. The subscription is kept for this even with
  * `RECORDING_SEGMENT_SECS=0`; only the upload passes are skipped then.
  *
  * One session runs per recorder (spec §5.3): program, and one per input the
@@ -197,7 +199,9 @@ export function startLiveRecordingUpload(
       onFileChanged: (event) => onFileChanged(rec, event),
       // Events sent while the socket was down are lost: sweep everything but the newest file.
       onConnected: () => trigger(rec),
-    });
+    // Part 0 opened before this session existed (the flow starts before the
+    // production is active): take this flow's buffered events first (spec §6).
+    }, { replayFlowId: rec.flowId });
   }
   const rec = sessions.program;
   log.info(
@@ -274,10 +278,11 @@ function onFileChanged(rec: LiveRecording, event: RecorderFileEvent): void {
   const name = baseName(event.filename);
   const part = parsePartName(name);
   if (!part) return;
-  // First sighting of the file is its open time (spec §6 rule 2).
+  // First sighting of the file is its open time (spec §6 rule 2): when the
+  // event was received, which for a replayed event is before this session.
   if (!rec.openedAt.has(name)) {
     rec.openedAt.set(name, {
-      openedAtMs: Date.now(),
+      openedAtMs: event.receivedAtMs,
       ...(event.startUtcUs !== undefined ? { startUtcUs: event.startUtcUs } : {}),
     });
   }

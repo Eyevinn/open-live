@@ -511,6 +511,14 @@ records each file's first-seen time (`openedAt`, part start rule 2 of
 'liverecorder'`) deactivate stops the flow before the upload sweep and never calls split-now:
 the block finalises its open file inside the stop.
 
+Part 0 opens at `flows.start`, before activation reaches `active` and starts the sessions. So
+`runActivationFlow` takes `holdRecorderEvents()` before `activateStromFlow` (when a `recording`
+output is assigned; waits ≤ 2 s for the socket, never fails activation) and releases it in its
+`finally`; the socket keeps a short per-flow buffer (`RECENT_EVENT_TTL_MS`), and each session
+subscribes with `replayFlowId` so part 0 keeps its original receipt time (`startedAtSource:
+'event'`) instead of falling back to the file name. Any new early consumer must replay the same way:
+an event's time is `RecorderFileEvent.receivedAtMs`, never `Date.now()` in the subscriber.
+
 ## Input recordings: one live session per recorder, input directories swept before program
 
 OL-32 records chosen inputs to `recordings/<productionId>/<mixerInput>/`, nested under the program

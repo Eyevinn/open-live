@@ -2,7 +2,9 @@
  * Shared Strom recorder-event listener (issue #556): one socket for every
  * subscriber, RecorderFileChanged fan-out, reconnect with backoff and an
  * onConnected catch-up after each (re)connect, closed after the last
- * unsubscribe. The socket is a fake injected through the factory hook.
+ * unsubscribe; the replay buffer and activation's hold (spec
+ * iso-input-recording.md §6). The socket is a fake injected through the
+ * factory hook.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
@@ -11,6 +13,8 @@ import {
   resetRecorderEvents,
   recorderEventSubscriberCount,
   reconnectDelayMs,
+  holdRecorderEvents,
+  RECENT_EVENT_TTL_MS,
   type RecorderSocketHandlers,
 } from '../services/strom-recorder-events.js';
 
@@ -60,6 +64,7 @@ describe('strom-recorder-events', () => {
       blockId: 'rec-1',
       filename: 'recordings/p/p_20261022_080000_00001.mp4',
       startUtcUs: 1_790_000_000_000_000,
+      receivedAtMs: Date.now(),
     };
     expect(a).toHaveBeenCalledTimes(1);
     expect(a).toHaveBeenCalledWith(expected);
@@ -147,6 +152,92 @@ describe('strom-recorder-events', () => {
     const onConnected = vi.fn();
     subscribeRecorderEvents({ onFileChanged: vi.fn(), onConnected });
     expect(onConnected).toHaveBeenCalledTimes(1);
+  });
+
+  it('replays a flow\'s buffered events to a new subscriber with their receipt time, before live ones', async () => {
+    const hold = holdRecorderEvents();
+    await vi.advanceTimersByTimeAsync(0);
+    sockets[0]!.handlers.onOpen();
+    const receivedAt = Date.now();
+    sockets[0]!.handlers.onEvent(fileEvent('recordings/p/p_20261022_080000_00000.mp4'));
+    sockets[0]!.handlers.onEvent({
+      type: 'RecorderFileChanged',
+      data: { flow_id: 'flow-other', block_id: 'rec-9', filename: 'recordings/q/q_20261022_080000_00000.mp4' },
+    });
+    await vi.advanceTimersByTimeAsync(4000);
+
+    const seen: Array<{ filename: string; receivedAtMs: number }> = [];
+    subscribeRecorderEvents({ onFileChanged: (e) => seen.push(e) }, { replayFlowId: 'flow-1' });
+    expect(seen).toEqual([expect.objectContaining({ filename: 'recordings/p/p_20261022_080000_00000.mp4', receivedAtMs: receivedAt })]);
+    sockets[0]!.handlers.onEvent(fileEvent('recordings/p/p_20261022_080000_00001.mp4'));
+    expect(seen.map((e) => e.filename)).toEqual([
+      'recordings/p/p_20261022_080000_00000.mp4',
+      'recordings/p/p_20261022_080000_00001.mp4',
+    ]);
+    expect(seen[1]!.receivedAtMs).toBe(receivedAt + 4000);
+    // A subscriber that names no flow gets no replay.
+    const plain = vi.fn();
+    subscribeRecorderEvents({ onFileChanged: plain });
+    expect(plain).not.toHaveBeenCalled();
+    hold.release();
+  });
+
+  it('drops buffered events older than the TTL, and everything once the socket closes', async () => {
+    const hold = holdRecorderEvents();
+    await vi.advanceTimersByTimeAsync(0);
+    sockets[0]!.handlers.onOpen();
+    sockets[0]!.handlers.onEvent(fileEvent('recordings/p/p_20261022_080000_00000.mp4'));
+    await vi.advanceTimersByTimeAsync(RECENT_EVENT_TTL_MS + 1);
+    const late = vi.fn();
+    const off = subscribeRecorderEvents({ onFileChanged: late }, { replayFlowId: 'flow-1' });
+    expect(late).not.toHaveBeenCalled();
+
+    sockets[0]!.handlers.onEvent(fileEvent('recordings/p/p_20261022_080000_00001.mp4'));
+    off();
+    hold.release();
+    expect(sockets[0]!.close).toHaveBeenCalledTimes(1);
+    const after = vi.fn();
+    const hold2 = holdRecorderEvents();
+    subscribeRecorderEvents({ onFileChanged: after }, { replayFlowId: 'flow-1' });
+    expect(after).not.toHaveBeenCalled();
+    hold2.release();
+  });
+
+  it('a hold opens the socket; ready resolves on open, on a failed attempt, or on timeout', async () => {
+    const hold = holdRecorderEvents();
+    expect(recorderEventSubscriberCount()).toBe(1);
+    let ready = false;
+    void hold.ready(2000).then(() => { ready = true; });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sockets).toHaveLength(1);
+    expect(ready).toBe(false);
+    sockets[0]!.handlers.onOpen();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ready).toBe(true);
+    // Already open: resolves at once.
+    await hold.ready(2000);
+
+    // A failed attempt resolves it too (activation then goes on without waiting).
+    sockets[0]!.handlers.onClose();
+    let failedReady = false;
+    void hold.ready(2000).then(() => { failedReady = true; });
+    await vi.advanceTimersByTimeAsync(reconnectDelayMs(0));
+    sockets[1]!.handlers.onClose();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(failedReady).toBe(true);
+
+    // No outcome at all: the timeout resolves it.
+    await vi.advanceTimersByTimeAsync(reconnectDelayMs(1));
+    let timedOut = false;
+    void hold.ready(2000).then(() => { timedOut = true; });
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(timedOut).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(timedOut).toBe(true);
+
+    hold.release();
+    hold.release();
+    expect(recorderEventSubscriberCount()).toBe(0);
   });
 
   it('caps the backoff at 30 s', () => {

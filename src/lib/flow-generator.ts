@@ -1359,7 +1359,12 @@ export async function activateStromFlow(
     const COL_INREC = COL_OUTPUT - 400;
     for (const { assignment, streamType } of plan.record) {
       const tap = inputTaps.get(assignment.mixerInput);
-      if (!tap) continue;
+      if (!tap) {
+        // Planned but not wired into this flow (e.g. no mixer input for it):
+        // not recorded. Say so rather than drop it silently (PR #573 review).
+        console.warn(`[flow-generator] input ${assignment.mixerInput} asked to record but has no tap in this flow — not recorded`);
+        continue;
+      }
       // Keyed by the STORED pad index, like b-offset-N — never the compacted one.
       const n = tap.padIndex;
       const vqId = `e-inrec-vq-${n}-${endpointSuffix}`;

@@ -27,6 +27,7 @@ import { parsePartName, resolvePartTimings } from '../lib/recording-parts.js';
 import { upsertRecordingDoc } from '../lib/recording-registry.js';
 import { resolveRecordingUploadTarget } from '../lib/recording-upload-target.js';
 import { startLiveRecordingUpload, stopLiveRecordingUpload, type LiveRecordingSession } from '../services/live-recording-upload.js';
+import { holdRecorderEvents, type RecorderEventsHold } from '../services/strom-recorder-events.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type OutputStatusEntry } from '../lib/production-health.js';
@@ -39,6 +40,8 @@ import { checkProductionStartAllowed } from '../services/production-gate.js';
 
 const FLOW_POLL_INTERVAL_MS = 500;
 const FLOW_POLL_TIMEOUT_MS = 30_000;
+/** Longest an activation waits for the recorder-event socket before `flows.start` (spec §6). */
+const RECORDER_EVENTS_READY_MS = 2000;
 const MAX_DB_WRITE_RETRIES = 3;
 
 // ---------------------------------------------------------------------------
@@ -658,6 +661,9 @@ async function runActivationFlow(
   let loudnessMainBlockId: string | undefined;
   let whepOutputEntries: Array<{ outputId: string; endpointId: string }> | undefined;
   let pgmWhepEndpointId: string | undefined;
+  // Keeps the recorder-event socket open from before flows.start until the
+  // live sessions subscribe (spec §6): released in `finally` on every path.
+  let recorderEventsHold: RecorderEventsHold | undefined;
 
   // Force-stop the meter and clip relays bound to this run's (dying) flow,
   // mirroring deactivate (issue #435). A controller connecting while status is
@@ -695,6 +701,17 @@ async function runActivationFlow(
 
     const stromToken = await getStromToken(config.stromToken);
     const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
+
+    // Part 0 of program and of every input opens as soon as the flow starts,
+    // before this run reaches 'active' and starts the live sessions. Open the
+    // recorder-event socket first, so those events are received and buffered
+    // for the sessions to replay with their receipt times (spec §6, AC 3).
+    // Best effort: if the socket is not up in time, part 0 falls back to the
+    // later rules as before.
+    if (outputDocs.some((o) => o.outputType === 'recording')) {
+      recorderEventsHold = holdRecorderEvents();
+      await recorderEventsHold.ready(RECORDER_EVENTS_READY_MS);
+    }
 
     // Step 1: Start the Strom flow
     if (signal.aborted) return;
@@ -1004,6 +1021,8 @@ async function runActivationFlow(
 
     notifyProductionDeactivated(productionId);
   } finally {
+    // The live sessions (if started) hold their own subscriptions by now.
+    recorderEventsHold?.release();
     // Only remove the entry if it still points to *this* run's controller.
     // A slow aborted run can otherwise finish after a newer activation has
     // registered its own controller and delete that entry, leaving the newer
