@@ -563,3 +563,15 @@ NEGOTIATED). Live Recorder then drops the video track and the file is audio-only
 or `videoconvert` alone does not work: both pass CUDA memory through. The constraint reaches the
 decoder through Strom's auto-inserted tee, so that input's mixer branch also gets system memory.
 Remove the workaround once Eyevinn/strom#1104 makes `videoenc` adapt CUDA input itself.
+
+## Anything that needs CouchDB at boot belongs in `connectDbAndInit()`, not in `main.ts`
+
+The key bootstraps (`ensureGuestSigningKey`, `ensureCredentialEncryptionKey`,
+`ensureRtmpCredentialKey`), the one-time migrations, reconcile and the live-upload resume all run
+from `connectDbAndInit()` in `src/lib/post-connect-init.ts`. Startup, `POST /api/v1/reconnect`
+and the background DB retry all call it. Before #581 this init sat inline in `main.ts`'s startup
+DB-success branch. An instance whose first connect failed (a 401 on a fresh managed instance) then
+recovered the DB through `/reconnect` with empty key caches, so every credential write failed
+closed with a 503 until a restart. Add a new post-connect step to the helper: idempotent steps go
+in `bootstrapKeys()` (run on every call), once-per-process steps go in `runOnceSteps()`. Never add
+a bare `connectDb()` call anywhere else.

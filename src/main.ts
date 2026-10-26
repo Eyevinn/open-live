@@ -2,16 +2,8 @@ import { config } from './config.js';
 import { startIdleWatchdog } from './services/idle-watchdog.js';
 import { startGpuUsageSweep, stopGpuUsageSweep } from './services/gpu-usage.js';
 import { startPortReservation, stopPortReservation } from './services/port-reservation.js';
-import { connectDb } from './db/index.js';
-import { cleanLegacyFixtures } from './db/seed.js';
-import { ensureGuestSigningKey } from './lib/guest-signing-key.js';
-import { ensureCredentialEncryptionKey } from './lib/credential-encryption-key.js';
-import { ensureRtmpCredentialKey } from './lib/rtmp-credential-key.js';
-import { migrateAudioChannelOrder } from './services/migrate-audio-channel-order.js';
-import { migrateRecordingKind } from './services/migrate-recording-kind.js';
+import { connectDbAndInit, startDbConnectRetry, stopDbConnectRetry } from './lib/post-connect-init.js';
 import { buildServer } from './server.js';
-import { reconcileProductionStatuses } from './services/reconcile.js';
-import { resumeLiveRecordingUploads } from './services/live-recording-upload.js';
 
 async function main() {
   // API_KEY is required in production. Without it every route is unauthenticated,
@@ -82,79 +74,15 @@ async function main() {
 
   const app = await buildServer();
 
+  // Post-connect init (key bootstraps, migrations, reconcile, upload resume)
+  // lives in one idempotent helper shared with /api/v1/reconnect (issue #581).
+  // If CouchDB is unreachable at startup, keep serving and retry in the
+  // background so the instance recovers without a restart.
   try {
-    await connectDb();
-    app.log.info('[db] Connected to CouchDB');
-    // Guest calling is on by default (issue #391): ensure a signing key exists —
-    // generated and stored on first start, reused on every restart. The key is
-    // never logged. Env `GUEST_INVITE_SECRET`, if set, overrides it. Best-effort:
-    // a failure here must not block startup (guest routes degrade to 503 until a
-    // key is available), mirroring the DB-failure handling below.
-    try {
-      await ensureGuestSigningKey();
-      app.log.info('[guest-calling] Invite signing key ready');
-    } catch (err: any) {
-      app.log.error(
-        '[guest-calling] Failed to load/generate invite signing key — guest routes will 503 until it is available (reason: %s)',
-        err?.statusCode ?? err?.message ?? 'unknown',
-      );
-    }
-    // Credential encryption key (issue #438): generated and stored on first start,
-    // reused on every restart, so SRT passphrases / HTML-source credentials can be
-    // stored at rest on OSC without a key env var. `SRT_PASSPHRASE_KEY` /
-    // `HTML_AUTH_KEY` still override it. The key is never logged. Best-effort: a
-    // failure here must not block startup (credential writes degrade to 503 until
-    // a key is available), mirroring the signing-key handling above.
-    try {
-      await ensureCredentialEncryptionKey();
-      app.log.info('[credential-storage] Encryption key ready');
-    } catch (err: any) {
-      app.log.error(
-        '[credential-storage] Failed to load/generate credential encryption key — credential writes will 503 until it is available (reason: %s)',
-        err?.statusCode ?? err?.message ?? 'unknown',
-      );
-    }
-    // RTMP stream-key encryption key (issue #447): a DEDICATED key, generated and
-    // stored on first start under its own doc id, reused on every restart, so RTMP
-    // stream keys can be stored at rest on OSC without a key env var. Kept separate
-    // from the credential key above — RTMP never reuses the SRT/credential key
-    // (ADR-004 Resolved Decision 2). `RTMP_CREDENTIALS_KEY` still overrides it. The
-    // key is never logged. Best-effort: a failure here must not block startup (RTMP
-    // stream-key writes degrade to 503 until a key is available).
-    try {
-      await ensureRtmpCredentialKey();
-      app.log.info('[credential-storage] RTMP stream-key encryption key ready');
-    } catch (err: any) {
-      app.log.error(
-        '[credential-storage] Failed to load/generate RTMP stream-key encryption key — RTMP stream-key writes will 503 until it is available (reason: %s)',
-        err?.statusCode ?? err?.message ?? 'unknown',
-      );
-    }
-    await cleanLegacyFixtures();
-    // One-time migration (issue #487): the audio channel sort changed to numeric
-    // pad order, which renumbers channels for productions with a guest or 10+
-    // sources. Remap persisted per-channel `ch{N}_aux{M}_pre` settings BEFORE any
-    // flow is (re)built so operator pre/post choices follow their source. Runs at
-    // most once per instance; best-effort — a failure retries on next start.
-    try {
-      await migrateAudioChannelOrder(app.log);
-    } catch (err: any) {
-      app.log.error('[migrate:audio-channel-order] Migration errored — will retry next start (reason: %s)', err?.statusCode ?? err?.message ?? 'unknown');
-    }
-    // One-time migration (OL-32a): backfill `kind: 'program'` on recordings
-    // written before the field existed. Best-effort; an interrupted run resumes
-    // on the next start.
-    try {
-      await migrateRecordingKind(app.log);
-    } catch (err: any) {
-      app.log.error('[migrate:recording-kind] Migration errored — will retry next start (reason: %s)', err?.statusCode ?? err?.message ?? 'unknown');
-    }
-    await reconcileProductionStatuses(app.log);
-    // Productions still live after a restart: upload the recording parts that
-    // closed while open-live was down, and keep uploading (issue #556).
-    await resumeLiveRecordingUploads(app.log);
+    await connectDbAndInit(app.log);
   } catch (err: any) {
-    app.log.error('[db] Failed to connect to CouchDB — continuing without database (status: %s)', err?.statusCode ?? err?.message ?? 'unknown');
+    app.log.error('[db] Failed to connect to CouchDB — continuing without database, retrying in background (status: %s)', err?.statusCode ?? err?.message ?? 'unknown');
+    startDbConnectRetry(app.log);
   }
 
   startIdleWatchdog(app.log);
@@ -179,6 +107,7 @@ async function main() {
     setTimeout(() => process.exit(1), 5000).unref();
     void (async () => {
       stopGpuUsageSweep();
+      stopDbConnectRetry();
       await stopPortReservation(app.log);
       await app.close();
       process.exit(0);
