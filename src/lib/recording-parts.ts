@@ -116,29 +116,10 @@ function baseName(path: string): string {
 }
 
 /**
- * How much earlier than its `RecorderFileChanged` a recorder's first part
- * started (issue #577): Live Recorder signals the file only once every track
- * has data, so for an input whose video starts at its first IDR (up to one GOP
- * after the audio) the event arrives about that late after the file's t=0.
- * The correction is the latest-starting track's offset from the earliest
- * (`trackStartOffsetMs`), so the start is anchored on the earliest track.
- * Only for part 0 of a session; 0 when the offset is unknown or implausible
- * (not shorter than the part itself).
- */
-function firstPartTrackOffsetMs(seg: UploadedSegment, part: PartName | undefined): number {
-  const offset = seg.trackStartOffsetMs;
-  if (part?.index !== 0 || offset === undefined || !Number.isFinite(offset) || offset <= 0) return 0;
-  if (seg.durationMs !== undefined && offset >= seg.durationMs) return 0;
-  return offset;
-}
-
-/**
  * Per-part start and end times with the start-time precedence of spec §6
  * (OL-32a), best first:
  *  1. `strom` — the file's own `start_utc_us` from `RecorderFileChanged`;
  *  2. `event` — when open-live received `RecorderFileChanged` for the file;
- *     for a session's first part (index 0), moved earlier by the file's
- *     `trackStartOffsetMs` (issue #577), so later chained parts inherit it;
  *  3. `chained` — the previous part of the same session (stem): its start +
  *     duration, when both are known;
  *  4. `filename` — the session stamp in the name + earlier parts' durations
@@ -195,7 +176,7 @@ export function resolvePartTimings(
       startMs = chainedMs;
       source = 'chained';
     } else if (open && Number.isFinite(open.openedAtMs)) {
-      startMs = open.openedAtMs - firstPartTrackOffsetMs(seg, part);
+      startMs = open.openedAtMs;
       source = 'event';
     } else {
       if (chainedMs !== undefined) {

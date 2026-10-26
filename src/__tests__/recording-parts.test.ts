@@ -180,111 +180,46 @@ describe('resolvePartTimings — start-time precedence (OL-32a, spec §6)', () =
     });
   });
 
-  describe("a recorder's first part whose tracks start apart (issue #577)", () => {
-    const withOffset = (seg: UploadedSegment, trackStartOffsetMs: number): UploadedSegment => ({ ...seg, trackStartOffsetMs });
+  describe("a recorder's first part keeps the uncorrected event start (issue #579, reverts #578)", () => {
+    // #569 attempt 6, SRT input: RecorderFileChanged for part 0 arrived at
+    // 14:24:58.971 and the file's video started 0.981 s after its audio. #578
+    // moved the start back by that offset, to 14:24:57.990, which put the input
+    // about 1.1 s early against program. The start is the event receipt again.
+    const SRT_STEM = 'prod-1_20261026_142458';
+    const srtName = (i: number) => `${SRT_STEM}_${String(i).padStart(5, '0')}.mp4`;
     const openedAt = new Map<string, PartOpenTime>([
-      [nameOf(0), { openedAtMs: at('2026-10-19T10:00:01.717Z') }],
-      [nameOf(1), { openedAtMs: at('2026-10-19T10:05:03.130Z') }],
+      [srtName(0), { openedAtMs: at('2026-10-26T14:24:58.971Z') }],
+      [srtName(1), { openedAtMs: at('2026-10-26T14:30:02.100Z') }],
     ]);
+    // A segment carrying a late-track offset, as #578's uploader produced it. The field no longer
+    // exists on UploadedSegment, hence the cast: it guards against #578's correction returning.
+    const withTrackOffset = (seg: UploadedSegment, trackStartOffsetMs: number) =>
+      ({ ...seg, trackStartOffsetMs }) as UploadedSegment;
 
-    it('rule 2: part 0 is moved back by the late track offset, and chained parts follow it', () => {
-      // Video starts 1717 ms into the file; the event arrived once it did.
-      const segs = [withOffset(part(STEM, 0, 300_000), 1_717), part(STEM, 1, 300_000), part(STEM, 2, 1_000)];
-      const timings = resolvePartTimings(segs, { segmentSecs: 300, openedAt, recorderType: 'liverecorder' });
-      expect(timings[0]).toEqual({ startedAt: '2026-10-19T10:00:00.000Z', endedAt: '2026-10-19T10:05:00.000Z', startedAtSource: 'event' });
-      expect(timings[1]).toEqual({ startedAt: '2026-10-19T10:05:00.000Z', endedAt: '2026-10-19T10:10:00.000Z', startedAtSource: 'chained' });
-      expect(timings[2]).toEqual({ startedAt: '2026-10-19T10:10:00.000Z', endedAt: '2026-10-19T10:10:01.000Z', startedAtSource: 'chained' });
+    it('rule 2 part 0 is not shifted by the track offset, and chained parts follow the event start', () => {
+      const timings = resolvePartTimings(
+        [withTrackOffset(part(SRT_STEM, 0, 300_000), 981), part(SRT_STEM, 1, 300_000)],
+        { segmentSecs: 300, openedAt, recorderType: 'liverecorder' },
+      );
+      expect(timings[0]).toEqual({ startedAt: '2026-10-26T14:24:58.971Z', endedAt: '2026-10-26T14:29:58.971Z', startedAtSource: 'event' });
+      expect(timings[1]).toMatchObject({ startedAt: '2026-10-26T14:29:58.971Z', startedAtSource: 'chained' });
     });
 
-    it('rule 2: the corrected start is what a later batch chains from (live upload, then deactivate)', () => {
+    it('the uncorrected start is what later batches chain from (live upload, then deactivate)', () => {
       const known = new Map<string, KnownPartStart>();
-      resolvePartTimings([withOffset(part(STEM, 0, 300_000), 1_717)], { segmentSecs: 300, openedAt, known, recorderType: 'liverecorder' });
-      expect(known.get(partKey({ stem: STEM, index: 0 }))).toEqual({ startedAtMs: at('2026-10-19T10:00:00.000Z'), durationMs: 300_000, anchor: 'event' });
-      const [t] = resolvePartTimings([part(STEM, 1, 300_000)], { segmentSecs: 300, openedAt, known, recorderType: 'liverecorder' });
-      expect(t).toMatchObject({ startedAt: '2026-10-19T10:05:00.000Z', startedAtSource: 'chained' });
-    });
-
-    it('rule 1 is not corrected', () => {
-      const withStrom = new Map<string, PartOpenTime>([
-        [nameOf(0), { openedAtMs: at('2026-10-19T10:00:01.717Z'), startUtcUs: at('2026-10-19T10:00:00.003Z') * 1000 }],
-      ]);
-      const [t] = resolvePartTimings([withOffset(part(STEM, 0, 300_000), 1_717)], { segmentSecs: 300, openedAt: withStrom });
-      expect(t).toMatchObject({ startedAt: '2026-10-19T10:00:00.003Z', startedAtSource: 'strom' });
-    });
-
-    it('a chained part, or an event-stamped part after the first, is not corrected', () => {
-      // Live Recorder: part 1 chains; its own offset is ignored.
-      const lr = resolvePartTimings([part(STEM, 0, 300_000), withOffset(part(STEM, 1, 300_000), 900)],
-        { segmentSecs: 300, openedAt, recorderType: 'liverecorder' });
-      expect(lr[1]).toMatchObject({ startedAt: '2026-10-19T10:05:01.717Z', startedAtSource: 'chained' });
-      // builtin.recorder: part 1 keeps rule 2, uncorrected.
-      const br = resolvePartTimings([part(STEM, 0, 300_000), withOffset(part(STEM, 1, 300_000), 900)],
-        { segmentSecs: 300, openedAt, recorderType: 'recorder' });
-      expect(br[1]).toMatchObject({ startedAt: '2026-10-19T10:05:03.130Z', startedAtSource: 'event' });
-    });
-
-    it('ignores a zero, missing or implausible offset (not shorter than the part)', () => {
-      for (const seg of [part(STEM, 0, 300_000), withOffset(part(STEM, 0, 300_000), 0),
-        withOffset(part(STEM, 0, 1_000), 1_717), withOffset(part(STEM, 0, 300_000), Number.NaN)]) {
-        const [t] = resolvePartTimings([seg], { segmentSecs: 300, openedAt });
-        expect(t).toMatchObject({ startedAt: '2026-10-19T10:00:01.717Z', startedAtSource: 'event' });
-      }
-    });
-
-    it('rules 3/4 for part 0 without an event are not corrected', () => {
-      const [t] = resolvePartTimings([withOffset(part(STEM, 0, 300_000), 1_717)], { segmentSecs: 300 });
-      expect(t).toMatchObject({ startedAt: SESSION_START, startedAtSource: 'filename' });
-    });
-
-    /**
-     * #569 acceptance run attempt 5 (activation 40a6b370), as registered live
-     * and at deactivate: event receipt times, exact fMP4 durations, registration
-     * times, and the SRT input's video starting 1.717 s into part 0.
-     */
-    describe('attempt 5 model: SRT input part 0 video starts 1.717 s after audio', () => {
-      const SRT = 'prod-c9e7d97b_20261026_132548';
-      const srtName = (i: number) => `${SRT}_${String(i).padStart(5, '0')}.mp4`;
-      const srtOpened = new Map<string, PartOpenTime>([
-        [srtName(0), { openedAtMs: at('2026-10-26T12:25:51.451Z') }],
-        // Split events, seconds late; Live Recorder chains ahead of them.
-        [srtName(1), { openedAtMs: at('2026-10-26T12:30:55.400Z') }],
-        [srtName(2), { openedAtMs: at('2026-10-26T12:35:55.600Z') }],
-      ]);
-      const srtParts = (offsetMs?: number) => [
-        { seg: part(SRT, 0, 301_077), registeredAt: '2026-10-26T12:31:03.000Z', offsetMs },
-        { seg: part(SRT, 1, 300_203), registeredAt: '2026-10-26T12:36:03.200Z' },
-        { seg: part(SRT, 2, 27_033), registeredAt: '2026-10-26T12:36:18.214Z' },
-      ];
-      // Program: both tracks start at 0; chained end of its last part.
-      const PROGRAM_END = at('2026-10-26T12:36:18.685Z');
-
-      /** Registers the parts one at a time, as the live upload and deactivate sweep do. */
-      function register(offsetMs?: number) {
-        const known = new Map<string, KnownPartStart>();
-        const uploaded: UploadedSegment[] = [];
-        return srtParts(offsetMs).map(({ seg, registeredAt, offsetMs: o }) => {
-          uploaded.push(o !== undefined ? withOffset(seg, o) : seg);
-          const timings = resolvePartTimings([...uploaded], { segmentSecs: 300, openedAt: srtOpened, known, recorderType: 'liverecorder' });
-          return { timing: timings[timings.length - 1]!, registeredAt };
-        });
-      }
-
-      it("without the correction the last part's endedAt is after its registration (the defect)", () => {
-        const parts = register();
-        expect(parts[2]!.timing.endedAt).toBe('2026-10-26T12:36:19.764Z');
-        expect(at(parts[2]!.timing.endedAt!)).toBeGreaterThan(at(parts[2]!.registeredAt));
-        expect(at(parts[2]!.timing.endedAt!) - PROGRAM_END).toBeGreaterThan(1_000);
+      resolvePartTimings([withTrackOffset(part(SRT_STEM, 0, 300_000), 981)], { segmentSecs: 300, openedAt, known, recorderType: 'liverecorder' });
+      expect(known.get(partKey({ stem: SRT_STEM, index: 0 }))).toEqual({
+        startedAtMs: at('2026-10-26T14:24:58.971Z'),
+        durationMs: 300_000,
+        anchor: 'event',
       });
+      const [t] = resolvePartTimings([part(SRT_STEM, 1, 300_000)], { segmentSecs: 300, openedAt, known, recorderType: 'liverecorder' });
+      expect(t).toMatchObject({ startedAt: '2026-10-26T14:29:58.971Z', startedAtSource: 'chained' });
+    });
 
-      it('with it, no part ends after it was registered, and the input stays within 1 s of program', () => {
-        const parts = register(1_717);
-        expect(parts.map((p) => p.timing.startedAtSource)).toEqual(['event', 'chained', 'chained']);
-        expect(parts[0]!.timing.startedAt).toBe('2026-10-26T12:25:49.734Z');
-        for (const { timing, registeredAt } of parts) {
-          expect(at(timing.endedAt!)).toBeLessThanOrEqual(at(registeredAt));
-        }
-        expect(Math.abs(at(parts[2]!.timing.endedAt!) - PROGRAM_END)).toBeLessThan(1_000);
-      });
+    it('builtin.recorder part 0 also keeps the event start', () => {
+      const [t] = resolvePartTimings([withTrackOffset(part(SRT_STEM, 0, 300_000), 1_717)], { segmentSecs: 300, openedAt, recorderType: 'recorder' });
+      expect(t).toMatchObject({ startedAt: '2026-10-26T14:24:58.971Z', startedAtSource: 'event' });
     });
   });
 
