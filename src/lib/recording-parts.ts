@@ -1,5 +1,5 @@
 import type { UploadedSegment } from './recording-uploader.js';
-import type { RecordingStartSource } from '../db/types.js';
+import type { RecorderType, RecordingStartSource } from '../db/types.js';
 
 /** Start and end of one uploaded recording part (ISO 8601). */
 export interface PartTiming {
@@ -92,6 +92,12 @@ export interface PartOpenTime {
 export interface KnownPartStart {
   startedAtMs: number;
   durationMs?: number;
+  /**
+   * The rule the start is anchored on: its own `startedAtSource`, or for a
+   * `chained` start its predecessor's anchor. Only a chain not anchored on
+   * `filename` is taken ahead of rule 2 (issue #575).
+   */
+  anchor?: RecordingStartSource;
 }
 
 /** {@link PartTiming} plus which rule of spec §6 produced `startedAt`. */
@@ -119,6 +125,15 @@ function baseName(path: string): string {
  *  4. `filename` — the session stamp in the name + earlier parts' durations
  *     ({@link recordingPartTimings}).
  *
+ * On Live Recorder (`recorderType: 'liverecorder'`) a part after a split
+ * (index > 0) takes rule 3 ahead of rule 2 when its predecessor's start is
+ * anchored on rule 1 or 2 and its duration is known (issue #575): Live Recorder's
+ * parts are gapless, while its `RecorderFileChanged` for a split arrives
+ * seconds after the new file's t=0. `builtin.recorder` keeps rule 2 first, as
+ * its splits are not gapless (#571). A predecessor started by rule 4 is not
+ * chained ahead of rule 2 (nor is a chain from one), so a name-stamp error
+ * does not carry forward.
+ *
  * `openedAt` is keyed by file base name. `known` holds parts resolved earlier
  * (e.g. uploaded while live) by {@link partKey}; it is updated with every part
  * resolved here, so a batch chains within itself too. `endedAt` is
@@ -131,6 +146,8 @@ export function resolvePartTimings(
     segmentSecs: number;
     openedAt?: ReadonlyMap<string, PartOpenTime>;
     known?: Map<string, KnownPartStart>;
+    /** The block that wrote this activation's parts; `liverecorder` chains split parts first. */
+    recorderType?: RecorderType;
   },
 ): ResolvedPartTiming[] {
   const byName = recordingPartTimings(segments, opts.segmentSecs);
@@ -146,18 +163,24 @@ export function resolvePartTimings(
   for (const { i, name, part } of order) {
     const seg = segments[i]!;
     const open = opts.openedAt?.get(name);
+    const prev = part && part.index > 0 ? known.get(partKey({ stem: part.stem, index: part.index - 1 })) : undefined;
+    const chainedMs = prev?.durationMs !== undefined ? prev.startedAtMs + prev.durationMs : undefined;
+    // Live Recorder split (issue #575): the parts are gapless and the event is late.
+    const chainFirst = opts.recorderType === 'liverecorder' && (prev?.anchor === 'strom' || prev?.anchor === 'event');
     let startMs: number | undefined;
     let source: RecordingStartSource | undefined;
     if (open?.startUtcUs !== undefined && Number.isFinite(open.startUtcUs)) {
       startMs = Math.round(open.startUtcUs / 1000);
       source = 'strom';
+    } else if (chainFirst && chainedMs !== undefined && Number.isFinite(chainedMs)) {
+      startMs = chainedMs;
+      source = 'chained';
     } else if (open && Number.isFinite(open.openedAtMs)) {
       startMs = open.openedAtMs;
       source = 'event';
     } else {
-      const prev = part && part.index > 0 ? known.get(partKey({ stem: part.stem, index: part.index - 1 })) : undefined;
-      if (prev && prev.durationMs !== undefined) {
-        startMs = prev.startedAtMs + prev.durationMs;
+      if (chainedMs !== undefined) {
+        startMs = chainedMs;
         source = 'chained';
       } else {
         const fromName = byName[i]?.startedAt;
@@ -171,7 +194,13 @@ export function resolvePartTimings(
       out[i] = {};
       continue;
     }
-    if (part) known.set(partKey(part), { startedAtMs: startMs, ...(seg.durationMs !== undefined ? { durationMs: seg.durationMs } : {}) });
+    if (part) {
+      known.set(partKey(part), {
+        startedAtMs: startMs,
+        ...(seg.durationMs !== undefined ? { durationMs: seg.durationMs } : {}),
+        ...(source ? { anchor: source === 'chained' ? prev?.anchor ?? source : source } : {}),
+      });
+    }
     out[i] = {
       startedAt: new Date(startMs).toISOString(),
       ...(seg.durationMs !== undefined ? { endedAt: new Date(startMs + seg.durationMs).toISOString() } : {}),

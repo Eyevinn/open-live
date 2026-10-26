@@ -457,7 +457,9 @@ components:
             start reported by Strom), `event` (when open-live received the
             recorder's file-opened event), `chained` (the previous part's start
             + duration), `filename` (the session stamp in the file name +
-            earlier parts' durations). Absent on older recordings (= `filename`).
+            earlier parts' durations). On Live Recorder, a part after a split
+            prefers `chained` over `event`. Absent on older recordings
+            (= `filename`).
         startedAt:
           type: string
           format: date-time

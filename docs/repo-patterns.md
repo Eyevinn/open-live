@@ -519,6 +519,14 @@ subscribes with `replayFlowId` so part 0 keeps its original receipt time (`start
 'event'`) instead of falling back to the file name. Any new early consumer must replay the same way:
 an event's time is `RecorderFileEvent.receivedAtMs`, never `Date.now()` in the subscriber.
 
+The receipt time is only close to a file's t=0 when the **first** file opens. At a Live Recorder
+split, `RecorderFileChanged` arrives 3-5 s after the new file's t=0, by a different amount per
+recorder (#569 run, issue #575). So `resolvePartTimings` takes `recorderType` and, on
+`liverecorder`, chains a part with index > 0 from its predecessor (start + exact duration) ahead of
+the event, as long as the chain is anchored on a `strom`/`event` start (`KnownPartStart.anchor`).
+Pass the activation's `recorderType` from every caller; `builtin.recorder` keeps the event first
+(its splits are not gapless, #571).
+
 ## Input recordings: one live session per recorder, input directories swept before program
 
 OL-32 records chosen inputs to `recordings/<productionId>/<mixerInput>/`, nested under the program
