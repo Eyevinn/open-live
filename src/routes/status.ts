@@ -1,5 +1,6 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { isDbReady, connectDb, isDbConnected } from '../db/index.js';
+import { isDbReady, isDbConnected } from '../db/index.js';
+import { connectDbAndInit } from '../lib/post-connect-init.js';
 import { StromClient } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
@@ -32,15 +33,18 @@ const statusRoutes: FastifyPluginAsync = async (fastify) => {
     async (_req, reply) => {
     const result: { db: boolean; strom: boolean } = { db: isDbConnected(), strom: false };
 
-    if (!result.db) {
-      try {
-        await connectDb();
-        fastify.log.info('[reconnect] Database connection restored');
-        result.db = true;
-      } catch (err: any) {
-        fastify.log.error('[reconnect] Failed to connect to database: %s', err?.statusCode ?? err?.message ?? 'unknown');
-      }
+    // Connect (if needed) AND run the post-connect init (key bootstraps,
+    // migrations, …) — connecting alone left the credential-key caches empty
+    // so credential writes kept failing with a 503 (issue #581). Idempotent and
+    // shares one in-flight run across concurrent calls.
+    const wasConnected = result.db;
+    try {
+      await connectDbAndInit(fastify.log);
+      if (!wasConnected) fastify.log.info('[reconnect] Database connection restored');
+    } catch (err: any) {
+      fastify.log.error('[reconnect] Failed to connect/initialise database: %s', err?.statusCode ?? err?.message ?? 'unknown');
     }
+    result.db = isDbConnected();
 
     try {
       const token = await getStromToken(config.stromToken);
