@@ -418,6 +418,7 @@ async function runPass(rec: LiveRecording): Promise<void> {
       segmentSecs: config.recordingSegmentSecs,
       openedAt: rec.openedAt,
       known: rec.known,
+      recorderType: rec.recorderType,
     });
     const timing = timings[timings.length - 1]!;
     const finishedAt = new Date().toISOString();

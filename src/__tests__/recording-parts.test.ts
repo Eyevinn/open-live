@@ -106,7 +106,7 @@ describe('resolvePartTimings — start-time precedence (OL-32a, spec §6)', () =
     const [t] = resolvePartTimings([part(STEM, 5, 1_000)], { segmentSecs: 600, known });
     expect(t).toMatchObject({ startedAt: '2026-10-19T10:50:00.100Z', startedAtSource: 'chained' });
     // The resolved part is recorded for the next one.
-    expect(known.get(partKey({ stem: STEM, index: 5 }))).toEqual({ startedAtMs: at('2026-10-19T10:50:00.100Z'), durationMs: 1_000 });
+    expect(known.get(partKey({ stem: STEM, index: 5 }))).toEqual({ startedAtMs: at('2026-10-19T10:50:00.100Z'), durationMs: 1_000, anchor: 'chained' });
   });
 
   it('rule 3 needs the predecessor duration; otherwise rule 4 (file name) applies', () => {
@@ -121,6 +121,63 @@ describe('resolvePartTimings — start-time precedence (OL-32a, spec §6)', () =
     expect(timings[0]).toEqual({ startedAt: SESSION_START, endedAt: '2026-10-19T10:01:00.000Z', startedAtSource: 'filename' });
     // Part 1 chains from part 0 (whose start is known from its name and duration).
     expect(timings[1]).toEqual({ startedAt: '2026-10-19T10:01:00.000Z', startedAtSource: 'chained' });
+  });
+
+  describe('a part after a split (issue #575)', () => {
+    // Part 0 opened at 10:00:00.050 and is exactly 300 s long, so part 1's
+    // media starts at 10:05:00.050. Its RecorderFileChanged arrived 3.08 s late,
+    // as measured on Live Recorder in the #569 acceptance run.
+    const openedAt = new Map<string, PartOpenTime>([
+      [nameOf(0), { openedAtMs: at('2026-10-19T10:00:00.050Z') }],
+      [nameOf(1), { openedAtMs: at('2026-10-19T10:05:03.130Z') }],
+      [nameOf(2), { openedAtMs: at('2026-10-19T10:10:04.900Z') }],
+    ]);
+    const parts = () => [part(STEM, 0, 300_000), part(STEM, 1, 300_000), part(STEM, 2, 1_000)];
+
+    it('Live Recorder: a late file-changed event does not shift startedAt; the part chains from its predecessor', () => {
+      const timings = resolvePartTimings(parts(), { segmentSecs: 300, openedAt, recorderType: 'liverecorder' });
+      // First-part behaviour is unchanged: the event time.
+      expect(timings[0]).toEqual({ startedAt: '2026-10-19T10:00:00.050Z', endedAt: '2026-10-19T10:05:00.050Z', startedAtSource: 'event' });
+      expect(timings[1]).toEqual({ startedAt: '2026-10-19T10:05:00.050Z', endedAt: '2026-10-19T10:10:00.050Z', startedAtSource: 'chained' });
+      expect(timings[2]).toEqual({ startedAt: '2026-10-19T10:10:00.050Z', endedAt: '2026-10-19T10:10:01.050Z', startedAtSource: 'chained' });
+    });
+
+    it('Live Recorder: chains from a predecessor registered earlier (live upload, then deactivate)', () => {
+      const known = new Map<string, KnownPartStart>();
+      resolvePartTimings([part(STEM, 0, 300_000)], { segmentSecs: 300, openedAt, known, recorderType: 'liverecorder' });
+      const [t] = resolvePartTimings([part(STEM, 1, 300_000)], { segmentSecs: 300, openedAt, known, recorderType: 'liverecorder' });
+      expect(t).toMatchObject({ startedAt: '2026-10-19T10:05:00.050Z', startedAtSource: 'chained' });
+    });
+
+    it("Live Recorder: Strom's start_utc_us still wins over the chain", () => {
+      const withStrom = new Map(openedAt);
+      withStrom.set(nameOf(1), { openedAtMs: at('2026-10-19T10:05:03.130Z'), startUtcUs: at('2026-10-19T10:05:00.051Z') * 1000 });
+      const timings = resolvePartTimings(parts(), { segmentSecs: 300, openedAt: withStrom, recorderType: 'liverecorder' });
+      expect(timings[1]).toMatchObject({ startedAt: '2026-10-19T10:05:00.051Z', startedAtSource: 'strom' });
+      expect(timings[2]).toMatchObject({ startedAt: '2026-10-19T10:10:00.051Z', startedAtSource: 'chained' });
+    });
+
+    it('Live Recorder: falls back to the event when the predecessor has no duration', () => {
+      const timings = resolvePartTimings([part(STEM, 0), part(STEM, 1, 300_000)], { segmentSecs: 300, openedAt, recorderType: 'liverecorder' });
+      expect(timings[1]).toMatchObject({ startedAt: '2026-10-19T10:05:03.130Z', startedAtSource: 'event' });
+    });
+
+    it('Live Recorder: does not chain ahead of the event from a start anchored on the file name', () => {
+      // Part 0 opened before open-live subscribed (rule 4); part 1 without an
+      // event chains from it (rule 3); part 2's event must not be overridden.
+      const noEarly = new Map<string, PartOpenTime>([[nameOf(2), { openedAtMs: at('2026-10-19T10:10:04.900Z') }]]);
+      const timings = resolvePartTimings(parts(), { segmentSecs: 300, openedAt: noEarly, recorderType: 'liverecorder' });
+      expect(timings[0]).toMatchObject({ startedAtSource: 'filename' });
+      expect(timings[1]).toMatchObject({ startedAtSource: 'chained' });
+      expect(timings[2]).toMatchObject({ startedAt: '2026-10-19T10:10:04.900Z', startedAtSource: 'event' });
+    });
+
+    it('builtin.recorder (or unknown) keeps the event first', () => {
+      for (const recorderType of ['recorder', undefined] as const) {
+        const timings = resolvePartTimings(parts(), { segmentSecs: 300, openedAt, ...(recorderType ? { recorderType } : {}) });
+        expect(timings[1]).toMatchObject({ startedAt: '2026-10-19T10:05:03.130Z', startedAtSource: 'event' });
+      }
+    });
   });
 
   it('leaves startedAt unset when no rule applies', () => {

@@ -540,6 +540,9 @@ async function sweepRecordingDir(args: {
   const timings = resolvePartTimings(uploadRes.uploaded, {
     segmentSecs: config.recordingSegmentSecs,
     ...(liveSession ? { openedAt: liveSession.openedAt, known: liveSession.known } : {}),
+    // Live Recorder chains split parts ahead of rule 2 (issue #575). Only this
+    // activation's parts have open times, so leftovers resolve as before.
+    recorderType,
   });
   for (const [i, seg] of uploadRes.uploaded.entries()) {
     const timing = timings[i];

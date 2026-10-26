@@ -203,6 +203,33 @@ describe('live recording part upload — event to upload mapping', () => {
     });
   });
 
+  it('Live Recorder: a late RecorderFileChanged at a split does not shift the part (issue #575)', async () => {
+    const now = vi.spyOn(Date, 'now');
+    listing = [entry(0)];
+    startLiveRecordingUpload({ ...doc, recorderType: 'liverecorder' }, log);
+    await vi.waitFor(() => expect(socket).toBeDefined());
+    now.mockReturnValue(Date.parse('2026-10-22T08:00:00.180Z'));
+    fileChanged(0);
+    await waitForLiveRecordingPass(PROD);
+    // Part 0 is 60 s long (upload mock), so part 1 starts at 08:01:00.180; its event is 3 s late.
+    listing.push(entry(1));
+    now.mockReturnValue(Date.parse('2026-10-22T08:01:03.260Z'));
+    fileChanged(1);
+    await waitForLiveRecordingPass(PROD);
+    listing.push(entry(2));
+    now.mockReturnValue(Date.parse('2026-10-22T08:02:04.900Z'));
+    fileChanged(2);
+    await waitForLiveRecordingPass(PROD);
+    now.mockRestore();
+    expect(recordingDocs.get(recordingDocId('vod', `${PROD}/${name(0)}`))).toMatchObject({
+      partIndex: 0, startedAt: '2026-10-22T08:00:00.180Z', startedAtSource: 'event', endedAt: '2026-10-22T08:01:00.180Z',
+    });
+    expect(recordingDocs.get(recordingDocId('vod', `${PROD}/${name(1)}`))).toMatchObject({
+      partIndex: 1, startedAt: '2026-10-22T08:01:00.180Z', startedAtSource: 'chained', endedAt: '2026-10-22T08:02:00.180Z',
+      recorderType: 'liverecorder',
+    });
+  });
+
   it("prefers Strom's start_utc_us over the receipt time (spec §6 rule 1)", async () => {
     listing = [entry(0), entry(1)];
     await started();
