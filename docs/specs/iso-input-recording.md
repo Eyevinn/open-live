@@ -4,7 +4,7 @@
 - Studio half: [Eyevinn/open-live-studio#233](https://github.com/Eyevinn/open-live-studio/issues/233) (OL-32b) — builds against §2 and §8 of this spec, nothing else
 - Supersedes: [#410](https://github.com/Eyevinn/open-live/issues/410) (request) / draft [#411](https://github.com/Eyevinn/open-live/pull/411), draft [#489](https://github.com/Eyevinn/open-live/pull/489); see Q4 for what carries over
 - Builds on (merged): #553 (time-based parts), #520 (storage connections), #534 (upload target snapshot), #565 (idempotent registration by bucket+key), #566 (live part upload)
-- Upstream: [Eyevinn/strom#1034](https://github.com/Eyevinn/strom/pull/1034) `builtin.liverecorder` (merged, Strom v0.7.0, 2026-10-08; latest v0.7.1); [Eyevinn/strom#1057](https://github.com/Eyevinn/strom/pull/1057) exact per-file start time (open, **not required**, see §6)
+- Upstream: [Eyevinn/strom#1034](https://github.com/Eyevinn/strom/pull/1034) `builtin.liverecorder` (merged, Strom v0.7.0, 2026-10-08; latest v0.7.1); [Eyevinn/strom#1057](https://github.com/Eyevinn/strom/pull/1057) exact per-file start time (open; not required to record, but **AC 3 for input parts depends on it** since @svensson00's 2026-10-26 decision, see §6)
 - Companion ADR: [`ADR-011`](../decisions/ADR-011-live-recorder-iso-recording.md)
 - Status: Draft (architect, Phase 1 of `skills/epic-workflow.md`). Code references are to `open-live` main at `931715b` and Strom main at `4abc286`.
 - Repos affected: `Eyevinn/open-live` (flow generator, recording pipeline, API, WS, docs), `Eyevinn/open-live-studio` (#233). No Strom change is needed.
@@ -517,7 +517,7 @@ rule 3 ahead of rule 2 (see "Parts after a split" below):
 | # | `startedAtSource` | Source | Precision | Available |
 |---|---|---|---|---|
 | 1 | `strom` | `RecorderFileChanged.start_utc_us` — the file's t=0 on the flow's UTC anchor | < 1 ms between files of one flow (strom#1057 tests) | only once strom#1057 merges and is deployed. Already parsed by `strom-recorder-events.ts:75-84`; no code change when it lands |
-| 2 | `event` | wall-clock time open-live **received** `RecorderFileChanged` for that file; for a recorder's **first** part, minus the file's `trackStartOffsetMs` (#577, see "First part" below) | first file: 50-80 ms late on program (#411's rig, two-track reference), but **up to one GOP late on an input** until corrected by the track offset (+1.03 s SRT in the #569 attempt 5 run); **3-5 s late at a Live Recorder split** (#569 acceptance run, #575) | today, whenever open-live is connected to the event socket when the file opens |
+| 2 | `event` | wall-clock time open-live **received** `RecorderFileChanged` for that file | first file: 50-80 ms late on program (measured on #411's rig against a two-track reference), but on an **input** it varied by about 1 s between runs (+1.03 s late in #569 attempt 5, +0.08 s in attempt 6) and does not follow the file's track offsets (see "First part" below); **3-5 s late at a Live Recorder split** (#569 acceptance run, #575) | today, whenever open-live is connected to the event socket when the file opens |
 | 3 | `chained` | previous part of the same recorder and stem: its `startedAt + durationMs` | carries the predecessor's error; fMP4 durations are exact | a part opened while open-live was disconnected, after a part with a known start; on Live Recorder, every part after a split whose chain is anchored on rule 1 or 2 |
 | 4 | `filename` | today's rule: name stamp + summed earlier durations (`recordingPartTimings`) | ≥1 s (second-truncated block-build time, Strom local zone) — and wrong for late-joining WHIP inputs | last resort |
 
@@ -536,30 +536,44 @@ accounted for by part durations at its first split, so its parts are not gapless
 of every recorder is unchanged (rule 1, else 2, else 4). Once strom#1057 is deployed, rule 1
 takes over for every part and this reorder no longer applies.
 
-**First part (#577).** Live Recorder emits `RecorderFileChanged` only once every track of the file
-has data. Program's tracks start together, but an input's video track starts at the first IDR the
-input decoder produces, which can be up to one GOP after the audio (the file's t=0). In the #569
-attempt 5 run the SRT input's video started 1.717 s into part 0, and its event-stamped start came
-out +1.03 s against program (attempt 4 got +0.17 s on the same path: it depends on where the GOP
-falls when the input connects). So for a part with index 0 whose start comes from rule 2,
-`startedAt = eventReceipt − trackStartOffsetMs`: the start is anchored on the file's earliest
-track. `Mp4DurationScanner` reads `trackStartOffsetMs` from the fragments it already streams for
-§7 — per track, the first `traf`'s `tfdt` plus the first sample's composition offset, through the
-track's `edts/elst` — as the latest track start minus the earliest, in ms. The correction is
-skipped when the offset is unknown (a non-fragmented file, or one whose header carries the
-duration), 0, or not shorter than the part. Rule 1 and rule 3 starts are never corrected, and a
-part after a split is not either; on Live Recorder those chain from the corrected part 0, so they
-inherit it. `durationMs` is the longest track, which spans from the earliest track's start, so
-`endedAt` follows from the corrected start and no longer lands after the part was registered.
+**First part (#577, #578 reverted by #579).** A recorder's first part is stamped by rule 2 with the
+uncorrected event receipt time. #578 tried moving an event-stamped part 0 back by the file's late-track
+offset (`trackStartOffsetMs`, the latest track's first sample minus the earliest's), on the theory that
+Live Recorder emits `RecorderFileChanged` only once every track has data. #569 attempt 6 disproved
+it: the SRT input's part 0 had a 981 ms video offset, the correction moved it to about 1.1 s **early**
+against program (read from the timeoverlay burned into the SRT feed, which also shows on PGM), and
+the uncorrected receipt would have been within 0.12 s. In attempt 5 the uncorrected receipt was
++1.03 s **late** with a 1.717 s offset. So when the event arrives relative to a file's t=0 varies by
+about 1 s across runs and recorders and does not follow the track offset, and no correction on
+our side can fix rule 2 for inputs. #579 removed the correction and the scanner code that fed it.
 
-**AC 3 without strom#1057:** the first parts of program and input recorders of one activation are
-all stamped by rule 2 (same open-live process, same clock, same socket), corrected to each file's
-earliest track (#577), so the worst-case skew between any two first files is the spread of event
-delivery delays: tens of ms, well inside 1 s. On Live Recorder every later part chains from those starts by exact
-fMP4 durations, so it keeps that skew (all three recorders ended within 0.2 s of each other in the
-#569 run). Rule 3 also keeps it inside 1 s after a reconnect. Only rule 4 can miss, and only when open-live saw no event for the first part of a
-recorder (it was down when the file opened); `startedAtSource: "filename"` tells a consumer so.
-**With strom#1057**, rule 1 makes alignment exact and nothing else changes.
+**Anchor for AC 3 (decision, @svensson00, 2026-10-26 on #569).** Options (a) and (b) of #579 were
+taken, not (c): revert #578, keep the uncorrected event start for now, and make AC 3 for input parts
+depend on strom#1057. AC 3's 1 s bound is **not** restated for `startedAtSource: "event"` input parts.
+
+- **Until strom#1057 is merged and deployed on the dev Strom** (`strom-se-sto01.osaas.io:8082`):
+  every recorder's first part uses rule 2 (uncorrected event receipt) and later Live Recorder parts
+  chain from it by exact fMP4 durations (rule 3, exact to within 30 ms in attempt 6). Program parts
+  and the alignment of parts after a split are covered by #569's other ACs. For **input** parts, an
+  acceptance run reports the measured input-vs-program skew for information only; AC 3 for input
+  parts is "pending strom#1057", neither passed nor failed. #579 carries it until then.
+- **Once strom#1057 is on the dev Strom:** rule 1 (`start_utc_us`, the file's t=0 on the flow's
+  single UTC anchor) applies to every part of every recorder with no code change here (it is
+  already parsed, and rule 1 wins over rules 2 and 3). It is the only anchor that does not depend
+  on when an event is delivered. AC 3 for input parts is then verified in a #569-style acceptance
+  run on the dev Strom:
+  1. Confirm the dev Strom includes strom#1057 (its version or commit is at or after the merge),
+     and record the version in the run.
+  2. Record program plus at least one SRT and one WHIP input across at least two splits
+     (`RECORDING_SEGMENT_SECS=300`).
+  3. Every program and input `RecordingDoc` part has `startedAtSource: "strom"`. Any other source
+     on that Strom fails the run (it means the event carried no `start_utc_us`).
+  4. For each part index, every input's stored `startedAt` is within 1 s of program's.
+  5. Cross-check against the media: read the timeoverlay burned into the SRT test feed (also visible
+     on PGM) at the same file times in the input and program files; the stored skew must match the
+     media skew to well under 1 s, in both directions.
+- Rule 4 can still miss, and only when open-live saw no event for a recorder's first part (it was
+  down when the file opened); `startedAtSource: "filename"` tells a consumer so.
 
 The open-time index lives in the live session (`Map<filename, { openedAtMs, startUtcUs? }>`) and
 is handed to the deactivate sweep in `LiveRecordingSession`, so the last part (registered at
@@ -781,10 +795,14 @@ Recorder does not stall on a quiet track and releases a track that never starts 
 the reason #411 split tracks (`builtin.recorder` waits for both) is gone; the Strom maintainers
 rejected per-track recorders for the same reason ("the operator wants one file with A/V sync").
 
-**Q8. How is AC 3 (alignment within 1 s) met while strom#1057 is open?** → By rule 2 of §6
-(event receipt time, corrected by the file's late-track offset, #577), tens of ms, for each recorder's first part, and on Live Recorder by rule 3
-(chained by exact durations) for the parts after a split (#575), with `startedAtSource` on every doc. When strom#1057 ships, rule
-1 takes over automatically. No ticket waits on it.
+**Q8. How is AC 3 (alignment within 1 s) met while strom#1057 is open?** → It is not, for input
+parts (decision, @svensson00, 2026-10-26). Rule 2 of §6 (event receipt time) misses by up to about
+1 s in either direction on inputs (#569 attempts 5 and 6), and the #578 track-offset correction made
+it worse, so it was reverted (#579). Until strom#1057 is on the dev Strom, every recorder's first
+part keeps the uncorrected event start, parts after a Live Recorder split chain by exact durations
+(#575), and `startedAtSource` is on every doc. AC 3 for input parts is verified once strom#1057 is
+deployed, as §6 "Anchor for AC 3" describes; #579 tracks it. Rule 1 then takes over automatically,
+with no code change.
 
 ---
 
@@ -840,7 +858,7 @@ dev instance is done by the agent in the ticket. No human ticket.
 4. **OL-32b — Studio** ([open-live-studio#233](https://github.com/Eyevinn/open-live-studio/issues/233)).
    Starts when ticket 2 is merged and deployed to staging (epic-workflow Phase 3); uses §8 only.
 
-strom#1057 needs no ticket on our side (§6 rule 1 is already parsed).
+strom#1057 needs no code ticket on our side (§6 rule 1 is already parsed). Verifying AC 3 for input parts once it is on the dev Strom is tracked in #579 (§6 "Anchor for AC 3").
 
 **What a human does next (after ticket 2 closes):** turn on Record for two inputs on a production
 with a recording output, go live for ten minutes, and check the Recordings tab lists program and

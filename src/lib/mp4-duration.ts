@@ -16,10 +16,6 @@
  * top-level box headers as they stream past and keeps only the `moov` box —
  * wherever the muxer put it (start or end of the file) — and, for a
  * fragmented file, each `moof` box in turn (never an `mdat` payload).
- *
- * From the same fragments it also reports how far the latest-starting track's
- * first sample lies after the earliest track's (issue #577), which corrects a
- * first part's event-stamped start time (spec iso-input-recording.md §6).
  */
 
 interface Box {
@@ -113,37 +109,8 @@ interface MoovInfo {
   headerDurationMs: number | undefined;
   /** The file has `mvex`, so its media may be in fragments. */
   fragmented: boolean;
-  /** Per `track_ID`: the `mdhd` timescale, the `trex` default sample duration and the edit list. */
-  tracks: Map<number, TrackInfo>;
-}
-
-interface TrackInfo {
-  timescale?: number;
-  defaultSampleDuration?: number;
-  /** Presentation time before the track starts, from leading empty `elst` edits, in ms. */
-  emptyEditMs?: number;
-  /** `media_time` of the first non-empty `elst` edit, in track timescale ticks. */
-  editMediaTime?: number;
-}
-
-/** Reads a track's `edts/elst`: leading empty edits (ms) and the first edit's `media_time`. */
-function readElst(buf: Buffer, box: Box, movieTimescale: number): Pick<TrackInfo, 'emptyEditMs' | 'editMediaTime'> {
-  if (box.start + 8 > box.end) return {};
-  const version = buf.readUInt8(box.start);
-  const count = buf.readUInt32BE(box.start + 4);
-  const entrySize = version === 1 ? 20 : 12;
-  let emptyTicks = 0;
-  let at = box.start + 8;
-  for (let i = 0; i < count && at + entrySize <= box.end; i++, at += entrySize) {
-    const segmentDuration = version === 1 ? Number(buf.readBigUInt64BE(at)) : buf.readUInt32BE(at);
-    const mediaTime = version === 1 ? Number(buf.readBigInt64BE(at + 8)) : buf.readInt32BE(at + 4);
-    if (mediaTime === -1) {
-      emptyTicks += segmentDuration;
-      continue;
-    }
-    return { emptyEditMs: (emptyTicks * 1000) / movieTimescale, editMediaTime: mediaTime };
-  }
-  return emptyTicks > 0 ? { emptyEditMs: (emptyTicks * 1000) / movieTimescale } : {};
+  /** Per `track_ID`: the `mdhd` timescale and the `trex` default sample duration. */
+  tracks: Map<number, { timescale?: number; defaultSampleDuration?: number }>;
 }
 
 function readMoov(buf: Buffer, moov: Box): MoovInfo | undefined {
@@ -171,13 +138,7 @@ function readMoov(buf: Buffer, moov: Box): MoovInfo | undefined {
     const mdia = child(buf, box, 'mdia');
     const mdhd = mdia ? child(buf, mdia, 'mdhd') : undefined;
     const timescale = mdhd ? readMdhdTimescale(buf, mdhd) : undefined;
-    const edts = child(buf, box, 'edts');
-    const elst = edts ? child(buf, edts, 'elst') : undefined;
-    tracks.set(trackId, {
-      ...tracks.get(trackId),
-      ...(timescale ? { timescale } : {}),
-      ...(elst ? readElst(buf, elst, mvhd.timescale) : {}),
-    });
+    tracks.set(trackId, { ...tracks.get(trackId), ...(timescale ? { timescale } : {}) });
   }
   if (mvex) {
     for (const box of boxes(buf, mvex.start, mvex.end)) {
@@ -199,27 +160,10 @@ function readMoov(buf: Buffer, moov: Box): MoovInfo | undefined {
 interface FragmentTotals {
   ticks: Map<number, number>;
   samplesWithTrexDefault: Map<number, number>;
-  /**
-   * Per `track_ID`, from the first `traf` of the track: its `tfdt` decode time
-   * (0 when absent) plus the first sample's composition time offset, in track
-   * timescale ticks — the track's first presentation time before the edit list
-   * (issue #577).
-   */
-  firstSampleTime: Map<number, number>;
 }
 
 function newFragmentTotals(): FragmentTotals {
-  return { ticks: new Map(), samplesWithTrexDefault: new Map(), firstSampleTime: new Map() };
-}
-
-/** `baseMediaDecodeTime` of a `tfdt` payload, or undefined when truncated. */
-function readTfdt(buf: Buffer, box: Box): number | undefined {
-  if (box.start + 8 > box.end) return undefined;
-  if (buf.readUInt8(box.start) === 1) {
-    if (box.start + 12 > box.end) return undefined;
-    return Number(buf.readBigUInt64BE(box.start + 4));
-  }
-  return buf.readUInt32BE(box.start + 4);
+  return { ticks: new Map(), samplesWithTrexDefault: new Map() };
 }
 
 function addTo(map: Map<number, number>, key: number, value: number): void {
@@ -236,13 +180,6 @@ function addMoof(buf: Buffer, moof: Box, totals: FragmentTotals): boolean {
     //       [default_sample_duration(4)] …
     const tfhdFlags = buf.readUInt32BE(tfhd.start) & 0xffffff;
     const trackId = buf.readUInt32BE(tfhd.start + 4);
-    const firstTraf = !totals.firstSampleTime.has(trackId);
-    let firstTime: number | undefined;
-    if (firstTraf) {
-      const tfdt = child(buf, traf, 'tfdt');
-      firstTime = tfdt ? readTfdt(buf, tfdt) : 0;
-      if (firstTime === undefined) return false;
-    }
     let at = tfhd.start + 8;
     if (tfhdFlags & 0x01) at += 8;
     if (tfhdFlags & 0x02) at += 4;
@@ -258,18 +195,6 @@ function addMoof(buf: Buffer, moof: Box, totals: FragmentTotals): boolean {
       if (trun.start + 8 > trun.end) return false;
       const flags = buf.readUInt32BE(trun.start) & 0xffffff;
       const count = buf.readUInt32BE(trun.start + 4);
-      if (firstTime !== undefined && count > 0) {
-        // The track's first sample: its decode time plus its composition offset (B-frames).
-        let cto = 0;
-        if (flags & 0x800) {
-          let at = trun.start + 8 + (flags & 0x01 ? 4 : 0) + (flags & 0x04 ? 4 : 0);
-          at += 4 * [0x100, 0x200, 0x400].filter((f) => flags & f).length;
-          if (at + 4 > trun.end) return false;
-          cto = buf.readUInt8(trun.start) === 1 ? buf.readInt32BE(at) : buf.readUInt32BE(at);
-        }
-        totals.firstSampleTime.set(trackId, firstTime + cto);
-        firstTime = undefined;
-      }
       if (!(flags & 0x100)) {
         if (defaultDuration !== undefined) addTo(totals.ticks, trackId, count * defaultDuration);
         else addTo(totals.samplesWithTrexDefault, trackId, count);
@@ -305,26 +230,6 @@ function fragmentDurationMs(info: MoovInfo, totals: FragmentTotals): number | un
     if (ms > 0 && Number.isFinite(ms) && (longest === undefined || ms > longest)) longest = ms;
   }
   return longest;
-}
-
-/**
- * How far the latest-starting track's first sample lies after the earliest
- * track's, in ms (issue #577): the presentation start of each track timed from
- * its first `traf` (`tfdt` + first composition offset) through its edit list.
- * 0 for a file with one timed track; undefined when no track can be timed.
- */
-function trackStartOffsetMs(info: MoovInfo, totals: FragmentTotals): number | undefined {
-  let earliest: number | undefined;
-  let latest: number | undefined;
-  for (const [id, ticks] of totals.firstSampleTime) {
-    const track = info.tracks.get(id);
-    if (!track?.timescale) continue;
-    const ms = (track.emptyEditMs ?? 0) + ((ticks - (track.editMediaTime ?? 0)) * 1000) / track.timescale;
-    if (!Number.isFinite(ms)) continue;
-    if (earliest === undefined || ms < earliest) earliest = ms;
-    if (latest === undefined || ms > latest) latest = ms;
-  }
-  return earliest === undefined || latest === undefined ? undefined : Math.round(latest - earliest);
 }
 
 /** Duration of an MP4 file in milliseconds, or undefined when it cannot be read. */
@@ -493,18 +398,6 @@ export class Mp4DurationScanner {
   private stop(): void {
     this.stopped = true;
     this.capture = undefined;
-  }
-
-  /**
-   * After {@link finish}: how far into the file the latest-starting track's
-   * first sample lies, relative to the earliest track's, in ms (issue #577).
-   * Read from the fragments only, so undefined for a file whose header carries
-   * the duration (the scan stops at `moov`), a non-fragmented or unreadable
-   * file, or one in which no track's first fragment was seen.
-   */
-  trackStartOffsetMs(): number | undefined {
-    if (this.broken || !this.moovInfo?.fragmented) return undefined;
-    return trackStartOffsetMs(this.moovInfo, this.fragments);
   }
 
   /** Duration in milliseconds, or undefined when it could not be read. */

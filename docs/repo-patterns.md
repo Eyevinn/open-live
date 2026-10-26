@@ -527,6 +527,13 @@ the event, as long as the chain is anchored on a `strom`/`event` start (`KnownPa
 Pass the activation's `recorderType` from every caller; `builtin.recorder` keeps the event first
 (its splits are not gapless, #571).
 
+Do not try to "correct" a first part's event receipt time from the file's contents. #578 subtracted
+the late-track offset (latest track's first sample minus the earliest's) from an input's part 0 and
+landed about 1.1 s early (#569 attempt 6); without it, attempt 5 was 1.03 s late. On input
+recorders the event's delay after t=0 varies by about 1 s and does not follow the track offset, so
+#579 reverted it. The only reliable anchor for input parts is Strom's `start_utc_us` (rule 1,
+Eyevinn/strom#1057); spec §6 "Anchor for AC 3" records the decision.
+
 ## Input recordings: one live session per recorder, input directories swept before program
 
 OL-32 records chosen inputs to `recordings/<productionId>/<mixerInput>/`, nested under the program
