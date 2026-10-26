@@ -167,6 +167,98 @@ describe('fragmented MP4 without a header duration (Live Recorder)', () => {
     small.push(file);
     expect(small.finish()).toBeUndefined();
   });
+
+  describe('track start offset (issue #577)', () => {
+    const u64 = (v: number) => {
+      const b = Buffer.alloc(8);
+      b.writeBigUInt64BE(BigInt(v), 0);
+      return b;
+    };
+    /** Video track 1 @ 90 kHz starting at `tfdt`; optional first-sample composition offset. */
+    function videoFrom(tfdt: number, count: number, cto?: number): Buffer {
+      const flags = 0x000100 | 0x000200 | (cto !== undefined ? 0x000800 : 0);
+      const perSample = Buffer.concat(Array.from({ length: count }, (_, i) =>
+        cto !== undefined ? u32(3000, 100, i === 0 ? cto : 0) : u32(3000, 100)));
+      return box('traf', full('tfhd', 0, 0x020000, u32(1)), full('tfdt', 1, 0, u64(tfdt)),
+        full('trun', 0, flags, u32(count), perSample));
+    }
+    /** Audio track 2 @ 48 kHz starting at `tfdt` (v0 tfdt), tfhd default duration. */
+    function audioFrom(tfdt: number, count: number): Buffer {
+      return box('traf', full('tfhd', 0, 0x08, u32(2, 1024)), full('tfdt', 0, 0, u32(tfdt)),
+        full('trun', 0, 0x000200, u32(count), Buffer.concat(Array.from({ length: count }, () => u32(10)))));
+    }
+    /** elst v0 entries: [segment_duration (movie timescale), media_time (track timescale)]. */
+    const edts = (...entries: Array<[number, number]>) => box('edts', full('elst', 0, 0,
+      u32(entries.length), Buffer.concat(entries.map(([d, m]) => {
+        const e = Buffer.alloc(12);
+        e.writeUInt32BE(d, 0);
+        e.writeInt32BE(m, 4);
+        e.writeUInt32BE(0x00010000, 8);
+        return e;
+      }))));
+    function file(frags: Buffer[][], videoEdts?: Buffer): Buffer {
+      const videoTrak = videoEdts
+        ? box('trak', tkhd(1), videoEdts, box('mdia', mdhd(90_000)))
+        : trak(1, 90_000);
+      const moov = box('moov', mvhdV0(1000, 0), videoTrak, trak(2, 48_000),
+        box('mvex', trex(1, 3000), trex(2, 1024)));
+      const parts: Buffer[] = [ftyp, moov];
+      frags.forEach((trafs, i) => {
+        parts.push(box('moof', full('mfhd', 0, 0, u32(i + 1)), ...trafs), box('mdat', Buffer.alloc(256)));
+      });
+      return Buffer.concat(parts);
+    }
+    function scan(buf: Buffer, chunkSize = buf.length): { durationMs?: number; offsetMs?: number } {
+      const s = new Mp4DurationScanner();
+      for (let off = 0; off < buf.length; off += chunkSize) s.push(buf.subarray(off, off + chunkSize));
+      return { durationMs: s.finish(), offsetMs: s.trackStartOffsetMs() };
+    }
+
+    it('reports how late the video track starts after the audio (attempt 5: 1.717 s)', () => {
+      // Audio starts at 0; video's first sample (the first IDR) at 1.717 s.
+      // The first fragment holds only audio, as when the input's video starts late.
+      const buf = file([
+        [audioFrom(0, 94)],
+        [videoFrom(Math.round(1.717 * 90_000), 60), audioFrom(94 * 1024, 94)],
+        [videoFrom(Math.round(1.717 * 90_000) + 60 * 3000, 60), audioFrom(188 * 1024, 94)],
+      ]);
+      for (const chunkSize of [1, 13, 4096, buf.length]) {
+        expect(scan(buf, chunkSize)).toEqual({ durationMs: Math.round((3 * 94 * 1024 * 1000) / 48_000), offsetMs: 1_717 });
+      }
+    });
+
+    it('is 0 when both tracks start together, or for a single-track file', () => {
+      expect(scan(file([[videoFrom(0, 60), audioFrom(0, 94)]])).offsetMs).toBe(0);
+      expect(scan(file([[videoFrom(450_000, 60)]])).offsetMs).toBe(0);
+    });
+
+    it('takes the earliest track as t=0 whichever track starts first', () => {
+      // Video first at 0.2 s, audio 0.5 s later.
+      expect(scan(file([[videoFrom(18_000, 60), audioFrom(33_600, 94)]])).offsetMs).toBe(500);
+    });
+
+    it("adds the first sample's composition offset and applies the edit list", () => {
+      // B-frames: first sample presented 2 frames (6000 ticks) after its decode
+      // time, and the edit list's media_time removes exactly that delay.
+      expect(scan(file([[videoFrom(0, 60, 6000), audioFrom(0, 94)]], edts([0, 6000]))).offsetMs).toBe(0);
+      // Without an edit list the composition offset delays video by 66.7 ms.
+      expect(scan(file([[videoFrom(0, 60, 6000), audioFrom(0, 94)]])).offsetMs).toBe(67);
+      // A leading empty edit of 400 ms (movie timescale 1000) delays video.
+      expect(scan(file([[videoFrom(0, 60), audioFrom(0, 94)]], edts([400, -1], [0, 0]))).offsetMs).toBe(400);
+    });
+
+    it('is undefined when the header carries the duration, or the file is unreadable', () => {
+      const withHeader = Buffer.concat([ftyp, box('moov', mvhdV0(1000, 7_000), trak(1, 90_000), trak(2, 48_000),
+        box('mvex', trex(1, 3000), trex(2, 1024))), box('moof', videoFrom(90_000, 60), audioFrom(0, 94))]);
+      expect(scan(withHeader)).toEqual({ durationMs: 7_000, offsetMs: undefined });
+
+      const buf = file([[audioFrom(0, 94)], [videoFrom(90_000, 60), audioFrom(94 * 1024, 94)]]);
+      const truncated = new Mp4DurationScanner();
+      truncated.push(buf.subarray(0, buf.length - 256 - 20));
+      expect(truncated.finish()).toBeUndefined();
+      expect(truncated.trackStartOffsetMs()).toBeUndefined();
+    });
+  });
 });
 
 /**
@@ -216,6 +308,19 @@ describe('fragmented MP4 written by Strom Live Recorder (real fixture)', () => {
       }
     });
   }
+
+  it('reports the video track starting 5.6 ms / 22.4 ms after the audio (issue #577)', () => {
+    // tfdt: part-00000 video 14 @ 2500 Hz, audio 1 @ 44100 Hz; part-00001 video 56, audio 1.
+    for (const [name, offsetMs] of [['part-00000.mp4', 6], ['part-00001.mp4', 22]] as const) {
+      const file = fixture(name);
+      for (const chunkSize of [7, 65_536]) {
+        const s = new Mp4DurationScanner();
+        for (let off = 0; off < file.length; off += chunkSize) s.push(file.subarray(off, off + chunkSize));
+        s.finish();
+        expect(s.trackStartOffsetMs()).toBe(offsetMs);
+      }
+    }
+  });
 
   it('returns undefined for a real part cut off inside a moof', () => {
     const file = fixture('part-00001.mp4');

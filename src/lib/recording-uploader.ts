@@ -69,6 +69,13 @@ export interface UploadedSegment {
    * #534). Undefined for a non-MP4 file or a header that cannot be read.
    */
   durationMs?: number;
+  /**
+   * How far into the file the latest-starting track's first sample lies,
+   * relative to the earliest track's, in ms (issue #577) — e.g. an input whose
+   * video starts at its first IDR after the audio. Read from a fragmented
+   * MP4's first fragments; undefined when it cannot be.
+   */
+  trackStartOffsetMs?: number;
 }
 
 export interface UploadResult {
@@ -740,12 +747,14 @@ export async function uploadRecordingFile(
   const sizeBytes = await uploadStream(args.target, key, tap(download, (c) => scanner?.push(c)), contentType);
   const startedAt = recordingStartFromFileName(entry.name);
   const durationMs = scanner?.finish();
+  const trackStartOffsetMs = scanner?.trackStartOffsetMs();
   return {
     key,
     sizeBytes,
     stromPath: entry.path,
     ...(startedAt ? { startedAt } : {}),
     ...(durationMs !== undefined ? { durationMs } : {}),
+    ...(trackStartOffsetMs !== undefined ? { trackStartOffsetMs } : {}),
   };
 }
 

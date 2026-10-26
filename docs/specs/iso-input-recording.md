@@ -517,7 +517,7 @@ rule 3 ahead of rule 2 (see "Parts after a split" below):
 | # | `startedAtSource` | Source | Precision | Available |
 |---|---|---|---|---|
 | 1 | `strom` | `RecorderFileChanged.start_utc_us` — the file's t=0 on the flow's UTC anchor | < 1 ms between files of one flow (strom#1057 tests) | only once strom#1057 merges and is deployed. Already parsed by `strom-recorder-events.ts:75-84`; no code change when it lands |
-| 2 | `event` | wall-clock time open-live **received** `RecorderFileChanged` for that file | 50-80 ms late when the first file opens (measured on #411's rig against a two-track reference); **3-5 s late at a Live Recorder split** (#569 acceptance run, #575) | today, whenever open-live is connected to the event socket when the file opens |
+| 2 | `event` | wall-clock time open-live **received** `RecorderFileChanged` for that file; for a recorder's **first** part, minus the file's `trackStartOffsetMs` (#577, see "First part" below) | first file: 50-80 ms late on program (#411's rig, two-track reference), but **up to one GOP late on an input** until corrected by the track offset (+1.03 s SRT in the #569 attempt 5 run); **3-5 s late at a Live Recorder split** (#569 acceptance run, #575) | today, whenever open-live is connected to the event socket when the file opens |
 | 3 | `chained` | previous part of the same recorder and stem: its `startedAt + durationMs` | carries the predecessor's error; fMP4 durations are exact | a part opened while open-live was disconnected, after a part with a known start; on Live Recorder, every part after a split whose chain is anchored on rule 1 or 2 |
 | 4 | `filename` | today's rule: name stamp + summed earlier durations (`recordingPartTimings`) | ≥1 s (second-truncated block-build time, Strom local zone) — and wrong for late-joining WHIP inputs | last resort |
 
@@ -536,10 +536,26 @@ accounted for by part durations at its first split, so its parts are not gapless
 of every recorder is unchanged (rule 1, else 2, else 4). Once strom#1057 is deployed, rule 1
 takes over for every part and this reorder no longer applies.
 
+**First part (#577).** Live Recorder emits `RecorderFileChanged` only once every track of the file
+has data. Program's tracks start together, but an input's video track starts at the first IDR the
+input decoder produces, which can be up to one GOP after the audio (the file's t=0). In the #569
+attempt 5 run the SRT input's video started 1.717 s into part 0, and its event-stamped start came
+out +1.03 s against program (attempt 4 got +0.17 s on the same path: it depends on where the GOP
+falls when the input connects). So for a part with index 0 whose start comes from rule 2,
+`startedAt = eventReceipt − trackStartOffsetMs`: the start is anchored on the file's earliest
+track. `Mp4DurationScanner` reads `trackStartOffsetMs` from the fragments it already streams for
+§7 — per track, the first `traf`'s `tfdt` plus the first sample's composition offset, through the
+track's `edts/elst` — as the latest track start minus the earliest, in ms. The correction is
+skipped when the offset is unknown (a non-fragmented file, or one whose header carries the
+duration), 0, or not shorter than the part. Rule 1 and rule 3 starts are never corrected, and a
+part after a split is not either; on Live Recorder those chain from the corrected part 0, so they
+inherit it. `durationMs` is the longest track, which spans from the earliest track's start, so
+`endedAt` follows from the corrected start and no longer lands after the part was registered.
+
 **AC 3 without strom#1057:** the first parts of program and input recorders of one activation are
-all stamped by rule 2 (same open-live process, same clock, same socket), so the worst-case skew
-between any two first files is the spread of event delivery delays: tens of ms, well inside 1 s
-(+0.17 s measured on #569). On Live Recorder every later part chains from those starts by exact
+all stamped by rule 2 (same open-live process, same clock, same socket), corrected to each file's
+earliest track (#577), so the worst-case skew between any two first files is the spread of event
+delivery delays: tens of ms, well inside 1 s. On Live Recorder every later part chains from those starts by exact
 fMP4 durations, so it keeps that skew (all three recorders ended within 0.2 s of each other in the
 #569 run). Rule 3 also keeps it inside 1 s after a reconnect. Only rule 4 can miss, and only when open-live saw no event for the first part of a
 recorder (it was down when the file opened); `startedAtSource: "filename"` tells a consumer so.
@@ -766,7 +782,7 @@ the reason #411 split tracks (`builtin.recorder` waits for both) is gone; the St
 rejected per-track recorders for the same reason ("the operator wants one file with A/V sync").
 
 **Q8. How is AC 3 (alignment within 1 s) met while strom#1057 is open?** → By rule 2 of §6
-(event receipt time), tens of ms, for each recorder's first part, and on Live Recorder by rule 3
+(event receipt time, corrected by the file's late-track offset, #577), tens of ms, for each recorder's first part, and on Live Recorder by rule 3
 (chained by exact durations) for the parts after a split (#575), with `startedAtSource` on every doc. When strom#1057 ships, rule
 1 takes over automatically. No ticket waits on it.
 
