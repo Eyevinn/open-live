@@ -535,3 +535,16 @@ recorder (they share the `recording` snapshot); `inputRecordings` entries carry 
 `recorderBlockId` / `outputDir`, which `toProductionView()` strips — keep any new production
 response on that projection. A leftover input file only knows its directory, so its
 `RecordingDoc` gets `kind: 'input'` and `mixerInput` but no `sourceId` / `sourceName`.
+
+## A `builtin.videoenc` fed straight from a decoded input never negotiates on a GPU Strom
+
+On a GPU Strom, decoded SRT/EFP/WHIP inputs stay in `video/x-raw(memory:CUDAMemory)`: Strom's
+`decode_chain::link_raw_video` links a progressive `decodebin` pad straight to the block output so
+the decoder keeps its frames on the GPU. A `builtin.videoenc` fed directly from such a pad converts
+with `autovideoconvert`, which yields GLMemory that `nvh264enc` will not encode (src NOT
+NEGOTIATED). Live Recorder then drops the video track and the file is audio-only after ~20 s
+(#569). Pin system memory in front of the encoder with a core `capsfilter`, `caps: "video/x-raw"`
+(no caps features), as `flow-generator.ts` does with `e-inrec-vmem-<n>-<suffix>`. `cudadownload`
+or `videoconvert` alone does not work: both pass CUDA memory through. The constraint reaches the
+decoder through Strom's auto-inserted tee, so that input's mixer branch also gets system memory.
+Remove the workaround once Eyevinn/strom#1104 makes `videoenc` adapt CUDA input itself.

@@ -370,6 +370,8 @@ one recorder holding **both** tracks of the input in **one** file (ADR-011 Decis
 // elements
 { "id": "e-inrec-vq-<padIndex>-<suffix>", "element_type": "queue",
   "properties": { "leaky": "downstream", "max-size-buffers": 0, "max-size-bytes": 0, "max-size-time": 1000000000 } }
+{ "id": "e-inrec-vmem-<padIndex>-<suffix>", "element_type": "capsfilter",
+  "properties": { "caps": "video/x-raw" } }                                        // system memory, see Notes
 { "id": "e-inrec-aq-<padIndex>-<suffix>", "element_type": "queue", "properties": { /* same */ } }
 // blocks
 { "id": "b-inrec-venc-<padIndex>-<suffix>", "block_definition_id": "builtin.videoenc",
@@ -383,7 +385,8 @@ one recorder holding **both** tracks of the input in **one** file (ADR-011 Decis
     "max_size_time_secs": 600, "num_video_tracks": 1, "num_audio_tracks": 1 } }
 // links
 { "from": "<videoTap>",                   "to": "e-inrec-vq-…:sink" }
-{ "from": "e-inrec-vq-…:src",             "to": "b-inrec-venc-…:video_in" }
+{ "from": "e-inrec-vq-…:src",             "to": "e-inrec-vmem-…:sink" }
+{ "from": "e-inrec-vmem-…:src",           "to": "b-inrec-venc-…:video_in" }
 { "from": "b-inrec-venc-…:encoded_out",   "to": "b-inrec-…:video_in_0" }
 { "from": "<audioTap>",                   "to": "e-inrec-aq-…:sink" }
 { "from": "e-inrec-aq-…:src",             "to": "b-inrec-…:audio_in_0" }      // raw; the block encodes AAC
@@ -406,6 +409,13 @@ Notes:
 - The leaky queue (from #411) gives the encoder its own thread and drops frames from the
   recording rather than back-pressuring the tee that feeds the mixers. A recording may drop; the
   program must not.
+- The `e-inrec-vmem-…` capsfilter (`caps: "video/x-raw"`, no caps features, so system memory)
+  sits between the leaky queue and the encoder because, on a GPU Strom, the decoder keeps frames
+  in CUDA memory and `autovideoconvert` inside `builtin.videoenc` turns them into GLMemory that
+  `nvh264enc` won't encode, so the file ends up audio-only (#569, Eyevinn/strom#1104). Trade-off:
+  the constraint reaches the decoder through the tee, so a recorded input's mixer branch also gets
+  system memory (the GPU mixer uploads it again); inputs that are not recorded keep GPU memory.
+  Drop the capsfilter once strom#1104 makes `videoenc` accept CUDA input itself.
 - An audio-only guest or a camera without sound: Live Recorder releases a connected track that
   carries nothing for 20 s and starts the file without it (strom#1034 "Late tracks"), so one
   two-track recorder still records the other track. A track that stops later leaves a gap in the

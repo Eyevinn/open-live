@@ -175,7 +175,7 @@ describe('one Live Recorder per recorded input (spec §4.3)', () => {
     const venc = flow.blocks.find((b) => String(b['id']).startsWith('b-inrec-venc-1-'))!;
     expect(venc['block_definition_id']).toBe('builtin.videoenc');
     expect(venc['properties']).toEqual({ codec: 'h264', bitrate: 2500, keyframe_interval: 60 });
-    for (const q of flow.elements.filter((e) => String(e['id']).startsWith('e-inrec-'))) {
+    for (const q of flow.elements.filter((e) => /^e-inrec-[va]q-/.test(String(e['id'])))) {
       expect(q['element_type']).toBe('queue');
       expect(q['properties']).toMatchObject({ leaky: 'downstream', 'max-size-time': 1_000_000_000 });
     }
@@ -203,9 +203,23 @@ describe('one Live Recorder per recorded input (spec §4.3)', () => {
     expect(linksFrom(flow, `${inputId}:audio_out_0`)).toEqual(expect.arrayContaining([
       expect.stringMatching(/^b-audio-offset-1-.*:in$/), `${aq}:sink`,
     ]));
-    expect(linkTo(flow, `${vencId}:video_in`)?.['from']).toBe(`${vq}:src`);
+    const vmem = flow.elements.find((e) => String(e['id']).startsWith('e-inrec-vmem-1-'))!['id'] as string;
+    expect(linkTo(flow, `${vmem}:sink`)?.['from']).toBe(`${vq}:src`);
+    expect(linkTo(flow, `${vencId}:video_in`)?.['from']).toBe(`${vmem}:src`);
     expect(linkTo(flow, `${recId}:video_in_0`)?.['from']).toBe(`${vencId}:encoded_out`);
     expect(linkTo(flow, `${recId}:audio_in_0`)?.['from']).toBe(`${aq}:src`);
+  });
+
+  it('pins system memory in front of the input video encoder (#569: CUDA memory never encodes)', async () => {
+    const { flow } = await activate(sources);
+    for (const n of [1, 15]) {
+      const vmem = flow.elements.find((e) => String(e['id']).startsWith(`e-inrec-vmem-${n}-`))!;
+      expect(vmem['element_type']).toBe('capsfilter');
+      // No caps features: system memory, never memory:CUDAMemory / GLMemory.
+      expect(vmem['properties']).toEqual({ caps: 'video/x-raw' });
+      const vencId = flow.blocks.find((b) => String(b['id']).startsWith(`b-inrec-venc-${n}-`))!['id'] as string;
+      expect(linkTo(flow, `${vencId}:video_in`)?.['from']).toBe(`${vmem['id'] as string}:src`);
+    }
   });
 
   it('taps a WHIP input at video_out / audio_out', async () => {
