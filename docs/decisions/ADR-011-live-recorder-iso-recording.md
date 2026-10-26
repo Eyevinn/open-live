@@ -139,11 +139,12 @@ Constraints:
 ## Amendment 1: AC 3 for input parts depends on strom#1057 (2026-10-26)
 
 **Issues**: #569, #579 (reverts PR #578). The Decision above is unchanged except for the claim that
-rule 2 (event receipt time) meets AC 3 without strom#1057, in Context, Decision 4, Consequences and
-the "Wait for strom#1057" alternative. #569 acceptance runs 5 and 6 showed that, on **input**
-recorders, the event arrives about 1 s late or early relative to the file's t=0, and that this does
-not follow the file's track offsets, so #578's track-offset correction was reverted. Decision by
-@svensson00 on #569: keep the uncorrected event start for now, and make AC 3 for input parts depend
-on strom#1057 (`start_utc_us`, rule 1) being deployed on the dev Strom, rather than restating the
-1 s bound. Recording itself still ships without strom#1057. Spec §6 ("Anchor for AC 3") and Q8
-describe the anchor and how AC 3 is verified once strom#1057 is available.
+rule 2 (event receipt time) meets AC 3 without strom#1057, in Context (the constraint that AC 3
+"must hold without strom#1057"), Decision 5, Consequences and the "Wait for strom#1057" alternative.
+#569 acceptance runs 5 and 6 showed that, on **input** recorders, the event arrives about 1 s late
+or early relative to the file's t=0, and that this does not follow the file's track offsets, so
+#578's track-offset correction was reverted. Decision by @svensson00 on #569: keep the uncorrected
+event start for now, and make AC 3 for input parts depend on strom#1057 (`start_utc_us`, rule 1)
+being deployed on the dev Strom, rather than restating the 1 s bound. Recording itself still ships
+without strom#1057. Spec §6 ("Anchor for AC 3") and Q8 describe the anchor and how AC 3 is verified
+once strom#1057 is available.

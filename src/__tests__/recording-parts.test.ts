@@ -191,7 +191,8 @@ describe('resolvePartTimings — start-time precedence (OL-32a, spec §6)', () =
       [srtName(0), { openedAtMs: at('2026-10-26T14:24:58.971Z') }],
       [srtName(1), { openedAtMs: at('2026-10-26T14:30:02.100Z') }],
     ]);
-    // A segment carrying a late-track offset, as #578's uploader produced it.
+    // A segment carrying a late-track offset, as #578's uploader produced it. The field no longer
+    // exists on UploadedSegment, hence the cast: it guards against #578's correction returning.
     const withTrackOffset = (seg: UploadedSegment, trackStartOffsetMs: number) =>
       ({ ...seg, trackStartOffsetMs }) as UploadedSegment;
 
