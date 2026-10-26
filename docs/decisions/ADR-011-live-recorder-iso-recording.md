@@ -49,8 +49,9 @@ Constraints:
 
 2. **Taps before the lipsync offset, re-encoded.** Each recorded input (WHIP, SRT, EFP) is tapped
    at the pad that feeds its `time_offset` blocks, so the file holds the feed as it arrived. Video
-   goes through a leaky queue and `builtin.videoenc` (H.264, 60-frame GOP,
-   `RECORDING_INPUT_VIDEO_BITRATE_KBPS`); audio goes raw through a leaky queue into the recorder,
+   goes through a leaky queue, a `capsfilter` pinning `video/x-raw` (system memory, so a GPU
+   Strom's CUDA-memory decode can be encoded; Eyevinn/strom#1104) and `builtin.videoenc` (H.264,
+   60-frame GOP, `RECORDING_INPUT_VIDEO_BITRATE_KBPS`); audio goes raw through a leaky queue into the recorder,
    which encodes AAC. Passthrough is out of v1 (`record: "passthrough"` is reserved and refused).
 
 3. **One recorder and one file per recorded input, holding both tracks.** Not one recorder per
