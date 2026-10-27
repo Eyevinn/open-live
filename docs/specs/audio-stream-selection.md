@@ -463,7 +463,8 @@ Rules:
    precedent (`flow-generator.ts:84-95`): read `GET /api/blocks` and, if needed, `GET /api/version`
    (`src/lib/strom.ts:870`), and decide whether `builtin.mpegtssrt_input` maps `audio_out_k` by
    PID order. **The predicate is defined by the upstream follow-up (§7.1 c) and must not be
-   guessed.** Until it exists, the check returns `false`. An unreadable block list returns `false`
+   guessed.** *(#545: it is `map_audio_by_pid` present in the block's `exposed_properties`,
+   and the k > 0 shape also sets `map_audio_by_pid: true`.)* An unreadable block list returns `false`
    for this feature: wiring an unordered `audio_out_k` is the #510 failure mode, so the
    conservative answer here is the opposite of `stromHasAudioEncoder`'s.
 4. **EFP (`builtin.efpsrt_input`) is out of v1 scope** (ADR-010 Decision 3). An `efp` source
@@ -555,16 +556,20 @@ first + warn) stand. Q4 is now **resolved by @svensson00 (#516, 2026-10-15)**.
 - **strom#1077 (open)** — "Option Park" fixes the takeover so that `audio_out_0` carries the
   first stream (fixes #510). It is needed for the default `k = 0` path to be correct, but it does
   **not** enable `k > 0`.
-- **PID-order follow-up (not yet filed)** must cover:
-  (a) `audio_out_k` ← k-th audio stream in ascending PID order when `num_audio_tracks > 1`,
-      stable across reconnects/PID changes, in both `decode` and passthrough modes;
-  (b) defined behaviour for a missing k-th stream (Q3, prefer in-block fallback) plus a runtime
-      signal (Q5);
-  (c) a capability signal Open Live can detect (Q6).
-  Filing it is a team-lead action outside this PR. Link it in ADR-010 before moving it to
-  Accepted.
-- Until (a) + (c) land, every `k > 0` is clamped and warns `strom-capability-missing`. The
-  feature is safe but inert.
+- **PID-order follow-up: [Eyevinn/strom#1081](https://github.com/Eyevinn/strom/issues/1081)**,
+  fixed by [Eyevinn/strom#1120](https://github.com/Eyevinn/strom/pull/1120) (`dc2d228`), first
+  released in Strom `v0.8.0-alpha.1` (prerelease). It covers:
+  (a) `audio_out_k` ← k-th audio stream in ascending PID order, stable across reconnects, in both
+      `decode` and passthrough modes, when the opt-in Bool property `map_audio_by_pid` is set;
+  (b) in-block fallback to the first stream for a missing k-th stream (Q3 option A), plus a
+      runtime element message `strom-mpegtssrt-audio-map` (per-output `pids` / `fallback`) that
+      the flows API does **not** expose yet (Q5 open — `stream-not-present` from it is a
+      follow-up to #545);
+  (c) the capability signal: `map_audio_by_pid` in `builtin.mpegtssrt_input`'s
+      `exposed_properties` in `GET /api/blocks` (Q6).
+  Open Live implements (a) + (c) in #545 (`stromMapsAudioByPid()`). On a Strom without the
+  property (v0.7.2 and earlier) every `k > 0` is still clamped and warns
+  `strom-capability-missing`.
 
 ### 7.2 Other risks
 

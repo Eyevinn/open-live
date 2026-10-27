@@ -57,6 +57,7 @@ Receives an MPEG-TS stream over SRT.
 | `latency` | integer (ms) | 20–8000, default 125 |
 | `num_video_tracks` | uint | Number of video outputs. Default 1 |
 | `num_audio_tracks` | uint | Number of audio outputs (`audio_out_0` … `audio_out_{N-1}`). Default 1 |
+| `map_audio_by_pid` | bool | Feed `audio_out_k` from the k-th audio stream in ascending PID order (both modes, stable across reconnects); an output with no stream of its own carries the first stream. Default false. Strom v0.8.0-alpha.1+ (Eyevinn/strom#1081, #1120) |
 | `decode` | bool | Decode streams (true) or pass through encoded elementary streams (false). Default true |
 | `tsdemux_latency` | int (ms) | MPEG-TS demuxer latency |
 | `ignore_pcr` | bool | Ignore MPEG-TS PCR timestamps. Default true |
@@ -68,13 +69,23 @@ Receives an MPEG-TS stream over SRT.
 
 **Pads**: outputs `video_out`, `audio_out_0` … `audio_out_{N-1}` (N = `num_audio_tracks`)
 
-Open Live sets only `srt_uri` and `latency` and links `audio_out_0`. With
-`num_audio_tracks > 1` Strom does **not** yet map `audio_out_k` to a stable
-audio stream (the #510 takeover, strom#1077; PID-order mapping is
-Eyevinn/strom#1081), so a source's `audioStreamIndex > 0` is clamped to
-`audio_out_0` and reported as an `audio-stream-not-applied` activation warning
-(`docs/specs/audio-stream-selection.md` §5.3/§5.4). Every `audio_out_N` that is
-created must be linked — an unconnected output pad can fail the flow. Confirm
+Open Live sets `srt_uri` and `latency` and links `audio_out_0` — unchanged for
+every source whose `audioStreamIndex` is absent or 0. For an `srt` source with
+`0 < audioStreamIndex = k <= 7` it also sets `num_audio_tracks: k + 1` and
+`map_audio_by_pid: true`, links `audio_out_<k>` to the per-source audio
+`time_offset`, and drains every `audio_out_<j != k>` into its own `fakesink`
+element (`e-audio-drain-<padIndex>-<j>-<suffix>`, `sync: false`, `async: false`)
+(`docs/specs/audio-stream-selection.md` §5.3). This only happens when Strom's
+`GET /api/blocks` lists `map_audio_by_pid` in the `exposed_properties` of
+`builtin.mpegtssrt_input` (`stromMapsAudioByPid()` in `src/lib/flow-generator.ts`).
+Without it (Strom v0.7.2 and earlier, or an unreadable block list) — and for
+`efp` sources or k > 7 — the selection is clamped to `audio_out_0` and reported
+as an `audio-stream-not-applied` activation warning (§5.4). Without
+`map_audio_by_pid`, `num_audio_tracks > 1` maps streams in arrival order (the
+#510 hazard), so never set it on its own. Every `audio_out_N` that is created
+must be linked — an unconnected output pad can fail the flow. Strom also posts a
+`strom-mpegtssrt-audio-map` element message (per-output `pids` / `fallback`)
+when it assigns outputs, but does not expose it through the flows API yet. Confirm
 property names and defaults against live `GET /api/blocks` before relying on them.
 
 ---

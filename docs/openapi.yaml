@@ -988,8 +988,11 @@ components:
           description: >-
             `stream-type-unsupported`: `efp` source (selection is MPEG-TS/SRT only).
             `strom-capability-missing`: this Strom cannot map audio outputs by PID
-            order yet. `stream-not-present`: the index is above the supported
-            ceiling (more than 8 audio streams) or the feed lacks that stream.
+            order (its `builtin.mpegtssrt_input` has no `map_audio_by_pid`, i.e.
+            Strom before v0.8.0-alpha.1, or the block list could not be read).
+            `stream-not-present`: the index is above the supported ceiling (more
+            than 8 audio streams). Reporting a feed that lacks the selected
+            stream at runtime is not wired yet.
         message:
           type: string
           description: Human text with 1-based stream numbers.
