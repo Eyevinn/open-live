@@ -68,6 +68,22 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       aspect-ratio: 16 / 9; object-fit: cover;
     }
     #return { margin-top: 12px; }
+    /* Picture-in-picture (issue #583): the return feed fills the video area and
+       the guest's own camera sits as a small inset in one corner. */
+    .videos.pip #return { margin-top: 0; }
+    .videos.pip #preview {
+      position: absolute; z-index: 1; width: 30%; min-width: 96px; max-width: 200px;
+      height: auto; aspect-ratio: 16 / 9; border-radius: 8px; cursor: pointer;
+      border: 2px solid rgba(255, 255, 255, 0.85); box-shadow: 0 2px 10px rgba(0, 0, 0, 0.6);
+    }
+    .videos.pip #preview-hint { display: none; }
+    .videos.pip.pip-tl #preview { top: 10px; left: 10px; }
+    .videos.pip.pip-tr #preview { top: 10px; right: 10px; }
+    .videos.pip.pip-br #preview { bottom: 10px; right: 10px; }
+    .videos.pip.pip-bl #preview { bottom: 10px; left: 10px; }
+    #pip-option { margin-top: 10px; }
+    #pip-option label { display: flex; align-items: center; gap: 8px; font-size: 14px; color: #f4f4f6; margin: 0; }
+    #pip-toggle { width: 18px; height: 18px; margin: 0; }
     .hint { color: #a0a0ad; font-size: 13px; margin: 6px 2px 0; }
     .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
     .field { flex: 1 1 220px; }
@@ -131,11 +147,17 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       <button id="device-retry">Reconnect</button>
     </div>
 
-    <div class="videos">
+    <div id="videos" class="videos">
       <video id="preview" autoplay playsinline muted></video>
       <div id="preview-hint" class="hint">This is your camera preview. It is muted here so you don't hear yourself.</div>
       <video id="return" autoplay playsinline class="hidden"></video>
-      <div id="return-hint" class="hint hidden">Return feed from the studio.</div>
+    </div>
+    <!-- Outside .videos so a bottom-corner inset sits on the return video, not on this hint. -->
+    <div id="return-hint" class="hint hidden">Return feed from the studio.</div>
+
+    <div id="pip-option" class="hidden">
+      <label><input type="checkbox" id="pip-toggle" /> Show my camera as picture-in-picture</label>
+      <div id="pip-hint" class="hint hidden">Tap your camera to move it to another corner.</div>
     </div>
 
     <fieldset id="return-mode" class="hidden">
@@ -188,6 +210,10 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     var previewHint = document.getElementById("preview-hint");
     var returnVideo = document.getElementById("return");
     var returnHint = document.getElementById("return-hint");
+    var videosBox = document.getElementById("videos");
+    var pipOption = document.getElementById("pip-option");
+    var pipToggle = document.getElementById("pip-toggle");
+    var pipHint = document.getElementById("pip-hint");
     var camSel = document.getElementById("cam");
     var micSel = document.getElementById("mic");
     var pickers = document.getElementById("pickers");
@@ -252,6 +278,14 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     // as gone (kicked, invite revoked) after MODE_MAX_REFUSALS of them.
     var modeRefusals = 0;
     var MODE_MAX_REFUSALS = 3;
+    // Picture-in-picture self view (issue #583): off by default, remembered in
+    // the browser. Corners go clockwise when the guest taps the inset.
+    var PIP_KEY = "openlive.guest.pip";
+    var PIP_CORNER_KEY = "openlive.guest.pipCorner";
+    var PIP_CORNERS = ["tl", "tr", "br", "bl"];
+    var pipOn = loadSetting(PIP_KEY) === "1";
+    var pipCorner = loadSetting(PIP_CORNER_KEY);
+    if (PIP_CORNERS.indexOf(pipCorner) < 0) pipCorner = "br";
 
     function setBanner(text, cls) {
       banner.textContent = text;
@@ -260,6 +294,49 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
 
     function show(el) { el.classList.remove("hidden"); }
     function hide(el) { el.classList.add("hidden"); }
+
+    // localStorage throws in some browsers (Safari private mode, storage
+    // blocked), so a setting that cannot be read or saved is simply not kept.
+    function loadSetting(key) {
+      try { return window.localStorage.getItem(key); } catch (e) { return null; }
+    }
+    function saveSetting(key, value) {
+      try { window.localStorage.setItem(key, value); } catch (e) {}
+    }
+
+    // ---- Picture-in-picture self view --------------------------------------
+    // The option is offered only while the return feed plays on a slot that has
+    // a camera; otherwise (before going live, return-only slot, after leaving)
+    // the page keeps the stacked layout.
+    function applyPipLayout() {
+      var offered = !left && !!localStream && !!returnPc && !returnLost;
+      if (offered) show(pipOption);
+      else hide(pipOption);
+      pipToggle.checked = pipOn;
+      var on = offered && pipOn;
+      PIP_CORNERS.forEach(function (c) { videosBox.classList.remove("pip-" + c); });
+      if (on) {
+        videosBox.classList.add("pip");
+        videosBox.classList.add("pip-" + pipCorner);
+        show(pipHint);
+      } else {
+        videosBox.classList.remove("pip");
+        hide(pipHint);
+      }
+    }
+
+    function setPip(next) {
+      pipOn = next;
+      saveSetting(PIP_KEY, next ? "1" : "0");
+      applyPipLayout();
+    }
+
+    function nextPipCorner() {
+      if (!videosBox.classList.contains("pip")) return;
+      pipCorner = PIP_CORNERS[(PIP_CORNERS.indexOf(pipCorner) + 1) % PIP_CORNERS.length];
+      saveSetting(PIP_CORNER_KEY, pipCorner);
+      applyPipLayout();
+    }
 
     // Map a join error status to a readable message (issue #382 states).
     function joinErrorMessage(status, payload) {
@@ -617,10 +694,12 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
           returnLost = true;
           returnHint.textContent = "Lost the return feed from the studio. The studio still sees and hears you.";
           show(returnHint);
+          applyPipLayout();
         } else if (state === "connected") {
           if (returnLost) {
             returnLost = false;
             returnHint.textContent = "Return feed from the studio.";
+            applyPipLayout();
           }
         }
       });
@@ -680,6 +759,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         watchReturnConnection(pc);
         show(returnVideo);
         show(returnHint);
+        applyPipLayout();
       });
     }
 
@@ -853,6 +933,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       senders = {};
       publishLost = false;
       returnLost = false;
+      applyPipLayout();
       setBanner("Reconnecting to the studio\\u2026", "");
       connect().catch(function (err) {
         senders = {};
@@ -892,6 +973,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       if (localStream) { localStream.getTracks().forEach(function (t) { t.stop(); }); }
       // A page restored from the back/forward cache opens the devices afresh.
       localStream = null;
+      applyPipLayout();
     }
 
     function leave() {
@@ -914,6 +996,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       hide(rejoinBtn);
       hide(pickers);
       mutedIndicator.classList.remove("show");
+      applyPipLayout();
       setBanner("You have left the broadcast. You can close this page.", "left");
     }
 
@@ -948,6 +1031,9 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     camSel.addEventListener("change", function () { onPickerChange("video"); });
     micSel.addEventListener("change", function () { onPickerChange("audio"); });
     deviceRetryBtn.addEventListener("click", reconnectDevices);
+    pipToggle.addEventListener("change", function () { setPip(!!pipToggle.checked); });
+    preview.addEventListener("click", nextPipCorner);
+    returnVideo.addEventListener("playing", applyPipLayout);
     if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
       // Show a newly plugged-in device without a reload.
       navigator.mediaDevices.addEventListener("devicechange", function () {

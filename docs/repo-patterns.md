@@ -575,3 +575,13 @@ recovered the DB through `/reconnect` with empty key caches, so every credential
 closed with a 503 until a restart. Add a new post-connect step to the helper: idempotent steps go
 in `bootstrapKeys()` (run on every call), once-per-process steps go in `runOnceSteps()`. Never add
 a bare `connectDb()` call anywhere else.
+
+## A new element id on the guest page must be added to `guest-page-return-only.test.ts`'s fake DOM
+
+The guest page (`src/routes/guest-page.ts`) looks up every element once at boot with
+`document.getElementById`. Most guest-page tests (`guest-page-return-mode`, `-pip`, `-devices`)
+create fake elements on demand, but `guest-page-return-only.test.ts` builds a fixed list of ids,
+and an unknown id comes back `undefined`. A new element the script touches at boot (an
+`addEventListener` on it, say) then throws inside the VM, and every test in that file fails with
+`Cannot read properties of undefined`. Add the new id to that list (and to `hiddenAtStart` if the
+HTML starts it hidden) in the same PR (hit in #583).

@@ -166,11 +166,13 @@ async function settle() {
 async function loadPage(inv: { id: string; token: string }, options: { slotCheckFails?: boolean } = {}) {
   const html = (await app.inject({ method: 'GET', url: `/guest/${inv.id}` })).body;
   const script = /<script>([\s\S]*?)<\/script>/.exec(html)![1];
-  const hiddenAtStart = new Set(['onair-badge', 'return', 'return-hint', 'rejoin', 'mute', 'leave', 'return-mode', 'self-warning', 'device-alert']);
+  const hiddenAtStart = new Set(['onair-badge', 'return', 'return-hint', 'rejoin', 'mute', 'leave', 'return-mode', 'self-warning', 'device-alert',
+    'pip-option', 'pip-hint']);
   const els: Record<string, FakeElement> = {};
   for (const id of ['banner', 'muted-indicator', 'onair-badge', 'preview', 'preview-hint', 'return',
     'return-hint', 'cam', 'mic', 'pickers', 'golive', 'rejoin', 'mute', 'leave', 'return-mode', 'mode-program-minus',
-    'mode-program', 'self-warning', 'device-alert', 'device-alert-text', 'device-retry']) {
+    'mode-program', 'self-warning', 'device-alert', 'device-alert-text', 'device-retry',
+    'videos', 'pip-option', 'pip-toggle', 'pip-hint']) {
     els[id] = new FakeElement(hiddenAtStart.has(id));
   }
   const tracks: Array<{ kind: string; enabled: boolean; stopped: boolean; stop(): void }> = [];
