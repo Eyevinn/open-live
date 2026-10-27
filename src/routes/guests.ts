@@ -21,10 +21,10 @@ import { config, isGuestCallingEnabled } from '../config.js';
 import { getGuestSigningKey } from '../lib/guest-signing-key.js';
 import { broadcast } from '../services/tally.service.js';
 import { resolvePublicBaseUrl, updateProductionDoc } from './productions.js';
-import { applyReturnMode } from '../ws/controller.js';
+import { applyReturnMode, isInputOnProgram } from '../ws/controller.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { assertSameStromOrigin } from '../lib/url-validation.js';
-import { slotTakesWhip } from '../lib/guest-scope.js';
+import { resolveGuestSession, slotTakesWhip } from '../lib/guest-scope.js';
 import {
   applyGuestSlotMixerLabel,
   guestSlotDefaultLabel,
@@ -890,6 +890,48 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         fastify.log.warn({ err }, 'PUT guests/:id/session/mute — DB write failed');
         return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
       }
+    },
+  );
+
+  // Guest reads whether they are on program (token-authed, issue #592). The
+  // guest page polls this while live to show its ON AIR badge: it holds only the
+  // invite token, never an operator WS connection, so it cannot see the tally.
+  // The guest is untrusted, so the answer is the guest's OWN on-air boolean and
+  // nothing else of the tally. Same identity check as `session/return`: the
+  // invite's LIVE session, whose mixerInput is used (a left guest's token must
+  // not read the state of whoever holds the slot now). A return-only slot (its
+  // source is not WHIP) is never on air as the guest's picture: the guest only
+  // receives the return there, so it always reads false.
+  fastify.get<{ Params: { inviteId: string } }>(
+    '/api/v1/guests/:inviteId/session/status',
+    async (req, reply) => {
+      if (!isGuestCallingEnabled()) return reply.status(503).send(guestsDisabled());
+      const token = bearerToken(req);
+      const who = token ? await resolveGuestSession(token) : undefined;
+      if (!who?.ok || who.invite._id !== req.params.inviteId) {
+        return reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
+      }
+      const { invite, session } = who;
+      let production: ProductionDoc;
+      try {
+        production = await getDb().get(invite.productionId);
+      } catch {
+        return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+      }
+      const slot = production.sources.find((s) => s.mixerInput === session.mixerInput);
+      if (!session.mixerInput || !slot || production.status === 'ended') {
+        return reply.send({ onAir: false });
+      }
+      let takesWhip: boolean;
+      try {
+        takesWhip = await slotTakesWhip(slot);
+      } catch (err) {
+        fastify.log.warn({ err }, 'GET guests/:id/session/status — source lookup failed');
+        return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
+      }
+      return reply.send({
+        onAir: takesWhip && isInputOnProgram(invite.productionId, session.mixerInput),
+      });
     },
   );
 

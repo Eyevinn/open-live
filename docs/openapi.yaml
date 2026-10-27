@@ -1324,6 +1324,18 @@ components:
         defaultMode:
           type: string
 
+    GuestSessionStatus:
+      type: object
+      required: [onAir]
+      additionalProperties: false
+      properties:
+        onAir:
+          type: boolean
+          description: >-
+            True while the guest's input contributes to the program picture (main
+            PGM input or a layer of the PiP on PGM). Always false on a return-only
+            slot.
+
     GuestJoinResult:
       type: object
       required: [guestId, returnOnly, feeds, modes, defaultMode, returnMode]
@@ -3688,6 +3700,52 @@ paths:
                 $ref: '#/components/schemas/Error'
         '503':
           description: Guest calling disabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/guests/{inviteId}/session/status:
+    parameters:
+      - name: inviteId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Guest reads whether they are on program (token-authed)
+      description: >-
+        Whether the guest's own input is on program right now: the main PGM input,
+        or a layer (background or zone source) of the PiP on PGM. The guest page
+        polls this while live to show its ON AIR badge. Returns only the guest's
+        own boolean, no other tally details. Needs the invite's live session; the
+        mixerInput is the session's. A return-only slot (its source is not WHIP)
+        always reads `false`.
+      operationId: guestGetSessionStatus
+      tags: [Guests]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The guest's on-air state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GuestSessionStatus'
+        '401':
+          description: Missing, invalid, revoked or expired invite token, or the guest has left or been removed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Production not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Guest calling disabled, or the source lookup failed
           content:
             application/json:
               schema:

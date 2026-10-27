@@ -88,7 +88,11 @@ function runPage(script: string, opts: PageOpts = {}) {
   const server = { mode: opts.returnMode ?? 'program-minus' };
   // GETs of the return mode wait here until the test releases them.
   const heldGets: Array<() => void> = [];
-  let interval: (() => void) | null = null;
+  // Every running interval by id. The page also runs an on-air poll (issue
+  // #592) on its own timer; these tests drive only the return-mode poll.
+  const intervals = new Map<number, () => void>();
+  let nextIntervalId = 0;
+  const returnPoll = () => [...intervals.values()].find((fn) => fn.name === 'pollReturnMode') ?? null;
   // Timers of 5 s or more (the PUT timeout) wait for the test to fire them.
   const longTimers: Array<() => void> = [];
 
@@ -167,8 +171,8 @@ function runPage(script: string, opts: PageOpts = {}) {
       return setTimeout(fn, ms);
     },
     clearTimeout: () => {},
-    setInterval: (fn: () => void) => { interval = fn; return 1; },
-    clearInterval: () => { interval = null; },
+    setInterval: (fn: () => void) => { intervals.set(++nextIntervalId, fn); return nextIntervalId; },
+    clearInterval: (id: number) => { intervals.delete(id); },
   };
   vm.runInNewContext(script, context);
 
@@ -177,8 +181,8 @@ function runPage(script: string, opts: PageOpts = {}) {
     requests,
     server,
     /** Runs one poll tick, if polling. */
-    tick: () => interval?.(),
-    polling: () => interval !== null,
+    tick: () => returnPoll()?.(),
+    polling: () => returnPoll() !== null,
     releaseGets: () => heldGets.splice(0).forEach((r) => r()),
     fireLongTimers: () => longTimers.splice(0).forEach((fn) => fn()),
     gets: () => requests.filter((r) => r.method === 'GET' && r.url === RETURN_URL).length,
