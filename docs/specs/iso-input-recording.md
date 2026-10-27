@@ -7,7 +7,7 @@
 - Upstream: [Eyevinn/strom#1034](https://github.com/Eyevinn/strom/pull/1034) `builtin.liverecorder` (merged, Strom v0.7.0, 2026-10-08; latest v0.7.1); [Eyevinn/strom#1057](https://github.com/Eyevinn/strom/pull/1057) exact per-file start time (open; not required to record, but **AC 3 for input parts depends on it** since @svensson00's 2026-10-26 decision, see §6)
 - Companion ADR: [`ADR-011`](../decisions/ADR-011-live-recorder-iso-recording.md)
 - Status: Draft (architect, Phase 1 of `skills/epic-workflow.md`). Code references are to `open-live` main at `931715b` and Strom main at `4abc286`.
-- Repos affected: `Eyevinn/open-live` (flow generator, recording pipeline, API, WS, docs), `Eyevinn/open-live-studio` (#233). No Strom change is needed.
+- Repos affected: `Eyevinn/open-live` (flow generator, recording pipeline, API, WS, docs), `Eyevinn/open-live-studio` (#233). ISO input recording needs Strom v0.7.2 or later (strom#1111, see §4.3 Notes and §10.2).
 
 ---
 
@@ -370,8 +370,6 @@ one recorder holding **both** tracks of the input in **one** file (ADR-011 Decis
 // elements
 { "id": "e-inrec-vq-<padIndex>-<suffix>", "element_type": "queue",
   "properties": { "leaky": "downstream", "max-size-buffers": 0, "max-size-bytes": 0, "max-size-time": 1000000000 } }
-{ "id": "e-inrec-vmem-<padIndex>-<suffix>", "element_type": "capsfilter",
-  "properties": { "caps": "video/x-raw" } }                                        // system memory, see Notes
 { "id": "e-inrec-aq-<padIndex>-<suffix>", "element_type": "queue", "properties": { /* same */ } }
 // blocks
 { "id": "b-inrec-venc-<padIndex>-<suffix>", "block_definition_id": "builtin.videoenc",
@@ -385,8 +383,7 @@ one recorder holding **both** tracks of the input in **one** file (ADR-011 Decis
     "max_size_time_secs": 600, "num_video_tracks": 1, "num_audio_tracks": 1 } }
 // links
 { "from": "<videoTap>",                   "to": "e-inrec-vq-…:sink" }
-{ "from": "e-inrec-vq-…:src",             "to": "e-inrec-vmem-…:sink" }
-{ "from": "e-inrec-vmem-…:src",           "to": "b-inrec-venc-…:video_in" }
+{ "from": "e-inrec-vq-…:src",             "to": "b-inrec-venc-…:video_in" }   // no memory pin, see Notes
 { "from": "b-inrec-venc-…:encoded_out",   "to": "b-inrec-…:video_in_0" }
 { "from": "<audioTap>",                   "to": "e-inrec-aq-…:sink" }
 { "from": "e-inrec-aq-…:src",             "to": "b-inrec-…:audio_in_0" }      // raw; the block encodes AAC
@@ -409,13 +406,15 @@ Notes:
 - The leaky queue (from #411) gives the encoder its own thread and drops frames from the
   recording rather than back-pressuring the tee that feeds the mixers. A recording may drop; the
   program must not.
-- The `e-inrec-vmem-…` capsfilter (`caps: "video/x-raw"`, no caps features, so system memory)
-  sits between the leaky queue and the encoder because, on a GPU Strom, the decoder keeps frames
-  in CUDA memory and `autovideoconvert` inside `builtin.videoenc` turns them into GLMemory that
-  `nvh264enc` won't encode, so the file ends up audio-only (#569, Eyevinn/strom#1104). Trade-off:
-  the constraint reaches the decoder through the tee, so a recorded input's mixer branch also gets
-  system memory (the GPU mixer uploads it again); inputs that are not recorded keep GPU memory.
-  Drop the capsfilter once strom#1104 makes `videoenc` accept CUDA input itself.
+- The leaky queue feeds `builtin.videoenc` directly. On a GPU Strom the decoder keeps frames in
+  CUDA memory; Strom v0.7.2 and later (Eyevinn/strom#1111, `a0e32bb`) adapt CUDA input inside
+  `videoenc` itself, so the encoder negotiates and the recorded input's mixer branch keeps GPU
+  memory. Before that, `autovideoconvert` inside `builtin.videoenc` turned CUDA frames into
+  GLMemory that `nvh264enc` would not encode and the file came out audio-only (#569,
+  Eyevinn/strom#1104); open-live pinned system memory with an `e-inrec-vmem-…` capsfilter until
+  #588 removed it. **ISO recording therefore requires Strom v0.7.2 or later**; on an older GPU
+  Strom, input files are audio-only. There is no runtime version gate (ADR-011 Decision 1: detection
+  is by block list, not version).
 - An audio-only guest or a camera without sound: Live Recorder releases a connected track that
   carries nothing for 20 s and starts the file without it (strom#1034 "Late tracks"), so one
   two-track recorder still records the other track. A track that stops later leaves a gap in the
@@ -695,8 +694,10 @@ README/OSC config docs.
 
 ### 10.2 Strom
 
-- Requires nothing new from Strom. Live Recorder is present from Strom v0.7.0; detection is by
-  block list, so any build that has the block works and older ones fall back.
+- Requires Strom v0.7.2 or later for ISO input recording (Eyevinn/strom#1111, `a0e32bb`:
+  `builtin.videoenc` adapts CUDA input memory itself, #588). Live Recorder is present from Strom
+  v0.7.0 and detection is by block list, so v0.7.0/v0.7.1 still activate and record program, but
+  on a GPU Strom older than v0.7.2 the input files are audio-only. No runtime version gate.
 - Disk on the Strom host: each recorded input adds roughly
   `RECORDING_INPUT_VIDEO_BITRATE_KBPS` + ~128 kbit/s of AAC ≈ 1.9 GB/h at the default, held until
   each part uploads (`RECORDING_SEGMENT_SECS` + stability wait, or until deactivate with
