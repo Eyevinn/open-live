@@ -13,7 +13,9 @@ import type { FastifyPluginAsync } from 'fastify';
  * (WHIP), and plays the return feed from `feeds[].url` (WHEP). Once live, the
  * guest picks what they hear (program minus themselves, or full program) with
  * `PUT …/session/return`, and the page polls `GET …/session/return` so a change
- * the crew makes shows up here too. On a return-only slot (its source is not
+ * the crew makes shows up here too. While live it also polls
+ * `GET …/session/status` (the guest's own `onAir` flag, issue #592) and shows
+ * the ON AIR badge while the guest's input is on program. On a return-only slot (its source is not
  * WHIP, e.g. an SRT encoder) the page never asks for a camera or microphone and
  * only plays the return; it learns which from `GET /api/v1/guests/:inviteId/slot`
  * before touching any device.
@@ -278,6 +280,15 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     // as gone (kicked, invite revoked) after MODE_MAX_REFUSALS of them.
     var modeRefusals = 0;
     var MODE_MAX_REFUSALS = 3;
+    // Whether the guest's input is on program (issue #592), and the poll that
+    // keeps it in step with the server. It has its own timer because the return
+    // switch is not always offered; it polls at the same rate and stops the same
+    // way (leave, or MODE_MAX_REFUSALS 401s in a row). Never runs on a
+    // return-only slot: the guest's picture is not what goes to air there.
+    var onAir = false;
+    var onAirPoll = null;
+    var onAirSeq = 0;
+    var onAirRefusals = 0;
     // Picture-in-picture self view (issue #583): off by default, remembered in
     // the browser. Corners go clockwise when the guest taps the inset.
     var PIP_KEY = "openlive.guest.pip";
@@ -290,6 +301,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     function setBanner(text, cls) {
       banner.textContent = text;
       banner.className = cls || "";
+      if (onAir && cls === "live") banner.classList.add("onair");
     }
 
     function show(el) { el.classList.remove("hidden"); }
@@ -852,6 +864,53 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       hide(selfWarning);
     }
 
+    // ---- On air ------------------------------------------------------------
+    // Shows the ON AIR badge, and turns the live banner red, while the server
+    // says the guest's input is on program.
+    function applyOnAir(next) {
+      onAir = next;
+      if (onAir) show(onairBadge);
+      else hide(onairBadge);
+      if (onAir && banner.classList.contains("live")) banner.classList.add("onair");
+      else banner.classList.remove("onair");
+    }
+
+    function statusUrl() {
+      return apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/session/status";
+    }
+
+    function pollOnAir() {
+      var seq = onAirSeq;
+      fetch(statusUrl(), {
+        headers: { "Authorization": "Bearer " + token }
+      }).then(function (res) {
+        if (res.status === 401) {
+          if (seq === onAirSeq && ++onAirRefusals >= MODE_MAX_REFUSALS) stopOnAir();
+          return null;
+        }
+        if (!res.ok) return null;
+        onAirRefusals = 0;
+        return res.json();
+      }).then(function (data) {
+        // Drop an answer that started before the poll was stopped or restarted.
+        if (!live || !onAirPoll || seq !== onAirSeq || !data) return;
+        applyOnAir(data.onAir === true);
+      }).catch(function () { /* try again next tick */ });
+    }
+
+    function startOnAir() {
+      stopOnAir();
+      onAirPoll = setInterval(pollOnAir, MODE_POLL_MS);
+      pollOnAir();
+    }
+
+    function stopOnAir() {
+      onAirSeq++;
+      onAirRefusals = 0;
+      if (onAirPoll) { clearInterval(onAirPoll); onAirPoll = null; }
+      applyOnAir(false);
+    }
+
     // ---- Go live -----------------------------------------------------------
     // Joins the session and publishes (and plays the return feed). Shared by the
     // first "Go live" and by "Rejoin" after the connection drops; both reuse the
@@ -896,6 +955,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
           : "You are connected. You hear the studio here; your camera reaches it separately.", "live");
         updateDeviceAlert();
         startReturnMode(joinData);
+        if (joinData.whipUrl) startOnAir();
         // Play the return feed(s), if any are live yet. Failure here is
         // non-fatal: the guest is still contributing even without return video.
         var feeds = (joinData && joinData.feeds) || [];
@@ -928,6 +988,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       rejoinBtn.disabled = true;
       clearPublishDisconnect();
       stopReturnMode();
+      stopOnAir();
       if (publishPc) { try { publishPc.close(); } catch (e) {} publishPc = null; }
       if (returnPc) { try { returnPc.close(); } catch (e) {} returnPc = null; }
       senders = {};
@@ -968,6 +1029,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       hide(deviceAlert);
       clearPublishDisconnect();
       stopReturnMode();
+      stopOnAir();
       if (publishPc) { try { publishPc.close(); } catch (e) {} publishPc = null; }
       if (returnPc) { try { returnPc.close(); } catch (e) {} returnPc = null; }
       if (localStream) { localStream.getTracks().forEach(function (t) { t.stop(); }); }

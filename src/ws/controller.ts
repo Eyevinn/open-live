@@ -14,7 +14,7 @@ import {
 import { getClipStateEntry, getAllClipStates, setClipStateEntry, clearClipState } from '../services/clip-state.service.js';
 import { persistClipCue, clearPersistedClipCue } from '../services/clip-cue-store.js';
 import { startClipRelay, stopClipRelay, reconcileClipRelay } from '../services/clip-relay.js';
-import { CONTRACT_VERSION, computeTallyContributions } from '../services/automation-contract.js';
+import { CONTRACT_VERSION, computeTallyContributions, isMixerInputOnProgram } from '../services/automation-contract.js';
 import { startMeterRelay, stopMeterRelay, reconcileMeterRelay } from '../services/meter-relay.js';
 import { StromClient, StromClientError, StromPropertiesRejectedError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms, type VideoEffect, type EffectTarget, type SetVideoEffectRequest } from '../lib/strom.js';
 import { mixerInputToStromPad, storedPadToStromPad, expandToStoredPadIndex } from '../lib/mixer-input-map.js';
@@ -1059,6 +1059,23 @@ function buildTallyPayload(
   return { pgm: tally.pgm, pvw: tally.pvw, pgmBg, pgmPip, pvwPip, program, preview, contributions };
 }
 
+
+/**
+ * Whether a mixer input is on program right now (issue #592) — as the main PGM
+ * input, or as a layer of the PiP on PGM (its background or a zone source).
+ * Read from the same in-memory switch state the TALLY broadcast is built from.
+ * Backs the guest-scoped `GET /api/v1/guests/:inviteId/session/status`, so the
+ * guest page can show its ON AIR badge without an operator WS connection.
+ */
+export function isInputOnProgram(productionId: string, mixerInput: string): boolean {
+  return isMixerInputOnProgram(
+    mixerInput,
+    getTally(productionId).pgm,
+    pgmPipByProduction.get(productionId) ?? null,
+    pgmBgOf(productionId),
+    pipConfigsByProduction.get(productionId),
+  );
+}
 
 /** Wipe all per-production audio state. Called when the pipeline changes or production deactivates. */
 export function clearAudioState(productionId: string): void {

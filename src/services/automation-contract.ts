@@ -167,3 +167,38 @@ function addPipZoneSources(
     }
   }
 }
+
+/**
+ * Whether `mixerInput` contributes to the program picture (issue #592): it is
+ * the main PGM input, the real background behind a PiP that is on PGM, or a
+ * source in one of that PiP's zones. Uses the same contribution rules as the
+ * controller's TALLY (`computeTallyContributions`), so the guest page's ON AIR
+ * badge agrees with the studio's tally. Preview, DSK and graphics overlays do
+ * not matter here: a guest slot is a `video_in_N` pad, never a keyer or overlay.
+ *
+ * @param mixerInput - the guest slot's pad name, e.g. 'video_in_15'
+ * @param pgm        - current PGM mixer input (null while a PiP is on PGM)
+ * @param pgmPip     - PiP slot index on PGM, or null
+ * @param pgmBg      - the real input behind the PiP on PGM, or null
+ * @param pipConfigs - per-slot PiP layout (bg + zones); may be undefined
+ */
+export function isMixerInputOnProgram(
+  mixerInput: string,
+  pgm: string | null,
+  pgmPip: number | null,
+  pgmBg: string | null,
+  pipConfigs: PipConfig[] | undefined,
+): boolean {
+  const { program } = computeTallyContributions(
+    pgm,
+    null,
+    pgmPip,
+    null,
+    pgmBg,
+    null,
+    pipConfigs,
+    undefined,
+    [],
+  );
+  return program.includes(mixerInput);
+}

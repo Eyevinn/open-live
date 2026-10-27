@@ -582,3 +582,14 @@ and an unknown id comes back `undefined`. A new element the script touches at bo
 `addEventListener` on it, say) then throws inside the VM, and every test in that file fails with
 `Cannot read properties of undefined`. Add the new id to that list (and to `hiddenAtStart` if the
 HTML starts it hidden) in the same PR (hit in #583).
+
+## Guest-page VM tests: the page now runs more than one `setInterval`
+
+The guest page (`src/routes/guest-page.ts`) runs two independent polls while live: the
+return-mode poll (`pollReturnMode`, only when the return switch is offered) and the on-air poll
+(`pollOnAir`, issue #592, only on a WHIP slot). A VM test fake that keeps a single
+`interval` slot (`setInterval: (fn) => { interval = fn }`) silently ends up driving whichever
+poll registered last. Fakes that tick a poll must keep intervals by id and pick the one they
+want by function name (`fn.name === 'pollReturnMode'`), as `guest-page-return-mode.test.ts`
+and `guest-page-on-air.test.ts` do. The on-air answer (`GET …/session/status`) is the guest's own
+`{ onAir }` boolean only — never widen it with other tally fields; the guest is untrusted.
