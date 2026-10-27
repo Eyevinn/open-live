@@ -2,20 +2,14 @@
 
 # open-live
 
-Open Live is a cloud-native live broadcast production suite that replaces traditional hardware — vision mixers, audio consoles, and multiviewers — with a fully browser-based solution. This repository is the central API server. The browser-based production controller lives in [open-live-studio](https://github.com/Eyevinn/open-live-studio).
+Open Live is an open source, browser-based live production suite: vision mixer, audio mixer and multiviewer for remote and cloud production, with SRT and WHIP contribution. This repository is the API server; the production controller is [open-live-studio](https://github.com/Eyevinn/open-live-studio) and the media engine is [Strom](https://github.com/Eyevinn/strom).
 
 ## Try it on OSC
 
-The fastest way to try Open Live — no Kubernetes required.
+The quickest way to try it is the managed version on Open Source Cloud at [openlive.apps.osaas.io](https://openlive.apps.osaas.io). Plans and included production hours are listed in the [pricing section](https://openlive.apps.osaas.io/#pricing) on that page. You can also self-host it: see the [self-hosting guide](https://openlive.apps.osaas.io/guides/self-hosting-open-live).
 
-Visit **[openlive.apps.osaas.io](https://openlive.apps.osaas.io)** to spin up a managed Open Live instance on Open Source Cloud. Start for an event, tear down after. No infrastructure to manage and no monthly minimum.
-
-- 14-day free trial, free plan available
-- 15 EUR/month (self-hosted Strom) or 69 EUR/month (shared GPU in Frankfurt — **demo purposes
-  only**; the Frankfurt GPU is shared between all users on this plan, capacity is not guaranteed
-  and performance varies with load, so it is not suitable for live production)
-- For guaranteed capacity and live production, add a **Hosted GPU** add-on (from 750 EUR/month) —
-  see the pricing card on [openlive.apps.osaas.io](https://openlive.apps.osaas.io)
+For dedicated GPU capacity, see the **Hosted GPU** add-on in the same
+[pricing section](https://openlive.apps.osaas.io/#pricing).
 
 The in-app **Create New Open Live** flow provisions CouchDB for you and generates its admin
 password automatically. You do not choose or handle that password yourself on this path.
@@ -23,21 +17,15 @@ The `COUCHDB_URL` environment variable documented under [Configuration](#configu
 below is only for a self-hosted deployment where you run CouchDB yourself; it does not apply
 to the managed OSC flow above.
 
-**Before you start, two things that are not obvious from the pricing line above:**
-
-- **Shared Strom (the 69 EUR/month option) requires the Professional plan or above.** If your
-  account is not eligible, the app shows this up front when you open the environment, not as a
-  failed submission after you try to create one.
-- **Your own ("BYO") Strom instance has no plan requirement, but its URL must be publicly
-  reachable.** A plain local-network or loopback address is rejected, and so is any address
-  that is not reachable from OSC, including a plain Tailscale or other mesh-VPN address in the
-  `100.64.0.0/10` range even though it clears the initial check. To expose a locally hosted
-  Strom instance without port-forwarding, use a public ingress feature such as
-  [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) (opt-in, off by default; also
-  implemented by self-hosted [Headscale](https://github.com/juanfont/headscale)), which gives
-  the instance a genuinely public `ts.net` hostname. On the free plan this path is metered by
-  your one-time token allowance rather than gated by plan, so budget for that if you are
-  testing rather than running on a paid plan.
+**Before you start, one thing that is not obvious from the pricing section:** if you connect
+your own ("BYO") Strom instance, its URL must be publicly reachable. A plain local-network or
+loopback address is rejected, and so is any address that is not reachable from OSC, including
+a plain Tailscale or other mesh-VPN address in the `100.64.0.0/10` range even though it clears
+the initial check. To expose a locally hosted Strom instance without port-forwarding, use a
+public ingress feature such as [Tailscale Funnel](https://tailscale.com/kb/1223/funnel)
+(opt-in, off by default; also implemented by self-hosted
+[Headscale](https://github.com/juanfont/headscale)), which gives the instance a genuinely
+public `ts.net` hostname.
 
 ## Features
 
