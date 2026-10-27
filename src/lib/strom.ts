@@ -98,6 +98,21 @@ export interface BlockDefinition {
   links: FlowLink[]
   inputs?: string[]
   outputs?: string[]
+  /**
+   * Properties a block exposes (Strom `types/src/block.rs` `ExposedProperty`).
+   * Only `name` is read here — capability checks key off a property's presence.
+   */
+  exposed_properties?: BlockExposedProperty[]
+}
+
+/** One entry of a block definition's `exposed_properties` (subset Open Live reads). */
+export interface BlockExposedProperty {
+  name: string
+  label?: string
+  description?: string
+  property_type?: unknown
+  default_value?: unknown
+  live?: boolean
 }
 
 export interface BlockResponse {

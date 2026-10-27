@@ -5,7 +5,7 @@ import type {
 } from '../db/types.js';
 import { getSourcesDb, getGraphicsDb } from '../db/index.js';
 import { deserializeClipReference } from './clip-reference.js';
-import { StromClient } from './strom.js';
+import { StromClient, type BlockDefinition } from './strom.js';
 import { config } from '../config.js';
 import { DEFAULT_FLOW, type FlowTopology } from './default-flow.js';
 import { decryptAddressPassphrase } from './srt-passphrase-crypto.js';
@@ -105,24 +105,12 @@ export type { ActivationWarning, AudioStreamNotAppliedReason };
 export const MAX_APPLIED_AUDIO_STREAM_INDEX = 7;
 
 /**
- * Whether Strom's `builtin.mpegtssrt_input` maps `audio_out_<k>` to the k-th
- * audio stream in ascending PID order (spec §5.3 rule 3, ADR-010). The predicate
- * is defined by the upstream follow-up Eyevinn/strom#1081, which has not landed,
- * so this is `false` for every Strom today. Wiring an unordered `audio_out_k` is
- * the #510 failure mode, so the answer must stay `false` until the real
- * capability signal exists — do not guess it.
- */
-function stromMapsAudioByPid(): boolean {
-  return false;
-}
-
-/**
  * Decide whether an SRT/EFP source's selected audio stream can be applied
  * (spec §5.4). Returns `null` when nothing needs reporting (k = 0, or applied),
  * otherwise the reason the input is clamped to the first stream. A `null` for
- * k > 0 means "apply k": the `num_audio_tracks` / `audio_out_<k>` / drain wiring
- * for that case (spec §8 step 3) is gated on strom#1081 and is only reachable
- * once `stromMapsAudioByPid()` can return true.
+ * k > 0 means "apply k": `num_audio_tracks = k + 1` + `map_audio_by_pid`,
+ * `audio_out_<k>` linked and every other output drained (spec §5.3). `capability`
+ * is {@link stromMapsAudioByPid}.
  */
 export function audioStreamNotAppliedReason(
   streamType: SourceDoc['streamType'],
@@ -144,16 +132,33 @@ const AUDIO_STREAM_REASON_TEXT: Record<AudioStreamNotAppliedReason, string> = {
 };
 
 /**
- * The block definition ids Strom offers, or `null` when the list cannot be
- * read. Fetched once per activation that wires a recorder (OL-32a, spec §4.1).
+ * The block definitions Strom offers, or `null` when the list cannot be read.
+ * Fetched at most once per activation, and only when something needs it: a
+ * recorder (OL-32a, spec §4.1) or an SRT source selecting audio stream k > 0
+ * (spec §5.3 rule 3).
  */
-async function readStromBlockIds(strom: Pick<StromClient, 'blocks'>): Promise<ReadonlySet<string> | null> {
+async function readStromBlocks(strom: Pick<StromClient, 'blocks'>): Promise<readonly BlockDefinition[] | null> {
   try {
     const { blocks } = await strom.blocks.list();
-    return new Set(blocks.map((b) => b.id));
+    return blocks;
   } catch {
     return null;
   }
+}
+
+/**
+ * Whether Strom's `builtin.mpegtssrt_input` can map `audio_out_<k>` to the k-th
+ * audio stream in ascending PID order (spec §5.3 rule 3, ADR-010). The
+ * capability is the opt-in Bool property `map_audio_by_pid` in the block's
+ * `exposed_properties` (Eyevinn/strom#1081, shipped by strom#1120 in
+ * v0.8.0-alpha.1). An unreadable block list answers `false` — the opposite
+ * default to {@link stromHasAudioEncoder}, on purpose: wiring an unordered
+ * `audio_out_k` is the #510 failure mode, so without proof the selection is
+ * clamped and reported instead.
+ */
+export function stromMapsAudioByPid(blocks: readonly BlockDefinition[] | null): boolean {
+  const def = blocks?.find((b) => b.id === 'builtin.mpegtssrt_input');
+  return def?.exposed_properties?.some((p) => p.name === 'map_audio_by_pid') ?? false;
 }
 
 /**
@@ -268,6 +273,11 @@ export async function activateStromFlow(
       console.warn(`[flow-generator] Source ${assignment.sourceId} (${assignment.mixerInput}) not found — skipping`);
     }
   }
+
+  // Strom's block catalog, read lazily and at most once per activation: an
+  // activation with no recorder and no SRT audio-stream selection never asks.
+  let stromBlocks: Promise<readonly BlockDefinition[] | null> | undefined;
+  const getStromBlocks = () => (stromBlocks ??= readStromBlocks(strom));
 
   // Deep-clone the default flow so we don't mutate the module-level constant
   const flow = JSON.parse(JSON.stringify(DEFAULT_FLOW)) as FlowTopology;
@@ -1002,11 +1012,17 @@ export async function activateStromFlow(
       }
     } else {
       // srt → builtin.mpegtssrt_input, efp → builtin.efpsrt_input
-      // Audio-stream selection (spec §5.3/§5.4, ADR-010): until Strom maps
-      // audio_out_<k> by PID order (strom#1081) every k > 0 is clamped to the
-      // first stream — the block and links stay byte-identical to k = 0 — and
-      // the operator gets a warning on this input.
-      const notApplied = audioStreamNotAppliedReason(source.streamType, source.audioStreamIndex, stromMapsAudioByPid());
+      // Audio-stream selection (spec §5.3/§5.4, ADR-010): an srt source with
+      // 0 < k <= 7 on a Strom that maps audio_out_<k> by PID order
+      // (map_audio_by_pid, strom#1081) gets k + 1 audio outputs with audio_out_<k>
+      // selected. Every other k > 0 is clamped to the first stream — the block
+      // and links stay byte-identical to k = 0 — and the operator gets a warning
+      // on this input. Strom's block list is only read when it can matter.
+      const k = source.audioStreamIndex ?? 0;
+      const capability = source.streamType === 'srt' && k > 0 && k <= MAX_APPLIED_AUDIO_STREAM_INDEX
+        ? stromMapsAudioByPid(await getStromBlocks())
+        : false;
+      const notApplied = audioStreamNotAppliedReason(source.streamType, source.audioStreamIndex, capability);
       if (notApplied) {
         const requestedIndex = source.audioStreamIndex ?? 0;
         const label = `${source.name} (${source.streamType === 'efp' ? 'EFP' : 'SRT'})`;
@@ -1022,6 +1038,8 @@ export async function activateStromFlow(
             AUDIO_STREAM_REASON_TEXT[notApplied],
         });
       }
+      const selectedAudio = k > 0 && !notApplied ? k : 0;
+      const audioPad = `${inputId}:audio_out_${selectedAudio}`;
       flow.blocks.push({
         id: inputId,
         block_definition_id: source.streamType === 'efp' ? 'builtin.efpsrt_input' : 'builtin.mpegtssrt_input',
@@ -1029,11 +1047,25 @@ export async function activateStromFlow(
         properties: {
           srt_uri: source.address || 'srt://127.0.0.1:5005?mode=caller',
           latency: source.latency ?? 125,
+          ...(selectedAudio > 0 && { num_audio_tracks: selectedAudio + 1, map_audio_by_pid: true }),
         },
         position: { x: COL_INPUT, y: yPos },
       });
       flow.links.push({ from: `${inputId}:video_out`, to: `${offsetId}:in` });
-      inputTaps.set(assignment.mixerInput, { video: `${inputId}:video_out`, audio: `${inputId}:audio_out_0`, padIndex, y: yPos });
+      inputTaps.set(assignment.mixerInput, { video: `${inputId}:video_out`, audio: audioPad, padIndex, y: yPos });
+      // Every audio output Strom creates must be linked exactly once (spec §5.3
+      // rule 1, the group_out_N precedent): drain the unselected ones. async:
+      // false so a drain that never gets a buffer cannot hold up preroll.
+      for (let j = 0; j < selectedAudio; j++) {
+        const drainId = `e-audio-drain-${padIndex}-${j}-${endpointSuffix}`;
+        flow.elements.push({
+          id: drainId,
+          element_type: 'fakesink',
+          properties: { sync: false, async: false },
+          position: [COL_ELEM, yPos + 40 * j],
+        } as unknown as typeof flow.elements[number]);
+        flow.links.push({ from: `${inputId}:audio_out_${j}`, to: `${drainId}:sink` });
+      }
       // Audio goes via the delay block to both vision mixer and audio mixer so
       // operators can trim lipsync and vision mixer audio stays in sync.
       const audioOffsetId = `b-audio-offset-${padIndex}-${endpointSuffix}`;
@@ -1045,7 +1077,7 @@ export async function activateStromFlow(
         position: { x: COL_OFFSET, y: yPos + 80 },
       });
       sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetId;
-      flow.links.push({ from: `${inputId}:audio_out_0`, to: `${audioOffsetId}:in` });
+      flow.links.push({ from: audioPad, to: `${audioOffsetId}:in` });
       flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${stromPad}` });
       if (audioMixerBlock && audioMixerBlockId) {
         flow.links.push({ from: `${audioOffsetId}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
@@ -1187,7 +1219,8 @@ export async function activateStromFlow(
           ? { max_size_time_secs: config.recordingSegmentSecs }
           : {};
         // Live Recorder or Recorder, chosen once per activation (OL-32a, spec §4.1).
-        const blockIds = await readStromBlockIds(strom);
+        const catalog = await getStromBlocks();
+        const blockIds = catalog ? new Set(catalog.map((b) => b.id)) : null;
         const useType = chooseRecorderType(blockIds);
         if (useType === 'liverecorder') {
           // Live Recorder (spec §4.2): fragmented MP4 through a live muxer, so a

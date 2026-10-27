@@ -1,9 +1,17 @@
 # ADR-010: Audio-stream selection is applied by wiring `audio_out_<index>` of a multi-output `builtin.mpegtssrt_input` (PID-ordered upstream), MPEG-TS/SRT only in v1, clamped to the first stream with an input-scoped Studio warning
 
 **Date**: 2026-10-17
-**Status**: Proposed. Gated on an upstream Strom capability that does not exist yet: a stable
-mapping of `audio_out_k` to the k-th audio stream in PID order on `builtin.mpegtssrt_input`
-(follow-up to [Eyevinn/strom#1077](https://github.com/Eyevinn/strom/issues/1077), not yet filed).
+**Status**: Accepted (2026-10-27). The upstream capability shipped as
+[Eyevinn/strom#1081](https://github.com/Eyevinn/strom/issues/1081) (PR
+[Eyevinn/strom#1120](https://github.com/Eyevinn/strom/pull/1120), `dc2d228`, first released in
+Strom `v0.8.0-alpha.1`): the opt-in Bool property `map_audio_by_pid` on
+`builtin.mpegtssrt_input` maps `audio_out_k` to the k-th audio stream in ascending PID order,
+falls back in-block to the first stream when the k-th is missing, and is the capability signal
+Open Live detects in `GET /api/blocks` (Decision 2c). Implemented in
+[Eyevinn/open-live#545](https://github.com/Eyevinn/open-live/issues/545). Because the
+property is opt-in, Decision 1's "no new property" is amended: the k > 0 shape also sets
+`map_audio_by_pid: true`. The runtime `stream-not-present` signal (Decision 4) is not yet
+exposed through Strom's flows API and is a follow-up.
 
 > Supersedes **Decisions 4 and 5** of
 > [ADR-006](ADR-006-audio-stream-selection.md). ADR-006 Decisions 1–3 (persist
