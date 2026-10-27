@@ -759,9 +759,9 @@ async function runActivationFlow(
       ...(mixerBlockId !== undefined && { mixerBlockId }),
       ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
       ...(loudnessMainBlockId !== undefined && { loudnessMainBlockId }),
-      ...(activation.recorderBlockId !== undefined && { recorderBlockId: activation.recorderBlockId }),
-      // Written with recorderBlockId, as undefined without a recorder so a
-      // stale value from an earlier activation never leaks into this one.
+      // Always written, as undefined without a recorder, so a stale value from
+      // an earlier activation never leaks into this one.
+      recorderBlockId: activation.recorderBlockId,
       recorderType: activation.recorderBlockId !== undefined ? activation.recorderType ?? 'recorder' : undefined,
       // The inputs recorded to their own files (OL-32); undefined when none, so
       // a stale list from an earlier activation never leaks into this one.
@@ -1017,6 +1017,9 @@ async function runActivationFlow(
       pgmWhepEndpoint: undefined,
       whipEndpoints: undefined,
       activationWarnings: undefined,
+      recorderBlockId: undefined,
+      recorderType: undefined,
+      recording: undefined,
       inputRecordings: undefined,
     }).catch((resetErr) => {
       log.error({ resetErr, productionId }, 'Failed to reset production to inactive after activation failure');
