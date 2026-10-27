@@ -1345,17 +1345,11 @@ export async function activateStromFlow(
   // each branch drops frames from the recording rather than back-pressuring the
   // tee that feeds the mixers: a recording may drop, the program must not.
   //
-  // The video branch pins system memory (`video/x-raw`, no caps features) in
-  // front of builtin.videoenc. On a GPU Strom the input decodes to
-  // video/x-raw(memory:CUDAMemory); fed that, videoenc's autovideoconvert goes
-  // CUDA -> cudadownload -> GL and hands nvh264enc GLMemory it never encodes
-  // (its src stays NOT NEGOTIATED), so Live Recorder drops the video track
-  // after 20 s and every input file is audio-only (#569, dev run 2026-10-25).
-  // From system memory the same videoenc encodes. The constraint reaches the
-  // decoder through the tee, so a recorded input's mixer branch gets system
-  // memory too (the GPU mixer uploads it); unrecorded inputs keep GPU memory.
-  // On a Strom whose inputs are already in system memory it changes nothing.
-  // Drop it once Strom's videoenc adapts CUDA input itself.
+  // The video branch feeds builtin.videoenc straight from its queue. On a GPU
+  // Strom the input decodes to video/x-raw(memory:CUDAMemory); Strom v0.7.2+
+  // (strom#1111) adapts that memory inside videoenc, so no system-memory
+  // capsfilter is needed (#588, which removed the #569 workaround). On an
+  // older GPU Strom the input files come out audio-only.
   const inputRecorders: ActiveInputRecording[] = [];
   {
     const plan = planInputRecordings(
@@ -1380,14 +1374,12 @@ export async function activateStromFlow(
       // Keyed by the STORED pad index, like b-offset-N — never the compacted one.
       const n = tap.padIndex;
       const vqId = `e-inrec-vq-${n}-${endpointSuffix}`;
-      const vmemId = `e-inrec-vmem-${n}-${endpointSuffix}`;
       const aqId = `e-inrec-aq-${n}-${endpointSuffix}`;
       const vencId = `b-inrec-venc-${n}-${endpointSuffix}`;
       const recId = `b-inrec-${n}-${endpointSuffix}`;
       const outputDir = inputRecordingDir(production._id, assignment.mixerInput);
       flow.elements.push(
         { id: vqId, element_type: 'queue', properties: { ...leakyQueue }, position: [COL_INREC - 200, tap.y] },
-        { id: vmemId, element_type: 'capsfilter', properties: { caps: 'video/x-raw' }, position: [COL_INREC - 100, tap.y] },
         { id: aqId, element_type: 'queue', properties: { ...leakyQueue }, position: [COL_INREC - 200, tap.y + 60] },
       );
       flow.blocks.push(
@@ -1416,8 +1408,7 @@ export async function activateStromFlow(
       );
       flow.links.push(
         { from: tap.video, to: `${vqId}:sink` },
-        { from: `${vqId}:src`, to: `${vmemId}:sink` },
-        { from: `${vmemId}:src`, to: `${vencId}:video_in` },
+        { from: `${vqId}:src`, to: `${vencId}:video_in` },
         { from: `${vencId}:encoded_out`, to: `${recId}:video_in_0` },
         { from: tap.audio, to: `${aqId}:sink` },
         { from: `${aqId}:src`, to: `${recId}:audio_in_0` },

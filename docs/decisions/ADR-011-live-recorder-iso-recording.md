@@ -1,7 +1,7 @@
 # ADR-011: Program and ISO input recording use Strom's Live Recorder, one A/V file per recorded input, with a `builtin.recorder` fallback that never drops program
 
 **Date**: 2026-10-25
-**Status**: Proposed (amended 2026-10-26, see Amendment 1)
+**Status**: Proposed (amended 2026-10-26, see Amendment 1; Decision 2 superseded 2026-10-27, see Amendment 2)
 
 > Companion spec: [`docs/specs/iso-input-recording.md`](../specs/iso-input-recording.md).
 > Issue: [Eyevinn/open-live#569](https://github.com/Eyevinn/open-live/issues/569) (OL-32), incl.
@@ -47,7 +47,8 @@ Constraints:
    is raised **only if** some input asked to be recorded. Detection is by block list, not by Strom
    version, and fails toward the block every Strom has.
 
-2. **Taps before the lipsync offset, re-encoded.** Each recorded input (WHIP, SRT, EFP) is tapped
+2. **Taps before the lipsync offset, re-encoded.** *(Superseded by Amendment 2, #588 / strom#1111:
+   the `capsfilter` is removed.)* Each recorded input (WHIP, SRT, EFP) is tapped
    at the pad that feeds its `time_offset` blocks, so the file holds the feed as it arrived. Video
    goes through a leaky queue, a `capsfilter` pinning `video/x-raw` (system memory, so a GPU
    Strom's CUDA-memory decode can be encoded; Eyevinn/strom#1104) and `builtin.videoenc` (H.264,
@@ -148,3 +149,16 @@ event start for now, and make AC 3 for input parts depend on strom#1057 (`start_
 being deployed on the dev Strom, rather than restating the 1 s bound. Recording itself still ships
 without strom#1057. Spec §6 ("Anchor for AC 3") and Q8 describe the anchor and how AC 3 is verified
 once strom#1057 is available.
+
+## Amendment 2: Decision 2 superseded — no system-memory capsfilter (2026-10-27)
+
+**Issues**: #588 (OL-39), Eyevinn/strom#1111 (merged as `a0e32bb`, in Strom v0.7.2). Decision 2 is
+superseded in one respect only: the video branch no longer has a `capsfilter` pinning
+`video/x-raw`. Strom v0.7.2's `builtin.videoenc` adapts CUDA input memory itself, so the leaky
+queue feeds `builtin.videoenc` directly (`e-inrec-vq-…:src` → `b-inrec-venc-…:video_in`), and a
+recorded input's mixer branch keeps GPU memory. The tap point, leaky queues, H.264 re-encode,
+60-frame GOP, bitrate and raw-audio path are unchanged.
+
+Consequence: ISO input recording requires Strom v0.7.2 or later; on an older GPU Strom the input
+files come out audio-only. No runtime Strom-version gate is added — Decision 1's block-list
+detection stands.
