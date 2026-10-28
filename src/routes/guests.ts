@@ -1,4 +1,4 @@
-import type { FastifyBaseLogger, FastifyPluginAsync, FastifyRequest } from 'fastify';
+import type { FastifyBaseLogger, FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import {
@@ -39,6 +39,12 @@ import {
   provisionGuestLine,
   IntercomManagerError,
   type IntercomLine,
+  postTalkbackOffer,
+  deleteTalkbackSession,
+  talkbackUsername,
+  isTalkbackSessionId,
+  TALKBACK_SDP_MAX_BYTES,
+  type TalkbackKind,
 } from '../lib/intercom-manager.js';
 
 /**
@@ -125,10 +131,13 @@ function inviteToApi(doc: GuestInviteDoc) {
 }
 
 function sessionToApi(doc: GuestSessionDoc) {
-  const { _id, _rev, type, whipSessionUrl, ...rest } = doc;
+  const { _id, _rev, type, whipSessionUrl, talkbackWhipSessionId, talkbackWhepSessionId, ...rest } = doc;
   void _rev;
   void type;
   void whipSessionUrl; // internal Strom session-resource URL — never echo to clients
+  // Internal intercom-manager talkback session ids (issue #599) — never echo.
+  void talkbackWhipSessionId;
+  void talkbackWhepSessionId;
   // `muted` is always projected (default false) so the operator's guest list
   // reflects mute state even for a guest who has not toggled it yet (issue #382).
   return { id: _id, ...rest, muted: !!doc.muted };
@@ -320,6 +329,124 @@ async function resetGuestSlot(
   // so once this guest's session is marked `left` the strip reverts to "Guest N"
   // on its own.
   await clearGuestSlotPicture(production, mixerInput, log);
+}
+
+// ---------------------------------------------------------------------------
+// Talkback WHIP/WHEP proxy helpers (guest-talkback spec §3.2–§3.3, issue #599)
+// ---------------------------------------------------------------------------
+
+const TALKBACK_KINDS: readonly TalkbackKind[] = ['whip', 'whep'];
+
+/** The session field binding a guest's talkback resource of `kind`. */
+function talkbackField(kind: TalkbackKind): 'talkbackWhipSessionId' | 'talkbackWhepSessionId' {
+  return kind === 'whip' ? 'talkbackWhipSessionId' : 'talkbackWhepSessionId';
+}
+
+/**
+ * Checks the offer is an SDP body (spec §3.2: `application/sdp`, opaque,
+ * ≤ 64 KiB — the size cap is the content-type parser's `bodyLimit`). Sends
+ * `415` for another media type and `400` for an empty body. Returns the SDP,
+ * or undefined once a reply has been sent.
+ */
+function talkbackOfferSdp(req: FastifyRequest, reply: FastifyReply): string | undefined {
+  const contentType = String(req.headers['content-type'] ?? '').split(';')[0]!.trim().toLowerCase();
+  if (contentType !== 'application/sdp') {
+    void reply.status(415).send({ error: 'Unsupported Media Type', statusCode: 415 });
+    return undefined;
+  }
+  if (typeof req.body !== 'string' || !req.body.trim()) {
+    void reply.status(400).send({ error: 'Malformed SDP', statusCode: 400 });
+    return undefined;
+  }
+  return req.body;
+}
+
+/** Send a proxy error, with `Retry-After` when the manager rate-limited us. */
+function sendTalkbackError(
+  reply: FastifyReply,
+  result: { status: number; error: string; retryAfter?: string },
+): FastifyReply {
+  if (result.retryAfter) reply.header('Retry-After', result.retryAfter);
+  return reply.status(result.status).send({ error: result.error, statusCode: result.status });
+}
+
+/**
+ * `201` with the SDP answer and an open-live `Location`. `ETag` is the session
+ * id open-live exposes; the manager's raw `Location` and `Link` (ICE servers,
+ * possibly TURN credentials) are never forwarded.
+ */
+function sendTalkbackAnswer(
+  reply: FastifyReply,
+  location: string,
+  sessionId: string,
+  answer: string,
+): FastifyReply {
+  reply.header('Location', location);
+  reply.header('ETag', sessionId);
+  reply.header('Content-Type', 'application/sdp');
+  return reply.status(201).send(answer);
+}
+
+/**
+ * The intercom production/line a guest session talks on, read from open-live's
+ * own DB (spec §3.2, R4): `ProductionDoc.intercomProductionId` and the live
+ * `GuestSessionDoc.intercomLineId`. Undefined when talkback is unavailable
+ * (intercom unconfigured, nothing provisioned, or the production ended).
+ */
+function talkbackLine(
+  production: ProductionDoc,
+  session: GuestSessionDoc,
+): { productionId: string; lineId: string } | undefined {
+  if (!isIntercomEnabled() || production.status === 'ended') return undefined;
+  if (!production.intercomProductionId || !session.intercomLineId) return undefined;
+  return { productionId: production.intercomProductionId, lineId: session.intercomLineId };
+}
+
+/** Load a production for a talkback call; `undefined` = not found, throws on a DB failure. */
+async function loadTalkbackProduction(productionId: string): Promise<ProductionDoc | undefined> {
+  try {
+    return await getDb().get(productionId);
+  } catch (err) {
+    if ((err as { statusCode?: number }).statusCode === 404) return undefined;
+    throw err;
+  }
+}
+
+/**
+ * Write (or clear, with `sessionId` undefined) a guest's talkback session id on
+ * their session doc. One retry on a revision conflict, re-reading the doc.
+ * Best-effort: a failure is logged and the guest fails closed on a later
+ * DELETE (403) rather than the proxy trusting an unbound id.
+ */
+async function bindTalkbackSession(
+  session: GuestSessionDoc,
+  kind: TalkbackKind,
+  sessionId: string | undefined,
+  log: FastifyBaseLogger,
+): Promise<void> {
+  const field = talkbackField(kind);
+  const write = async (doc: GuestSessionDoc) => {
+    const { [field]: _previous, ...rest } = doc;
+    void _previous;
+    await getGuestSessionsDb().insert({
+      ...rest,
+      ...(sessionId ? { [field]: sessionId } : {}),
+      updatedAt: new Date().toISOString(),
+    } as GuestSessionDoc);
+  };
+  try {
+    await write(session);
+  } catch (err) {
+    if ((err as { statusCode?: number }).statusCode !== 409) {
+      log.warn({ err, kind }, 'talkback: guest session-id bind failed');
+      return;
+    }
+    try {
+      await write(await getGuestSessionsDb().get(session._id));
+    } catch (retryErr) {
+      log.warn({ err: retryErr, kind }, 'talkback: guest session-id bind failed after a conflict');
+    }
+  }
 }
 
 /** How long a guest join waits for Strom's ICE servers before going on without them. */
@@ -789,6 +916,17 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         // join still works with WHIP video + WHEP return, no talkback (fallback is
         // first-class — spec §Configuration, guest-talkback spec §3.6).
         ...(intercomLine ? { intercomLine } : {}),
+        // Server-issued talkback proxy URLs (guest-talkback spec §3.4, issue
+        // #599): present exactly when a line was provisioned or reused. No
+        // whipUrl on a return-only slot — the guest only listens (§4.1).
+        ...(intercomLine
+          ? {
+              talkback: {
+                ...(takesWhip ? { whipUrl: `${base}/api/v1/guests/${req.params.inviteId}/talkback/whip` } : {}),
+                whepUrl: `${base}/api/v1/guests/${req.params.inviteId}/talkback/whep`,
+              },
+            }
+          : {}),
       });
     },
   );
@@ -1019,6 +1157,223 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.status(204).send();
     },
   );
+
+  // -------------------------------------------------------------------------
+  // Talkback WHIP/WHEP proxy (guest-talkback spec §3.2–§3.3, ADR-012, issue
+  // #599). open-live holds the manager's WHIP/WHEP Bearer and derives the
+  // intercom production + line from its own DB; the client only supplies the
+  // SDP. The guest routes are invite-token authed (exempt from API_KEY in
+  // server.ts, UUID-constrained); the crew routes sit behind the default gate.
+  // -------------------------------------------------------------------------
+
+  // Opaque SDP offers, capped at the manager's 64 KiB (larger → 413).
+  fastify.addContentTypeParser(
+    'application/sdp',
+    { parseAs: 'string', bodyLimit: TALKBACK_SDP_MAX_BYTES },
+    (_req, body, done) => {
+      done(null, body);
+    },
+  );
+
+  for (const kind of TALKBACK_KINDS) {
+    const field = talkbackField(kind);
+
+    // Guest: publish (whip) into / listen (whep) to their own slot's line.
+    fastify.post<{ Params: { inviteId: string } }>(
+      `/api/v1/guests/:inviteId/talkback/${kind}`,
+      { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
+      async (req, reply) => {
+        if (!isGuestCallingEnabled()) return reply.status(503).send(guestsDisabled());
+        const token = bearerToken(req);
+        const who = token ? await resolveGuestSession(token) : undefined;
+        if (!who?.ok || who.invite._id !== req.params.inviteId) {
+          return reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
+        }
+        const sdp = talkbackOfferSdp(req, reply);
+        if (sdp === undefined) return reply;
+        const { invite, session } = who;
+
+        let production: ProductionDoc | undefined;
+        try {
+          production = await loadTalkbackProduction(invite.productionId);
+        } catch (err) {
+          req.log.warn({ err }, `POST guests/:id/talkback/${kind} — production lookup failed`);
+          return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
+        }
+        if (!production) {
+          return reply.status(404).send({ error: 'Talkback unavailable', statusCode: 404 });
+        }
+        // A return-only slot (SRT encoder) only listens (spec §4.1).
+        if (kind === 'whip') {
+          const slot = (production.sources ?? []).find((s) => s.mixerInput === session.mixerInput);
+          let takesWhip = false;
+          try {
+            takesWhip = slot ? await slotTakesWhip(slot) : false;
+          } catch (err) {
+            req.log.warn({ err }, 'POST guests/:id/talkback/whip — source lookup failed');
+            return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
+          }
+          if (!takesWhip) {
+            return reply.status(403).send({ error: 'This guest slot does not take WHIP', statusCode: 403 });
+          }
+        }
+        const line = talkbackLine(production, session);
+        if (!line) {
+          return reply.status(404).send({ error: 'Talkback unavailable', statusCode: 404 });
+        }
+
+        // The manager-side name is the invite label, never client-chosen.
+        const username = talkbackUsername(
+          invite.label,
+          guestSlotDefaultLabel(production, session.mixerInput) ?? 'Guest',
+        );
+        const result = await postTalkbackOffer({ kind, ...line, username, sdp, log: req.log });
+        if (!result.ok) return sendTalkbackError(reply, result);
+
+        // Bind the new manager session to this guest, then end the one it
+        // replaces so a rejoin never leaves two of the guest's sessions on the line.
+        const previous = session[field];
+        await bindTalkbackSession(session, kind, result.sessionId, req.log);
+        if (previous && previous !== result.sessionId) {
+          const ended = await deleteTalkbackSession({ kind, ...line, sessionId: previous, log: req.log });
+          if (!ended.ok) {
+            req.log.warn({ kind, status: ended.status }, 'talkback: could not end the replaced guest session');
+          }
+        }
+        return sendTalkbackAnswer(
+          reply,
+          `/api/v1/guests/${encodeURIComponent(req.params.inviteId)}/talkback/${kind}/${result.sessionId}`,
+          result.sessionId,
+          result.answer,
+        );
+      },
+    );
+
+    // Guest: end their own talkback session.
+    fastify.delete<{ Params: { inviteId: string; sessionId: string } }>(
+      `/api/v1/guests/:inviteId/talkback/${kind}/:sessionId`,
+      async (req, reply) => {
+        if (!isGuestCallingEnabled()) return reply.status(503).send(guestsDisabled());
+        const token = bearerToken(req);
+        const who = token ? await resolveGuestSession(token) : undefined;
+        if (!who?.ok || who.invite._id !== req.params.inviteId) {
+          return reply.status(401).send({ error: 'Invalid or expired invite', statusCode: 401 });
+        }
+        const { sessionId } = req.params;
+        if (!isTalkbackSessionId(sessionId)) {
+          return reply.status(400).send({ error: 'Invalid session id', statusCode: 400 });
+        }
+        const { invite, session } = who;
+        // R5: only the session bound to THIS guest, never a caller-chosen id.
+        if (session[field] !== sessionId) {
+          return reply.status(403).send({ error: 'Session does not belong to this guest', statusCode: 403 });
+        }
+        let production: ProductionDoc | undefined;
+        try {
+          production = await loadTalkbackProduction(invite.productionId);
+        } catch (err) {
+          req.log.warn({ err }, `DELETE guests/:id/talkback/${kind} — production lookup failed`);
+          return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
+        }
+        const line = production ? talkbackLine(production, session) : undefined;
+        if (line) {
+          const result = await deleteTalkbackSession({ kind, ...line, sessionId, log: req.log });
+          if (!result.ok) return sendTalkbackError(reply, result);
+        }
+        await bindTalkbackSession(session, kind, undefined, req.log);
+        return reply.status(204).send();
+      },
+    );
+
+    // Crew (Studio): talk to / listen to a guest's line. Not persisted —
+    // Studio owns these sessions; crew is trusted at production scope.
+    fastify.post<{ Params: { id: string; guestId: string }; Querystring: { name?: unknown } }>(
+      `/api/v1/productions/:id/guests/:guestId/talkback/${kind}`,
+      { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
+      async (req, reply) => {
+        if (!isGuestCallingEnabled()) return reply.status(503).send(guestsDisabled());
+        let session: GuestSessionDoc;
+        try {
+          session = await getGuestSessionsDb().get(req.params.guestId);
+        } catch (err) {
+          if ((err as { statusCode?: number }).statusCode === 404) {
+            return reply.status(404).send({ error: 'Guest not found', statusCode: 404 });
+          }
+          req.log.warn({ err }, `POST guests/:guestId/talkback/${kind} — DB read failed`);
+          return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
+        }
+        if (session.productionId !== req.params.id || session.state === 'left') {
+          return reply.status(404).send({ error: 'Guest not found', statusCode: 404 });
+        }
+        const sdp = talkbackOfferSdp(req, reply);
+        if (sdp === undefined) return reply;
+        let production: ProductionDoc | undefined;
+        try {
+          production = await loadTalkbackProduction(req.params.id);
+        } catch (err) {
+          req.log.warn({ err }, `POST guests/:guestId/talkback/${kind} — production lookup failed`);
+          return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
+        }
+        if (!production) {
+          return reply.status(404).send({ error: 'Guest not found', statusCode: 404 });
+        }
+        const line = talkbackLine(production, session);
+        if (!line) {
+          return reply.status(404).send({ error: 'Talkback unavailable', statusCode: 404 });
+        }
+        const name = typeof req.query.name === 'string' ? req.query.name : undefined;
+        const username = talkbackUsername(name, 'Producer');
+        const result = await postTalkbackOffer({ kind, ...line, username, sdp, log: req.log });
+        if (!result.ok) return sendTalkbackError(reply, result);
+        return sendTalkbackAnswer(
+          reply,
+          `/api/v1/productions/${encodeURIComponent(req.params.id)}/guests/` +
+            `${encodeURIComponent(req.params.guestId)}/talkback/${kind}/${result.sessionId}`,
+          result.sessionId,
+          result.answer,
+        );
+      },
+    );
+
+    // Crew: end a talkback session on the guest's line. Works after the guest
+    // left (Studio tears down on GUEST_STATE left); nothing to do → 204.
+    fastify.delete<{ Params: { id: string; guestId: string; sessionId: string } }>(
+      `/api/v1/productions/:id/guests/:guestId/talkback/${kind}/:sessionId`,
+      async (req, reply) => {
+        if (!isGuestCallingEnabled()) return reply.status(503).send(guestsDisabled());
+        const { sessionId } = req.params;
+        if (!isTalkbackSessionId(sessionId)) {
+          return reply.status(400).send({ error: 'Invalid session id', statusCode: 400 });
+        }
+        let session: GuestSessionDoc;
+        let production: ProductionDoc | undefined;
+        try {
+          session = await getGuestSessionsDb().get(req.params.guestId);
+        } catch (err) {
+          if ((err as { statusCode?: number }).statusCode === 404) {
+            return reply.status(404).send({ error: 'Guest not found', statusCode: 404 });
+          }
+          req.log.warn({ err }, `DELETE guests/:guestId/talkback/${kind} — DB read failed`);
+          return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
+        }
+        if (session.productionId !== req.params.id) {
+          return reply.status(404).send({ error: 'Guest not found', statusCode: 404 });
+        }
+        try {
+          production = await loadTalkbackProduction(req.params.id);
+        } catch (err) {
+          req.log.warn({ err }, `DELETE guests/:guestId/talkback/${kind} — production lookup failed`);
+          return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
+        }
+        const line = production ? talkbackLine(production, session) : undefined;
+        if (line) {
+          const result = await deleteTalkbackSession({ kind, ...line, sessionId, log: req.log });
+          if (!result.ok) return sendTalkbackError(reply, result);
+        }
+        return reply.status(204).send();
+      },
+    );
+  }
 };
 
 export default guestsRoutes;

@@ -11,6 +11,10 @@
  * without a dedicated rule (epic #208, issue #299, spec §Risks: "Redact
  * INTERCOM_MANAGER_TOKEN and GUEST_INVITE_SECRET in logs").
  *
+ * `auth_?key` covers the talkback proxy's intercom-manager WHIP/WHEP Bearer,
+ * `INTERCOM_WHIP_AUTH_KEY` / config key `intercomWhipAuthKey` (guest-talkback
+ * spec §7, issue #599), which no other sub-pattern matches.
+ *
  * `address` / `url` are redacted because an authenticated HTML source (Design D,
  * token-in-URL — `docs/specs/authenticated-html-sources.md`, ADR-003) carries a
  * signed/expiring access token inside the source `address`, which becomes the
@@ -20,7 +24,7 @@
  */
 
 const SENSITIVE_KEYS =
-  /srt_uri|passphrase|streamid|authorization|token|pat|secret|access_?key|address|url/i;
+  /srt_uri|passphrase|streamid|authorization|token|pat|secret|access_?key|auth_?key|address|url/i;
 
 export function redactSensitive(obj: unknown): unknown {
   if (Array.isArray(obj)) {

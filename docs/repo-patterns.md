@@ -611,3 +611,15 @@ test relies on for a multi-write flow should enforce revisions, as
 `POST` is a `400 { message }`. `INTERCOM_MANAGER_URL` must include `/api/v1`. Pick lines out of
 the array by `name`, and test with these real shapes, not an invented `{ id, name, joinUrl }`
 object (#598, `docs/specs/guest-talkback.md` §3.1).
+
+## Proxying intercom-manager WHIP/WHEP: own fetch, own SDP parser, log-capture seam
+
+The talkback proxy (#599) cannot reuse `intercom-manager.ts`'s `request()`: it forces JSON and
+parses the body, but SDP must pass through untouched and the raw `Location`/`ETag`/`Retry-After`
+headers are needed. Use `postTalkbackOffer` / `deleteTalkbackSession` there, and
+`talkbackAuthorization()` for the Bearer (SAT in `osc` mode via `managerBearer()`, else
+`INTERCOM_WHIP_AUTH_KEY`, else none). Never forward the manager's `Link` header (TURN creds).
+Fastify content-type parsers are scoped to the plugin that registers them, so `guests.ts` has its
+own `application/sdp` parser (with the 64 KiB `bodyLimit`) next to the ones in `whip.ts` and
+`returns.ts`. To assert something never reaches the logs, build the server with
+`buildServer({ logStream })` and inspect the captured lines (`guests-talkback.test.ts`).
