@@ -209,7 +209,7 @@ describe('part 0 start time of an activation (spec §6, #569 AC 3)', () => {
         recorderBlockId: 'b-out-rec', recorderType: 'liverecorder', recorderOutputId: 'output-rec',
         inputRecorders: [inputRecorder], whepOutputEntries: undefined, pgmWhepEndpointId: undefined, warnings: [],
         sourceOffsetBlockIds: {}, sourceAudioOffsetBlockIds: {}, clipPlayerBlockIds: {}, returnBuses: [],
-        returnWhepEntries: [], mixerInputMap: {},
+        returnWhepEntries: [], fastWhepEntries: [], mixerInputMap: {},
       };
     });
     // The first running-poll still sees the flow starting: the sessions start later.

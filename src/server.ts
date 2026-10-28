@@ -99,15 +99,15 @@ function isGuestTokenAuthedPath(path: string): boolean {
   // session/return (guest return-mode switch, #300), session/mute (guest mic
   // mute toggle, #382), session/status (the guest's own on-air flag, #592),
   // and the guest-scoped WHIP publish + its session
-  // PATCH/DELETE and the return-picture WHEP + its teardown (issue #423) —
-  // needed because the OSC ingress gate only passes `^/api/v1/guests`
-  // (osaas-app#6143). Each handler verifies the per-invite token itself
-  // (whip.ts / returns.ts), exactly like join/session.
+  // PATCH/DELETE and the return WHEP feeds (picture and fast)
+  // + their teardown (issue #423) — needed because the OSC ingress gate only
+  // passes `^/api/v1/guests` (osaas-app#6143). Each handler verifies the
+  // per-invite token itself (whip.ts / returns.ts), exactly like join/session.
   // The talkback WHIP/WHEP proxy (issue #599, guest-talkback spec §3.2) is the
   // POST on `talkback/{whip|whep}` and the DELETE on its UUID-shaped session
   // child only: anything else under `talkback/` (a non-UUID tail, an extra
   // segment) stays behind the shared API_KEY.
-  return /^\/api\/v1\/guests\/[^/]+\/(join|slot|session|session\/return|session\/mute|session\/status|whip|returns\/picture\/whep(?:\/[^/]+)?|talkback\/(?:whip|whep)(?:\/[0-9a-fA-F-]{36})?)$/.test(path);
+  return /^\/api\/v1\/guests\/[^/]+\/(join|slot|session|session\/return|session\/mute|session\/status|whip|returns\/(?:picture|fast)\/whep(?:\/[^/]+)?|talkback\/(?:whip|whep)(?:\/[0-9a-fA-F-]{36})?)$/.test(path);
 }
 
 // Sentinel subprotocols used to carry the API key through the
