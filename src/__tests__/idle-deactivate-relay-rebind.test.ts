@@ -36,6 +36,7 @@ vi.mock('../routes/productions.js', () => ({
   activationAbortControllers: new Map(),
   updateProductionDoc: vi.fn().mockResolvedValue(undefined),
   emitProductionStatus: vi.fn(),
+  uploadRecordingBeforeTeardown: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock('../services/pfl-state.js', () => ({ clearProductionPflState: vi.fn() }));
 vi.mock('../services/guest-sweep.js', () => ({ sweepGuestsOnProductionEnd: vi.fn().mockResolvedValue(undefined) }));

@@ -65,6 +65,7 @@ import { buildServer } from '../server.js';
 import { config } from '../config.js';
 import { setRecorderSocketFactory, resetRecorderEvents, type RecorderSocketHandlers } from '../services/strom-recorder-events.js';
 import { startLiveRecordingUpload, resetLiveRecordingUploads } from '../services/live-recording-upload.js';
+import { deactivateProduction } from '../services/idle-watchdog.js';
 
 const STORAGE = {
   minioEndpoint: 'http://minio.local:9000',
@@ -213,5 +214,68 @@ describe('deactivate — builtin.recorder path is unchanged (OL-32a, AC 8)', () 
     expect(written).toBeDefined();
     expect(written!['recorderType']).toBeUndefined();
     expect(written!['recorderBlockId']).toBeUndefined();
+  });
+});
+
+// Issue #596: the idle auto-deactivate uploads the recording the same way as
+// the explicit deactivate, before the flow teardown, and records the outcome.
+describe('idle auto-deactivate uploads the recording (issue #596)', () => {
+  const silentLog = {
+    debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(),
+  } as unknown as import('fastify').FastifyBaseLogger;
+
+  function writtenProduction(): Record<string, unknown> {
+    const docs = mockInsert.mock.calls.map((c) => c[0] as Record<string, unknown>).filter((d) => d['_id'] === 'prod-lr-1');
+    expect(docs).toHaveLength(1);
+    return docs[0]!;
+  }
+
+  it.each([
+    ['recorder', 'recorder' as const],
+    ['absent (activated before OL-32a)', undefined],
+  ])('builtin.recorder (recorderType %s): split-now, upload, then teardown; lastRecordingUpload written', async (_label, type) => {
+    mockGet.mockResolvedValue(prod(type));
+    await deactivateProduction('prod-lr-1', silentLog);
+    expect(mockSplitNow).toHaveBeenCalledWith('flow-lr', 'b-out-rec-1');
+    expect(mockFlowStop).not.toHaveBeenCalled();
+    expect(calls).toEqual(['splitNow', 'media.list', 'media.list', 'deactivateStromFlow']);
+    expect(mockRecordingInsert).toHaveBeenCalledWith(expect.objectContaining({ key: `prod-lr-1/${FILE}`, kind: 'program' }));
+    const written = writtenProduction();
+    expect(written).toMatchObject({ status: 'ended', endedReason: 'idle', autoDeactivated: true });
+    expect(written['stromFlowId']).toBeUndefined();
+    expect(written['lastRecordingUpload']).toMatchObject({ outputId: 'output-rec', bucket: 'openlive-vod', uploaded: 1, failed: [] });
+  });
+
+  it('Live Recorder: stops the flow before the upload and never calls split-now', async () => {
+    mockGet.mockResolvedValue(prod('liverecorder'));
+    await deactivateProduction('prod-lr-1', silentLog);
+    expect(mockSplitNow).not.toHaveBeenCalled();
+    expect(mockFlowStop).toHaveBeenCalledWith('flow-lr');
+    expect(calls).toEqual(['flows.stop', 'media.list', 'media.list', 'deactivateStromFlow']);
+    expect(writtenProduction()['lastRecordingUpload']).toMatchObject({ uploaded: 1, failed: [] });
+  });
+
+  it('writes no production doc before the upload (#366 _rev guard)', async () => {
+    mockGet.mockResolvedValue(prod('recorder'));
+    mockMediaList.mockImplementation(async () => {
+      calls.push('media.list');
+      expect(mockInsert).not.toHaveBeenCalled();
+      return { entries: [{ name: FILE, path: `recordings/prod-lr-1/${FILE}`, is_dir: false }] };
+    });
+    await deactivateProduction('prod-lr-1', silentLog);
+    expect(mockMediaList).toHaveBeenCalled();
+    expect(mockInsert).toHaveBeenCalled();
+  });
+
+  it('without a recorder block: no split-now, no upload, no lastRecordingUpload', async () => {
+    const { recorderBlockId: _omit, ...noRecorder } = prod('recorder');
+    mockGet.mockResolvedValue(noRecorder);
+    await deactivateProduction('prod-lr-1', silentLog);
+    expect(mockSplitNow).not.toHaveBeenCalled();
+    expect(mockFlowStop).not.toHaveBeenCalled();
+    expect(mockMediaList).not.toHaveBeenCalled();
+    expect(mockRecordingInsert).not.toHaveBeenCalled();
+    expect(calls).toEqual(['deactivateStromFlow']);
+    expect(writtenProduction()['lastRecordingUpload']).toBeUndefined();
   });
 });
