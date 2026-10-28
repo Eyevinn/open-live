@@ -315,7 +315,7 @@ describe('guest page devices', () => {
     els['device-retry']!.fire('click');
     await flush();
 
-    expect(page.gumCalls.at(-1)).toEqual({ audio: { deviceId: { exact: 'mic-a' } } });
+    expect(page.gumCalls.at(-1)).toEqual({ audio: { echoCancellation: true, deviceId: { exact: 'mic-a' } } });
     const mic = page.track('audio');
     expect(mic).not.toBe(oldMic);
     expect(page.senders['audio']!.track).toBe(mic);
