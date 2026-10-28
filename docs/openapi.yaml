@@ -125,9 +125,12 @@ components:
       enum: [mpegtssrt, efpsrt, whep, recording]
       description: >
         Output kind. 'recording' records the programme with Strom's builtin
-        recorder to Strom's media path. When MinIO/S3 is configured the segments
-        are uploaded to object storage on deactivate and listed by the
-        /recordings endpoints; otherwise they stay on Strom.
+        recorder to Strom's media path. The segments are uploaded on deactivate to
+        a storage connection named by `connectionId`, or to the MinIO/S3 store
+        when MinIO/S3 is configured, and listed by the /recordings endpoints.
+        With neither, creating the output returns 400 unless the server sets
+        `RECORDING_LOCAL_ONLY=true` (default off); then the segments stay on
+        Strom's media path with no upload and no retention.
 
     OutputStatus:
       type: string

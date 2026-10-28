@@ -118,6 +118,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  (config as Record<string, unknown>)['recordingLocalOnly'] = false;
   setStorage({});
 });
 
@@ -141,7 +142,8 @@ describe('object storage config', () => {
 });
 
 describe('POST /api/v1/outputs — recording without object storage', () => {
-  it('creates a recording output when no MinIO var is set', async () => {
+  it('creates a recording output when no MinIO var is set and RECORDING_LOCAL_ONLY is on', async () => {
+    (config as Record<string, unknown>)['recordingLocalOnly'] = true;
     const app = await buildServer();
     const res = await app.inject({
       method: 'POST',

@@ -326,6 +326,12 @@ export const config = {
   minioBucket: optionalEnv('MINIO_BUCKET'),
   minioRegion: optionalEnv('MINIO_REGION') ?? 'us-east-1',
   minioUseSsl: parseBoolEnv('MINIO_USE_SSL', true),
+  /**
+   * Opt-in (default off): accept a `recording` output with no storage target, so
+   * the recording stays on Strom's media path with no upload and no retention.
+   * Without it, such an output is refused with 400.
+   */
+  recordingLocalOnly: parseBoolEnv('RECORDING_LOCAL_ONLY', false),
   /** Optional prefix prepended to every recording object key. */
   recordingKeyPrefix: process.env['RECORDING_KEY_PREFIX'] ?? '',
   /**

@@ -98,7 +98,7 @@ Amendment for recording end to end from Studio (issue #534). All changes are add
   An unknown `connectionId` on `POST` or `PATCH` → `400 "Storage connection not found"`; a
   connection without a default bucket → `400 "Storage connection has no default bucket"`.
   Nothing is written in either case. A recording output with no target at all (disk-only, PR
-  #404) stays refused.
+  #404) stays refused unless the operator sets `RECORDING_LOCAL_ONLY=true` (default off).
 - **Recordings routes** no longer return `503 "Object storage unavailable"` when the `MINIO_*`
   env is incomplete: they return the stored `RecordingDoc`s (or `[]`). `503` is kept for a
   database failure only (all three routes).
@@ -290,12 +290,15 @@ Added to `src/config.ts` (same `process.env` + optional-fallback style used ther
 | `RECORDING_PRESIGN_TTL_S` | no | `3600` | Presigned playback URL TTL |
 | `RECORDING_SEGMENT_SECS` | no | `600` | Length of each recording part in seconds (Strom recorder `max_size_time_secs`); `0` = one file per activation; integer 0-86400 (#553) |
 | `RECORDING_BLOCK` | no | `auto` | Which Strom block records program: `auto` = `builtin.liverecorder` (Live Recorder, fragmented MP4) when the Strom's block list has it, else `builtin.recorder`; `recorder` = always `builtin.recorder`. Any other value fails startup (OL-32a, [`iso-input-recording.md`](iso-input-recording.md) §4.1, ADR-011) |
+| `RECORDING_LOCAL_ONLY` | no | `false` | Accept a `recording` output with no storage target (no `connectionId` or `"default"`, and no `MINIO_*`). The recording stays on Strom's media path with no upload and no retention |
 | `RECORDING_MAX_INPUTS` | no | `4` | Most inputs one production may record to their own files (OL-32, [`iso-input-recording.md`](iso-input-recording.md) §10.1); integer 0-16; `0` turns input recording off (every enable returns 409 `record-cap-reached`). Provisional until the load measurement (OL-32c) |
 | `RECORDING_INPUT_VIDEO_BITRATE_KBPS` | no | `4000` | `bitrate` of each input recorder's H.264 encode (`builtin.videoenc`); integer 500-50000 |
 
-When the MinIO vars are unset, the `recording` output type is still accepted: Strom's recorder
-writes local files (Open Question 1), so recording works without object storage. The segments
-stay on Strom's media path and deactivate skips the upload, so there is no `RecordingDoc` to list.
+When the MinIO vars are unset and the output names no storage connection, creating a `recording`
+output is refused with `400` unless `RECORDING_LOCAL_ONLY=true` (default off). With the opt-in,
+Strom's recorder writes local files (Open Question 1) and nothing uploads them: the segments stay
+on Strom's media path with no retention, deactivate skips the upload, and there is no
+`RecordingDoc` to list.
 
 ## Open Questions (need a human/maintainer decision)
 
