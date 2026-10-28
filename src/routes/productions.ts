@@ -28,7 +28,12 @@ import { upsertRecordingDoc } from '../lib/recording-registry.js';
 import { resolveRecordingUploadTarget } from '../lib/recording-upload-target.js';
 import { startLiveRecordingUpload, stopLiveRecordingUpload, type LiveRecordingSession } from '../services/live-recording-upload.js';
 import { holdRecorderEvents, type RecorderEventsHold } from '../services/strom-recorder-events.js';
-import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
+import {
+  isIntercomEnabled,
+  IntercomManagerError,
+  sweepTalkbackSessions,
+  teardownIntercomProduction,
+} from '../lib/intercom-manager.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type OutputStatusEntry } from '../lib/production-health.js';
 import { settleOnStop, preserveGpuUsageOnDelete } from '../services/gpu-usage.js';
@@ -1557,10 +1562,30 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
     // Tear down the Open Intercom talkback grouping (all its lines) with the
     // production lifecycle (issue #302). Best-effort: a failed teardown must not
     // block deactivation, mirroring the Strom/recording teardown contract.
+    // First end every WHIP/WHEP participant session on its lines — guest and
+    // Studio crew talkback alike (guest-talkback spec §6, issue #600):
+    // intercom-manager v4.1.0 refuses `DELETE /production/:p` with 409 while
+    // any session is active. A 409 left after the sweep is logged and the
+    // manager's reaper takes over.
     if (doc.intercomProductionId && isIntercomEnabled()) {
-      await teardownIntercomProduction(doc.intercomProductionId).catch((err) => {
-        log.warn({ err, productionId: doc._id }, 'intercom teardown failed — continuing deactivation');
-      });
+      const intercomProductionId = doc.intercomProductionId;
+      await sweepTalkbackSessions(intercomProductionId, log);
+      await teardownIntercomProduction(intercomProductionId).then(
+        () => log.info({ productionId: doc._id, intercomProductionId }, 'intercom production deleted'),
+        (err) => {
+          const status = err instanceof IntercomManagerError ? err.status : undefined;
+          if (status === 404) {
+            log.info({ productionId: doc._id, intercomProductionId }, 'intercom production already gone');
+          } else if (status === 409) {
+            log.warn(
+              { productionId: doc._id, intercomProductionId, status },
+              'intercom teardown refused (409: a talkback session is still active) — the manager reaper takes over; continuing deactivation',
+            );
+          } else {
+            log.warn({ err, productionId: doc._id }, 'intercom teardown failed — continuing deactivation');
+          }
+        },
+      );
     }
 
     // Revoke the production's outstanding guest invites and mark any live guest
