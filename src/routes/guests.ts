@@ -41,6 +41,7 @@ import {
   type IntercomLine,
   postTalkbackOffer,
   deleteTalkbackSession,
+  endTalkbackSession,
   talkbackUsername,
   isTalkbackSessionId,
   TALKBACK_SDP_MAX_BYTES,
@@ -172,11 +173,13 @@ function broadcastGuestState(session: GuestSessionDoc, label?: string): void {
  * had no live session, one event keyed by the invite id still carries the slot's
  * `mixerInput` so the strip refreshes. Skipped only when no slot is known (an
  * unpinned invite nobody redeemed). Never throws — the invite is already revoked.
+ * Returns the invite's live sessions (empty when the lookup failed) so the
+ * caller can tear down their talkback (issue #600).
  */
 async function broadcastInviteRevoked(
   invite: GuestInviteDoc,
   log: FastifyBaseLogger,
-): Promise<void> {
+): Promise<GuestSessionDoc[]> {
   let live: GuestSessionDoc[] = [];
   try {
     const result = await getGuestSessionsDb().find({
@@ -190,9 +193,9 @@ async function broadcastInviteRevoked(
     for (const session of live) {
       broadcastGuestState({ ...session, state: 'left' });
     }
-    return;
+    return live;
   }
-  if (!invite.mixerInput) return;
+  if (!invite.mixerInput) return live;
   broadcast(invite.productionId, {
     type: 'GUEST_STATE',
     guestId: invite._id,
@@ -200,6 +203,7 @@ async function broadcastInviteRevoked(
     state: 'left',
     muted: false,
   });
+  return live;
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +300,47 @@ async function teardownGuestWhip(
       'guest WHIP teardown — DELETE to Strom failed; session may linger until the inactivity reaper',
     );
   }
+}
+
+/**
+ * End a guest's own talkback sessions on the intercom manager (guest-talkback
+ * spec §6, issue #600) — used when a guest leaves, is kicked, or their invite is
+ * revoked. DELETEs the manager WHIP/WHEP sessions stored in
+ * `talkbackWhipSessionId` / `talkbackWhepSessionId` so the line frees straight
+ * away instead of waiting for the manager's media-less-session reaper. The line
+ * itself is NOT deleted: it belongs to the slot and is reused (§3.6).
+ *
+ * No-op when the session never opened talkback (no stored ids — also legacy
+ * sessions), when intercom is unconfigured, or when nothing is provisioned. A
+ * manager `404` counts as already gone. Never throws, same contract as
+ * `teardownGuestWhip`: every outcome is logged and the triggering action
+ * always succeeds.
+ */
+async function teardownGuestTalkback(
+  session: GuestSessionDoc,
+  log: FastifyBaseLogger,
+): Promise<void> {
+  const owned = TALKBACK_KINDS.flatMap((kind) => {
+    const sessionId = session[talkbackField(kind)];
+    return sessionId ? [{ kind, sessionId }] : [];
+  });
+  if (owned.length === 0 || !session.intercomLineId || !isIntercomEnabled()) return;
+  const context = { guestId: session._id, productionId: session.productionId };
+  let production: ProductionDoc | undefined;
+  try {
+    production = await loadTalkbackProduction(session.productionId);
+  } catch (err) {
+    log.warn({ ...context, err }, 'talkback teardown: production lookup failed; the manager reaper takes over');
+    return;
+  }
+  const intercomProductionId = production?.intercomProductionId;
+  if (!intercomProductionId) return;
+  const lineId = session.intercomLineId;
+  await Promise.all(
+    owned.map(({ kind, sessionId }) =>
+      endTalkbackSession({ kind, productionId: intercomProductionId, lineId, sessionId }, log, context),
+    ),
+  );
 }
 
 /**
@@ -593,7 +638,10 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
       // Tell every connected controller the slot is free (issue #561). Without
       // this only the client that issued the DELETE re-fetched `/audio`; every
       // other operator kept the revoked guest's name on the audio strip.
-      await broadcastInviteRevoked(doc, fastify.log);
+      const live = await broadcastInviteRevoked(doc, fastify.log);
+      // End each live session's talkback on the intercom manager (issue #600).
+      // Best-effort and never throws — the invite is already revoked.
+      await Promise.all(live.map((session) => teardownGuestTalkback(session, fastify.log)));
       return reply.status(204).send();
     },
   );
@@ -975,7 +1023,12 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
           // browser lingers or crashed (issue #467 — DELETE the session resource,
           // not the endpoint). teardownGuestWhip never throws, so it needs no
           // guard of its own.
-          await teardownGuestWhip(leftSession, fastify.log);
+          // Its talkback sessions are ended on the intercom manager next to it
+          // (issue #600); neither throws.
+          await Promise.all([
+            teardownGuestWhip(leftSession, fastify.log),
+            teardownGuestTalkback(leftSession, fastify.log),
+          ]);
           // Reset the multiview tile back to `Guest N` (issue #466) and black the
           // slot's picture so the guest's last frame no longer stays frozen on
           // PGM / the multiview (issue #493). Best-effort — never fails the leave.
@@ -1148,7 +1201,11 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
       // end the guest's Strom WHIP session resource, not the endpoint (issue
       // #467). teardownGuestWhip never throws. `session` carries the stored
       // whipSessionUrl (leftSession is just the same doc marked `left`).
-      await teardownGuestWhip(session, fastify.log);
+      // Its talkback sessions are ended on the intercom manager too (issue #600).
+      await Promise.all([
+        teardownGuestWhip(session, fastify.log),
+        teardownGuestTalkback(session, fastify.log),
+      ]);
       // Reset the multiview tile back to `Guest N` (issue #466) and black the
       // slot's picture so the kicked guest's last frame no longer stays frozen on
       // PGM / the multiview (issue #493). Best-effort — never fails the kick.

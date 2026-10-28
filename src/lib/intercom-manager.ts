@@ -221,7 +221,10 @@ export async function provisionGuestLine(opts: {
  * must not block deactivation, so callers ignore failures.
  */
 export async function teardownIntercomProduction(intercomProductionId: string): Promise<void> {
-  await request(`/production/${encodeURIComponent(intercomProductionId)}`, { method: 'DELETE' });
+  await request(`/production/${encodeURIComponent(intercomProductionId)}`, {
+    method: 'DELETE',
+    signal: AbortSignal.timeout(TALKBACK_TIMEOUT_MS),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -500,4 +503,128 @@ export async function deleteTalkbackSession(opts: {
     log.warn({ kind, status: res.status }, 'talkback: intercom-manager error on DELETE');
   }
   return { ok: false, status: 502, error: UNREACHABLE };
+}
+
+// ---------------------------------------------------------------------------
+// Talkback teardown (guest-talkback spec §6, issue #600). Every teardown is best
+// effort: it logs its outcome and never throws, so it cannot block or fail the
+// leave / kick / revoke / deactivate that triggered it.
+// ---------------------------------------------------------------------------
+
+/** Logger shape for teardown: outcomes are logged at info, failures at warn. */
+export interface TalkbackTeardownLog extends TalkbackLog {
+  info(obj: object, msg: string): void;
+}
+
+/** One manager talkback session to end. */
+export interface TalkbackSessionRef {
+  kind: TalkbackKind;
+  productionId: string;
+  lineId: string;
+  sessionId: string;
+}
+
+/**
+ * DELETE one talkback session on the manager. A `404` counts as already gone.
+ * Never throws; returns true when the session is gone (deleted or `404`).
+ */
+export async function endTalkbackSession(
+  ref: TalkbackSessionRef,
+  log: TalkbackTeardownLog,
+  context: object = {},
+): Promise<boolean> {
+  const where = { ...context, kind: ref.kind, lineId: ref.lineId, sessionId: ref.sessionId };
+  let result: TalkbackDeleteResult;
+  try {
+    result = await deleteTalkbackSession({ ...ref, log });
+  } catch (err) {
+    log.warn(
+      { ...where, reason: scrubKey(err instanceof Error ? err.message : String(err)) },
+      'talkback teardown: DELETE failed; the manager reaper takes over',
+    );
+    return false;
+  }
+  if (result.ok) {
+    log.info({ ...where, outcome: result.outcome }, 'talkback teardown: session ended');
+    return true;
+  }
+  log.warn({ ...where, status: result.status }, 'talkback teardown: DELETE failed; the manager reaper takes over');
+  return false;
+}
+
+/** Outcome counts of a production-wide talkback sweep. */
+export interface TalkbackSweepResult {
+  ended: number;
+  failed: number;
+}
+
+function idString(value: unknown): string | undefined {
+  if (typeof value === 'string' && value) return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  return undefined;
+}
+
+/**
+ * The sessions to end before `DELETE /production/:p` (spec §6): from
+ * `GET /production/:p/line`, every participant with `isWhepReceiver` is a WHEP
+ * session, every other participant with `isWhip` a WHIP session. Participants
+ * that are neither (browser clients of the line) are not ours to end. Exported
+ * for tests.
+ */
+export function talkbackSessionsFromLines(productionId: string, body: unknown): TalkbackSessionRef[] {
+  if (!Array.isArray(body)) {
+    throw new IntercomManagerError('intercom-manager returned an unexpected line list shape');
+  }
+  const refs: TalkbackSessionRef[] = [];
+  for (const line of body as Array<{ id?: unknown; participants?: unknown } | null>) {
+    const lineId = idString(line?.id);
+    if (!lineId || !Array.isArray(line?.participants)) continue;
+    for (const p of line.participants as Array<Record<string, unknown> | null>) {
+      const sessionId = idString(p?.['sessionId']);
+      if (!sessionId) continue;
+      if (p?.['isWhepReceiver'] === true) refs.push({ kind: 'whep', productionId, lineId, sessionId });
+      else if (p?.['isWhip'] === true) refs.push({ kind: 'whip', productionId, lineId, sessionId });
+    }
+  }
+  return refs;
+}
+
+/**
+ * Production deactivate sweep (spec §6): list every line of the intercom
+ * production and DELETE every WHIP/WHEP participant session on it — guest and
+ * Studio crew sessions alike (crew sessions are not persisted, so this is the
+ * only thing that releases them). intercom-manager v4.1.0 refuses
+ * `DELETE /production/:p` with `409` while a session is active, so callers run
+ * this first. Never throws; an unreachable manager is logged and counted as
+ * nothing ended.
+ */
+export async function sweepTalkbackSessions(
+  intercomProductionId: string,
+  log: TalkbackTeardownLog,
+): Promise<TalkbackSweepResult> {
+  let refs: TalkbackSessionRef[];
+  try {
+    const body = await request(`/production/${encodeURIComponent(intercomProductionId)}/line`, {
+      method: 'GET',
+      signal: AbortSignal.timeout(TALKBACK_TIMEOUT_MS),
+    });
+    refs = talkbackSessionsFromLines(intercomProductionId, body);
+  } catch (err) {
+    log.warn(
+      {
+        intercomProductionId,
+        status: err instanceof IntercomManagerError ? err.status : undefined,
+        reason: scrubKey(err instanceof Error ? err.message : String(err)),
+      },
+      'talkback sweep: could not list intercom lines; the manager reaper takes over',
+    );
+    return { ended: 0, failed: 0 };
+  }
+  const outcomes = await Promise.all(
+    refs.map((ref) => endTalkbackSession(ref, log, { intercomProductionId })),
+  );
+  const ended = outcomes.filter(Boolean).length;
+  const result = { ended, failed: outcomes.length - ended };
+  log.info({ intercomProductionId, ...result }, 'talkback sweep: participant sessions ended');
+  return result;
 }
