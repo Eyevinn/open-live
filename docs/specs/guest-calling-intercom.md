@@ -313,6 +313,9 @@ included in the connect-time sync:
 | 404  | production / invite / guest not found; no return on that input |
 | 409  | invite expired / capacity reached; production inactive (return feeds) |
 | 502/503 | Strom or intercom-manager unreachable |
+| 404  | `Talkback unavailable` — talkback routes only: intercom off, no line for the guest, or manager 404 ([guest-talkback §3.5](guest-talkback.md#35-error-code-additions)) |
+| 502  | talkback routes only: intercom-manager unreachable, 5xx, or `401` (`INTERCOM_WHIP_AUTH_KEY` mismatch) |
+| 503 + `Retry-After` | talkback routes only: intercom-manager rate limit (`429`) |
 
 ## Data Model
 
