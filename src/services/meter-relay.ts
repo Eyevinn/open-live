@@ -2,6 +2,7 @@ import { StromClient } from '../lib/strom.js';
 import { config } from '../config.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { broadcast } from './tally.service.js';
+import { guestHealthMessage, guestHealthSnapshot } from './guest-health.js';
 
 interface RelayEntry {
   stop: () => void;
@@ -11,6 +12,8 @@ interface RelayEntry {
   flowId: string;
   meterPrefix: string;
   loudnessBlockId?: string | null;
+  /** Guest input block id → guest seat, for relaying `BlockHealthChanged`. */
+  guestBlocks: ReadonlyMap<string, string>;
 }
 
 const relays = new Map<string, RelayEntry>();
@@ -24,7 +27,7 @@ let nextGeneration = 1;
  * Take one ref on the production's meter relay, creating it if needed. Returns
  * the relay's generation; pass it to `stopMeterRelay` to release that ref.
  */
-export function startMeterRelay(productionId: string, flowId: string, mixerBlockId: string, loudnessBlockId?: string | null): number {
+export function startMeterRelay(productionId: string, flowId: string, mixerBlockId: string, loudnessBlockId?: string | null, guestBlocks: ReadonlyMap<string, string> = new Map()): number {
   const meterPrefix = `${mixerBlockId}:meter:`;
   const existing = relays.get(productionId);
   if (existing) {
@@ -37,12 +40,34 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
       existing.meterPrefix = meterPrefix;
       existing.loudnessBlockId = loudnessBlockId;
     }
+    if (existing.flowId === flowId) existing.guestBlocks = guestBlocks;
     return existing.generation;
   }
 
   let stopped = false;
   let wsCleanup: (() => void) | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // Guest blocks that had a live health event since the current re-read
+  // started; the re-read's older view must not overwrite them.
+  let healthSeen: Set<string> | null = null;
+
+  // Health events sent while this socket was down are lost, so on every open
+  // re-read the flow's current block_health and broadcast each guest seat.
+  function rereadGuestHealth(strom: StromClient) {
+    if (entry.guestBlocks.size === 0) return;
+    const readFlowId = entry.flowId;
+    const seen = new Set<string>();
+    healthSeen = seen;
+    strom.flows.get(readFlowId).then(({ flow }) => {
+      if (stopped || entry.flowId !== readFlowId || healthSeen !== seen) return;
+      healthSeen = null;
+      for (const message of guestHealthSnapshot(entry.guestBlocks, flow.block_health)) {
+        if (!seen.has(message.blockId)) broadcast(productionId, message);
+      }
+    }).catch((err: unknown) => {
+      console.warn('[meter-relay] guest health re-read failed:', err);
+    });
+  }
 
   function connect() {
     if (stopped) return;
@@ -58,6 +83,13 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
             const { flow_id, element_id, momentary, shortterm, integrated, loudness_range, true_peak } = event.data;
             if (flow_id !== entry.flowId || element_id !== entry.loudnessBlockId) return;
             broadcast(productionId, { type: 'LOUDNESS_DATA', elementId: 'main', momentary, shortterm, integrated, loudness_range, true_peak });
+            return;
+          }
+          if (event.type === 'BlockHealthChanged') {
+            if (event.data.flow_id !== entry.flowId) return;
+            healthSeen?.add(event.data.block_id);
+            const message = guestHealthMessage(entry.guestBlocks, event.data);
+            if (message) broadcast(productionId, message);
             return;
           }
           if (event.type !== 'MeterData') return;
@@ -98,6 +130,7 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
             reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
           }
         },
+        () => rereadGuestHealth(strom),
       );
 
       wsCleanup = closeCleanup;
@@ -115,6 +148,7 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
     flowId,
     meterPrefix,
     loudnessBlockId,
+    guestBlocks,
     stop: () => {
       stopped = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
@@ -141,7 +175,7 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
  * per-socket stops land it back on zero. Returns the relay's generation, or
  * undefined (a no-op) when `holderCount <= 0`.
  */
-export function reconcileMeterRelay(productionId: string, flowId: string, mixerBlockId: string, loudnessBlockId: string | null | undefined, holderCount: number): number | undefined {
+export function reconcileMeterRelay(productionId: string, flowId: string, mixerBlockId: string, loudnessBlockId: string | null | undefined, holderCount: number, guestBlocks: ReadonlyMap<string, string> = new Map()): number | undefined {
   if (holderCount <= 0) return undefined;
   const meterPrefix = `${mixerBlockId}:meter:`;
   const existing = relays.get(productionId);
@@ -152,10 +186,11 @@ export function reconcileMeterRelay(productionId: string, flowId: string, mixerB
     existing.flowId = flowId;
     existing.meterPrefix = meterPrefix;
     existing.loudnessBlockId = loudnessBlockId;
+    existing.guestBlocks = guestBlocks;
     existing.refCount = holderCount;
     return existing.generation;
   }
-  const generation = startMeterRelay(productionId, flowId, mixerBlockId, loudnessBlockId);
+  const generation = startMeterRelay(productionId, flowId, mixerBlockId, loudnessBlockId, guestBlocks);
   const created = relays.get(productionId);
   if (created) created.refCount = holderCount;
   return generation;
