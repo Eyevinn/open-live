@@ -599,6 +599,16 @@ export interface GuestSessionDoc {
    * caller-supplied :sessionId for another guest's feed.
    */
   returnWhepSessionId?: string;
+  /**
+   * intercom-manager WHIP session id of this guest's talkback publish
+   * (guest-talkback spec §3.2/§4, issue #599). Bound on `POST
+   * /guests/:inviteId/talkback/whip` so the matching DELETE can verify the
+   * guest owns it, and replaced (old manager session DELETEd) on a new POST.
+   * Internal — stripped from `sessionToApi`.
+   */
+  talkbackWhipSessionId?: string;
+  /** intercom-manager WHEP session id of this guest's talkback listen (as above). Internal. */
+  talkbackWhepSessionId?: string;
   createdAt: string;
   updatedAt: string;
 }
