@@ -593,3 +593,21 @@ poll registered last. Fakes that tick a poll must keep intervals by id and pick 
 want by function name (`fn.name === 'pollReturnMode'`), as `guest-page-return-mode.test.ts`
 and `guest-page-on-air.test.ts` do. The on-air answer (`GET …/session/status`) is the guest's own
 `{ onAir }` boolean only — never widen it with other tally fields; the guest is untrusted.
+
+## Writing a CouchDB doc twice in one request: carry the `_rev` from the first write
+
+`nano`'s `insert` of an existing doc needs that doc's current `_rev`; a missing or stale one is a
+`409 conflict`. Guest join wrote the session, then wrote it again to add `intercomLineId`,
+without taking the `rev` the first `insert` returned. Every join with a talkback line would have
+hit the 409 on real CouchDB, but test mocks that accept any write hid it (found in #598). When a
+handler writes the same doc twice, set `_rev` from the first `insert`'s result. A mock DB that a
+test relies on for a multi-write flow should enforce revisions, as
+`guests-intercom.test.ts`'s sessions mock does.
+
+## intercom-manager line routes answer with the whole production's line list
+
+`GET` and `POST /production/:p/line` on Eyevinn/intercom-manager both return `LineResponse[]`
+(every line of the production), never the created line alone, and a duplicate line name on
+`POST` is a `400 { message }`. `INTERCOM_MANAGER_URL` must include `/api/v1`. Pick lines out of
+the array by `name`, and test with these real shapes, not an invented `{ id, name, joinUrl }`
+object (#598, `docs/specs/guest-talkback.md` §3.1).

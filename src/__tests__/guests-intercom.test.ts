@@ -1,18 +1,20 @@
 /**
- * Intercom talkback provisioning on guest join (epic #208, issue #302,
- * `docs/specs/guest-calling-intercom.md` §"Service Interactions", §Configuration).
+ * Intercom talkback provisioning on guest join (epic #208, issue #302; reworked
+ * for the real intercom-manager API in issue #598, `docs/specs/guest-talkback.md`
+ * §1.1, §3.1, §3.6).
  *
- * Two concerns are tested with the HTTP boundary mocked (no real network):
+ * The intercom-manager HTTP boundary is mocked with the manager's REAL shapes:
+ * `POST /production` → `{ name, productionId }`, `GET|POST /production/:p/line`
+ * → `LineResponse[]` (every line of the production), a duplicate line name on
+ * POST → `400 { message }`, plus a `500` and a network error.
  *
- *  1. The guest-join route: with intercom CONFIGURED a joined guest gets an
- *     `intercomLine` and the refs are recorded on the session + production; with
- *     intercom UNREACHABLE during an explicitly-enabled provision the join fails
- *     502 (talkback was asked for and could not be delivered).
- *  2. The intercom-manager client itself: production-grouping create on first
- *     use, line attach on an existing grouping, and unreachable/non-2xx →
- *     IntercomManagerError.
+ *  1. Guest join: one line per guest slot (`guest-<mixerInput>`), found by GET
+ *     or created by POST, reused on rejoin; any IntercomManagerError degrades
+ *     to `200` without `intercomLine` and a warn log — join never 502s.
+ *  2. The client itself: lookup-before-create, array selection, the
+ *     duplicate-400 race fallback, auth header, and error mapping.
  *
- * The "unconfigured → intercomLine absent, join still succeeds" degrade path is
+ * The "unconfigured → intercomLine absent, join still succeeds" path is
  * covered in guests-routes.test.ts (that suite runs with intercom vars unset).
  */
 
@@ -25,7 +27,7 @@ process.env['API_KEY'] = TEST_API_KEY;
 process.env['GUEST_INVITE_SECRET'] = 'test-hmac-secret';
 process.env['PUBLIC_BASE_URL'] = 'https://live.example.com';
 // Intercom CONFIGURED for this suite — talkback is explicitly enabled.
-process.env['INTERCOM_MANAGER_URL'] = 'https://intercom.example.com';
+process.env['INTERCOM_MANAGER_URL'] = 'https://intercom.example.com/api/v1';
 process.env['INTERCOM_MANAGER_TOKEN'] = 'ic-token';
 
 // ---- Mock CouchDB stores ----
@@ -75,9 +77,17 @@ const sessionsDb = {
     if (!doc) throw Object.assign(new Error('not_found'), { statusCode: 404 });
     return doc;
   }),
+  // CouchDB revision semantics: writing an existing doc needs its current _rev
+  // (a stale or missing one is a 409), so a second write in one join must carry
+  // the revision returned by the first.
   insert: vi.fn(async (doc: GuestSessionDoc) => {
-    sessionsStore.set(doc._id, { ...doc, _rev: '1-x' });
-    return { ok: true };
+    const current = sessionsStore.get(doc._id);
+    if (current && current._rev !== doc._rev) {
+      throw Object.assign(new Error('conflict'), { statusCode: 409 });
+    }
+    const rev = `${Number(current?._rev?.split('-')[0] ?? 0) + 1}-x`;
+    sessionsStore.set(doc._id, { ...doc, _rev: rev });
+    return { ok: true, id: doc._id, rev };
   }),
   destroy: vi.fn(),
   find: vi.fn(async (q: { selector: Record<string, unknown> }) => ({
@@ -125,6 +135,7 @@ function seedProduction(id = 'prod-1'): ProductionDoc {
     // One declared guest slot (#381): a source assignment carrying a returnFeed.
     sources: [
       { sourceId: 'Whip', mixerInput: 'video_in_0', returnFeed: { synced: 'program-minus' as const, lowLatency: false } },
+      { sourceId: 'Whip', mixerInput: 'video_in_1', returnFeed: { synced: 'program-minus' as const, lowLatency: false } },
     ],
     pipeline: { stromConfig: null, status: 'stopped' },
     graphics: [],
@@ -138,7 +149,7 @@ function seedProduction(id = 'prod-1'): ProductionDoc {
 }
 
 async function createInvite(payload: Record<string, unknown> = {}) {
-  seedProduction();
+  if (!productionsStore.has('prod-1')) seedProduction();
   const res = await app.inject({
     method: 'POST',
     url: '/api/v1/productions/prod-1/guests/invites',
@@ -165,155 +176,325 @@ beforeEach(() => {
   vi.restoreAllMocks();
 });
 
+// ---- Fake intercom-manager speaking the real API shapes (spec §3.1) ----
+
+const MANAGER = 'https://intercom.example.com/api/v1';
+
+interface FakeLine {
+  name: string;
+  id: string;
+  smbConferenceId: string;
+  participants: unknown[];
+}
+
+interface FakeManager {
+  productions: Map<string, FakeLine[]>;
+  calls: Array<{ method: string; path: string; auth?: string; body?: unknown }>;
+  /** Make the next POST …/line answer a duplicate 400 after another join "won" the race. */
+  raceOnNextLinePost?: boolean;
+}
+
+function lineResponse(lines: FakeLine[]): Response {
+  return new Response(JSON.stringify(lines), { status: 200, headers: { 'content-type': 'application/json' } });
+}
+
+function fakeManager(seed: Record<string, FakeLine[]> = {}): FakeManager {
+  const mgr: FakeManager = { productions: new Map(Object.entries(seed)), calls: [] };
+  let nextProduction = 100;
+  let nextLine = 1;
+  const addLine = (lines: FakeLine[], name: string) =>
+    lines.push({ name, id: String(nextLine++), smbConferenceId: `conf-${name}`, participants: [] });
+
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+    const u = String(url);
+    if (!u.startsWith(MANAGER)) throw new Error(`unexpected fetch ${u}`);
+    const path = u.slice(MANAGER.length);
+    const method = (init?.method ?? 'GET').toUpperCase();
+    const headers = new Headers(init?.headers as HeadersInit);
+    const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+    mgr.calls.push({ method, path, auth: headers.get('authorization') ?? undefined, body });
+
+    if (path === '/production' && method === 'POST') {
+      const productionId = String(nextProduction++);
+      mgr.productions.set(productionId, []);
+      return new Response(JSON.stringify({ name: body.name, productionId }), { status: 200 });
+    }
+    const m = /^\/production\/([^/]+)\/line$/.exec(path);
+    if (m) {
+      const lines = mgr.productions.get(decodeURIComponent(m[1]));
+      if (!lines) return new Response(JSON.stringify({ message: 'Production not found' }), { status: 404 });
+      if (method === 'GET') return lineResponse(lines);
+      if (method === 'POST') {
+        if (mgr.raceOnNextLinePost) {
+          mgr.raceOnNextLinePost = false;
+          addLine(lines, body.name); // a concurrent join created it first
+        }
+        if (lines.some((l) => l.name === body.name)) {
+          return new Response(
+            JSON.stringify({ message: `Line with name ${body.name} already exists` }),
+            { status: 400 },
+          );
+        }
+        addLine(lines, body.name);
+        return lineResponse(lines);
+      }
+    }
+    throw new Error(`unexpected fetch ${method} ${path}`);
+  });
+  return mgr;
+}
+
+// Join is rate-limited per IP (10/min); give each join its own address.
+let joinIp = 0;
+async function join(invite: { id: string; token: string }) {
+  joinIp += 1;
+  return app.inject({
+    method: 'POST',
+    remoteAddress: `10.0.${Math.floor(joinIp / 250)}.${(joinIp % 250) + 1}`,
+    url: `/api/v1/guests/${invite.id}/join`,
+    headers: { authorization: `Bearer ${invite.token}` },
+  });
+}
+
+/** Mark a guest session `left` so the slot can take its next occupant. */
+function leave(guestId: string) {
+  const s = sessionsStore.get(guestId)!;
+  sessionsStore.set(guestId, { ...s, state: 'left' });
+}
+
 describe('guest join — intercom configured', () => {
-  it('provisions a talkback line and records refs on the session + production', async () => {
-    // Mock the intercom-manager HTTP boundary: grouping create then line attach.
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
-      const u = String(url);
-      const method = (init?.method ?? 'GET').toUpperCase();
-      if (u.endsWith('/production') && method === 'POST') {
-        return new Response(JSON.stringify({ productionId: 'ic-prod-9' }), { status: 201 });
-      }
-      if (/\/production\/ic-prod-9\/line$/.test(u) && method === 'POST') {
-        return new Response(
-          JSON.stringify({ id: 'ic-line-1', name: 'guest', joinUrl: 'https://intercom.example.com/line/ic-line-1' }),
-          { status: 201 },
-        );
-      }
-      throw new Error(`unexpected fetch ${method} ${u}`);
+  it('creates the slot line by POST when missing and selects it from the LineResponse[]', async () => {
+    // An unrelated line already exists on the production, so the POST response
+    // array has more than one entry and the right one must be picked by name.
+    const prod = seedProduction();
+    productionsStore.set('prod-1', { ...prod, intercomProductionId: '7' });
+    const mgr = fakeManager({
+      '7': [{ name: 'producer', id: '1', smbConferenceId: 'c', participants: [] }],
     });
+    mgr.productions.get('7')!.push({ name: 'other', id: '2', smbConferenceId: 'c', participants: [] });
 
     const invite = await createInvite({ label: 'Remote guest' });
-    const res = await app.inject({
-      method: 'POST',
-      url: `/api/v1/guests/${invite.id}/join`,
-      headers: { authorization: `Bearer ${invite.token}` },
-    });
+    const res = await join(invite);
 
     expect(res.statusCode).toBe(200);
     const body = res.json();
-    expect(body.intercomLine).toMatchObject({
-      id: 'ic-line-1',
-      productionId: 'ic-prod-9',
-      joinUrl: 'https://intercom.example.com/line/ic-line-1',
-    });
-    // The line ref is recorded on the guest session…
-    expect(sessionsStore.get(body.guestId)?.intercomLineId).toBe('ic-line-1');
-    // …and the grouping id on the production so teardown can find it.
-    expect(productionsStore.get('prod-1')?.intercomProductionId).toBe('ic-prod-9');
-    // WHIP video + WHEP return unaffected — talkback is additive. The whipUrl is
-    // the guest-scoped alias (issue #423), keyed by :inviteId not mixerInput.
+    const created = mgr.productions.get('7')!.find((l) => l.name === 'guest-video_in_0')!;
+    expect(body.intercomLine).toEqual({ id: created.id, productionId: '7', name: 'guest-video_in_0' });
+    expect(body.intercomLine).not.toHaveProperty('joinUrl');
+    expect(sessionsStore.get(body.guestId)?.intercomLineId).toBe(created.id);
+    // Lookup first, then create.
+    expect(mgr.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      'GET /production/7/line',
+      'POST /production/7/line',
+    ]);
+    expect(mgr.calls[1].body).toEqual({ name: 'guest-video_in_0' });
+    // WHIP video unaffected — talkback is additive.
     expect(body.whipUrl).toMatch(/\/api\/v1\/guests\/[^/]+\/whip$/);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it('reuses an existing intercom grouping and only attaches a line', async () => {
-    const prod = seedProduction();
-    productionsStore.set('prod-1', { ...prod, intercomProductionId: 'ic-prod-existing' });
-
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
-      const u = String(url);
-      const method = (init?.method ?? 'GET').toUpperCase();
-      if (/\/production\/ic-prod-existing\/line$/.test(u) && method === 'POST') {
-        return new Response(JSON.stringify({ id: 'ic-line-2', name: 'guest' }), { status: 201 });
-      }
-      throw new Error(`unexpected fetch ${method} ${u}`);
-    });
-
-    const inviteRes = await app.inject({
-      method: 'POST',
-      url: '/api/v1/productions/prod-1/guests/invites',
-      headers: AUTH,
-      payload: { mixerInput: 'video_in_0' },
-    });
-    const invite = inviteRes.json() as { id: string; token: string };
-    const res = await app.inject({
-      method: 'POST',
-      url: `/api/v1/guests/${invite.id}/join`,
-      headers: { authorization: `Bearer ${invite.token}` },
-    });
+  it('creates the intercom grouping on first use and records it on the production', async () => {
+    const mgr = fakeManager();
+    const invite = await createInvite({ label: 'Remote guest' });
+    const res = await join(invite);
 
     expect(res.statusCode).toBe(200);
-    expect(res.json().intercomLine.id).toBe('ic-line-2');
-    // No grouping create — only the line attach was called.
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const body = res.json();
+    expect(body.intercomLine).toMatchObject({ productionId: '100', name: 'guest-video_in_0' });
+    expect(productionsStore.get('prod-1')?.intercomProductionId).toBe('100');
+    expect(mgr.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      'POST /production',
+      'GET /production/100/line',
+      'POST /production/100/line',
+    ]);
   });
 
-  it('502s when intercom is enabled but the manager is unreachable', async () => {
-    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('ECONNREFUSED'));
-
-    const invite = await createInvite();
-    const res = await app.inject({
-      method: 'POST',
-      url: `/api/v1/guests/${invite.id}/join`,
-      headers: { authorization: `Bearer ${invite.token}` },
+  it('reuses a line found by GET without POSTing', async () => {
+    const prod = seedProduction();
+    productionsStore.set('prod-1', { ...prod, intercomProductionId: '7' });
+    const mgr = fakeManager({
+      '7': [{ name: 'guest-video_in_0', id: '42', smbConferenceId: 'c', participants: [] }],
     });
 
-    expect(res.statusCode).toBe(502);
+    const invite = await createInvite();
+    const res = await join(invite);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().intercomLine).toEqual({ id: '42', productionId: '7', name: 'guest-video_in_0' });
+    expect(mgr.calls.map((c) => `${c.method} ${c.path}`)).toEqual(['GET /production/7/line']);
   });
 
-  it('502s when the manager returns a non-2xx status', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('nope', { status: 500 }));
+  it('falls back to a re-GET when the POST hits a duplicate-name 400 (race)', async () => {
+    const prod = seedProduction();
+    productionsStore.set('prod-1', { ...prod, intercomProductionId: '7' });
+    const mgr = fakeManager({ '7': [] });
+    mgr.raceOnNextLinePost = true;
 
     const invite = await createInvite();
-    const res = await app.inject({
-      method: 'POST',
-      url: `/api/v1/guests/${invite.id}/join`,
-      headers: { authorization: `Bearer ${invite.token}` },
-    });
+    const res = await join(invite);
 
-    expect(res.statusCode).toBe(502);
+    expect(res.statusCode).toBe(200);
+    const raced = mgr.productions.get('7')!.find((l) => l.name === 'guest-video_in_0')!;
+    expect(res.json().intercomLine.id).toBe(raced.id);
+    expect(mgr.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      'GET /production/7/line',
+      'POST /production/7/line',
+      'GET /production/7/line',
+    ]);
+    expect(mgr.productions.get('7')!.filter((l) => l.name === 'guest-video_in_0')).toHaveLength(1);
+  });
+
+  it('a rejoin with the same invite gets the same intercomLine.id and no second line', async () => {
+    const mgr = fakeManager();
+    const invite = await createInvite({ label: 'Remote guest' });
+
+    const first = await join(invite);
+    const second = await join(invite);
+
+    expect(first.statusCode).toBe(200);
+    expect(second.statusCode).toBe(200);
+    expect(second.json().intercomLine.id).toBe(first.json().intercomLine.id);
+    expect(second.json().guestId).toBe(first.json().guestId);
+    const lines = mgr.productions.get('100')!.filter((l) => l.name === 'guest-video_in_0');
+    expect(lines).toHaveLength(1);
+    // The second join only looked the line up.
+    expect(mgr.calls.filter((c) => c.method === 'POST' && c.path.endsWith('/line'))).toHaveLength(1);
+  });
+
+  it('the slot\'s next occupant reuses the slot line', async () => {
+    fakeManager();
+    const a = await createInvite({ label: 'Guest A' });
+    const first = await join(a);
+    leave(first.json().guestId);
+
+    const b = await createInvite({ label: 'Guest B' });
+    const second = await join(b);
+
+    expect(second.statusCode).toBe(200);
+    expect(second.json().intercomLine.id).toBe(first.json().intercomLine.id);
+  });
+
+  it('two invites with the same label in different slots get different lines, neither fails', async () => {
+    const mgr = fakeManager();
+    const a = await createInvite({ label: 'Studio guest', mixerInput: 'video_in_0' });
+    const b = await createInvite({ label: 'Studio guest', mixerInput: 'video_in_1' });
+
+    const ra = await join(a);
+    const rb = await join(b);
+
+    expect(ra.statusCode).toBe(200);
+    expect(rb.statusCode).toBe(200);
+    expect(ra.json().intercomLine.name).toBe('guest-video_in_0');
+    expect(rb.json().intercomLine.name).toBe('guest-video_in_1');
+    expect(ra.json().intercomLine.id).not.toBe(rb.json().intercomLine.id);
+    expect(mgr.productions.get('100')!.map((l) => l.name).sort()).toEqual([
+      'guest-video_in_0',
+      'guest-video_in_1',
+    ]);
+  });
+
+  it('manager 500 → join 200 without intercomLine, no intercomLineId, warn log', async () => {
+    const warn = vi.spyOn(app.log, 'warn');
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ message: 'boom' }), { status: 500 }),
+    );
+
+    const invite = await createInvite();
+    const res = await join(invite);
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body).not.toHaveProperty('intercomLine');
+    expect(sessionsStore.get(body.guestId)?.intercomLineId).toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ err: expect.objectContaining({ name: 'IntercomManagerError' }) }),
+      expect.stringContaining('intercom'),
+    );
+  });
+
+  it('manager network error → join 200 without intercomLine, warn log', async () => {
+    const warn = vi.spyOn(app.log, 'warn');
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new TypeError('fetch failed: ECONNREFUSED'));
+
+    const invite = await createInvite();
+    const res = await join(invite);
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body).not.toHaveProperty('intercomLine');
+    expect(sessionsStore.get(body.guestId)?.intercomLineId).toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ err: expect.objectContaining({ name: 'IntercomManagerError' }) }),
+      expect.stringContaining('intercom'),
+    );
+  });
+
+  it('a rejoin whose provisioning fails drops the previous intercomLineId', async () => {
+    fakeManager();
+    const invite = await createInvite();
+    const first = await join(invite);
+    expect(first.json().intercomLine).toBeDefined();
+
+    vi.restoreAllMocks();
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new TypeError('fetch failed'));
+    const second = await join(invite);
+
+    expect(second.statusCode).toBe(200);
+    expect(second.json()).not.toHaveProperty('intercomLine');
+    expect(sessionsStore.get(second.json().guestId)?.intercomLineId).toBeUndefined();
   });
 });
 
 describe('intercom-manager client', () => {
-  it('creates a grouping on first use then attaches a line, sending the bearer token', async () => {
+  it('sends the bearer token and names nothing it did not ask for', async () => {
     const { provisionGuestLine } = await import('../lib/intercom-manager.js');
-    const calls: Array<{ url: string; method: string; auth?: string }> = [];
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
-      const headers = new Headers(init?.headers as HeadersInit);
-      calls.push({ url: String(url), method: (init?.method ?? 'GET').toUpperCase(), auth: headers.get('authorization') ?? undefined });
-      if (String(url).endsWith('/production')) {
-        return new Response(JSON.stringify({ productionId: 'ic-prod-1' }), { status: 201 });
-      }
-      return new Response(JSON.stringify({ id: 'ic-line-1', name: 'l' }), { status: 201 });
-    });
-
-    const line = await provisionGuestLine({ productionId: 'prod-1', lineName: 'video_in_0' });
-    expect(line).toMatchObject({ id: 'ic-line-1', productionId: 'ic-prod-1' });
-    expect(calls[0]).toMatchObject({ method: 'POST', auth: 'Bearer ic-token' });
-    expect(calls[0].url).toContain('/production');
-    expect(calls[1].url).toContain('/production/ic-prod-1/line');
+    const mgr = fakeManager();
+    const line = await provisionGuestLine({ productionId: 'prod-1', lineName: 'guest-video_in_0' });
+    expect(line).toEqual({ id: '1', productionId: '100', name: 'guest-video_in_0' });
+    expect(mgr.calls.every((c) => c.auth === 'Bearer ic-token')).toBe(true);
+    expect(mgr.calls[0].body).toEqual({ name: 'open-live-prod-1', lines: [] });
   });
 
-  it('skips grouping create when intercomProductionId is supplied', async () => {
-    const { provisionGuestLine } = await import('../lib/intercom-manager.js');
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(JSON.stringify({ id: 'ic-line-3', name: 'l' }), { status: 201 }),
-    );
-    const line = await provisionGuestLine({
-      intercomProductionId: 'ic-prod-keep',
-      productionId: 'prod-1',
-      lineName: 'video_in_1',
-    });
-    expect(line.productionId).toBe('ic-prod-keep');
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(String(fetchMock.mock.calls[0][0])).toContain('/production/ic-prod-keep/line');
+  it('guestLineName is guest-<mixerInput>', async () => {
+    const { guestLineName } = await import('../lib/intercom-manager.js');
+    expect(guestLineName('video_in_3')).toBe('guest-video_in_3');
   });
 
   it('throws IntercomManagerError when unreachable', async () => {
     const { provisionGuestLine, IntercomManagerError } = await import('../lib/intercom-manager.js');
     vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('ECONNREFUSED'));
     await expect(
-      provisionGuestLine({ intercomProductionId: 'ic-p', productionId: 'prod-1', lineName: 'x' }),
+      provisionGuestLine({ intercomProductionId: '7', productionId: 'prod-1', lineName: 'x' }),
     ).rejects.toBeInstanceOf(IntercomManagerError);
   });
 
-  it('throws IntercomManagerError on a non-2xx response', async () => {
+  it('throws IntercomManagerError (with status) on a non-2xx response', async () => {
     const { provisionGuestLine, IntercomManagerError } = await import('../lib/intercom-manager.js');
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('boom', { status: 503 }));
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('boom', { status: 500 }));
+    const err = await provisionGuestLine({ intercomProductionId: '7', productionId: 'prod-1', lineName: 'x' })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(IntercomManagerError);
+    expect((err as InstanceType<typeof IntercomManagerError>).status).toBe(500);
+  });
+
+  it('a duplicate 400 whose re-GET still lacks the line is an IntercomManagerError', async () => {
+    const { provisionGuestLine, IntercomManagerError } = await import('../lib/intercom-manager.js');
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) =>
+      (init?.method ?? 'GET') === 'GET'
+        ? lineResponse([])
+        : new Response(JSON.stringify({ message: 'Line with name x already exists' }), { status: 400 }),
+    );
     await expect(
-      provisionGuestLine({ intercomProductionId: 'ic-p', productionId: 'prod-1', lineName: 'x' }),
+      provisionGuestLine({ intercomProductionId: '7', productionId: 'prod-1', lineName: 'x' }),
+    ).rejects.toBeInstanceOf(IntercomManagerError);
+  });
+
+  it('rejects a non-array line response (the invented { id, name, joinUrl } object)', async () => {
+    const { provisionGuestLine, IntercomManagerError } = await import('../lib/intercom-manager.js');
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ id: 'ic-line-1', name: 'x', joinUrl: 'https://x' }), { status: 200 }),
+    );
+    await expect(
+      provisionGuestLine({ intercomProductionId: '7', productionId: 'prod-1', lineName: 'x' }),
     ).rejects.toBeInstanceOf(IntercomManagerError);
   });
 });
