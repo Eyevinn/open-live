@@ -421,6 +421,21 @@ first start and stores it in its own CouchDB (`src/lib/guest-signing-key.ts`), r
 restart. When intercom vars are unset, guest calling still works with WHIP video + WHEP return but
 no talkback line (feature degrades cleanly — the fallback is first-class by design).
 
+## Talkback client (addendum, issue #593)
+
+This spec covers line *provisioning*. How the guest page and Studio join the line is specified in
+the linked addendum [`guest-talkback.md`](guest-talkback.md) (Proposed), with
+[ADR-012](../decisions/ADR-012-guest-talkback-whip-whep-proxy.md). Once that addendum is accepted,
+it amends this spec in three places:
+
+- **Join no longer returns 502 for intercom.** An intercom-manager failure during provisioning
+  is logged, and join returns `200` without `intercomLine`. This replaces the "502/503 …
+  intercom-manager unreachable" behaviour for join in [Error codes](#error-codes).
+- **`intercomLine.joinUrl` is removed.** intercom-manager returns no join URL. Join instead adds
+  a server-issued `talkback { whipUrl?, whepUrl }` object.
+- **One line per guest slot (`guest-<mixerInput>`), reused on rejoin.** This replaces one line
+  per join named after the invite label.
+
 ## Open Questions
 
 ### Resolved by @svensson00 (#208, 2026-09-16)
