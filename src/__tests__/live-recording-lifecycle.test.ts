@@ -48,7 +48,7 @@ vi.mock('../lib/strom.js', () => ({
 
 vi.mock('../config.js', async (orig) => {
   const actual = await orig<typeof import('../config.js')>();
-  return { ...actual, isRecordingEnabled: () => true };
+  return { ...actual, isObjectStorageConfigured: () => true };
 });
 
 const mockUploadRecordings = vi.fn();

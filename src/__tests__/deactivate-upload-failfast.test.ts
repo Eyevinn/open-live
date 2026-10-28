@@ -53,7 +53,7 @@ vi.mock('../lib/strom.js', () => ({
 // Recording is enabled; everything else in config is left real.
 vi.mock('../config.js', async (orig) => {
   const actual = await orig<typeof import('../config.js')>();
-  return { ...actual, isRecordingEnabled: () => true };
+  return { ...actual, isObjectStorageConfigured: () => true };
 });
 
 // The uploader reports an auth-aborted sweep (as it now does on a 401/403 or an
