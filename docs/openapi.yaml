@@ -1397,6 +1397,26 @@ components:
             name:
               type: string
               description: Line name on the intercom manager (`guest-<mixerInput>`).
+        talkback:
+          type: object
+          description: >-
+            Server-built talkback proxy URLs (guest-talkback spec §3.4, issue
+            #599). Present exactly when `intercomLine` is (a line was
+            provisioned or reused); the guest page shows talkback only when it
+            is present. Clients never build these URLs.
+          required: [whepUrl]
+          properties:
+            whipUrl:
+              type: string
+              format: uri
+              description: >-
+                `<base>/api/v1/guests/{inviteId}/talkback/whip` — publish the
+                guest's talkback mic into the line. Absent on a return-only slot
+                (the guest only listens).
+            whepUrl:
+              type: string
+              format: uri
+              description: '`<base>/api/v1/guests/{inviteId}/talkback/whep` — listen to the line.'
         iceServers:
           type: array
           description: >-
@@ -3775,6 +3795,201 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /api/v1/guests/{inviteId}/talkback/{kind}:
+    parameters:
+      - name: inviteId
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: kind
+        in: path
+        required: true
+        description: '`whip` publishes into the line (talk); `whep` subscribes to it (listen).'
+        schema:
+          type: string
+          enum: [whip, whep]
+    post:
+      summary: Guest opens a talkback WHIP (talk) or WHEP (listen) session (token-authed)
+      description: >-
+        Proxies the offer to intercom-manager's per-line WHIP/WHEP endpoint
+        (guest-talkback spec §3.2, ADR-012, issue #599). The intercom production
+        and line come from the guest's live session, never from the request;
+        the manager-side username is the invite label (sanitized to
+        `[\w .-]`, at most 200 characters; fallback `Guest <slot number>`).
+        open-live holds the manager key (`INTERCOM_WHIP_AUTH_KEY`, or the SAT in
+        `osc` mode). On `201` the session id is bound to the guest; a new POST
+        replaces it and ends the previous manager session. No PATCH: the
+        manager has no trickle ICE.
+      operationId: guestTalkbackOffer
+      tags: [Guests]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        description: Complete SDP offer (ICE gathered; no trickle), at most 64 KiB, passed through opaque
+        content:
+          application/sdp:
+            schema:
+              type: string
+      responses:
+        '201':
+          description: >-
+            SDP answer. `Location` is the open-live resource for DELETE;
+            `ETag` is the session id. The manager's `Location` and `Link`
+            (ICE servers, possibly TURN credentials) are never forwarded.
+          headers:
+            Location:
+              description: '`/api/v1/guests/{inviteId}/talkback/{kind}/{sessionId}`'
+              schema:
+                type: string
+            ETag:
+              description: The talkback session id (a UUID)
+              schema:
+                type: string
+          content:
+            application/sdp:
+              schema:
+                type: string
+        '400':
+          description: '`Malformed SDP` — empty body, or the manager rejected the offer'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: '`Invalid or expired invite` — missing/invalid/revoked/expired token, or the guest left or was removed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: '`This guest slot does not take WHIP` — WHIP on a return-only slot (WHEP still works)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: >-
+            `Talkback unavailable` — intercom unconfigured, no line provisioned
+            for the guest, production ended, or the manager answered 404
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '406':
+          description: The manager could not negotiate an m= section (its message is passed through)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: SDP offer larger than 64 KiB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          description: '`Unsupported Media Type` — the body is not `application/sdp`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: open-live's own limit (10 offers per minute per route and client IP)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: >-
+            `Intercom manager unreachable` — network error or timeout, a manager
+            5xx, a manager 401 (`INTERCOM_WHIP_AUTH_KEY` mismatch; logged as
+            `talkback: intercom-manager rejected INTERCOM_WHIP_AUTH_KEY`), or a
+            manager `Location`/`ETag` that is not
+            `/api/v1/{kind}/<p>/<l>/<uuid>` on the manager origin (R4)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: >-
+            `Intercom manager busy` (the manager rate-limited open-live; a
+            `Retry-After` header is set, default 5 s), guest calling disabled,
+            or database unavailable
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying (manager rate limit only)
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/guests/{inviteId}/talkback/{kind}/{sessionId}:
+    parameters:
+      - name: inviteId
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: kind
+        in: path
+        required: true
+        description: '`whip` publishes into the line (talk); `whep` subscribes to it (listen).'
+        schema:
+          type: string
+          enum: [whip, whep]
+      - name: sessionId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    delete:
+      summary: Guest ends their own talkback session (token-authed)
+      description: >-
+        Ends the manager session bound to this guest. Only the id returned by
+        the guest's own last POST is accepted.
+      operationId: guestTalkbackDelete
+      tags: [Guests]
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Ended (also when the manager says the session is already gone)
+        '400':
+          description: '`sessionId` is not a UUID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing, invalid, revoked or expired invite token, or the guest has left or been removed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: '`Session does not belong to this guest`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: '`Intercom manager unreachable` — network error, manager 5xx or 401'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: '`Intercom manager busy` (with `Retry-After`), guest calling disabled, or database unavailable'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   /api/v1/productions/{id}/returns/{mixerInput}:
     parameters:
       - name: id
@@ -3953,6 +4168,201 @@ paths:
                 $ref: '#/components/schemas/Error'
         '503':
           description: Guest calling disabled or database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/productions/{id}/guests/{guestId}/talkback/{kind}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: guestId
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: kind
+        in: path
+        required: true
+        description: '`whip` publishes into the line (talk); `whep` subscribes to it (listen).'
+        schema:
+          type: string
+          enum: [whip, whep]
+    post:
+      summary: Crew opens a talkback WHIP (talk) or WHEP (listen) session on a guest's line
+      description: >-
+        Studio's side of talkback (guest-talkback spec §3.3, issue #599). Same
+        contract as the guest route, behind the shared `API_KEY` gate. Crew
+        sessions are not persisted; Studio owns them. WHIP is allowed on a
+        return-only guest's line (it carries the operator's mic).
+      operationId: crewTalkbackOffer
+      tags: [Guests]
+      parameters:
+        - name: name
+          in: query
+          required: false
+          description: Display name on the line, sanitized to `[\w .-]` (at most 200 characters). Default `Producer`
+          schema:
+            type: string
+      requestBody:
+        required: true
+        description: Complete SDP offer (ICE gathered; no trickle), at most 64 KiB, passed through opaque
+        content:
+          application/sdp:
+            schema:
+              type: string
+      responses:
+        '201':
+          description: >-
+            SDP answer. `Location` is the open-live resource for DELETE;
+            `ETag` is the session id. The manager's `Location` and `Link`
+            (ICE servers, possibly TURN credentials) are never forwarded.
+          headers:
+            Location:
+              description: '`/api/v1/productions/{id}/guests/{guestId}/talkback/{kind}/{sessionId}`'
+              schema:
+                type: string
+            ETag:
+              description: The talkback session id (a UUID)
+              schema:
+                type: string
+          content:
+            application/sdp:
+              schema:
+                type: string
+        '400':
+          description: '`Malformed SDP` — empty body, or the manager rejected the offer'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: >-
+            `Talkback unavailable` — intercom unconfigured, no line provisioned
+            for the guest, production ended, or the manager answered 404; or `Guest not found` — no such guest session, another production, or the guest has left
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '406':
+          description: The manager could not negotiate an m= section (its message is passed through)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: SDP offer larger than 64 KiB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          description: '`Unsupported Media Type` — the body is not `application/sdp`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: open-live's own limit (10 offers per minute per route and client IP)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: >-
+            `Intercom manager unreachable` — network error or timeout, a manager
+            5xx, a manager 401 (`INTERCOM_WHIP_AUTH_KEY` mismatch; logged as
+            `talkback: intercom-manager rejected INTERCOM_WHIP_AUTH_KEY`), or a
+            manager `Location`/`ETag` that is not
+            `/api/v1/{kind}/<p>/<l>/<uuid>` on the manager origin (R4)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: >-
+            `Intercom manager busy` (the manager rate-limited open-live; a
+            `Retry-After` header is set, default 5 s), guest calling disabled,
+            or database unavailable
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying (manager rate limit only)
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/productions/{id}/guests/{guestId}/talkback/{kind}/{sessionId}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: guestId
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: kind
+        in: path
+        required: true
+        description: '`whip` publishes into the line (talk); `whep` subscribes to it (listen).'
+        schema:
+          type: string
+          enum: [whip, whep]
+      - name: sessionId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    delete:
+      summary: Crew ends a talkback session on a guest's line
+      description: Works after the guest has left (Studio tears down on `GUEST_STATE` `left`).
+      operationId: crewTalkbackDelete
+      tags: [Guests]
+      responses:
+        '204':
+          description: Ended (also when the manager says the session is already gone, or no line exists)
+        '400':
+          description: '`sessionId` is not a UUID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: '`Guest not found`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: '`Intercom manager unreachable` — network error, manager 5xx or 401'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: '`Intercom manager busy` (with `Retry-After`), guest calling disabled, or database unavailable'
           content:
             application/json:
               schema:

@@ -46,6 +46,14 @@ describe('redactSensitive', () => {
     expect(JSON.stringify(out)).not.toContain('TOPSECRET-PW');
   });
 
+  it('redacts the talkback WHIP key in env and config form (issue #599)', () => {
+    const out = redactSensitive({
+      INTERCOM_WHIP_AUTH_KEY: 'whip-canary',
+      config: { intercomWhipAuthKey: 'whip-canary', intercomManagerUrl: 'https://x' },
+    });
+    expect(JSON.stringify(out)).not.toContain('whip-canary');
+  });
+
   it('preserves non-object primitives', () => {
     expect(redactSensitive('plain')).toBe('plain');
     expect(redactSensitive(42)).toBe(42);

@@ -52,6 +52,7 @@ describe('intercom-manager auth mode', () => {
     vi.restoreAllMocks();
     delete process.env['INTERCOM_MANAGER_AUTH_MODE'];
     delete process.env['STROM_AUTH_MODE'];
+    delete process.env['INTERCOM_WHIP_AUTH_KEY'];
   });
 
   it('direct (default): sends INTERCOM_MANAGER_TOKEN as the Bearer, no token exchange', async () => {
@@ -107,5 +108,27 @@ describe('intercom-manager auth mode', () => {
       { serviceId: 'eyevinn-strom' },
       { serviceId: 'eyevinn-intercom-manager' },
     ]);
+  });
+
+  // Talkback WHIP/WHEP proxy auth (issue #599, guest-talkback spec §7 / OQ3).
+  it('talkback, direct: sends INTERCOM_WHIP_AUTH_KEY, not the management token', async () => {
+    process.env['INTERCOM_WHIP_AUTH_KEY'] = 'whip-key';
+    const { talkbackAuthorization } = await import('../lib/intercom-manager.js');
+    expect(await talkbackAuthorization()).toBe('Bearer whip-key');
+  });
+
+  it('talkback, direct with INTERCOM_WHIP_AUTH_KEY unset: no Authorization', async () => {
+    const { talkbackAuthorization } = await import('../lib/intercom-manager.js');
+    expect(await talkbackAuthorization()).toBeUndefined();
+  });
+
+  it('talkback, osc: sends the eyevinn-intercom-manager SAT (and ignores INTERCOM_WHIP_AUTH_KEY)', async () => {
+    process.env['INTERCOM_MANAGER_AUTH_MODE'] = 'osc';
+    process.env['INTERCOM_WHIP_AUTH_KEY'] = 'whip-key';
+    const calls: Array<{ url: string; body?: unknown }> = [];
+    mockFetch(calls);
+    const { talkbackAuthorization } = await import('../lib/intercom-manager.js');
+    expect(await talkbackAuthorization()).toBe('Bearer sat-for-eyevinn-intercom-manager');
+    expect(calls.map((c) => c.body)).toEqual([{ serviceId: 'eyevinn-intercom-manager' }]);
   });
 });

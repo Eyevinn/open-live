@@ -103,7 +103,11 @@ function isGuestTokenAuthedPath(path: string): boolean {
   // needed because the OSC ingress gate only passes `^/api/v1/guests`
   // (osaas-app#6143). Each handler verifies the per-invite token itself
   // (whip.ts / returns.ts), exactly like join/session.
-  return /^\/api\/v1\/guests\/[^/]+\/(join|slot|session|session\/return|session\/mute|session\/status|whip|returns\/picture\/whep(?:\/[^/]+)?)$/.test(path);
+  // The talkback WHIP/WHEP proxy (issue #599, guest-talkback spec §3.2) is the
+  // POST on `talkback/{whip|whep}` and the DELETE on its UUID-shaped session
+  // child only: anything else under `talkback/` (a non-UUID tail, an extra
+  // segment) stays behind the shared API_KEY.
+  return /^\/api\/v1\/guests\/[^/]+\/(join|slot|session|session\/return|session\/mute|session\/status|whip|returns\/picture\/whep(?:\/[^/]+)?|talkback\/(?:whip|whep)(?:\/[0-9a-fA-F-]{36})?)$/.test(path);
 }
 
 // Sentinel subprotocols used to carry the API key through the
@@ -207,10 +211,16 @@ function deriveAuthContext(
   return { authMethod: 'none' };
 }
 
-export async function buildServer() {
+/** Test seam: `logStream` receives the server's log lines (the key-never-leaks test, issue #599). */
+export interface BuildServerOptions {
+  logStream?: { write(line: string): void };
+}
+
+export async function buildServer(opts: BuildServerOptions = {}) {
   const fastify = Fastify({
     logger: {
       level: config.logLevel,
+      ...(opts.logStream ? { stream: opts.logStream } : {}),
       // Defence-in-depth: strip credentials from any log object regardless of
       // call site, in case a raw flow/source/error escapes explicit redaction.
       // Field names mirror the sensitive keys in src/lib/log-redact.ts.
@@ -231,6 +241,13 @@ export async function buildServer() {
           'secretKey',
           'secretKeyEnc',
           'address',
+          // Talkback proxy's intercom-manager WHIP/WHEP Bearer (issue #599),
+          // next to the other intercom credential (INTERCOM_MANAGER_TOKEN is
+          // covered by the `token` paths).
+          'INTERCOM_WHIP_AUTH_KEY',
+          'intercomWhipAuthKey',
+          '*.INTERCOM_WHIP_AUTH_KEY',
+          '*.intercomWhipAuthKey',
           '*.srt_uri',
           '*.passphrase',
           '*.streamid',

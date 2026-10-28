@@ -476,6 +476,15 @@ export const config = {
   intercomManagerAuthMode: (process.env['INTERCOM_MANAGER_AUTH_MODE'] === 'osc' ? 'osc' : 'direct') as
     | 'osc'
     | 'direct',
+  /**
+   * Bearer for intercom-manager's per-line WHIP/WHEP endpoints (the manager's
+   * `WHIP_AUTH_KEY`; guest-talkback spec §7, issue #599). Used only by the
+   * talkback proxy in `direct` auth mode; when unset the proxy sends no
+   * `Authorization` (manager WHIP auth off). In `osc` mode the SAT is sent
+   * instead and this is ignored. Held server-side only — never sent to a
+   * browser — and redacted in `src/lib/log-redact.ts` and the logger paths.
+   */
+  intercomWhipAuthKey: process.env['INTERCOM_WHIP_AUTH_KEY'] || undefined,
   // --- Shared-GPU usage metering (issue #500, docs/specs/shared-gpu-usage-metering.md, ADR-005) ---
   /**
    * Shared-GPU pool label (e.g. `se-sto01`) surfaced as the `gpu_pool` label /
