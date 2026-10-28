@@ -43,7 +43,7 @@ export function guestInputBlocks(doc: Pick<ProductionDoc, '_id' | 'sources'>): M
     if (!assignment.returnFeed) continue;
     const padMatch = /video_in_(\d+)$/.exec(assignment.mixerInput);
     if (!padMatch) continue;
-    blocks.set(`b-input-${padMatch[1]}-${endpointSuffix}`, assignment.mixerInput);
+    blocks.set(`b-input-${parseInt(padMatch[1], 10)}-${endpointSuffix}`, assignment.mixerInput);
   }
   return blocks;
 }

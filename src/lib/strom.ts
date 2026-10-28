@@ -1224,10 +1224,6 @@ export class StromClient {
       console.error('[strom-ws] Connection error:', err.message)
     })
 
-    ws.on('open', () => {
-      onOpen?.()
-    })
-
     ws.on('close', (_code, _reason) => {
       onClose?.()
     })
