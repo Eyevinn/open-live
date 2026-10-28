@@ -75,3 +75,19 @@ describe('CORS credentials for allowed origins', () => {
     expect(res.headers['access-control-allow-credentials']).toBe('true');
   });
 });
+
+describe('CORS exposed headers for allowed origins', () => {
+  it('exposes Location, Retry-After and ETag on a cross-origin request', async () => {
+    const app = await buildServer();
+    const res = await app.inject({
+      method: 'GET',
+      url: '/health',
+      headers: { origin: 'https://studio.example.com' },
+    });
+    expect(res.headers['access-control-allow-origin']).toBe('https://studio.example.com');
+    const exposed = String(res.headers['access-control-expose-headers'] ?? '')
+      .split(',')
+      .map((h) => h.trim());
+    expect(exposed).toEqual(expect.arrayContaining(['Location', 'Retry-After', 'ETag']));
+  });
+});
