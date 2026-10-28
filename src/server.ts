@@ -299,6 +299,11 @@ export async function buildServer(opts: BuildServerOptions = {}) {
     origin: corsOrigins,
     methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
+    // Studio runs on a different origin, and browsers hide response headers
+    // that are not CORS-safelisted unless they are exposed. Studio reads
+    // Location from the talkback 201 to DELETE the session later, and
+    // Retry-After from a 503 to back off.
+    exposedHeaders: ['Location', 'Retry-After', 'ETag'],
     // The studio calls POST /api/v1/auth/token with `credentials: 'include'`
     // to ride the OSC proxy/same-origin session (open-live-studio's sat.ts).
     // With this false, @fastify/cors omits Access-Control-Allow-Credentials
