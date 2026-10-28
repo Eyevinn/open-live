@@ -35,6 +35,7 @@ import { getIceServers } from '../lib/ice-servers.js';
 import type { IceServer } from '../lib/strom.js';
 import {
   isIntercomEnabled,
+  guestLineName,
   provisionGuestLine,
   IntercomManagerError,
   type IntercomLine,
@@ -621,8 +622,11 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
           (s) => s.inviteId === invite._id && s.state !== 'left',
         );
         if (ownLive) {
-          // A rejoin starts unmuted — the mute state resets (issue #382).
-          session = { ...ownLive, mixerInput, state: 'joined', muted: false, updatedAt: now };
+          // A rejoin starts unmuted — the mute state resets (issue #382). The
+          // intercom line ref is re-established by step 5b, so a rejoin whose
+          // provisioning degrades does not keep a stale `intercomLineId` (#598).
+          const { intercomLineId: _staleLine, ...rest } = ownLive;
+          session = { ...rest, mixerInput, state: 'joined', muted: false, updatedAt: now };
         } else {
           const occupant = docs.find(
             (s) => s.mixerInput === mixerInput && s.inviteId !== invite._id && s.state !== 'left',
@@ -643,7 +647,10 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
             updatedAt: now,
           };
         }
-        await getGuestSessionsDb().insert(session);
+        // Carry the new revision so the intercom-ref write below (step 5b) is an
+        // update of this doc, not a conflicting second insert.
+        const written = await getGuestSessionsDb().insert(session);
+        if (written?.rev) session = { ...session, _rev: written.rev };
       } catch (err) {
         fastify.log.warn({ err }, 'POST guests/:id/join — DB write failed');
         return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
@@ -666,44 +673,49 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         }
       }
 
-      // 5b. Provision an Open Intercom talkback line (audio only, OQ1). Degrades
-      //    cleanly: when the intercom vars are unset this is silently skipped and
-      //    join succeeds with `intercomLine` absent. When the vars ARE set the
-      //    talkback line is explicitly enabled, so a failure to reach the manager
-      //    is a 502 — an operator asked for talkback and it could not be
-      //    delivered (spec §Configuration, §"Error codes").
+      // 5b. Provision (or reuse) the slot's Open Intercom talkback line (audio
+      //    only, OQ1; guest-talkback spec §3.6, issue #598). One line per guest
+      //    slot, named `guest-<mixerInput>`, reused on rejoin and by the slot's
+      //    next occupant. Degrades: when the intercom vars are unset this is
+      //    skipped, and any IntercomManagerError (or a failure to record the
+      //    refs) is logged at warn level — join still answers 200, just without
+      //    `intercomLine`, and the session carries no `intercomLineId`. Join
+      //    never fails because of intercom.
       let intercomLine: IntercomLine | undefined;
       if (isIntercomEnabled()) {
         try {
           intercomLine = await provisionGuestLine({
             intercomProductionId: production.intercomProductionId,
             productionId: production._id,
-            lineName: invite.label ?? mixerInput,
+            lineName: guestLineName(mixerInput),
           });
         } catch (err) {
-          if (err instanceof IntercomManagerError) {
-            fastify.log.warn({ err }, 'POST guests/:id/join — intercom-manager unreachable');
-            return reply.status(502).send({ error: 'Intercom manager unreachable', statusCode: 502 });
-          }
-          throw err;
+          if (!(err instanceof IntercomManagerError)) throw err;
+          fastify.log.warn({ err }, 'POST guests/:id/join — intercom line provisioning failed; joining without talkback');
         }
-
-        // Record the intercom refs on the session and (first time only) on the
-        // production so lines tear down with the production lifecycle. The
+      }
+      if (intercomLine) {
+        // Record the intercom refs on the production (first time only, so lines
+        // tear down with the production lifecycle) and then on the session. The
         // production write goes through updateProductionDoc (get-modify-put with
         // 409 retry) so it composes with the return-feed persist above instead of
         // clobbering it with a stale revision.
         try {
-          session = { ...session, intercomLineId: intercomLine.id, updatedAt: new Date().toISOString() };
-          await getGuestSessionsDb().insert(session);
           if (production.intercomProductionId !== intercomLine.productionId) {
             await updateProductionDoc(production._id, {
               intercomProductionId: intercomLine.productionId,
             });
           }
+          const withLine: GuestSessionDoc = {
+            ...session,
+            intercomLineId: intercomLine.id,
+            updatedAt: new Date().toISOString(),
+          };
+          const written = await getGuestSessionsDb().insert(withLine);
+          session = written?.rev ? { ...withLine, _rev: written.rev } : withLine;
         } catch (err) {
-          fastify.log.warn({ err }, 'POST guests/:id/join — intercom ref persist failed');
-          return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
+          fastify.log.warn({ err }, 'POST guests/:id/join — intercom ref persist failed; joining without talkback');
+          intercomLine = undefined;
         }
       }
 
@@ -773,8 +785,9 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         modes: returnModesFor(mixerInput),
         defaultMode: 'program-minus',
         returnMode,
-        // intercomLine absent when intercom is unconfigured — join still works with
-        // WHIP video + WHEP return, no talkback (fallback is first-class — spec §Configuration).
+        // intercomLine absent when intercom is unconfigured or provisioning failed —
+        // join still works with WHIP video + WHEP return, no talkback (fallback is
+        // first-class — spec §Configuration, guest-talkback spec §3.6).
         ...(intercomLine ? { intercomLine } : {}),
       });
     },

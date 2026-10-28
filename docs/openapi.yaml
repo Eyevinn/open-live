@@ -1379,7 +1379,24 @@ components:
           enum: [program, program-minus]
         intercomLine:
           type: object
-          description: Present only when an Open Intercom talkback line is provisioned (later sub-issue).
+          description: >-
+            The guest slot's Open Intercom talkback line (one line per slot, named
+            `guest-<mixerInput>`, reused on rejoin and by the slot's next
+            occupant). Present only when intercom is configured and the line was
+            provisioned or reused. Absent when intercom is unconfigured or the
+            intercom manager failed (unreachable, error, unexpected response):
+            join still succeeds, without talkback (issue #598).
+          required: [id, productionId, name]
+          properties:
+            id:
+              type: string
+              description: intercom-manager line id.
+            productionId:
+              type: string
+              description: intercom-manager production id grouping this production's lines.
+            name:
+              type: string
+              description: Line name on the intercom manager (`guest-<mixerInput>`).
         iceServers:
           type: array
           description: >-
@@ -3546,6 +3563,10 @@ paths:
         per-invite HMAC token in `Authorization: Bearer <token>` — NOT the shared
         API key. `whipUrl` reuses the existing WHIP proxy contract; it is absent
         (and `returnOnly` is true) when the slot's source is not WHIP.
+
+        Intercom never fails a join: when the Open Intercom manager is
+        unreachable or errors, join answers `200` without `intercomLine` and the
+        server logs a warning (issue #598).
       operationId: guestJoin
       tags: [Guests]
       security:
@@ -3579,7 +3600,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '503':
-          description: Guest calling disabled or database unavailable
+          description: >-
+            Guest calling disabled or database unavailable. Never returned for
+            an intercom-manager failure (join degrades to `200` without
+            `intercomLine`).
           content:
             application/json:
               schema:
