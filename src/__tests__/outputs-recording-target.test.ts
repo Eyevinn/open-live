@@ -6,6 +6,7 @@
 import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { OutputDoc, StorageConnectionDoc } from '../db/types.js';
+import { config } from '../config.js';
 
 const TEST_API_KEY = 'test-secret-key';
 process.env['API_KEY'] = TEST_API_KEY;
@@ -69,6 +70,7 @@ beforeAll(async () => {
 });
 
 beforeEach(() => {
+  (config as Record<string, unknown>)['recordingLocalOnly'] = false;
   outputs.clear();
   connections.clear();
   outputsDb.insert.mockClear();
@@ -104,6 +106,25 @@ describe('POST /api/v1/outputs (recording)', () => {
     });
     expect(res.statusCode).toBe(400);
     expect(res.json().error).toContain('MINIO_*');
+  });
+
+  it('creates a recording output without a connectionId when RECORDING_LOCAL_ONLY is on', async () => {
+    (config as Record<string, unknown>)['recordingLocalOnly'] = true;
+    const res = await app.inject({
+      method: 'POST', url: '/api/v1/outputs', headers: AUTH,
+      payload: { name: 'VOD', outputType: 'recording' },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(outputsDb.insert).toHaveBeenCalledTimes(1);
+  });
+
+  it('creates a recording output with the reserved "default" connection when RECORDING_LOCAL_ONLY is on', async () => {
+    (config as Record<string, unknown>)['recordingLocalOnly'] = true;
+    const res = await app.inject({
+      method: 'POST', url: '/api/v1/outputs', headers: AUTH,
+      payload: { name: 'VOD', outputType: 'recording', connectionId: 'default' },
+    });
+    expect(res.statusCode).toBe(201);
   });
 
   it('400s "Storage connection not found" for an unknown connectionId and writes nothing', async () => {

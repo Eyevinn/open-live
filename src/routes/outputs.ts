@@ -10,7 +10,7 @@ import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-p
 import { encryptStreamKey } from '../lib/rtmp-credentials-crypto.js';
 import { resolveIngestUrl, validateStreamKey } from '../lib/rtmp.js';
 import { resolveSrtConnect } from '../lib/srt-connect.js';
-import { config, isRecordingEnabled } from '../config.js';
+import { config, isObjectStorageConfigured } from '../config.js';
 import { DEFAULT_CONNECTION_ID } from '../lib/storage-connection.js';
 import { isDocNotFoundError } from '../lib/db-errors.js';
 import { getPortReservation } from '../services/port-reservation.js';
@@ -82,11 +82,12 @@ async function outputInActiveProduction(outputId: string): Promise<boolean> {
 /**
  * Why a `recording` output with this `connectionId` has nowhere to upload to,
  * or null when it does (issue #534). A real connection must exist and name a
- * bucket; no connection (or the reserved `"default"`) needs the MINIO_* env.
+ * bucket; no connection (or the reserved `"default"`) needs the MINIO_* env, or
+ * the default-off `RECORDING_LOCAL_ONLY` opt-in (the recording stays on Strom).
  */
 async function recordingTargetError(connectionId: string | undefined): Promise<string | null> {
   if (!connectionId || connectionId === DEFAULT_CONNECTION_ID) {
-    return isRecordingEnabled()
+    return isObjectStorageConfigured() || config.recordingLocalOnly
       ? null
       : 'Recording needs object storage: set the MINIO_* environment variables or choose a storage connection (connectionId)';
   }
