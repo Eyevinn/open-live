@@ -453,17 +453,29 @@ export const config = {
   /** Default guest invite lifetime in seconds. */
   guestInviteTtlS: parsePositiveIntEnv('GUEST_INVITE_TTL_S', 86400),
   /**
-   * Base URL of the Open Intercom manager (Eyevinn/intercom-manager). Optional:
-   * when unset, guest calling still works with WHIP video + WHEP return but no
+   * Base URL of the Open Intercom manager (Eyevinn/intercom-manager), **including
+   * `/api/v1`** (e.g. `https://intercom.example.com/api/v1`). Optional: when
+   * unset, guest calling still works with WHIP video + WHEP return but no
    * talkback line (the fallback is first-class by design — spec §Configuration).
-   * Consumed by a later sub-issue (intercom line provisioning).
    */
   intercomManagerUrl: process.env['INTERCOM_MANAGER_URL'] ?? undefined,
   /**
    * Auth token for the Open Intercom manager. Optional; held server-side only
-   * and redacted in `src/lib/log-redact.ts`. Consumed by a later sub-issue.
+   * and redacted in `src/lib/log-redact.ts`. In `direct` auth mode it is the
+   * manager's `API_KEY`; in `osc` mode it is an OSC Personal Access Token.
    */
   intercomManagerToken: process.env['INTERCOM_MANAGER_TOKEN'] ?? undefined,
+  /**
+   * How `INTERCOM_MANAGER_TOKEN` is used (issue #598, guest-talkback spec OQ3):
+   * - `direct` (default): sent as-is as `Authorization: Bearer <token>`.
+   * - `osc`: the token is an OSC PAT, exchanged for a Service Access Token
+   *   scoped to `eyevinn-intercom-manager` and sent as the Bearer (OSC-hosted,
+   *   SAT-gated manager; leave the instance's `whipAuthKey` unset in that mode).
+   * Any value other than `osc` means `direct`.
+   */
+  intercomManagerAuthMode: (process.env['INTERCOM_MANAGER_AUTH_MODE'] === 'osc' ? 'osc' : 'direct') as
+    | 'osc'
+    | 'direct',
   // --- Shared-GPU usage metering (issue #500, docs/specs/shared-gpu-usage-metering.md, ADR-005) ---
   /**
    * Shared-GPU pool label (e.g. `se-sto01`) surfaced as the `gpu_pool` label /
