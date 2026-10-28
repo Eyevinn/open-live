@@ -279,8 +279,28 @@ describe('POST /api/v1/productions/:id/activate', () => {
     await app.close();
   });
 
+  it('drops the previous recorder fields when this activation has no recorder', async () => {
+    const doc = makeProductionDoc({ status: 'ended', recorderBlockId: 'b-old', recorderType: 'recorder' });
+    mockGet.mockResolvedValue(doc);
+    mockInsert.mockResolvedValue({ rev: '2-bcd', ok: true, id: doc._id });
+    mockActivateStromFlow.mockResolvedValue(activationResultWithWarning());
+    mockStromFlowsGet.mockResolvedValue({ flow: { id: 'flow-abc', running: true, blocks: [] } });
+
+    const app = await buildServer();
+    await app.inject({ method: 'POST', url: '/api/v1/productions/prod-test-1/activate' });
+
+    await vi.waitFor(() => {
+      const saved = mockInsert.mock.calls.map((c) => c[0] as Record<string, unknown>);
+      const live = saved.find((d) => d['stromFlowId'] === 'flow-abc');
+      expect(live).toBeDefined();
+      expect(live!['recorderBlockId']).toBeUndefined();
+      expect(live!['recorderType']).toBeUndefined();
+    });
+    await app.close();
+  });
+
   it('clears activation warnings when activation fails', async () => {
-    const doc = makeProductionDoc();
+    const doc = makeProductionDoc({ recorderBlockId: 'b-old' });
     mockGet.mockImplementation(async () => mockInsert.mock.calls.at(-1)?.[0] ?? doc);
     mockInsert.mockResolvedValue({ rev: '2-bcd', ok: true, id: doc._id });
     mockActivateStromFlow.mockResolvedValue(activationResultWithWarning());
@@ -294,6 +314,7 @@ describe('POST /api/v1/productions/:id/activate', () => {
       const last = mockInsert.mock.calls.at(-1)?.[0] as Record<string, unknown>;
       expect(last['status']).toBe('inactive');
       expect(last['activationWarnings']).toBeUndefined();
+      expect(last['recorderBlockId']).toBeUndefined();
     });
     await app.close();
   });
