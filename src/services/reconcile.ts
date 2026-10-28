@@ -107,6 +107,9 @@ export async function reconcileProductionStatuses(
           ...(nextStatus === 'ended' ? { endedReason: 'flow-lost' as const } : {}),
           activatedAt: undefined,
           stromFlowId: undefined,
+          recorderBlockId: undefined,
+          recorderType: undefined,
+          recording: undefined,
           inputRecordings: undefined,
           updatedAt: new Date().toISOString(),
         } as ProductionDoc);

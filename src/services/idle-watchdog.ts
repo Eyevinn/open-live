@@ -21,11 +21,11 @@ import { forceStopMeterRelay } from './meter-relay.js';
 import { stopLiveRecordingUpload } from './live-recording-upload.js';
 import { forceStopClipRelay } from './clip-relay.js';
 import { broadcast } from './tally.service.js';
-import { activationAbortControllers, updateProductionDoc, emitProductionStatus } from '../routes/productions.js';
+import { activationAbortControllers, updateProductionDoc, emitProductionStatus, uploadRecordingBeforeTeardown } from '../routes/productions.js';
 import { sweepGuestsOnProductionEnd } from './guest-sweep.js';
 import { stoppedStatus } from '../lib/production-health.js';
 import { settleOnStop } from './gpu-usage.js';
-import type { ProductionDoc } from '../db/types.js';
+import type { ProductionDoc, RecordingUploadSummary } from '../db/types.js';
 
 // Idle deadline is config-driven (issue #290, env IDLE_TIMEOUT_SEC, default 300s
 // = the previous hardcoded 5-minute constant). Read via getIdleTimeoutMs() so a
@@ -251,13 +251,18 @@ export async function deactivateProduction(productionId: string, log: FastifyBas
   forceStopMeterRelay(doc._id, doc.stromFlowId);
   forceStopClipRelay(doc._id, doc.stromFlowId);
   broadcast(doc._id, { type: 'GRP_STATE_RESET' });
-  // Stop the live recording part upload with the flow (issue #556).
-  await stopLiveRecordingUpload(doc._id);
+  // Stop the live recording part upload with the flow (issue #556), and wait
+  // for a running pass so the sweep below never races it.
+  const liveSession = await stopLiveRecordingUpload(doc._id);
+  let lastRecordingUpload: RecordingUploadSummary | undefined;
 
   if (doc.stromFlowId) {
     try {
       const stromToken = await getStromToken(config.stromToken).catch(() => undefined);
       const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
+      // Upload the recording before the flow is torn down, same as the explicit
+      // deactivate (issue #596). No doc write may precede it (#366 _rev guard).
+      lastRecordingUpload = await uploadRecordingBeforeTeardown(doc, strom, stromToken, log, liveSession);
       await deactivateStromFlow(doc.stromFlowId, strom);
     } catch (err) {
       log.warn({ err, productionId: doc._id }, '[idle-watchdog] Strom flow teardown failed — continuing');
@@ -280,10 +285,15 @@ export async function deactivateProduction(productionId: string, log: FastifyBas
     autoDeactivated: true,
     activatedAt: undefined,
     ...(settledGpuHours ? { gpuHours: settledGpuHours } : {}),
+    // Replaced only when there was a recording to upload (issue #534, #596).
+    ...(lastRecordingUpload ? { lastRecordingUpload } : {}),
     stromFlowId: undefined,
     mixerBlockId: undefined,
     audioMixerBlockId: undefined,
     loudnessMainBlockId: undefined,
+    recorderBlockId: undefined,
+    recorderType: undefined,
+    recording: undefined,
     sourceOffsetBlockIds: undefined,
     sourceAudioOffsetBlockIds: undefined,
     whepEndpoint: undefined,

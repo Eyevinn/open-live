@@ -169,7 +169,7 @@ async function loadPage(inv: { id: string; token: string }, options: { slotCheck
   const hiddenAtStart = new Set(['onair-badge', 'return', 'return-hint', 'rejoin', 'mute', 'leave', 'return-mode', 'self-warning', 'device-alert',
     'pip-option', 'pip-hint']);
   const els: Record<string, FakeElement> = {};
-  for (const id of ['banner', 'muted-indicator', 'onair-badge', 'preview', 'preview-hint', 'return',
+  for (const id of ['banner', 'muted-indicator', 'onair-badge', 'preview', 'preview-hint', 'return', 'return-audio',
     'return-hint', 'cam', 'mic', 'pickers', 'golive', 'rejoin', 'mute', 'leave', 'return-mode', 'mode-program-minus',
     'mode-program', 'self-warning', 'device-alert', 'device-alert-text', 'device-retry',
     'videos', 'pip-option', 'pip-toggle', 'pip-hint']) {
