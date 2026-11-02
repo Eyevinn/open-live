@@ -36,13 +36,13 @@ jobs:
           esac
 
       - name: Install OSC CLI
-        run: npm install -g @osaas/cli@4.33.2
+        run: npm install -g @osaas/cli@4.35.0
 
       - name: Trigger sync fork
         env:
           OSC_ACCESS_TOKEN: unused
           OSC_API_KEY: ${{ secrets.OSC_API_KEY }}
-        run: osc --env "${{ inputs.environment }}" admin sync-fork --wait eyevinn-open-live
+        run: osc --env "${{ inputs.environment }}" admin sync-fork --repository-url https://github.com/Eyevinn/open-live --wait
 
       - name: Restart olivedev service instances
         if: inputs.environment == 'prod'
@@ -55,7 +55,7 @@ jobs:
             echo "::error::OSC_OLIVEDEV_PAT secret is empty"
             exit 1
           fi
-          # @osaas/cli 4.33.2 `restart` exits 0 even when the restart fails. With --json it
+          # @osaas/cli 4.35.0 `restart` exits 0 even when the restart fails. With --json it
           # prints {"restarted":true} to stdout only on success ({"error":...} to stderr
           # otherwise), so check the output. Restart both instances before failing the job.
           failed=0
