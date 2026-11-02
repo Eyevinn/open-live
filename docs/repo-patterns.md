@@ -628,3 +628,14 @@ Fastify content-type parsers are scoped to the plugin that registers them, so `g
 own `application/sdp` parser (with the 64 KiB `bodyLimit`) next to the ones in `whip.ts` and
 `returns.ts`. To assert something never reaches the logs, build the server with
 `buildServer({ logStream })` and inspect the captured lines (`guests-talkback.test.ts`).
+
+## There are two in-repo SigV4 signers — verify changes against the AWS vector
+
+`src/lib/recording-uploader.ts` `signedS3Request()` (PUT/POST/DELETE with a body hash, object
+keys) and `src/lib/storage-connection.ts` `signS3GetRequest()` (empty-body GET for any path +
+query: ListObjectsV2, and the MinIO admin API `storageinfo` / `get-bucket-quota` for #613) are
+separate implementations of the same algorithm. A change to canonicalisation in one does not
+reach the other. `src/__tests__/storage-capacity.test.ts` pins `signS3GetRequest()` to the
+AWS-documented "GET Bucket Lifecycle" vector and to admin-path vectors captured from
+`curl --aws-sigv4`; run it after touching either signer. Also note madmin's `Backend.Type` is
+serialised as an int (`1` FS, `2` erasure), not a string.

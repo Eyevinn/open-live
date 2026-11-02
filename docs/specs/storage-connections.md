@@ -263,6 +263,63 @@ Credentials are **never** in the response. Errors:
 
 Rate/size posture: page size capped server-side; no recursion (delimiter-scoped); read-only.
 
+### 2.8a `GET /api/v1/storage-connections/:id/capacity` — free space + recording-minutes estimate
+
+Issue #613. Read-only; same API-key gate as the other routes. S3 has no free-space API, but
+MinIO's admin API does, signed with the same SigV4 signer (`signS3GetRequest`,
+`src/lib/storage-connection.ts`; service `s3`, the connection's region).
+
+Implementation:
+
+1. **Server capacity** — `GET {scheme}://{endpoint}/minio/admin/v3/storageinfo`. Sums
+   `Disks[].totalspace` / `Disks[].availspace` (madmin-go `Disk`). When `Backend.Type` is erasure
+   (`2`) and `Backend.StandardSCData[0]` / `Backend.StandardSCParities[0]` are present, both sums
+   are scaled by `data / (data + parity)` to give usable bytes. `scope: "server"`.
+2. **Bucket quota** — only when the connection has a `defaultBucket` (for `default`, the env
+   `MINIO_BUCKET`): `GET /minio/admin/v3/get-bucket-quota?bucket=<b>`. If it returns `size > 0`,
+   bucket usage is the sum of `Size` over one recursive `ListObjectsV2` page capped at
+   `STORAGE_LIST_MAX_KEYS`; then `totalBytes = size`, `freeBytes = min(serverFree, size - usage)`
+   (floored at 0), `scope: "bucket-quota"`. A truncated or failed walk, or any error from the
+   quota call, keeps server scope.
+3. **Estimate** — `referenceBitrateKbps = 10000` (`REFERENCE_BITRATE_KBPS`, the Enc PGM default
+   in `default-flow.ts`, which feeds the recorder's video).
+   `estimatedMinutes = floor(freeBytes * 8 / (referenceBitrateKbps * 1000) / 60)`.
+
+Response `200`, one of:
+
+```jsonc
+{
+  "status": "available",
+  "totalBytes": 1073741824000,
+  "freeBytes": 644245094400,
+  "scope": "server",                 // "server" | "bucket-quota"
+  "referenceBitrateKbps": 10000,
+  "estimatedMinutes": 8589,
+  "checkedAt": "2026-11-02T10:00:00.000Z"
+}
+```
+
+```jsonc
+{ "status": "unavailable", "reason": "forbidden", "checkedAt": "2026-11-02T10:00:00.000Z" }
+```
+
+`reason` mapping (an upstream failure is never a 5xx from this route):
+
+| Upstream outcome | `reason` |
+|---|---|
+| HTTP 403 (or 401) — the key lacks MinIO `admin:StorageInfo` | `forbidden` |
+| HTTP 400/404/405/501 (and other 4xx), a 200 body that is not a madmin `StorageInfo`, or an AWS (`*.amazonaws.com`) endpoint (no admin API; not called) | `not-supported` |
+| Network/DNS/TLS error, the 5 s per-request timeout, or an upstream 5xx other than 501 | `unreachable` |
+
+- `404 { error: "Storage connection not found", statusCode: 404 }` → unknown id (or `default`
+  when env storage is not configured).
+- Results (including `unavailable`) are cached in memory per connection id for 30 s; concurrent
+  requests share one probe. `PATCH`/`DELETE` of the connection drops its cache entry.
+- The secret key is never logged or returned.
+
+Operator note: for free space to show, the connection's access key needs the MinIO
+`admin:StorageInfo` action (root credentials have it); without it the route reports `forbidden`.
+
 ### 2.9 `connectionId` additions to existing contracts
 
 **`s3` clip reference** (`src/lib/clip-reference.ts:50-54`, `clipReferenceS3Schema`): add an

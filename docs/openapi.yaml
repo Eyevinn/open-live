@@ -4403,3 +4403,68 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+
+  /api/v1/storage-connections/{id}/capacity:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Storage connection id, or `default` for the env-derived connection.
+        schema:
+          type: string
+    get:
+      summary: Storage connection free space and recording-minutes estimate
+      description: |
+        Reads free space through the MinIO admin API (`storageinfo`, plus `get-bucket-quota` for
+        the connection's `defaultBucket`), SigV4-signed with the connection's credentials. Upstream
+        failures are reported in the body with HTTP 200, never as a 5xx. Results are cached per
+        connection for 30 s. See `docs/specs/storage-connections.md` §2.8a.
+      operationId: getStorageConnectionCapacity
+      tags: [Storage connections]
+      responses:
+        '200':
+          description: Capacity result (`available`) or a classified upstream failure (`unavailable`)
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [status, totalBytes, freeBytes, scope, referenceBitrateKbps, estimatedMinutes, checkedAt]
+                    properties:
+                      status:
+                        type: string
+                        const: available
+                      totalBytes:
+                        type: number
+                      freeBytes:
+                        type: number
+                      scope:
+                        type: string
+                        enum: [server, bucket-quota]
+                      referenceBitrateKbps:
+                        type: number
+                        description: Bitrate the estimate assumes (the Enc PGM default, 10000).
+                      estimatedMinutes:
+                        type: number
+                        description: floor(freeBytes * 8 / (referenceBitrateKbps * 1000) / 60)
+                      checkedAt:
+                        type: string
+                        format: date-time
+                  - type: object
+                    required: [status, reason, checkedAt]
+                    properties:
+                      status:
+                        type: string
+                        const: unavailable
+                      reason:
+                        type: string
+                        enum: [forbidden, not-supported, unreachable]
+                      checkedAt:
+                        type: string
+                        format: date-time
+        '404':
+          description: Storage connection not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
