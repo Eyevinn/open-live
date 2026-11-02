@@ -129,17 +129,23 @@ const {
 } = await import('../services/strom-recorder-events.js');
 type Handlers = import('../services/strom-recorder-events.js').RecorderSocketHandlers;
 
-const NOW = '2026-11-01T17:59:00.000Z';
+// Anchored on the real clock, not a fixed date: the recorder-event replay
+// buffer (strom-recorder-events.ts) prunes events older than
+// RECENT_EVENT_TTL_MS against the real Date.now(), so fixed past timestamps
+// turn this test into a time bomb once that date is more than the TTL ago.
+const STEM_MS = Math.floor(Date.now() / 1000) * 1000 - 2000;
+const STEM_STAMP = new Date(STEM_MS).toISOString().replace(/[-:]/g, '').replace('T', '_').slice(0, 15);
+const NOW = new Date(STEM_MS - 60_000).toISOString();
 const PROD = 'prod-1';
 const FLOW = 'flow-1';
 const PGM_DIR = `recordings/${PROD}`;
 const IN = 'video_in_2';
 const IN_DIR = `${PGM_DIR}/${IN}`;
-const PGM_STEM = `${PROD}_20261101_180000`;
-const IN_STEM = `${PROD}_${IN}_20261101_180000`;
+const PGM_STEM = `${PROD}_${STEM_STAMP}`;
+const IN_STEM = `${PROD}_${IN}_${STEM_STAMP}`;
 const fileName = (stem: string, i: number) => `${stem}_${String(i).padStart(5, '0')}.mp4`;
 /** When open-live received part 0's events: program, then the input 300 ms later. */
-const PGM_OPENED_MS = Date.parse('2026-11-01T18:00:01.420Z');
+const PGM_OPENED_MS = STEM_MS + 1420;
 const IN_OPENED_MS = PGM_OPENED_MS + 300;
 
 const inputRecorder = {
