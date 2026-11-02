@@ -3,7 +3,9 @@
  * rtmp-multi-destination.md, ADR-004 Decision 3 / security condition 8).
  *
  * Asserts: one builtin.rtmp_output block per assigned rtmp output, the stream
- * key composed into rtmp_url ONLY at generation time, and that the composed
+ * key composed into the block's `location` property ONLY at generation time,
+ * pads/properties matching Strom's builtin.rtmp_output definition (Eyevinn/strom
+ * backend/src/blocks/builtin/rtmp.rs: `location`, `video_in`, `audio_in`), and that the composed
  * key-bearing URL never appears in any open-live log line — including the
  * flow-start-failure path (safeFlowProjection strips block properties).
  */
@@ -84,7 +86,7 @@ beforeEach(() => {
 });
 
 describe('activateStromFlow — RTMP output block', () => {
-  it('emits one builtin.rtmp_output with rtmp_url composed from the decrypted key', async () => {
+  it('emits one builtin.rtmp_output with location composed from the decrypted key', async () => {
     const { activateStromFlow } = await import('../lib/flow-generator.js');
     const strom = makeStromClient();
     const production = makeProduction([{ outputId: 'output-yt' }]);
@@ -96,10 +98,35 @@ describe('activateStromFlow — RTMP output block', () => {
     const rtmpBlocks = blocks.filter((b) => b['block_definition_id'] === 'builtin.rtmp_output');
     expect(rtmpBlocks).toHaveLength(1);
     const props = rtmpBlocks[0]!['properties'] as Record<string, unknown>;
-    expect(props['rtmp_url']).toBe(`rtmps://a.rtmp.youtube.com/live2/${STREAM_KEY}`);
+    expect(props['location']).toBe(`rtmps://a.rtmp.youtube.com/live2/${STREAM_KEY}`);
+    // Strom ignores unknown properties and would publish to its loopback default.
+    expect(props).not.toHaveProperty('rtmp_url');
   });
 
-  it('never leaks the composed rtmp_url / key on the flow-start-failure log path', async () => {
+  it('links the rtmp_output on Strom\'s video_in and audio_in pads (never audio_in_0) — #612', async () => {
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    const strom = makeStromClient();
+    const production = makeProduction([{ outputId: 'output-yt' }]);
+
+    await activateStromFlow(production as never, strom as never, undefined, [rtmpOutputDoc() as never]);
+
+    const flow = strom.capturedFlows[0]!;
+    const blocks = flow['blocks'] as Array<Record<string, unknown>>;
+    const links = flow['links'] as Array<Record<string, unknown>>;
+    const rtmpId = blocks.find((b) => b['block_definition_id'] === 'builtin.rtmp_output')!['id'] as string;
+    const rtmpLinks = links.filter((l) => String(l['to']).startsWith(`${rtmpId}:`));
+
+    expect(rtmpLinks.map((l) => l['to']).sort()).toEqual([`${rtmpId}:audio_in`, `${rtmpId}:video_in`]);
+    expect(links.some((l) => l['to'] === `${rtmpId}:audio_in_0`)).toBe(false);
+
+    // Video must come from the H.264 programme encode (Strom refuses raw video).
+    const videoFrom = rtmpLinks.find((l) => l['to'] === `${rtmpId}:video_in`)!['from'] as string;
+    const encPgm = blocks.find((b) => b['name'] === 'Enc PGM');
+    expect(encPgm).toBeDefined();
+    expect(videoFrom.startsWith(`${encPgm!['id'] as string}:`)).toBe(true);
+  });
+
+  it('never leaks the composed location URL / key on the flow-start-failure log path', async () => {
     const { activateStromFlow } = await import('../lib/flow-generator.js');
     const strom = makeStromClient({ failStart: true });
     const production = makeProduction([{ outputId: 'output-yt' }]);
@@ -112,7 +139,8 @@ describe('activateStromFlow — RTMP output block', () => {
     // No console.error argument may contain the stream key or the composed URL.
     const logged = errorSpy.mock.calls.flat().map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join('\n');
     expect(logged).not.toContain(STREAM_KEY);
-    expect(logged).not.toContain('rtmp_url');
+    expect(logged).not.toContain(`live2/${STREAM_KEY}`);
+    expect(logged).not.toContain('location');
     errorSpy.mockRestore();
   });
 });

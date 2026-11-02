@@ -259,7 +259,7 @@ sequenceDiagram
     OL->>DB: load production + assigned OutputDocs
     loop for each assigned rtmp OutputDoc
         OL->>OL: flow-generator: decrypt streamKey; compose ingestUrl + key; emit builtin.rtmp_output
-        OL->>OL: link pgmFeedPad → :video_in, mainAudioSource → :audio_in_0 (as mpegtssrt does)
+        OL->>OL: link pgmFeedPad → :video_in, mainAudioSource → :audio_in (single audio pad, unlike mpegtssrt's :audio_in_0)
     end
     OL->>Strom: create + start flow (rtmp_output blocks carry composed URL at generation time)
     Strom->>Plat: RTMP(S) connect + publish program feed
@@ -307,20 +307,24 @@ assigned RTMP destination, wired exactly like the existing SRT output
   "name": "<output name>",
   "properties": {
     // composed at generation time from decrypted key; NEVER logged, NEVER persisted composed:
-    "rtmp_url": "rtmps://a.rtmp.youtube.com/live2/<streamKey>"
+    // property name per Strom's builtin.rtmp_output definition (strom PR#827, rtmp.rs):
+    "location": "rtmps://a.rtmp.youtube.com/live2/<streamKey>"
     // encoder profile: constrained to what RTMP receivers accept (strom#783). The exact
     // property name/shape (whether set on rtmp_output or on the upstream builtin.videoenc
     // like Enc PGM at flow-generator.ts:212-222) is verified against strom#783's fix.
   },
   "position": { "x": COL_OUTPUT, "y": ROW_START + outputBlockIndex * ROW_H }
 }
-// links: { from: pgmFeedPad, to: "<id>:video_in" }, { from: mainAudioSource, to: "<id>:audio_in_0" }
+// links: { from: pgmFeedPad, to: "<id>:video_in" }, { from: mainAudioSource, to: "<id>:audio_in" }
+// Strom's block has exactly two input pads, `video_in` (H.264) and `audio_in` (raw or AAC; raw is
+// encoded to AAC inside the block). There is no `audio_in_0` — linking it fails flow start with
+// "External pad 'audio_in_0' not found" (open-live#612).
 ```
 
 > **Warning (strom PR#827 body).** The Strom flow-create handler logs the whole request body at
-> `debug`. Since the composed `rtmp_url` contains the stream key, open-live must (a) never send a
+> `debug`. Since the composed `location` URL contains the stream key, open-live must (a) never send a
 > composed-key URL to a Strom instance that logs it without the same redaction open-live PR#316
-> applied, and (b) redact `rtmp_url` in any open-live-side logging of the generated flow. This is an
+> applied, and (b) redact `location` in any open-live-side logging of the generated flow. This is an
 > ADR-004 hard rule.
 
 ## Studio UI scope (Eyevinn/open-live-studio#143)
@@ -366,7 +370,7 @@ contract the browser must honour, not new endpoints.
   only; no account linking, no channel enumeration, no token exchange in the browser. Possible
   follow-up epic, not v1.
 - Mid-show hot add/rotate of a destination on a live production — the backend composes the key into
-  `rtmp_url` only at flow-generation time and there is no running-element PATCH primitive (see
+  `location` URL only at flow-generation time and there is no running-element PATCH primitive (see
   **Risks**), so destination changes require a production restart. Studio reflects this (changes apply
   on next activation) rather than promising a live hot-swap.
 
@@ -450,7 +454,7 @@ provenance; each carries its **RESOLVED** annotation._
 
 - **Stream-key exfiltration (the core risk).** The stream key is a bearer credential for the
   operator's platform channel. It lives on a shared server-side host and is composed into an
-  `rtmp_url` handed to Strom. Mitigations designed in: encryption at rest (`srt-passphrase-crypto`),
+  `location` URL handed to Strom. Mitigations designed in: encryption at rest (`srt-passphrase-crypto`),
   write-only/masked API (never returned, never in the `url`/`connect` fields), and the log-redaction
   hard rule (open-live PR#316 discipline) covering both open-live's flow logging and Strom's
   debug-logs-the-body behaviour (strom PR#827). Cautionary precedent: open-live-studio#10 (HIGH,
@@ -463,7 +467,7 @@ provenance; each carries its **RESOLVED** annotation._
   silently fails on the first destination that refuses a codec turns "easy publishing" into a support
   burden — the epic's own disconfirming evidence. Implementation is blocked on these closing (epic
   kill-condition date 2026-10-16). Not duplicated here.
-- **No live-inject primitive.** The composed `rtmp_url` (with key) must be present at
+- **No live-inject primitive.** The composed `location` URL (with key) must be present at
   flow-generation time; there is no running-element property PATCH in the Strom client (the same gap
   ADR-002/ADR-003 flagged, `src/lib/strom.ts` `elements` is list/get/pads only). Adding or rotating a
   destination on a live production requires a flow restart, not a hot update — keep v1 to

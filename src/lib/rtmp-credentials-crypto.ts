@@ -21,7 +21,7 @@
  * degrades to a loud no-op so local dev without a key works.
  *
  * NEVER log the plaintext stream key or the raw key from this module. The
- * decrypted key is composed into `rtmp_url` only at flow-generation time and is
+ * decrypted key is composed into the rtmp_output `location` property only at flow-generation time and is
  * never persisted composed (spec §Configuration, ADR-004 Decision 3).
  */
 
