@@ -33,6 +33,9 @@ import {
   resolveStorageTarget,
   listStorageObjects,
   testStorageConnection,
+  resolveStorageCredentials,
+  getStorageCapacityCached,
+  clearStorageCapacityCache,
   StorageConnectionNotFoundError,
   StorageListError,
   DEFAULT_CONNECTION_ID,
@@ -236,6 +239,8 @@ const storageConnectionsRoutes: FastifyPluginAsync = async (fastify) => {
       fastify.log.warn({ err }, 'PATCH /api/v1/storage-connections/:id — DB write failed');
       return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
     }
+    // Endpoint/credentials/bucket may have changed — drop any cached capacity.
+    clearStorageCapacityCache(updated._id);
     return reply.send(toApi(updated));
   });
 
@@ -274,6 +279,7 @@ const storageConnectionsRoutes: FastifyPluginAsync = async (fastify) => {
       fastify.log.warn({ err }, 'DELETE /api/v1/storage-connections/:id — delete failed');
       return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
     }
+    clearStorageCapacityCache(doc._id);
     return reply.status(204).send();
   });
 
@@ -296,6 +302,22 @@ const storageConnectionsRoutes: FastifyPluginAsync = async (fastify) => {
       });
     }
     const result = await testStorageConnection(target, { from: body.from });
+    return reply.send(result);
+  });
+
+  // Free space + recording-minutes estimate via the MinIO admin API (spec §2.8a).
+  // Upstream failures are a structured `unavailable` body at HTTP 200, never 5xx.
+  fastify.get<{ Params: { id: string } }>('/api/v1/storage-connections/:id/capacity', async (req, reply) => {
+    let conn;
+    try {
+      conn = await resolveStorageCredentials(req.params.id);
+    } catch (err) {
+      if (err instanceof StorageConnectionNotFoundError) {
+        return reply.status(404).send({ error: 'Storage connection not found', statusCode: 404 });
+      }
+      throw err;
+    }
+    const result = await getStorageCapacityCached(req.params.id, conn, { maxKeys: config.storageListMaxKeys });
     return reply.send(result);
   });
 

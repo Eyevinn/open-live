@@ -98,7 +98,7 @@ export async function resolveStorageTarget(
   return minioTargetFromConfig(bucketOverride);
 }
 
-// --------------- SigV4-signed ListObjectsV2 (dependency-free) ---------------
+// --------------- SigV4 request signing (dependency-free) ---------------
 
 const EMPTY_SHA256 = createHash('sha256').update('').digest('hex');
 
@@ -122,30 +122,24 @@ function encodeBucketPath(bucket: string): string {
   return '/' + bucket.split('/').map(encodeURIComponent).join('/');
 }
 
-interface ListParams {
-  prefix?: string;
-  delimiter?: string;
-  maxKeys: number;
-  continuationToken?: string;
-}
+/** The connection fields a SigV4 signature needs — a `MinioTarget` minus the bucket. */
+export type S3Credentials = Pick<MinioTarget, 'endpoint' | 'useSsl' | 'region' | 'accessKey' | 'secretKey'>;
 
-/** SigV4-signed ListObjectsV2 GET; returns the raw HTTP status + body. */
-async function fetchListObjects(
-  target: MinioTarget,
-  params: ListParams,
+/**
+ * Builds the URL + headers of a SigV4-signed (service `s3`, the connection's
+ * region), empty-body `GET` for an arbitrary already-encoded `canonicalUri`
+ * (e.g. `/my-bucket` or `/minio/admin/v3/storageinfo`) and query. Query entries
+ * are RFC 3986-encoded and sorted as SigV4 requires; a valueless sub-resource is
+ * passed as `{ name: '' }`. Pure — the caller performs the request.
+ */
+export function signS3GetRequest(
+  creds: S3Credentials,
+  canonicalUri: string,
+  query: Record<string, string> = {},
   now: Date = new Date(),
-): Promise<{ status: number; ok: boolean; body: string }> {
-  const scheme = target.useSsl ? 'https' : 'http';
-  const host = target.endpoint;
-  const canonicalUri = encodeBucketPath(target.bucket);
-
-  const query: Record<string, string> = {
-    'list-type': '2',
-    'max-keys': String(params.maxKeys),
-  };
-  if (params.delimiter) query['delimiter'] = params.delimiter;
-  if (params.prefix) query['prefix'] = params.prefix;
-  if (params.continuationToken) query['continuation-token'] = params.continuationToken;
+): { url: string; headers: Record<string, string> } {
+  const scheme = creds.useSsl ? 'https' : 'http';
+  const host = creds.endpoint;
 
   const canonicalQuery = Object.keys(query)
     .sort()
@@ -155,7 +149,7 @@ async function fetchListObjects(
   const amzDate = now.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
   const dateStamp = amzDate.slice(0, 8);
   const algorithm = 'AWS4-HMAC-SHA256';
-  const credentialScope = `${dateStamp}/${target.region}/s3/aws4_request`;
+  const credentialScope = `${dateStamp}/${creds.region}/s3/aws4_request`;
 
   const canonicalHeaders =
     `host:${host}\n` +
@@ -179,28 +173,61 @@ async function fetchListObjects(
     sha256Hex(canonicalRequest),
   ].join('\n');
 
-  const kDate = hmac(`AWS4${target.secretKey}`, dateStamp);
-  const kRegion = hmac(kDate, target.region);
+  const kDate = hmac(`AWS4${creds.secretKey}`, dateStamp);
+  const kRegion = hmac(kDate, creds.region);
   const kService = hmac(kRegion, 's3');
   const kSigning = hmac(kService, 'aws4_request');
   const signature = createHmac('sha256', kSigning).update(stringToSign, 'utf8').digest('hex');
 
   const authorization =
-    `${algorithm} Credential=${target.accessKey}/${credentialScope}, ` +
+    `${algorithm} Credential=${creds.accessKey}/${credentialScope}, ` +
     `SignedHeaders=${signedHeaders}, Signature=${signature}`;
 
-  const url = `${scheme}://${host}${canonicalUri}?${canonicalQuery}`;
-  const res = await fetch(url, {
-    method: 'GET',
+  return {
+    url: `${scheme}://${host}${canonicalUri}${canonicalQuery ? `?${canonicalQuery}` : ''}`,
     headers: {
       Host: host,
       'x-amz-date': amzDate,
       'x-amz-content-sha256': EMPTY_SHA256,
       Authorization: authorization,
     },
-  });
+  };
+}
+
+/** Sends a SigV4-signed GET; returns the raw HTTP status + body. Throws on network error/abort. */
+async function signedGet(
+  creds: S3Credentials,
+  canonicalUri: string,
+  query: Record<string, string>,
+  signal?: AbortSignal,
+): Promise<{ status: number; ok: boolean; body: string }> {
+  const { url, headers } = signS3GetRequest(creds, canonicalUri, query);
+  const res = await fetch(url, { method: 'GET', headers, ...(signal ? { signal } : {}) });
   const body = await res.text().catch(() => '');
   return { status: res.status, ok: res.ok, body };
+}
+
+interface ListParams {
+  prefix?: string;
+  delimiter?: string;
+  maxKeys: number;
+  continuationToken?: string;
+}
+
+/** SigV4-signed ListObjectsV2 GET; returns the raw HTTP status + body. */
+async function fetchListObjects(
+  target: MinioTarget,
+  params: ListParams,
+  signal?: AbortSignal,
+): Promise<{ status: number; ok: boolean; body: string }> {
+  const query: Record<string, string> = {
+    'list-type': '2',
+    'max-keys': String(params.maxKeys),
+  };
+  if (params.delimiter) query['delimiter'] = params.delimiter;
+  if (params.prefix) query['prefix'] = params.prefix;
+  if (params.continuationToken) query['continuation-token'] = params.continuationToken;
+  return signedGet(target, encodeBucketPath(target.bucket), query, signal);
 }
 
 /** Decodes the five predefined XML entities that may appear in a key/prefix. */
@@ -385,4 +412,263 @@ export async function testStorageConnection(
     canList: false,
     message: `Unexpected response from the object store (status ${res.status}).`,
   };
+}
+
+// --------------- Capacity (MinIO admin storageinfo + bucket quota) ---------------
+
+/**
+ * Reference bitrate for the recording-minutes estimate: the Enc PGM default
+ * (`builtin.videoenc` `bitrate: 10000` kbps in `default-flow.ts`), which feeds
+ * the recorder's video (`flow-generator.ts`, Live Recorder branch).
+ */
+export const REFERENCE_BITRATE_KBPS = 10000;
+
+/** Per-upstream-request timeout for the capacity probe. */
+export const CAPACITY_TIMEOUT_MS = 5000;
+
+/** How long a capacity result is reused per connection id. */
+export const CAPACITY_CACHE_TTL_MS = 30_000;
+
+export type StorageCapacityResult =
+  | {
+      status: 'available';
+      totalBytes: number;
+      freeBytes: number;
+      scope: 'server' | 'bucket-quota';
+      referenceBitrateKbps: number;
+      estimatedMinutes: number;
+      checkedAt: string;
+    }
+  | {
+      status: 'unavailable';
+      reason: 'forbidden' | 'not-supported' | 'unreachable';
+      checkedAt: string;
+    };
+
+/** A connection's signing credentials plus its default bucket (if any). */
+export interface StorageConnectionCredentials {
+  creds: S3Credentials;
+  defaultBucket?: string;
+}
+
+/**
+ * Resolves a connection id to its signing credentials without requiring a
+ * bucket (capacity is a server-level query). `"default"` maps to the env
+ * connection and, like `GET /:id`, does not resolve when env storage is not
+ * configured. Throws {@link StorageConnectionNotFoundError} when the id does not
+ * resolve.
+ */
+export async function resolveStorageCredentials(connectionId: string): Promise<StorageConnectionCredentials> {
+  if (connectionId === DEFAULT_CONNECTION_ID) {
+    const t = minioTargetFromConfig();
+    if (!t) throw new StorageConnectionNotFoundError(connectionId);
+    const { bucket, ...creds } = t;
+    return { creds, defaultBucket: bucket };
+  }
+  let doc: StorageConnectionDoc;
+  try {
+    doc = await getStorageConnectionsDb().get(connectionId);
+  } catch {
+    throw new StorageConnectionNotFoundError(connectionId);
+  }
+  return {
+    creds: {
+      endpoint: doc.endpoint,
+      useSsl: doc.useSsl,
+      region: doc.region,
+      accessKey: doc.accessKey,
+      secretKey: decryptStorageSecret(doc.secretKeyEnc),
+    },
+    ...(doc.defaultBucket ? { defaultBucket: doc.defaultBucket } : {}),
+  };
+}
+
+type UnavailableReason = 'forbidden' | 'not-supported' | 'unreachable';
+
+class CapacityUnavailable extends Error {
+  constructor(readonly reason: UnavailableReason) {
+    super(reason);
+    this.name = 'CapacityUnavailable';
+  }
+}
+
+/** True for an AWS S3 endpoint — it has no admin API, so capacity is not supported. */
+function isAwsEndpoint(endpoint: string): boolean {
+  const host = endpoint.replace(/:\d+$/, '').toLowerCase();
+  return host === 'amazonaws.com' || host.endsWith('.amazonaws.com');
+}
+
+/** Maps a non-2xx admin-API status to an unavailable reason. */
+function reasonForStatus(status: number): UnavailableReason {
+  if (status === 401 || status === 403) return 'forbidden';
+  if (status >= 500 && status !== 501) return 'unreachable';
+  return 'not-supported';
+}
+
+/** SigV4-signed admin GET with a timeout; network error / abort → `unreachable`. */
+async function adminGet(
+  creds: S3Credentials,
+  path: string,
+  query: Record<string, string> = {},
+): Promise<{ status: number; ok: boolean; body: string }> {
+  try {
+    return await signedGet(creds, path, query, AbortSignal.timeout(CAPACITY_TIMEOUT_MS));
+  } catch {
+    throw new CapacityUnavailable('unreachable');
+  }
+}
+
+interface MadminDisk {
+  totalspace?: unknown;
+  availspace?: unknown;
+}
+interface MadminStorageInfo {
+  Disks?: unknown;
+  Backend?: { Type?: unknown; StandardSCData?: unknown; StandardSCParities?: unknown };
+}
+
+function num(v: unknown): number {
+  return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0;
+}
+
+/**
+ * Parses a madmin `StorageInfo` body into usable `{ total, free }` bytes. Raw
+ * sums over `Disks[]`; on an erasure backend with standard-class data/parity
+ * counts, both are scaled by `data / (data + parity)`. Returns null for a body
+ * that is not a madmin StorageInfo (→ not-supported).
+ */
+export function parseStorageInfo(body: string): { total: number; free: number } | null {
+  let info: MadminStorageInfo;
+  try {
+    info = JSON.parse(body) as MadminStorageInfo;
+  } catch {
+    return null;
+  }
+  if (!info || typeof info !== 'object' || !Array.isArray(info.Disks)) return null;
+  let total = 0;
+  let free = 0;
+  for (const d of info.Disks as MadminDisk[]) {
+    if (!d || typeof d !== 'object') continue;
+    total += num(d.totalspace);
+    free += num(d.availspace);
+  }
+  // madmin BackendType: 0 Unknown, 1 FS, 2 Erasure (serialised as an int).
+  const type = info.Backend?.Type;
+  const isErasure = type === 2 || (typeof type === 'string' && type.toLowerCase() === 'erasure');
+  const data = Array.isArray(info.Backend?.StandardSCData) ? num(info.Backend!.StandardSCData[0]) : 0;
+  const parity = Array.isArray(info.Backend?.StandardSCParities)
+    ? (info.Backend!.StandardSCParities[0] as unknown)
+    : undefined;
+  if (isErasure && data > 0 && typeof parity === 'number' && Number.isFinite(parity) && parity >= 0) {
+    const ratio = data / (data + parity);
+    total = Math.floor(total * ratio);
+    free = Math.floor(free * ratio);
+  }
+  return { total, free };
+}
+
+/** Returns the bucket's hard-quota size in bytes, or 0 when unset / any error. */
+async function fetchBucketQuota(creds: S3Credentials, bucket: string): Promise<number> {
+  try {
+    const res = await adminGet(creds, '/minio/admin/v3/get-bucket-quota', { bucket });
+    if (!res.ok) return 0;
+    const parsed = JSON.parse(res.body) as { size?: unknown; quota?: unknown };
+    return num(parsed.size) || num(parsed.quota);
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Sums object sizes over one recursive ListObjectsV2 page capped at `maxKeys`.
+ * Returns null when the listing fails or is truncated (usage unknown).
+ */
+async function fetchBucketUsage(creds: S3Credentials, bucket: string, maxKeys: number): Promise<number | null> {
+  let res: { status: number; ok: boolean; body: string };
+  try {
+    res = await fetchListObjects({ ...creds, bucket }, { maxKeys }, AbortSignal.timeout(CAPACITY_TIMEOUT_MS));
+  } catch {
+    return null;
+  }
+  if (!res.ok || /<IsTruncated>true<\/IsTruncated>/.test(res.body)) return null;
+  let used = 0;
+  for (const m of res.body.matchAll(/<Contents>[\s\S]*?<Size>(\d+)<\/Size>[\s\S]*?<\/Contents>/g)) {
+    used += Number(m[1]);
+  }
+  return used;
+}
+
+/**
+ * Probes a connection's free space through the MinIO admin API (spec §2.8a).
+ * Never throws: every upstream failure becomes an `unavailable` result, and
+ * neither the result nor any error carries the secret key.
+ */
+export async function getStorageCapacity(
+  conn: StorageConnectionCredentials,
+  opts: { maxKeys: number },
+): Promise<StorageCapacityResult> {
+  const checkedAt = new Date().toISOString();
+  try {
+    if (isAwsEndpoint(conn.creds.endpoint)) throw new CapacityUnavailable('not-supported');
+
+    const res = await adminGet(conn.creds, '/minio/admin/v3/storageinfo');
+    if (!res.ok) throw new CapacityUnavailable(reasonForStatus(res.status));
+    const server = parseStorageInfo(res.body);
+    if (!server) throw new CapacityUnavailable('not-supported');
+
+    let totalBytes = server.total;
+    let freeBytes = server.free;
+    let scope: 'server' | 'bucket-quota' = 'server';
+
+    if (conn.defaultBucket) {
+      const quota = await fetchBucketQuota(conn.creds, conn.defaultBucket);
+      if (quota > 0) {
+        const used = await fetchBucketUsage(conn.creds, conn.defaultBucket, opts.maxKeys);
+        if (used !== null) {
+          totalBytes = quota;
+          freeBytes = Math.max(0, Math.min(server.free, quota - used));
+          scope = 'bucket-quota';
+        }
+      }
+    }
+
+    return {
+      status: 'available',
+      totalBytes,
+      freeBytes,
+      scope,
+      referenceBitrateKbps: REFERENCE_BITRATE_KBPS,
+      estimatedMinutes: Math.floor((freeBytes * 8) / (REFERENCE_BITRATE_KBPS * 1000) / 60),
+      checkedAt,
+    };
+  } catch (err) {
+    const reason = err instanceof CapacityUnavailable ? err.reason : 'unreachable';
+    return { status: 'unavailable', reason, checkedAt };
+  }
+}
+
+const capacityCache = new Map<string, { expiresAt: number; result: Promise<StorageCapacityResult> }>();
+
+/**
+ * {@link getStorageCapacity} memoised per connection id for
+ * {@link CAPACITY_CACHE_TTL_MS}, so a list view polling every connection does not
+ * hammer the object store. Concurrent calls share one in-flight probe.
+ */
+export function getStorageCapacityCached(
+  connectionId: string,
+  conn: StorageConnectionCredentials,
+  opts: { maxKeys: number },
+): Promise<StorageCapacityResult> {
+  const now = Date.now();
+  const hit = capacityCache.get(connectionId);
+  if (hit && hit.expiresAt > now) return hit.result;
+  const result = getStorageCapacity(conn, opts);
+  capacityCache.set(connectionId, { expiresAt: now + CAPACITY_CACHE_TTL_MS, result });
+  return result;
+}
+
+/** Drops a cached capacity result (on connection update/delete), or all when no id is given. */
+export function clearStorageCapacityCache(connectionId?: string): void {
+  if (connectionId === undefined) capacityCache.clear();
+  else capacityCache.delete(connectionId);
 }
