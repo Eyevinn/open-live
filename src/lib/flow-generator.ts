@@ -1327,7 +1327,7 @@ export async function activateStromFlow(
         // RTMP multi-destination (spec: rtmp-multi-destination.md, ADR-004).
         // One builtin.rtmp_output per assigned rtmp output, wired from the
         // program feed pad + main audio bus exactly like the SRT output. The
-        // stream key is decrypted and composed into rtmp_url ONLY here, at
+        // stream key is decrypted and composed into `location` ONLY here, at
         // generation time — never persisted composed. Skip a destination with
         // no key/ingestUrl (nothing to publish), mirroring the SRT no-url skip.
         const rtmp = outputDoc.rtmp;
@@ -1340,13 +1340,16 @@ export async function activateStromFlow(
           properties: {
             // Composed key-bearing URL — NEVER logged (safeFlowProjection strips
             // all block properties) and NEVER persisted (spec §Configuration).
-            rtmp_url: rtmpUrl,
+            // Property name and pads (`video_in`, `audio_in` — single audio pad,
+            // no `_0` suffix) follow Strom's builtin.rtmp_output definition
+            // (Eyevinn/strom backend/src/blocks/builtin/rtmp.rs, Strom#827).
+            location: rtmpUrl,
           },
           position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
         });
         outputBlockIndex++;
         if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
-        if (mainAudioSource) flow.links.push({ from: mainAudioSource, to: `${blockId}:audio_in_0` });
+        if (mainAudioSource) flow.links.push({ from: mainAudioSource, to: `${blockId}:audio_in` });
       } else {
         // mpegtssrt or efpsrt — both use the MPEG-TS/SRT output block.
         // Skip if no URL — an empty srt_uri fails at GStreamer READY state.

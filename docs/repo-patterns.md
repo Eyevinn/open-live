@@ -177,9 +177,14 @@ An `outputType: 'rtmp'` destination keeps its ingest URL + key in the structured
 never in `url`. Keep `'rtmp'` out of `SRT_OUTPUT_TYPES` so the derived `connect` field
 (`outputs.ts`) is never computed from a key-bearing URL, and skip the SRT listener port-lease
 branch for it (RTMP is an outbound connect, not a listener). The stream key is decrypted and
-composed into `rtmp_url` **only** in the flow generator at activation time, never persisted
-composed, and only ever logged through `safeFlowProjection()` (which strips all block
-properties).
+composed into the `builtin.rtmp_output` block's `location` property **only** in the flow
+generator at activation time, never persisted composed, and only ever logged through
+`safeFlowProjection()` (which strips all block properties). Strom's `builtin.rtmp_output`
+(Eyevinn/strom `backend/src/blocks/builtin/rtmp.rs`, Strom#827) takes its URL as `location` and
+has exactly two input pads, `video_in` (H.264) and `audio_in` (raw or AAC) — **not**
+`audio_in_0` like `builtin.mpegtssrt_output`. An unknown property is silently ignored (the block
+falls back to its loopback default URL), while a wrong pad name fails flow start with
+`External pad '…' not found` (issue #612).
 
 ## A rejected Strom `/transition` must roll back the whole switch, not just the PiP announce
 

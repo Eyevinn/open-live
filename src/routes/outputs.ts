@@ -61,7 +61,7 @@ function outputStatusFor(outputId: string, live: Set<string> | null): OutputStat
 /**
  * True if `outputId` is assigned to any active/activating production. Used to
  * block a destructive mutation (delete, or an RTMP key/platform change) while a
- * production is live — the composed rtmp_url is baked into the running flow at
+ * production is live — the composed RTMP URL (`location`) is baked into the running flow at
  * activation time and there is no live-inject primitive, so a change would not
  * take effect until restart and must not silently diverge from what is on air
  * (spec §Error codes 409, ADR-004 security condition 10).
@@ -355,7 +355,7 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
         const mutatesCredential =
           rtmpPatch.platform !== undefined || rtmpPatch.streamKey !== undefined || rtmpPatch.ingestUrl !== undefined;
         // Block key/platform mutation while the destination is live (409) — the
-        // composed rtmp_url is baked into the running flow at activation time and
+        // composed RTMP URL (`location`) is baked into the running flow at activation time and
         // there is no live-inject primitive (ADR-004 security condition 10).
         if (mutatesCredential && (await outputInActiveProduction(doc._id))) {
           return reply.status(409).send({ error: 'Output is used in an active production', statusCode: 409 });
