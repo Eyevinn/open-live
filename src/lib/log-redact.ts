@@ -15,6 +15,12 @@
  * `INTERCOM_WHIP_AUTH_KEY` / config key `intercomWhipAuthKey` (guest-talkback
  * spec §7, issue #599), which no other sub-pattern matches.
  *
+ * The runtime intercom connection (issue #617, OL-47) stores `tokenEnc`
+ * (matched by `token`) and `whipKeyEnc`, and accepts the write-only `apiKey` /
+ * `whipKey` request fields; `whip_?key` and `api_?key` cover those, and
+ * `credential` covers the resolved connection's Bearer source
+ * (`ResolvedIntercomConnection.credential`).
+ *
  * `address` / `url` are redacted because an authenticated HTML source (Design D,
  * token-in-URL — `docs/specs/authenticated-html-sources.md`, ADR-003) carries a
  * signed/expiring access token inside the source `address`, which becomes the
@@ -24,7 +30,7 @@
  */
 
 const SENSITIVE_KEYS =
-  /srt_uri|passphrase|streamid|authorization|token|pat|secret|access_?key|auth_?key|address|url/i;
+  /srt_uri|passphrase|streamid|authorization|token|pat|secret|access_?key|auth_?key|whip_?key|api_?key|credential|address|url/i;
 
 export function redactSensitive(obj: unknown): unknown {
   if (Array.isArray(obj)) {

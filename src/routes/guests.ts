@@ -33,8 +33,8 @@ import {
 } from '../lib/guest-slot-label.js';
 import { getIceServers } from '../lib/ice-servers.js';
 import type { IceServer } from '../lib/strom.js';
+import { activeIntercomConnection, intercomRecordMatches, type ResolvedIntercomConnection } from '../lib/intercom-connection.js';
 import {
-  isIntercomEnabled,
   guestLineName,
   provisionGuestLine,
   IntercomManagerError,
@@ -324,7 +324,9 @@ async function teardownGuestTalkback(
     const sessionId = session[talkbackField(kind)];
     return sessionId ? [{ kind, sessionId }] : [];
   });
-  if (owned.length === 0 || !session.intercomLineId || !isIntercomEnabled()) return;
+  if (owned.length === 0 || !session.intercomLineId) return;
+  const conn = await activeIntercomConnection();
+  if (!conn) return;
   const context = { guestId: session._id, productionId: session.productionId };
   let production: ProductionDoc | undefined;
   try {
@@ -334,13 +336,28 @@ async function teardownGuestTalkback(
     return;
   }
   const intercomProductionId = production?.intercomProductionId;
-  if (!intercomProductionId) return;
+  if (!intercomProductionId || !lineBelongsTo(session, intercomProductionId)) return;
+  // Repointing safety (issue #617): never address an id on a manager it was not created on.
+  if (!intercomRecordMatches(production?.intercomManagerOrigin, conn)) {
+    log.info(context, 'talkback teardown: the intercom connection now points at another manager; skipped');
+    return;
+  }
   const lineId = session.intercomLineId;
   await Promise.all(
     owned.map(({ kind, sessionId }) =>
-      endTalkbackSession({ kind, productionId: intercomProductionId, lineId, sessionId }, log, context),
+      endTalkbackSession({ kind, productionId: intercomProductionId, lineId, sessionId, conn }, log, context),
     ),
   );
+}
+
+/**
+ * True when the session's talkback line belongs to the production's current
+ * intercom grouping (issue #617: after repointing, a line on the old grouping is
+ * never addressed on the new manager). Sessions written before #617 carry no
+ * grouping id and are accepted.
+ */
+function lineBelongsTo(session: GuestSessionDoc, intercomProductionId: string): boolean {
+  return session.intercomLineProductionId === undefined || session.intercomLineProductionId === intercomProductionId;
 }
 
 /**
@@ -435,16 +452,21 @@ function sendTalkbackAnswer(
 /**
  * The intercom production/line a guest session talks on, read from open-live's
  * own DB (spec §3.2, R4): `ProductionDoc.intercomProductionId` and the live
- * `GuestSessionDoc.intercomLineId`. Undefined when talkback is unavailable
- * (intercom unconfigured, nothing provisioned, or the production ended).
+ * `GuestSessionDoc.intercomLineId`, plus the connection in effect. Undefined
+ * when talkback is unavailable (intercom unconfigured, nothing provisioned, the
+ * production ended, or the connection now points at a different manager than
+ * the one the intercom production was created on — issue #617).
  */
-function talkbackLine(
+async function talkbackLine(
   production: ProductionDoc,
   session: GuestSessionDoc,
-): { productionId: string; lineId: string } | undefined {
-  if (!isIntercomEnabled() || production.status === 'ended') return undefined;
+): Promise<{ productionId: string; lineId: string; conn: ResolvedIntercomConnection } | undefined> {
+  if (production.status === 'ended') return undefined;
   if (!production.intercomProductionId || !session.intercomLineId) return undefined;
-  return { productionId: production.intercomProductionId, lineId: session.intercomLineId };
+  if (!lineBelongsTo(session, production.intercomProductionId)) return undefined;
+  const conn = await activeIntercomConnection();
+  if (!conn || !intercomRecordMatches(production.intercomManagerOrigin, conn)) return undefined;
+  return { productionId: production.intercomProductionId, lineId: session.intercomLineId, conn };
 }
 
 /** Load a production for a talkback call; `undefined` = not found, throws on a DB failure. */
@@ -800,7 +822,7 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
           // A rejoin starts unmuted — the mute state resets (issue #382). The
           // intercom line ref is re-established by step 5b, so a rejoin whose
           // provisioning degrades does not keep a stale `intercomLineId` (#598).
-          const { intercomLineId: _staleLine, ...rest } = ownLive;
+          const { intercomLineId: _staleLine, intercomLineProductionId: _staleGrouping, ...rest } = ownLive;
           session = { ...rest, mixerInput, state: 'joined', muted: false, updatedAt: now };
         } else {
           const occupant = docs.find(
@@ -856,34 +878,55 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
       //    refs) is logged at warn level — join still answers 200, just without
       //    `intercomLine`, and the session carries no `intercomLineId`. Join
       //    never fails because of intercom.
+      //    The connection is resolved here (stored, else env — issue #617), so
+      //    a connection set at runtime applies to the next join. A recorded
+      //    intercom production id is only reused when it belongs to the manager
+      //    the connection points at now; otherwise a new grouping is created.
       let intercomLine: IntercomLine | undefined;
-      if (isIntercomEnabled()) {
+      const intercomConn = await activeIntercomConnection();
+      if (intercomConn) {
+        const ownedId =
+          production.intercomProductionId && intercomRecordMatches(production.intercomManagerOrigin, intercomConn)
+            ? production.intercomProductionId
+            : undefined;
+        if (production.intercomProductionId && !ownedId) {
+          fastify.log.info(
+            { productionId: production._id },
+            'POST guests/:id/join — recorded intercom production belongs to another manager; creating one on the current manager',
+          );
+        }
         try {
           intercomLine = await provisionGuestLine({
-            intercomProductionId: production.intercomProductionId,
+            intercomProductionId: ownedId,
             productionId: production._id,
             lineName: guestLineName(mixerInput),
+            conn: intercomConn,
           });
         } catch (err) {
           if (!(err instanceof IntercomManagerError)) throw err;
           fastify.log.warn({ err }, 'POST guests/:id/join — intercom line provisioning failed; joining without talkback');
         }
       }
-      if (intercomLine) {
+      if (intercomLine && intercomConn) {
         // Record the intercom refs on the production (first time only, so lines
         // tear down with the production lifecycle) and then on the session. The
         // production write goes through updateProductionDoc (get-modify-put with
         // 409 retry) so it composes with the return-feed persist above instead of
         // clobbering it with a stale revision.
         try {
-          if (production.intercomProductionId !== intercomLine.productionId) {
+          if (
+            production.intercomProductionId !== intercomLine.productionId ||
+            production.intercomManagerOrigin !== intercomConn.origin
+          ) {
             await updateProductionDoc(production._id, {
               intercomProductionId: intercomLine.productionId,
+              intercomManagerOrigin: intercomConn.origin,
             });
           }
           const withLine: GuestSessionDoc = {
             ...session,
             intercomLineId: intercomLine.id,
+            intercomLineProductionId: intercomLine.productionId,
             updatedAt: new Date().toISOString(),
           };
           const written = await getGuestSessionsDb().insert(withLine);
@@ -1274,7 +1317,7 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
             return reply.status(403).send({ error: 'This guest slot does not take WHIP', statusCode: 403 });
           }
         }
-        const line = talkbackLine(production, session);
+        const line = await talkbackLine(production, session);
         if (!line) {
           return reply.status(404).send({ error: 'Talkback unavailable', statusCode: 404 });
         }
@@ -1332,7 +1375,7 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
           req.log.warn({ err }, `DELETE guests/:id/talkback/${kind} — production lookup failed`);
           return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
         }
-        const line = production ? talkbackLine(production, session) : undefined;
+        const line = production ? await talkbackLine(production, session) : undefined;
         if (line) {
           const result = await deleteTalkbackSession({ kind, ...line, sessionId, log: req.log });
           if (!result.ok) return sendTalkbackError(reply, result);
@@ -1374,7 +1417,7 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         if (!production) {
           return reply.status(404).send({ error: 'Guest not found', statusCode: 404 });
         }
-        const line = talkbackLine(production, session);
+        const line = await talkbackLine(production, session);
         if (!line) {
           return reply.status(404).send({ error: 'Talkback unavailable', statusCode: 404 });
         }
@@ -1422,7 +1465,7 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
           req.log.warn({ err }, `DELETE guests/:guestId/talkback/${kind} — production lookup failed`);
           return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
         }
-        const line = production ? talkbackLine(production, session) : undefined;
+        const line = production ? await talkbackLine(production, session) : undefined;
         if (line) {
           const result = await deleteTalkbackSession({ kind, ...line, sessionId, log: req.log });
           if (!result.ok) return sendTalkbackError(reply, result);

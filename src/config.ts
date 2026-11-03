@@ -491,6 +491,22 @@ export const config = {
    * browser — and redacted in `src/lib/log-redact.ts` and the logger paths.
    */
   intercomWhipAuthKey: process.env['INTERCOM_WHIP_AUTH_KEY'] || undefined,
+  /**
+   * SSRF allowlist for an operator-supplied intercom-manager URL set at runtime
+   * through `/api/v1/intercom-connection` (issue #617, OL-47,
+   * `docs/specs/intercom-connection.md` §6, ADR-013). Comma-separated
+   * private/loopback/link-local IP literals or CIDR ranges the manager URL MAY
+   * point at (a self-hosted manager on a private LAN, e.g. "192.168.1.0/24").
+   * Empty by default: every private/loopback/link-local manager URL is
+   * rejected. Same parsing idiom as `TRUSTED_STORAGE_HOSTS` and matched by the
+   * same `isTrustedHost` matcher (`src/lib/url-validation.ts`). Applies only to
+   * the stored runtime connection; the `INTERCOM_MANAGER_URL` env var is
+   * operator config and is not gated. NEVER add 169.254.0.0/16 or 0.0.0.0/0.
+   */
+  trustedIntercomHosts: (process.env['TRUSTED_INTERCOM_HOSTS'] ?? '')
+    .split(',')
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean),
   // --- Shared-GPU usage metering (issue #500, docs/specs/shared-gpu-usage-metering.md, ADR-005) ---
   /**
    * Shared-GPU pool label (e.g. `se-sto01`) surfaced as the `gpu_pool` label /

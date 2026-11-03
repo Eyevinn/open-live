@@ -639,3 +639,16 @@ reach the other. `src/__tests__/storage-capacity.test.ts` pins `signS3GetRequest
 AWS-documented "GET Bucket Lifecycle" vector and to admin-path vectors captured from
 `curl --aws-sigv4`; run it after touching either signer. Also note madmin's `Backend.Type` is
 serialised as an int (`1` FS, `2` erasure), not a string.
+
+## intercom-manager GET routes are not API-key guarded — probe auth with a guarded no-op
+
+In `Eyevinn/intercom-manager` the static `API_KEY` check is a per-route `preHandler:
+requireApiKey` on the mutating routes only; `GET /production/:id`, `GET /production/:id/line`
+etc. answer without it. So a GET cannot tell a wrong key from a right one, and
+`GET /productionlist` 500s on 4.1.0 (#598). The connection test (`testIntercomConnection`,
+#617) uses `PATCH /production/<30 nines>` with a schema-valid body: Fastify validates params/body
+before `preHandler`, so the body must be valid for the guard to run (`401` on a wrong key), and
+the handler then answers `404 { message }` without changing anything. Also: the intercom
+connection is resolved per call (`resolveIntercomConnection()`), so any new intercom call site
+must take/resolve a connection — never read `config.intercom*` directly — and must use
+`redirect: 'manual'`.
