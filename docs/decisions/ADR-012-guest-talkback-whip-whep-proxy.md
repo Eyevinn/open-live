@@ -40,7 +40,8 @@ in intercom-manager source (v4.1.0 `6a977b8d`, v3.5.3 `3b6fa09b`):
    `/api/v1/productions/:id/guests/:guestId/talkback/{whip,whep}[/:sessionId]` (API_KEY).
    open-live derives `productionId`/`lineId` from its own DB (`GuestSessionDoc.intercomLineId`,
    `ProductionDoc.intercomProductionId`), sets `Authorization: Bearer <INTERCOM_WHIP_AUTH_KEY>`
-   on the outbound call, rewrites `Location`, and drops `Link`. Only signalling is proxied.
+   (since #617: the WHIP key of the intercom connection in effect — stored at runtime, else this
+   env var; ADR-013) on the outbound call, rewrites `Location`, and drops `Link`. Only signalling is proxied.
    Media flows directly between browser and SMB.
 3. **Operator path: embedded in Studio** (GuestPanel), not an intercom-frontend share link.
 4. **One line per guest slot**, reused across rejoins and occupants. Removed with the intercom
@@ -75,7 +76,9 @@ in intercom-manager source (v4.1.0 `6a977b8d`, v3.5.3 `3b6fa09b`):
   `503 + Retry-After` and one client retry. Open an upstream issue if beta verification hits it.
 - On OSC the service may be gated by a Service Access Token in the same `Authorization` header
   WHIP auth uses (spec OQ3). Detect: the probe in sub-issue OL-A. Mitigation:
-  `INTERCOM_MANAGER_AUTH_MODE=osc` sends the SAT and leaves `whipAuthKey` unset.
+  `INTERCOM_MANAGER_AUTH_MODE=osc` sends the SAT and leaves `whipAuthKey` unset. (Since #617 the
+  connection is a runtime setting; an OSC manager URL infers `osc` mode and uses the instance's
+  `OscAccessToken` — ADR-013.)
 - Acoustic echo of talkback into the guest's program mic. Detect: tone test on beta.
   Mitigation: explicit echo cancellation, headphones hint, operator push-to-talk.
 

@@ -28,6 +28,38 @@ components:
   schemas:
     # ── Primitives ──────────────────────────────────────────────────────────────
 
+    IntercomConnectionStatus:
+      type: object
+      description: Status of the intercom connection in effect (issue #617). Never carries a secret.
+      required: [source, configured, url, mode, modeOverridden, tokenSet, whipKeySet, patSource, oscPatSet, problem, updatedAt]
+      properties:
+        source:
+          type: string
+          enum: [stored, env, none]
+        configured:
+          type: boolean
+        url:
+          type: [string, 'null']
+        mode:
+          type: [string, 'null']
+          enum: [osc, direct, null]
+        modeOverridden:
+          type: boolean
+        tokenSet:
+          type: boolean
+        whipKeySet:
+          type: boolean
+        patSource:
+          type: [string, 'null']
+          enum: [OscAccessToken, INTERCOM_MANAGER_TOKEN, null]
+        oscPatSet:
+          type: boolean
+        problem:
+          type: [string, 'null']
+        updatedAt:
+          type: [string, 'null']
+          format: date-time
+
     StreamType:
       type: string
       enum: [srt, efp, whip, html, clip]
@@ -4464,6 +4496,156 @@ paths:
                         format: date-time
         '404':
           description: Storage connection not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/intercom-connection:
+    get:
+      summary: Intercom connection status
+      description: |
+        The intercom-manager connection in effect: the stored runtime setting, else the
+        `INTERCOM_MANAGER_*` env vars, else none (`source`). Never returns a secret value — only
+        `tokenSet` / `whipKeySet`. See `docs/specs/intercom-connection.md` §2.1.
+      operationId: getIntercomConnection
+      tags: [Intercom connection]
+      responses:
+        '200':
+          description: Connection status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IntercomConnectionStatus'
+        '503':
+          description: Database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    put:
+      summary: Set or replace the intercom connection
+      description: |
+        Stores the connection; applies to the next provisioning, proxy call and teardown without a
+        restart and wins over the env vars. On OSC only `url` is needed (mode `osc` is inferred and
+        the instance's `OscAccessToken` is used). A `direct` manager needs `apiKey`; a stored key is
+        kept when omitted only if the manager origin is unchanged. Private addresses need
+        `TRUSTED_INTERCOM_HOSTS`. See `docs/specs/intercom-connection.md` §2.2.
+      operationId: putIntercomConnection
+      tags: [Intercom connection]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  type: string
+                  description: Manager URL, with or without `/api/v1`.
+                mode:
+                  type: string
+                  enum: [osc, direct]
+                  description: Advanced override; inferred from the host when omitted.
+                apiKey:
+                  type: string
+                  writeOnly: true
+                  description: Manager API key (`direct` mode only).
+                whipKey:
+                  type: [string, 'null']
+                  writeOnly: true
+                  description: Manager WHIP/WHEP key (`direct` mode only). `null` clears it.
+      responses:
+        '200':
+          description: Stored; the new status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IntercomConnectionStatus'
+        '400':
+          description: Invalid URL, SSRF refusal, wrong inputs for the mode, or missing API key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Concurrent update; retry
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      summary: Clear the intercom connection
+      description: Idempotent. The env vars, if set, apply again; otherwise talkback is off.
+      operationId: deleteIntercomConnection
+      tags: [Intercom connection]
+      responses:
+        '204':
+          description: Cleared
+
+  /api/v1/intercom-connection/test:
+    post:
+      summary: Test an intercom connection
+      description: |
+        Tests unsaved form values (`{ url, apiKey?, whipKey?, mode? }`, never persisted or logged) or,
+        with an empty body, the connection in effect. Creates no state on the manager and does not
+        use `GET /productionlist`. The WHIP key is reported as `not-verifiable`. See
+        `docs/specs/intercom-connection.md` §2.4.
+      operationId: testIntercomConnection
+      tags: [Intercom connection]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url:
+                  type: string
+                mode:
+                  type: string
+                  enum: [osc, direct]
+                apiKey:
+                  type: string
+                  writeOnly: true
+                whipKey:
+                  type: string
+                  writeOnly: true
+      responses:
+        '200':
+          description: Structured test result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, status, message, source]
+                properties:
+                  ok:
+                    type: boolean
+                  status:
+                    type: string
+                    enum: [ok, unreachable, auth-failed, sat-exchange-failed, missing-credential, unexpected-response, not-configured]
+                  message:
+                    type: string
+                  httpStatus:
+                    type: integer
+                  mode:
+                    type: string
+                    enum: [osc, direct]
+                  patSource:
+                    type: [string, 'null']
+                    enum: [OscAccessToken, INTERCOM_MANAGER_TOKEN, null]
+                  url:
+                    type: string
+                  whipKey:
+                    type: string
+                    enum: [not-verifiable, not-set, not-used]
+                  source:
+                    type: string
+                    enum: [unsaved, stored, env, none]
+        '400':
+          description: Invalid unsaved values (including SSRF refusal)
           content:
             application/json:
               schema:

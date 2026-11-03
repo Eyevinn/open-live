@@ -29,11 +29,11 @@ import { resolveRecordingUploadTarget } from '../lib/recording-upload-target.js'
 import { startLiveRecordingUpload, stopLiveRecordingUpload, type LiveRecordingSession } from '../services/live-recording-upload.js';
 import { holdRecorderEvents, type RecorderEventsHold } from '../services/strom-recorder-events.js';
 import {
-  isIntercomEnabled,
   IntercomManagerError,
   sweepTalkbackSessions,
   teardownIntercomProduction,
 } from '../lib/intercom-manager.js';
+import { activeIntercomConnection, intercomRecordMatches } from '../lib/intercom-connection.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type OutputStatusEntry } from '../lib/production-health.js';
 import { settleOnStop, preserveGpuUsageOnDelete } from '../services/gpu-usage.js';
@@ -254,6 +254,7 @@ function deactivatedDoc(
     returnBuses: undefined,
     returnWhepUrls: undefined,
     intercomProductionId: undefined,
+    intercomManagerOrigin: undefined,
     tally: { pgm: null, pvw: null },
     updatedAt: new Date().toISOString(),
   };
@@ -287,7 +288,9 @@ async function writeDeactivatedDoc(
       const current = await getDb().get(doc._id);
       const tornDown =
         (current.stromFlowId === undefined || current.stromFlowId === doc.stromFlowId) &&
-        (current.intercomProductionId === undefined || current.intercomProductionId === doc.intercomProductionId);
+        (current.intercomProductionId === undefined ||
+          (current.intercomProductionId === doc.intercomProductionId &&
+            current.intercomManagerOrigin === doc.intercomManagerOrigin));
       if (!tornDown) throw err;
       if (current.status === doc.status && current.stromFlowId === doc.stromFlowId) {
         updated = deactivatedDoc(current, undefined, lastRecordingUpload);
@@ -1567,10 +1570,20 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
     // intercom-manager v4.1.0 refuses `DELETE /production/:p` with 409 while
     // any session is active. A 409 left after the sweep is logged and the
     // manager's reaper takes over.
-    if (doc.intercomProductionId && isIntercomEnabled()) {
+    // Repointing safety (issue #617): only the manager the grouping was
+    // created on is called; if that manager is no longer the connection in
+    // effect (repointed or cleared), teardown is skipped with a log and the
+    // deactivation still completes.
+    const intercomConn = doc.intercomProductionId ? await activeIntercomConnection() : undefined;
+    if (doc.intercomProductionId && !(intercomConn && intercomRecordMatches(doc.intercomManagerOrigin, intercomConn))) {
+      log.info(
+        { productionId: doc._id, intercomProductionId: doc.intercomProductionId },
+        'intercom teardown skipped: the manager this grouping was created on is no longer configured',
+      );
+    } else if (doc.intercomProductionId && intercomConn) {
       const intercomProductionId = doc.intercomProductionId;
-      await sweepTalkbackSessions(intercomProductionId, log);
-      await teardownIntercomProduction(intercomProductionId).then(
+      await sweepTalkbackSessions(intercomProductionId, log, intercomConn);
+      await teardownIntercomProduction(intercomProductionId, intercomConn).then(
         () => log.info({ productionId: doc._id, intercomProductionId }, 'intercom production deleted'),
         (err) => {
           const status = err instanceof IntercomManagerError ? err.status : undefined;

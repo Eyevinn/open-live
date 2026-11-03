@@ -159,3 +159,10 @@ describe('authenticated HTML source token redaction (Design D, #315)', () => {
     expect(JSON.stringify(redactSensitive(flow))).not.toContain(CANARY);
   });
 });
+
+describe('redactSensitive — runtime intercom connection fields (issue #617)', () => {
+  it.each(['tokenEnc', 'whipKeyEnc', 'whipKey', 'apiKey', 'credential'])('redacts %s', (field) => {
+    const out = redactSensitive({ connection: { [field]: 'intercom-SECRET', url: 'https://ic.example.com' } });
+    expect(JSON.stringify(out)).not.toContain('intercom-SECRET');
+  });
+});

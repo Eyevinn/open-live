@@ -13,9 +13,16 @@
  * production grouping id (`ProductionDoc.intercomProductionId`) so lines can be
  * provisioned and torn down with the Open Live production lifecycle.
  *
- * SECURITY: the base URL is fixed server-side config (`INTERCOM_MANAGER_URL`),
- * never caller-supplied, so this cannot be turned into an SSRF. The auth token
- * (`INTERCOM_MANAGER_TOKEN`) is held server-side only and redacted in logs
+ * Connection (issue #617, OL-47, `docs/specs/intercom-connection.md`): the
+ * manager URL, auth mode and secrets come from `resolveIntercomConnection()`
+ * (`src/lib/intercom-connection.ts`) — the stored runtime setting, else the
+ * `INTERCOM_MANAGER_*` env vars. Nothing here reads `config.intercom*`.
+ *
+ * SECURITY: the base URL is server-side config (the env var, or a stored URL
+ * an `API_KEY` holder set, SSRF-gated by `TRUSTED_INTERCOM_HOSTS`), never
+ * supplied per call. Every call that carries a Bearer uses
+ * `redirect: 'manual'`, so a secret is never sent to a redirect target. The
+ * auth token and WHIP key are held server-side only and redacted in logs
  * (`src/lib/log-redact.ts`).
  *
  * Degrades cleanly (spec §Configuration; guest-talkback spec §3.6, issue #598):
@@ -33,20 +40,33 @@
  * production); a duplicate line name on POST → `400 { message }`. No manager
  * response carries a join URL.
  *
- * Auth (`INTERCOM_MANAGER_AUTH_MODE`, spec OQ3): `direct` sends
- * `INTERCOM_MANAGER_TOKEN` as the Bearer; `osc` exchanges it (an OSC PAT) for a
- * Service Access Token scoped to `eyevinn-intercom-manager`.
+ * Auth (spec OQ3, intercom-connection spec §5): `direct` sends the manager API
+ * key as the Bearer; `osc` exchanges an OSC PAT for a Service Access Token
+ * scoped to `eyevinn-intercom-manager`.
+ *
+ * Every exported call takes an optional `conn` (the connection in effect).
+ * Callers that already resolved it pass it through so one operation addresses
+ * one manager; when omitted it is resolved per call.
  */
 
-import { config } from '../config.js';
 import { getOscServiceToken } from './strom-token.js';
+import {
+  activeIntercomConnection,
+  type IntercomAuthMode,
+  type IntercomPatSource,
+  type ResolvedIntercomConnection,
+} from './intercom-connection.js';
 
 /** OSC serviceId of the intercom manager, for the PAT→SAT exchange in `osc` mode. */
 export const INTERCOM_MANAGER_SERVICE_ID = 'eyevinn-intercom-manager';
 
-/** True when both intercom-manager vars are set, i.e. talkback is enabled. */
-export function isIntercomEnabled(): boolean {
-  return Boolean(config.intercomManagerUrl && config.intercomManagerToken);
+/**
+ * True when an intercom connection is in effect and usable (stored, else env:
+ * URL and credential present), i.e. talkback is enabled. Resolved on every call,
+ * so a changed connection applies without a restart.
+ */
+export async function isIntercomEnabled(): Promise<boolean> {
+  return (await activeIntercomConnection()) !== undefined;
 }
 
 /**
@@ -79,52 +99,70 @@ export class IntercomManagerError extends Error {
   }
 }
 
-function baseUrl(): string {
-  // Non-null by contract: callers must gate on isIntercomEnabled() first.
-  return config.intercomManagerUrl!.replace(/\/+$/, '');
+/** Raised when no usable intercom connection is in effect (callers gate on `isIntercomEnabled()`). */
+function notConfigured(): IntercomManagerError {
+  return new IntercomManagerError('intercom connection is not configured');
+}
+
+/** The connection to use: the one passed in, else the one in effect. */
+async function connectionOf(conn?: ResolvedIntercomConnection): Promise<ResolvedIntercomConnection> {
+  const c = conn ?? (await activeIntercomConnection());
+  if (!c?.credential) throw notConfigured();
+  return c;
 }
 
 /**
- * The Bearer value for intercom-manager management calls: `INTERCOM_MANAGER_TOKEN`
- * as-is in `direct` mode, or the Service Access Token it is exchanged for in
- * `osc` mode. Shared by the management client (`authHeaders`) and the talkback
- * WHIP/WHEP proxy (`talkbackAuthorization`), so the SAT path lives in one place.
+ * The Bearer value for intercom-manager management calls: the manager API key
+ * as-is in `direct` mode, or the Service Access Token the PAT is exchanged for
+ * in `osc` mode. Shared by the management client (`authHeaders`), the talkback
+ * WHIP/WHEP proxy (`talkbackAuthorization`) and the connection test, so the SAT
+ * path lives in one place.
  *
  * @throws {IntercomManagerError} when the `osc` SAT exchange fails.
  */
-export async function managerBearer(): Promise<string> {
-  const token = config.intercomManagerToken!;
-  if (config.intercomManagerAuthMode !== 'osc') return token;
+export async function managerBearer(conn?: ResolvedIntercomConnection): Promise<string> {
+  const c = await connectionOf(conn);
+  const credential = c.credential!;
+  if (c.mode !== 'osc') return credential;
   try {
-    return await getOscServiceToken(token, INTERCOM_MANAGER_SERVICE_ID);
+    return await getOscServiceToken(credential, INTERCOM_MANAGER_SERVICE_ID);
   } catch (err) {
     throw new IntercomManagerError(
-      `intercom-manager SAT exchange failed: ${err instanceof Error ? err.message : String(err)}`,
+      `intercom-manager SAT exchange failed: ${scrubKey(err instanceof Error ? err.message : String(err), c)}`,
     );
   }
 }
 
-async function authHeaders(): Promise<Record<string, string>> {
+async function authHeaders(conn: ResolvedIntercomConnection): Promise<Record<string, string>> {
   return {
     'Content-Type': 'application/json',
-    Authorization: `Bearer ${await managerBearer()}`,
+    Authorization: `Bearer ${await managerBearer(conn)}`,
   };
 }
 
-async function request(path: string, init: RequestInit): Promise<unknown> {
-  const headers = await authHeaders();
+/**
+ * One management call. `redirect: 'manual'` (issue #617, spec §6): a `3xx` is
+ * an error, never followed, so the Bearer is never sent to a redirect target.
+ */
+async function request(path: string, init: RequestInit, conn?: ResolvedIntercomConnection): Promise<unknown> {
+  const c = await connectionOf(conn);
+  const headers = await authHeaders(c);
   let res: Response;
   try {
-    res = await fetch(`${baseUrl()}${path}`, { ...init, headers });
+    res = await fetch(`${c.url}${path}`, { ...init, headers, redirect: 'manual' });
   } catch (err) {
     throw new IntercomManagerError(
-      `intercom-manager unreachable: ${err instanceof Error ? err.message : String(err)}`,
+      `intercom-manager unreachable: ${scrubKey(err instanceof Error ? err.message : String(err), c)}`,
     );
+  }
+  if (res.status >= 300 && res.status < 400) {
+    await res.body?.cancel().catch(() => undefined);
+    throw new IntercomManagerError(`intercom-manager answered with a redirect (${res.status}); not followed`, res.status);
   }
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new IntercomManagerError(
-      `intercom-manager error: ${res.status} ${res.statusText} — ${body.slice(0, 200)}`,
+      `intercom-manager error: ${res.status} ${res.statusText} — ${scrubKey(body.slice(0, 200), c)}`,
       res.status,
     );
   }
@@ -172,14 +210,21 @@ export async function provisionGuestLine(opts: {
   productionId: string;
   /** Line name — `guestLineName(mixerInput)`, one line per guest slot. */
   lineName: string;
+  /** The connection to provision on (resolved when omitted). */
+  conn?: ResolvedIntercomConnection;
 }): Promise<IntercomLine> {
   let productionId = opts.intercomProductionId;
+  const conn = await connectionOf(opts.conn);
 
   if (!productionId) {
-    const created = (await request('/production', {
-      method: 'POST',
-      body: JSON.stringify({ name: `open-live-${opts.productionId}`, lines: [] }),
-    })) as { productionId?: unknown; id?: unknown } | undefined;
+    const created = (await request(
+      '/production',
+      {
+        method: 'POST',
+        body: JSON.stringify({ name: `open-live-${opts.productionId}`, lines: [] }),
+      },
+      conn,
+    )) as { productionId?: unknown; id?: unknown } | undefined;
     const id = created?.productionId ?? created?.id;
     if (typeof id === 'string' && id) productionId = id;
     else if (typeof id === 'number') productionId = String(id);
@@ -190,20 +235,24 @@ export async function provisionGuestLine(opts: {
   const line = (id: string): IntercomLine => ({ id, productionId: productionId!, name: opts.lineName });
 
   // 2. Reuse an existing line for this slot (rejoin, or the slot's next occupant).
-  const existing = findLineId(await request(linesPath, { method: 'GET' }), opts.lineName);
+  const existing = findLineId(await request(linesPath, { method: 'GET' }, conn), opts.lineName);
   if (existing) return line(existing);
 
   // 3. Missing: create it. The manager answers with every line of the production.
   let created: unknown;
   try {
-    created = await request(linesPath, {
-      method: 'POST',
-      body: JSON.stringify({ name: opts.lineName }),
-    });
+    created = await request(
+      linesPath,
+      {
+        method: 'POST',
+        body: JSON.stringify({ name: opts.lineName }),
+      },
+      conn,
+    );
   } catch (err) {
     // 4. Duplicate name → a concurrent join created it first. Use that line.
     if (err instanceof IntercomManagerError && err.status === 400) {
-      const raced = findLineId(await request(linesPath, { method: 'GET' }), opts.lineName);
+      const raced = findLineId(await request(linesPath, { method: 'GET' }, conn), opts.lineName);
       if (raced) return line(raced);
     }
     throw err;
@@ -220,11 +269,18 @@ export async function provisionGuestLine(opts: {
  * Live production. Best-effort — teardown rides the production lifecycle and
  * must not block deactivation, so callers ignore failures.
  */
-export async function teardownIntercomProduction(intercomProductionId: string): Promise<void> {
-  await request(`/production/${encodeURIComponent(intercomProductionId)}`, {
-    method: 'DELETE',
-    signal: AbortSignal.timeout(TALKBACK_TIMEOUT_MS),
-  });
+export async function teardownIntercomProduction(
+  intercomProductionId: string,
+  conn?: ResolvedIntercomConnection,
+): Promise<void> {
+  await request(
+    `/production/${encodeURIComponent(intercomProductionId)}`,
+    {
+      method: 'DELETE',
+      signal: AbortSignal.timeout(TALKBACK_TIMEOUT_MS),
+    },
+    conn,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -233,8 +289,8 @@ export async function teardownIntercomProduction(intercomProductionId: string): 
 // proxies signalling for the guest page and Studio, so no browser ever talks to
 // the manager or sees the key.
 //
-// R4 (SSRF / key exfiltration): manager URLs are built only from
-// `INTERCOM_MANAGER_URL` plus ids open-live read from its own DB, each checked
+// R4 (SSRF / key exfiltration): manager URLs are built only from the
+// connection in effect (`resolveIntercomConnection()`) plus ids open-live read from its own DB, each checked
 // here — production and line ids against `^[0-9]+$`, session ids against a
 // UUID. The only client-supplied input forwarded is the opaque SDP body. A
 // manager `Location` that is not `/api/v1/{whip|whep}/<p>/<l>/<uuid>` on the
@@ -281,18 +337,26 @@ export function talkbackUsername(raw: string | null | undefined, fallback: strin
 
 /**
  * The `Authorization` value for the manager's WHIP/WHEP endpoints (spec §7,
- * OQ3): the SAT in `osc` mode (via `managerBearer`), else
- * `INTERCOM_WHIP_AUTH_KEY`, else none (manager WHIP auth off). Never logged.
+ * OQ3): the SAT in `osc` mode (via `managerBearer`), else the connection's WHIP
+ * key (`INTERCOM_WHIP_AUTH_KEY` or the stored one), else none (manager WHIP
+ * auth off). Never logged.
  */
-export async function talkbackAuthorization(): Promise<string | undefined> {
-  if (config.intercomManagerAuthMode === 'osc') return `Bearer ${await managerBearer()}`;
-  return config.intercomWhipAuthKey ? `Bearer ${config.intercomWhipAuthKey}` : undefined;
+export async function talkbackAuthorization(conn?: ResolvedIntercomConnection): Promise<string | undefined> {
+  const c = await connectionOf(conn);
+  if (c.mode === 'osc') return `Bearer ${await managerBearer(c)}`;
+  return c.whipKey ? `Bearer ${c.whipKey}` : undefined;
 }
 
-/** Remove the WHIP key from any manager-supplied text before it reaches a client or a log. */
-function scrubKey(text: string): string {
-  const key = config.intercomWhipAuthKey;
-  return key ? text.split(key).join('[REDACTED]') : text;
+/**
+ * Remove the connection's secrets (WHIP key, manager API key / PAT) from any
+ * manager-supplied text before it reaches a client or a log.
+ */
+function scrubKey(text: string, conn?: Pick<ResolvedIntercomConnection, 'whipKey' | 'credential'>): string {
+  let out = text;
+  for (const secret of [conn?.whipKey, conn?.credential]) {
+    if (secret) out = out.split(secret).join('[REDACTED]');
+  }
+  return out;
 }
 
 /** Minimal logger shape (Fastify's logger fits). Only messages and status codes are logged — never headers. */
@@ -312,15 +376,16 @@ export type TalkbackDeleteResult =
 
 const UNREACHABLE = 'Intercom manager unreachable';
 
-function managerUrl(kind: TalkbackKind, productionId: string, lineId: string, tail: string): string {
-  return `${baseUrl()}/${kind}/${productionId}/${lineId}/${encodeURIComponent(tail)}`;
+function managerUrl(base: string, kind: TalkbackKind, productionId: string, lineId: string, tail: string): string {
+  return `${base}/${kind}/${productionId}/${lineId}/${encodeURIComponent(tail)}`;
 }
 
 /**
  * Validate a manager `Location` + `ETag` pair on a `201` and return the session
  * id, or undefined when it is not exactly `/api/v1/<kind>/<p>/<l>/<uuid>` (or
  * the same under the configured base path) on the manager origin with
- * `ETag` = that uuid. Exported for tests.
+ * `ETag` = that uuid. `managerBase` is the connection's base URL. Exported for
+ * tests.
  */
 export function managerSessionIdFromLocation(
   location: string | null,
@@ -328,12 +393,13 @@ export function managerSessionIdFromLocation(
   kind: TalkbackKind,
   productionId: string,
   lineId: string,
+  managerBase: string,
 ): string | undefined {
   if (!location) return undefined;
   let base: URL;
   let resolved: URL;
   try {
-    base = new URL(baseUrl());
+    base = new URL(managerBase);
     resolved = new URL(location, `${base.origin}/`);
   } catch {
     return undefined;
@@ -355,7 +421,7 @@ function retryAfterOf(res: Response): string {
 }
 
 /** Turn a manager error body into a short, key-free message for a pass-through status. */
-async function managerMessage(res: Response, fallback: string): Promise<string> {
+async function managerMessage(res: Response, fallback: string, conn: ResolvedIntercomConnection): Promise<string> {
   const text = (await res.text().catch(() => '')).trim();
   let message = text;
   try {
@@ -365,7 +431,7 @@ async function managerMessage(res: Response, fallback: string): Promise<string> 
   } catch {
     /* plain-text body */
   }
-  message = scrubKey(message).slice(0, 200);
+  message = scrubKey(message, conn).slice(0, 200);
   return message || fallback;
 }
 
@@ -385,18 +451,22 @@ export async function postTalkbackOffer(opts: {
   username: string;
   sdp: string;
   log: TalkbackLog;
+  /** The connection to proxy to (resolved when omitted). */
+  conn?: ResolvedIntercomConnection;
 }): Promise<TalkbackOfferResult> {
   const { kind, productionId, lineId, log } = opts;
   if (!isTalkbackLineRef(productionId, lineId)) {
     log.warn({ kind }, 'talkback: stored intercom production/line id is not numeric; refusing to proxy');
     return { ok: false, status: 404, error: 'Talkback unavailable' };
   }
+  const conn = opts.conn ?? (await activeIntercomConnection());
+  if (!conn?.credential) return { ok: false, status: 404, error: 'Talkback unavailable' };
   let res: Response;
   try {
     const headers: Record<string, string> = { 'Content-Type': 'application/sdp' };
-    const authorization = await talkbackAuthorization();
+    const authorization = await talkbackAuthorization(conn);
     if (authorization) headers['Authorization'] = authorization;
-    res = await fetch(managerUrl(kind, productionId, lineId, opts.username), {
+    res = await fetch(managerUrl(conn.url, kind, productionId, lineId, opts.username), {
       method: 'POST',
       headers,
       body: opts.sdp,
@@ -405,7 +475,7 @@ export async function postTalkbackOffer(opts: {
     });
   } catch (err) {
     log.warn(
-      { kind, reason: scrubKey(err instanceof Error ? err.message : String(err)) },
+      { kind, reason: scrubKey(err instanceof Error ? err.message : String(err), conn) },
       'talkback: intercom-manager unreachable',
     );
     return { ok: false, status: 502, error: UNREACHABLE };
@@ -418,6 +488,7 @@ export async function postTalkbackOffer(opts: {
       kind,
       productionId,
       lineId,
+      conn.url,
     );
     if (!sessionId) {
       await res.body?.cancel().catch(() => undefined);
@@ -439,7 +510,7 @@ export async function postTalkbackOffer(opts: {
       await res.body?.cancel().catch(() => undefined);
       return { ok: false, status: 404, error: 'Talkback unavailable' };
     case 406:
-      return { ok: false, status: 406, error: await managerMessage(res, 'Not Acceptable') };
+      return { ok: false, status: 406, error: await managerMessage(res, 'Not Acceptable', conn) };
     case 415:
       await res.body?.cancel().catch(() => undefined);
       return { ok: false, status: 415, error: 'Unsupported Media Type' };
@@ -466,18 +537,25 @@ export async function deleteTalkbackSession(opts: {
   lineId: string;
   sessionId: string;
   log: TalkbackLog;
+  /** The connection to proxy to (resolved when omitted). */
+  conn?: ResolvedIntercomConnection;
 }): Promise<TalkbackDeleteResult> {
   const { kind, productionId, lineId, sessionId, log } = opts;
   if (!isTalkbackLineRef(productionId, lineId) || !UUID_RE.test(sessionId)) {
     log.warn({ kind }, 'talkback: refusing DELETE with a non-numeric line ref or non-UUID session id');
     return { ok: false, status: 502, error: UNREACHABLE };
   }
+  const conn = opts.conn ?? (await activeIntercomConnection());
+  if (!conn?.credential) {
+    log.warn({ kind }, 'talkback: no intercom connection in effect; DELETE skipped');
+    return { ok: false, status: 502, error: UNREACHABLE };
+  }
   let res: Response;
   try {
     const headers: Record<string, string> = {};
-    const authorization = await talkbackAuthorization();
+    const authorization = await talkbackAuthorization(conn);
     if (authorization) headers['Authorization'] = authorization;
-    res = await fetch(managerUrl(kind, productionId, lineId, sessionId), {
+    res = await fetch(managerUrl(conn.url, kind, productionId, lineId, sessionId), {
       method: 'DELETE',
       headers,
       redirect: 'manual',
@@ -485,7 +563,7 @@ export async function deleteTalkbackSession(opts: {
     });
   } catch (err) {
     log.warn(
-      { kind, reason: scrubKey(err instanceof Error ? err.message : String(err)) },
+      { kind, reason: scrubKey(err instanceof Error ? err.message : String(err), conn) },
       'talkback: intercom-manager unreachable on DELETE',
     );
     return { ok: false, status: 502, error: UNREACHABLE };
@@ -522,6 +600,8 @@ export interface TalkbackSessionRef {
   productionId: string;
   lineId: string;
   sessionId: string;
+  /** The connection the session lives on (resolved when omitted). */
+  conn?: ResolvedIntercomConnection;
 }
 
 /**
@@ -539,7 +619,7 @@ export async function endTalkbackSession(
     result = await deleteTalkbackSession({ ...ref, log });
   } catch (err) {
     log.warn(
-      { ...where, reason: scrubKey(err instanceof Error ? err.message : String(err)) },
+      { ...where, reason: scrubKey(err instanceof Error ? err.message : String(err), ref.conn) },
       'talkback teardown: DELETE failed; the manager reaper takes over',
     );
     return false;
@@ -601,20 +681,25 @@ export function talkbackSessionsFromLines(productionId: string, body: unknown): 
 export async function sweepTalkbackSessions(
   intercomProductionId: string,
   log: TalkbackTeardownLog,
+  conn?: ResolvedIntercomConnection,
 ): Promise<TalkbackSweepResult> {
   let refs: TalkbackSessionRef[];
   try {
-    const body = await request(`/production/${encodeURIComponent(intercomProductionId)}/line`, {
-      method: 'GET',
-      signal: AbortSignal.timeout(TALKBACK_TIMEOUT_MS),
-    });
-    refs = talkbackSessionsFromLines(intercomProductionId, body);
+    const body = await request(
+      `/production/${encodeURIComponent(intercomProductionId)}/line`,
+      {
+        method: 'GET',
+        signal: AbortSignal.timeout(TALKBACK_TIMEOUT_MS),
+      },
+      conn,
+    );
+    refs = talkbackSessionsFromLines(intercomProductionId, body).map((ref) => (conn ? { ...ref, conn } : ref));
   } catch (err) {
     log.warn(
       {
         intercomProductionId,
         status: err instanceof IntercomManagerError ? err.status : undefined,
-        reason: scrubKey(err instanceof Error ? err.message : String(err)),
+        reason: scrubKey(err instanceof Error ? err.message : String(err), conn),
       },
       'talkback sweep: could not list intercom lines; the manager reaper takes over',
     );
@@ -627,4 +712,142 @@ export async function sweepTalkbackSessions(
   const result = { ended, failed: outcomes.length - ended };
   log.info({ intercomProductionId, ...result }, 'talkback sweep: participant sessions ended');
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// Connection test (issue #617, `docs/specs/intercom-connection.md` §4)
+// ---------------------------------------------------------------------------
+
+/** Production id no manager can hold (ids are integers counted from 1), so the probe changes nothing. */
+const PROBE_PRODUCTION_ID = '9'.repeat(30);
+
+export type IntercomTestStatus =
+  | 'ok'
+  | 'unreachable'
+  | 'auth-failed'
+  | 'sat-exchange-failed'
+  | 'missing-credential'
+  | 'unexpected-response';
+
+/** Structured connection-test result (always HTTP 200). Never carries a secret. */
+export interface IntercomTestResult {
+  ok: boolean;
+  status: IntercomTestStatus;
+  message: string;
+  /** HTTP status from the manager, or from the OSC token service on `sat-exchange-failed`. */
+  httpStatus?: number;
+  mode: IntercomAuthMode;
+  patSource: IntercomPatSource | null;
+  url: string;
+  /**
+   * The WHIP key cannot be verified without a live line (spec §4): `not-verifiable`
+   * when one is set, `not-set` when none is (direct), `not-used` in osc mode.
+   */
+  whipKey: 'not-verifiable' | 'not-set' | 'not-used';
+}
+
+/**
+ * Probe a connection (stored, env, or unsaved form values) without creating
+ * state. `GET /productionlist` is NOT used: manager 4.1.0 answers it with
+ * `500 "name is required"` even with a valid SAT (#598). The probe is
+ * `PATCH /production/<id no manager holds>` with a schema-valid body: the
+ * manager's API-key guard (`preHandler: requireApiKey`) runs first and answers
+ * `401` on a wrong key, and an OSC gateway answers `401`/`403` on a bad SAT;
+ * an authenticated call reaches the handler, which answers
+ * `404 { message: "Production with id … not found" }` and changes nothing.
+ * (The manager's GET routes are not API-key guarded, so they cannot tell a
+ * wrong key from a right one.)
+ *
+ * `redirect: 'manual'` — the Bearer is never sent to a redirect target. Never
+ * throws; never logs.
+ */
+export async function testIntercomConnection(
+  conn: Pick<ResolvedIntercomConnection, 'url' | 'mode' | 'patSource' | 'credential' | 'whipKey' | 'problem'>,
+): Promise<IntercomTestResult> {
+  const base = {
+    mode: conn.mode,
+    patSource: conn.mode === 'osc' ? (conn.patSource ?? null) : null,
+    url: conn.url,
+    whipKey: conn.mode === 'osc' ? ('not-used' as const) : conn.whipKey ? ('not-verifiable' as const) : ('not-set' as const),
+  };
+  const fail = (status: IntercomTestStatus, message: string, httpStatus?: number): IntercomTestResult => ({
+    ok: false,
+    status,
+    message: scrubKey(message, conn),
+    ...(httpStatus !== undefined ? { httpStatus } : {}),
+    ...base,
+  });
+
+  if (!conn.credential) {
+    return fail(
+      'missing-credential',
+      conn.problem ?? (conn.mode === 'osc' ? 'No OSC access token to exchange' : 'No manager API key'),
+    );
+  }
+
+  let bearer = conn.credential;
+  if (conn.mode === 'osc') {
+    try {
+      bearer = await getOscServiceToken(conn.credential, INTERCOM_MANAGER_SERVICE_ID);
+    } catch (err) {
+      const text = err instanceof Error ? err.message : String(err);
+      const m = /SAT exchange failed: (\d{3})/.exec(text);
+      return fail(
+        'sat-exchange-failed',
+        m
+          ? `The OSC token service refused to exchange the instance OSC access token for an intercom-manager SAT (HTTP ${m[1]})`
+          : 'The OSC token service could not be reached to exchange the instance OSC access token',
+        m ? Number(m[1]) : undefined,
+      );
+    }
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`${conn.url}/production/${PROBE_PRODUCTION_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bearer}` },
+      body: JSON.stringify({ name: 'open-live-connection-test' }),
+      redirect: 'manual',
+      signal: AbortSignal.timeout(TALKBACK_TIMEOUT_MS),
+    });
+  } catch {
+    return fail('unreachable', 'The intercom manager could not be reached (DNS, connection or timeout)');
+  }
+  const text = await res.text().catch(() => '');
+  if (res.status >= 300 && res.status < 400) {
+    return fail('unexpected-response', `The manager URL answered with a redirect (${res.status}); redirects are not followed`, res.status);
+  }
+  if (res.status === 401 || res.status === 403) {
+    return fail(
+      'auth-failed',
+      conn.mode === 'osc'
+        ? `The intercom manager rejected the OSC service access token (HTTP ${res.status}); is the manager in the same OSC workspace as this instance?`
+        : `The intercom manager rejected the API key (HTTP ${res.status})`,
+      res.status,
+    );
+  }
+  let message: unknown;
+  try {
+    message = (JSON.parse(text) as { message?: unknown })?.message;
+  } catch {
+    message = undefined;
+  }
+  if (res.status === 404 && typeof message === 'string' && /production/i.test(message)) {
+    return {
+      ok: true,
+      status: 'ok',
+      message:
+        conn.mode === 'osc'
+          ? 'Connected: the intercom manager accepted the OSC service access token'
+          : 'Connected: the intercom manager accepted the API key',
+      httpStatus: res.status,
+      ...base,
+    };
+  }
+  return fail(
+    'unexpected-response',
+    `The URL answered HTTP ${res.status}, which does not look like an Open Intercom manager API (check the URL)`,
+    res.status,
+  );
 }

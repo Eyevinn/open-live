@@ -34,6 +34,7 @@ import recordingsRoutes from './routes/recordings.js';
 import authRoutes from './routes/auth.js';
 import gatewaysRoutes from './routes/gateways.js';
 import storageConnectionsRoutes from './routes/storage-connections.js';
+import intercomConnectionRoutes from './routes/intercom-connection.js';
 import clipsRoutes from './routes/clips.js';
 import guestsRoutes from './routes/guests.js';
 import guestPageRoutes from './routes/guest-page.js';
@@ -248,6 +249,19 @@ export async function buildServer(opts: BuildServerOptions = {}) {
           'intercomWhipAuthKey',
           '*.INTERCOM_WHIP_AUTH_KEY',
           '*.intercomWhipAuthKey',
+          // Runtime intercom connection (issue #617): the stored ciphertext
+          // fields, the write-only request fields and the resolved Bearer
+          // source. Redact paths match exact keys, so each is named.
+          'tokenEnc',
+          'whipKeyEnc',
+          'whipKey',
+          'apiKey',
+          'credential',
+          '*.tokenEnc',
+          '*.whipKeyEnc',
+          '*.whipKey',
+          '*.apiKey',
+          '*.credential',
           '*.srt_uri',
           '*.passphrase',
           '*.streamid',
@@ -557,6 +571,7 @@ export async function buildServer(opts: BuildServerOptions = {}) {
   await fastify.register(authRoutes);
   await fastify.register(gatewaysRoutes);
   await fastify.register(storageConnectionsRoutes);
+  await fastify.register(intercomConnectionRoutes);
   await fastify.register(clipsRoutes);
   await fastify.register(guestsRoutes);
   await fastify.register(guestPageRoutes);

@@ -574,6 +574,13 @@ export interface GuestSessionDoc {
   /** Reference into intercom-manager, when a talkback line is provisioned (later sub-issue). */
   intercomLineId?: string;
   /**
+   * The intercom production grouping `intercomLineId` belongs to (issue #617).
+   * After the intercom connection is repointed, the production gets a new
+   * grouping on the new manager; a session whose line belongs to the old one
+   * must not be proxied there. Absent on sessions written before #617.
+   */
+  intercomLineProductionId?: string;
+  /**
    * Whether the guest has muted their microphone from the guest page (issue #382).
    * The guest reports every mute change via `PUT /guests/:inviteId/session/mute`;
    * this is surfaced to the operator in `GUEST_STATE` and the guests projection.
@@ -731,6 +738,38 @@ export interface StorageConnectionDoc {
   secretKeyEnc: string;     // "encv1:<base64url(iv|tag|ciphertext)>" — NEVER plaintext, NEVER returned
   defaultBucket?: string;
   role: StorageConnectionRole;
+  createdAt: string;        // ISO 8601
+  updatedAt: string;        // ISO 8601
+}
+
+// --------------- Intercom connection (issue #617, OL-47) ---------------
+
+/**
+ * The instance's intercom-manager connection, set at runtime through
+ * `/api/v1/intercom-connection` (issue #617, OL-47,
+ * `docs/specs/intercom-connection.md`, ADR-013). A singleton: one document
+ * under the fixed id `intercom-connection`. When present it wins over the
+ * `INTERCOM_MANAGER_*` env vars.
+ *
+ * Secrets are `encv1:` AES-256-GCM ciphertext in the shared credential-
+ * encryption key family (ADR-009 D1, ADR-013; `src/lib/intercom-connection.ts`),
+ * NEVER plaintext, NEVER returned by the API (only `tokenSet` / `whipKeySet`)
+ * and redacted in logs (`tokenEnc` / `whipKeyEnc`, `src/lib/log-redact.ts`).
+ */
+export interface IntercomConnectionDoc {
+  _id: string;              // always "intercom-connection"
+  _rev?: string;
+  type: 'intercom-connection';
+  /** Normalised manager base URL, always ending in `/api/v1`, no trailing slash. */
+  url: string;
+  /** `osc`: the instance OSC PAT is exchanged for a SAT; `direct`: `tokenEnc` is the Bearer. */
+  mode: 'osc' | 'direct';
+  /** True when `mode` was set explicitly rather than inferred from the host. */
+  modeOverridden: boolean;
+  /** Manager API key (direct mode only) — "encv1:…", NEVER plaintext, NEVER returned. */
+  tokenEnc?: string;
+  /** Manager WHIP/WHEP key (direct mode only, optional) — "encv1:…", NEVER plaintext, NEVER returned. */
+  whipKeyEnc?: string;
   createdAt: string;        // ISO 8601
   updatedAt: string;        // ISO 8601
 }
@@ -1070,6 +1109,18 @@ export interface ProductionDoc {
    * declared here only so the data model is stable.
    */
   intercomProductionId?: string;
+  /**
+   * Origin (`scheme://host[:port]`) of the intercom manager that
+   * `intercomProductionId` was created on (issue #617, OL-47,
+   * `docs/specs/intercom-connection.md` §5). The intercom connection is a
+   * runtime setting, so it can be repointed at another manager while a
+   * production holds an id from the old one: provisioning only reuses the id,
+   * and deactivate only tears it down, when this matches the connection in
+   * effect. Absent on docs written before #617 — those ids were created on the
+   * env-configured manager (`INTERCOM_MANAGER_URL`). Set and cleared together
+   * with `intercomProductionId`.
+   */
+  intercomManagerOrigin?: string;
   /** Warnings accumulated when a referenced source/graphic/output was deleted while production was inactive */
   deletionWarnings?: Array<{ type: 'source' | 'graphic' | 'output'; name: string }>;
   /**

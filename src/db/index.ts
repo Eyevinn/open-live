@@ -1,6 +1,6 @@
 import Nano from 'nano';
 import { config } from '../config.js';
-import type { ProductionDoc, SourceDoc, ProductionConfigDoc, GraphicDoc, OutputDoc, GatewayDoc, RecordingDoc, GuestInviteDoc, GuestSessionDoc, GuestSigningKeyDoc, CredentialEncryptionKeyDoc, RtmpCredentialKeyDoc, MigrationStateDoc, GpuUsageLedgerDoc, GpuMeteringStateDoc, StorageConnectionDoc } from './types.js';
+import type { ProductionDoc, SourceDoc, ProductionConfigDoc, GraphicDoc, OutputDoc, GatewayDoc, RecordingDoc, GuestInviteDoc, GuestSessionDoc, GuestSigningKeyDoc, CredentialEncryptionKeyDoc, RtmpCredentialKeyDoc, MigrationStateDoc, GpuUsageLedgerDoc, GpuMeteringStateDoc, StorageConnectionDoc, IntercomConnectionDoc } from './types.js';
 
 
 let db: Nano.DocumentScope<ProductionDoc>;
@@ -182,6 +182,10 @@ export function getGpuMeteringStateDb(): GuardedScope<GpuMeteringStateDoc> {
 
 export function getStorageConnectionsDb(): GuardedScope<StorageConnectionDoc> {
   return withTypeGuard(db as unknown as Nano.DocumentScope<StorageConnectionDoc>, 'storage-connection');
+}
+
+export function getIntercomConnectionDb(): GuardedScope<IntercomConnectionDoc> {
+  return withTypeGuard(db as unknown as Nano.DocumentScope<IntercomConnectionDoc>, 'intercom-connection');
 }
 
 const DB_NAME = 'open-live';
