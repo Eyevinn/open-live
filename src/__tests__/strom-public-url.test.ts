@@ -102,6 +102,7 @@ async function activate(): Promise<Record<string, unknown>> {
     clipPlayerBlockIds: {},
     returnBuses: [],
     returnWhepEntries: [{ mixerInput: 'video_in_1', endpointId: 'ret-ep' }],
+    fastWhepEntries: [],
     mixerInputMap: {},
     warnings: [],
   });
