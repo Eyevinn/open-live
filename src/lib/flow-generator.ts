@@ -16,6 +16,7 @@ import { VIRTUAL_SOURCES, assignAudioChannels } from './audio-channels.js';
 import { assignReturnBuses, returnSendMatrix } from './return-feeds.js';
 import { buildStromPropsFromStore } from './audio-processing.js';
 import { withGuestSlotStudioInputSuffix } from './mixer-input-map.js';
+import { PREVIEW_STREAM_TYPES } from './commentator-preview.js';
 import { inputRecordingDir, inputRecordingPrefix, planInputRecordings } from './input-recording.js';
 import { assignPortsToFlow, unassignPortsFromFlow } from '../services/port-reservation.js';
 import { listenerPortRequest } from '../services/listener-ports.js';
@@ -79,6 +80,14 @@ export interface ActivationResult {
   returnBuses: Array<{ mixerInput: string; auxBus: number; ownChannel: number; mode: 'program' | 'program-minus' }>;
   /** WHEP endpoint IDs for per-guest return outputs, keyed by the guest's mixerInput. */
   returnWhepEntries: Array<{ mixerInput: string; endpointId: string }>;
+  /**
+   * WHEP endpoint IDs for commentator preview outputs, keyed by the previewed
+   * source's mixerInput — one per assignment with `commentatorPreview: true`
+   * whose source kind supports it (`PREVIEW_STREAM_TYPES`, commentator-preview.ts).
+   * `sourceId` is the source the output was built for, so a later live swap of
+   * that input to another source is not served the old source's tap.
+   */
+  previewWhepEntries: Array<{ mixerInput: string; sourceId: string; endpointId: string }>;
   /**
    * Maps a stored `mixerInput` (e.g. 'video_in_15') to the COMPACT vision-mixer
    * pad index actually wired in the live Strom flow (issue #463). Studio allocates
@@ -786,6 +795,10 @@ export async function activateStromFlow(
   // Maps mixerInput → builtin.media_player block ID for 'clip' sources — returned so the
   // clip cue/play control surface (#277/#278) can target the player block by mixer input.
   const clipPlayerBlockIds: Record<string, string> = {};
+  // Raw (pre-offset) pads of each source marked for a commentator preview. The
+  // preview encoder + WHEP output are emitted after the return outputs so they
+  // stack in the same output column.
+  const previewTaps: Array<{ mixerInput: string; sourceId: string; padIndex: number; videoPad: string; audioPad: string }> = [];
   // The pads that feed each arriving input's time_offset blocks, by stored
   // mixerInput: where an input recorder taps the feed as it arrived (OL-32,
   // spec §4.3). Only WHIP, SRT and EFP inputs are recordable.
@@ -954,6 +967,9 @@ export async function activateStromFlow(
       clipPlayerBlockIds[assignment.mixerInput] = playerId;
       void clipRef;
       flow.links.push({ from: `${playerId}:video_out`, to: `${offsetId}:in` });
+      if (assignment.commentatorPreview && PREVIEW_STREAM_TYPES.has(source.streamType)) {
+        previewTaps.push({ mixerInput: assignment.mixerInput, sourceId: assignment.sourceId, padIndex, videoPad: `${playerId}:video_out`, audioPad: `${playerId}:audio_out` });
+      }
       const audioOffsetIdClip = `b-audio-offset-${padIndex}-${endpointSuffix}`;
       flow.blocks.push({
         id: audioOffsetIdClip,
@@ -1053,6 +1069,10 @@ export async function activateStromFlow(
       });
       flow.links.push({ from: `${inputId}:video_out`, to: `${offsetId}:in` });
       inputTaps.set(assignment.mixerInput, { video: `${inputId}:video_out`, audio: audioPad, padIndex, y: yPos });
+      // The preview carries the same (selected) audio stream the mixer gets, before its offset.
+      if (assignment.commentatorPreview && PREVIEW_STREAM_TYPES.has(source.streamType)) {
+        previewTaps.push({ mixerInput: assignment.mixerInput, sourceId: assignment.sourceId, padIndex, videoPad: `${inputId}:video_out`, audioPad });
+      }
       // Every audio output Strom creates must be linked exactly once (spec §5.3
       // rule 1, the group_out_N precedent): drain the unselected ones. async:
       // false so a drain that never gets a buffer cannot hold up preroll.
@@ -1487,6 +1507,40 @@ export async function activateStromFlow(
     }
   }
 
+  // Commentator preview outputs (`docs/specs/guest-calling-intercom.md`
+  // §"Commentator preview"). One builtin.videoenc + builtin.whep_output per
+  // marked source, fed from the input block's RAW pads — the same pads that
+  // feed the source's time_offset blocks (a pad may fan out to several links) —
+  // so the preview is neither delayed by the operator's offsets nor switched by
+  // the mixer. Audio is the source's own (undelayed) track: the one selected for
+  // the mixer (SRT/EFP audio-stream selection), or the clip's audio.
+  const previewWhepEntries: Array<{ mixerInput: string; sourceId: string; endpointId: string }> = [];
+  for (const tap of previewTaps) {
+    const endpointId = `whep-preview-${tap.padIndex}-${endpointSuffix}`;
+    const encId = `b-preview-enc-${tap.padIndex}-${endpointSuffix}`;
+    const blockId = `b-preview-${tap.padIndex}-${endpointSuffix}`;
+    const y = ROW_START + outputBlockIndex * ROW_H;
+    flow.blocks.push({
+      id: encId,
+      block_definition_id: 'builtin.videoenc',
+      name: `Enc Preview (${tap.mixerInput})`,
+      properties: { bitrate: 4000 },
+      position: { x: COL_OUTPUT - 200, y },
+    });
+    flow.blocks.push({
+      id: blockId,
+      block_definition_id: 'builtin.whep_output',
+      name: `Preview (${tap.mixerInput})`,
+      properties: { endpoint_id: endpointId, low_latency: true, mode: 'audio_video', num_audio_tracks: 1 },
+      position: { x: COL_OUTPUT, y },
+    });
+    flow.links.push({ from: tap.videoPad, to: `${encId}:video_in` });
+    flow.links.push({ from: `${encId}:encoded_out`, to: `${blockId}:video_in` });
+    flow.links.push({ from: tap.audioPad, to: `${blockId}:audio_in` });
+    previewWhepEntries.push({ mixerInput: tap.mixerInput, sourceId: tap.sourceId, endpointId });
+    outputBlockIndex++;
+  }
+
   // Compute encoder block positions — shared by loudness block and group drain placement.
   const encBlocks = flow.blocks.filter(
     (b) => (b as Record<string, unknown>)['block_definition_id'] === 'builtin.videoenc',
@@ -1616,6 +1670,7 @@ export async function activateStromFlow(
       mode: rb.mode,
     })),
     returnWhepEntries,
+    previewWhepEntries,
     mixerInputMap,
   };
 }
