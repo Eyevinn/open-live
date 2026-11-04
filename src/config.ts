@@ -128,6 +128,42 @@ export function buildCouchdbUrl(): string {
   return url.toString();
 }
 
+/** Database used when `COUCHDB_NAME` is unset or empty (today's behaviour). */
+export const DEFAULT_COUCHDB_NAME = 'open-live';
+
+/** CouchDB's database-name rule; names are at most 238 characters. */
+const COUCHDB_NAME_PATTERN = /^[a-z][a-z0-9_$()+/-]*$/;
+const COUCHDB_NAME_MAX_LENGTH = 238;
+
+/**
+ * Why `name` is not a valid CouchDB database name, or `null` when it is. The
+ * value itself is never part of the message: on OSC `COUCHDB_NAME` is the tail
+ * of `DatabaseUrl`, which for a URL with no database path can be part of the
+ * credentials.
+ */
+export function couchdbNameProblem(name: string): string | null {
+  if (name.length <= COUCHDB_NAME_MAX_LENGTH && COUCHDB_NAME_PATTERN.test(name)) return null;
+  return (
+    `Invalid COUCHDB_NAME (value not shown, ${name.length} characters). A CouchDB database name must start with a lowercase letter ` +
+    `(a-z), contain only lowercase letters, digits and the characters _ $ ( ) + - /, ` +
+    `and be at most ${COUCHDB_NAME_MAX_LENGTH} characters long.`
+  );
+}
+
+/**
+ * Parse `COUCHDB_NAME` (OL-49, issue #619): the CouchDB database this instance
+ * keeps its data in. Unset or empty means `open-live`. The name is NOT
+ * validated here: an existing OSC instance whose `DatabaseUrl` tail is not a
+ * valid name (e.g. `/OpenLive`) ran on `open-live` before this setting was
+ * honoured and must keep doing so (#619 AC4), which needs a look at the server.
+ * `resolveDbName()` (`src/db/index.ts`) applies `couchdbNameProblem()`: it
+ * falls back to an `open-live` that holds data, and otherwise stops startup
+ * with a non-retried `FatalStartupError` (AC3).
+ */
+export function buildCouchdbName(): string {
+  return optionalEnv('COUCHDB_NAME') ?? DEFAULT_COUCHDB_NAME;
+}
+
 /**
  * Parse `STROM_PUBLIC_URL`, trailing slashes removed. It is the base of the
  * WHEP URLs given to browsers, so it must be an absolute http(s) URL: without
@@ -165,6 +201,8 @@ const gpuMetering = resolveGpuMetering({
 export const config = {
   port: parseInt(process.env['PORT'] ?? '3000', 10),
   couchdbUrl: buildCouchdbUrl(),
+  /** CouchDB database name, from `COUCHDB_NAME` (default `open-live`). */
+  couchdbName: buildCouchdbName(),
   stromUrl: process.env['STROM_URL'] ?? 'http://localhost:7000',
   /**
    * Base URL browsers use to reach Strom, when it differs from `STROM_URL`

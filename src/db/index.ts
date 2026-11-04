@@ -1,5 +1,7 @@
 import Nano from 'nano';
-import { config } from '../config.js';
+import type { FastifyBaseLogger } from 'fastify';
+import { config, couchdbNameProblem } from '../config.js';
+import { FatalStartupError } from '../lib/fatal-startup-error.js';
 import type { ProductionDoc, SourceDoc, ProductionConfigDoc, GraphicDoc, OutputDoc, GatewayDoc, RecordingDoc, GuestInviteDoc, GuestSessionDoc, GuestSigningKeyDoc, CredentialEncryptionKeyDoc, RtmpCredentialKeyDoc, MigrationStateDoc, GpuUsageLedgerDoc, GpuMeteringStateDoc, StorageConnectionDoc, IntercomConnectionDoc } from './types.js';
 
 
@@ -188,15 +190,152 @@ export function getIntercomConnectionDb(): GuardedScope<IntercomConnectionDoc> {
   return withTypeGuard(db as unknown as Nano.DocumentScope<IntercomConnectionDoc>, 'intercom-connection');
 }
 
-const DB_NAME = 'open-live';
+/** The database every instance used before `COUCHDB_NAME` was honoured (OL-49). */
+const LEGACY_DB_NAME = 'open-live';
 
-export async function connectDb(): Promise<void> {
-  const nano = Nano({ url: config.couchdbUrl, requestDefaults: { timeout: 10_000 } });
-  const dbList = await nano.db.list();
-  if (!dbList.includes(DB_NAME)) {
-    await nano.db.create(DB_NAME);
+/**
+ * Marker document written into the configured database when an instance
+ * settles on it (OL-49). While `open-live` holds data, only a configured
+ * database with this document in it is used instead — a database that merely
+ * holds documents may belong to another app on the same server. It keeps an
+ * instance on its own database once it has started there, and an operator
+ * pre-claims a new studio's database by writing it (`PUT /<name>/open-live-database`
+ * with `{}`; see README, `COUCHDB_NAME`).
+ */
+export const DATABASE_MARKER_DOC_ID = 'open-live-database';
+
+/**
+ * Documents every instance writes for itself on start, whether or not anyone
+ * has used it: the key bootstraps, the GPU-metering marker, migration state and
+ * the database marker. They are not "data" when deciding whether `open-live`
+ * holds an existing instance's productions, sources and settings. Literal ids,
+ * not imports, because those modules import this one (a test checks they match).
+ */
+export const BOOKKEEPING_DOC_IDS: ReadonlySet<string> = new Set([
+  'guest-invite-signing-key',
+  'credential-encryption-key',
+  'rtmp-credentials-key',
+  'gpu-metering-state',
+  DATABASE_MARKER_DOC_ID,
+]);
+
+function isDesignDoc(id: string): boolean {
+  return id.startsWith('_design/');
+}
+
+/** A document that holds an instance's data, not per-instance bookkeeping. */
+export function isDataDocId(id: string): boolean {
+  return !isDesignDoc(id) && !id.startsWith('migration:') && !BOOKKEEPING_DOC_IDS.has(id);
+}
+
+const ID_PAGE_SIZE = 100;
+
+/** True when the database has a document whose id satisfies `match` (ids only, paged). */
+async function hasDocMatching(nano: Nano.ServerScope, name: string, match: (id: string) => boolean): Promise<boolean> {
+  const scope = nano.use(name);
+  let startkey: string | undefined;
+  for (;;) {
+    const page = await scope.list(
+      startkey === undefined ? { limit: ID_PAGE_SIZE } : { limit: ID_PAGE_SIZE, startkey, skip: 1 },
+    );
+    if (page.rows.some((row) => match(row.id))) return true;
+    if (page.rows.length < ID_PAGE_SIZE) return false;
+    startkey = page.rows[page.rows.length - 1]!.id;
   }
-  db = nano.use<ProductionDoc>(DB_NAME);
+}
+
+/** True when the database holds the `open-live-database` marker document. */
+async function hasMarkerDoc(nano: Nano.ServerScope, name: string): Promise<boolean> {
+  try {
+    await nano.use(name).get(DATABASE_MARKER_DOC_ID);
+    return true;
+  } catch (err) {
+    if ((err as { statusCode?: number })?.statusCode === 404) return false;
+    throw err;
+  }
+}
+
+/** The logger methods the database-name resolution uses (a Fastify logger fits). */
+export type DbLog = Pick<FastifyBaseLogger, 'info' | 'warn' | 'error'>;
+
+/**
+ * Pick the CouchDB database to use for the configured name (OL-49, issue #619),
+ * creating it when needed. "`open-live` holds data" means it has documents
+ * other than design docs and bookkeeping (see `isDataDocId`).
+ * - invalid name (`couchdbNameProblem`): before `COUCHDB_NAME` was honoured
+ *   such an instance ran on `open-live`, so when `open-live` holds data use it
+ *   and log an error naming `COUCHDB_NAME` and the rule (upgrade safety, AC4);
+ *   otherwise throw a `FatalStartupError`, which the retry loop does not retry
+ *   (fail fast, AC3). Nothing is created or written either way.
+ * - `open-live` configured: as before — use it, creating it if it is missing.
+ * - configured database holds the marker document: use it.
+ * - `open-live` holds data: use `open-live` and log an error. The configured
+ *   database is neither created nor written to, so an upgraded instance keeps
+ *   its data and never later switches to an empty or foreign database (AC4).
+ * - otherwise: create the configured database if missing, write the marker
+ *   document so the instance stays on it, and use it.
+ */
+export async function resolveDbName(nano: Nano.ServerScope, configured: string, log?: DbLog): Promise<string> {
+  const dbList = await nano.db.list();
+  const legacyHasData = async (): Promise<boolean> =>
+    dbList.includes(LEGACY_DB_NAME) && hasDocMatching(nano, LEGACY_DB_NAME, isDataDocId);
+
+  const problem = couchdbNameProblem(configured);
+  if (problem !== null) {
+    if (await legacyHasData()) {
+      log?.error(
+        `[db] ${problem} "${LEGACY_DB_NAME}" holds data, so this instance keeps using "${LEGACY_DB_NAME}" as it did before ` +
+          `COUCHDB_NAME was honoured. Set COUCHDB_NAME to a valid name (or unset it) to silence this error.`,
+      );
+      return LEGACY_DB_NAME;
+    }
+    throw new FatalStartupError(
+      `${problem} There is no existing "${LEGACY_DB_NAME}" data to fall back to, so startup stops. ` +
+        `Set COUCHDB_NAME to a valid name, or unset it to use "${LEGACY_DB_NAME}".`,
+    );
+  }
+
+  if (configured === LEGACY_DB_NAME) {
+    if (!dbList.includes(configured)) {
+      await nano.db.create(configured);
+      log?.info(`[db] Created CouchDB database "${configured}"`);
+    }
+    return configured;
+  }
+  const configuredExists = dbList.includes(configured);
+  if (configuredExists && (await hasMarkerDoc(nano, configured))) return configured;
+  if (await legacyHasData()) {
+    log?.error(
+      `[db] CouchDB database "${configured}" (COUCHDB_NAME) ` +
+        `${configuredExists ? `has no "${DATABASE_MARKER_DOC_ID}" marker document` : 'does not exist'}, ` +
+        `but "${LEGACY_DB_NAME}" holds data — using "${LEGACY_DB_NAME}" so an upgraded instance keeps its data; ` +
+        `"${configured}" was not ${configuredExists ? 'written to' : 'created'}. If this is a new instance on a shared ` +
+        `CouchDB server, it is now sharing "${LEGACY_DB_NAME}" with another instance, and each one's startup reconcile, ` +
+        `idle watchdog and sweeps will act on the other's productions. To give it its own database, create ` +
+        `"${configured}" with the document "${DATABASE_MARKER_DOC_ID}" in it (PUT /${configured}/${DATABASE_MARKER_DOC_ID} with {}) and restart.`,
+    );
+    return LEGACY_DB_NAME;
+  }
+  if (!configuredExists) {
+    await nano.db.create(configured);
+    log?.info(`[db] Created CouchDB database "${configured}"`);
+  }
+  try {
+    await nano
+      .use<{ type: string; createdAt: string }>(configured)
+      .insert({ _id: DATABASE_MARKER_DOC_ID, type: 'database-marker', createdAt: new Date().toISOString() });
+  } catch (err) {
+    // Another instance or the operator wrote it first: the database is claimed either way.
+    if ((err as { statusCode?: number })?.statusCode !== 409) throw err;
+  }
+  return configured;
+}
+
+export async function connectDb(log?: DbLog): Promise<void> {
+  const nano = Nano({ url: config.couchdbUrl, requestDefaults: { timeout: 10_000 } });
+  const dbName = await resolveDbName(nano, config.couchdbName, log);
+  db = nano.use<ProductionDoc>(dbName);
+  log?.info(`[db] Using CouchDB database "${dbName}"`);
 }
 
 export async function isDbReady(): Promise<boolean> {
