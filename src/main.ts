@@ -4,6 +4,7 @@ import { startGpuUsageSweep, stopGpuUsageSweep } from './services/gpu-usage.js';
 import { startPortReservation, stopPortReservation } from './services/port-reservation.js';
 import { connectDbAndInit, startDbConnectRetry, stopDbConnectRetry } from './lib/post-connect-init.js';
 import { buildServer } from './server.js';
+import { isFatalStartupError } from './lib/fatal-startup-error.js';
 
 async function main() {
   // API_KEY is required in production. Without it every route is unauthenticated,
@@ -89,11 +90,21 @@ async function main() {
   // lives in one idempotent helper shared with /api/v1/reconnect (issue #581).
   // If CouchDB is unreachable at startup, keep serving and retry in the
   // background so the instance recovers without a restart.
+  // A FatalStartupError (a bad setting such as an invalid COUCHDB_NAME with no
+  // `open-live` data to fall back to, OL-49) is not retried: the process exits.
+  const exitOnFatal = (): void => {
+    setTimeout(() => process.exit(1), 5000).unref();
+    process.exit(1);
+  };
   try {
     await connectDbAndInit(app.log);
   } catch (err: any) {
+    if (isFatalStartupError(err)) {
+      app.log.fatal('[db] %s', err.message);
+      exitOnFatal();
+    }
     app.log.error('[db] Failed to connect to CouchDB — continuing without database, retrying in background (status: %s)', err?.statusCode ?? err?.message ?? 'unknown');
-    startDbConnectRetry(app.log);
+    startDbConnectRetry(app.log, exitOnFatal);
   }
 
   startIdleWatchdog(app.log);
