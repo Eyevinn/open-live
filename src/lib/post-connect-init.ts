@@ -126,7 +126,7 @@ export function connectDbAndInit(log: FastifyBaseLogger): Promise<void> {
   if (inFlight) return inFlight;
   inFlight = (async () => {
     if (!isDbConnected()) {
-      await connectDb();
+      await connectDb(log);
       log.info('[db] Connected to CouchDB');
     }
     await bootstrapKeys(log);

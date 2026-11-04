@@ -652,3 +652,14 @@ the handler then answers `404 { message }` without changing anything. Also: the 
 connection is resolved per call (`resolveIntercomConnection()`), so any new intercom call site
 must take/resolve a connection — never read `config.intercom*` directly — and must use
 `redirect: 'manual'`.
+
+## Validate CouchDB-related env vars in `config.ts`, never inside `connectDb()`
+
+`connectDb()` runs under the background retry loop in `src/lib/post-connect-init.ts`, so an error
+thrown there for a bad setting (rather than an unreachable server) is retried forever with backoff
+instead of stopping startup. `COUCHDB_NAME` (OL-49, #619) is therefore parsed and validated by
+`buildCouchdbName()` at config load. The database it names is picked by `resolveDbName()` in
+`src/db/index.ts`: if the configured database is missing but `open-live` exists with documents, it
+keeps using `open-live` and does not create the configured one, so an upgraded OSC instance whose
+`DatabaseUrl` path is not `open-live` keeps its data. `vitest.config.ts` sets
+`COUCHDB_NAME=open-live-test`, so tests see that as `config.couchdbName`.

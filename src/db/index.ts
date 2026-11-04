@@ -1,4 +1,5 @@
 import Nano from 'nano';
+import type { FastifyBaseLogger } from 'fastify';
 import { config } from '../config.js';
 import type { ProductionDoc, SourceDoc, ProductionConfigDoc, GraphicDoc, OutputDoc, GatewayDoc, RecordingDoc, GuestInviteDoc, GuestSessionDoc, GuestSigningKeyDoc, CredentialEncryptionKeyDoc, RtmpCredentialKeyDoc, MigrationStateDoc, GpuUsageLedgerDoc, GpuMeteringStateDoc, StorageConnectionDoc, IntercomConnectionDoc } from './types.js';
 
@@ -188,15 +189,48 @@ export function getIntercomConnectionDb(): GuardedScope<IntercomConnectionDoc> {
   return withTypeGuard(db as unknown as Nano.DocumentScope<IntercomConnectionDoc>, 'intercom-connection');
 }
 
-const DB_NAME = 'open-live';
+/** The database every instance used before `COUCHDB_NAME` was honoured (OL-49). */
+const LEGACY_DB_NAME = 'open-live';
 
-export async function connectDb(): Promise<void> {
-  const nano = Nano({ url: config.couchdbUrl, requestDefaults: { timeout: 10_000 } });
+/** The logger methods the database-name resolution uses (a Fastify logger fits). */
+export type DbLog = Pick<FastifyBaseLogger, 'info' | 'warn'>;
+
+/**
+ * Pick the CouchDB database to use for the configured name (OL-49, issue #619),
+ * creating it when needed:
+ * - `open-live` configured: as before — use it, creating it if it is missing.
+ * - configured database exists: use it.
+ * - configured database missing, `open-live` exists and holds documents: use
+ *   `open-live` and warn. The configured database is NOT created, so an
+ *   upgraded instance keeps its data and never later switches to an empty
+ *   database (upgrade safety: on OSC `COUCHDB_NAME` comes from the
+ *   `DatabaseUrl` path and may not be `open-live` on existing instances).
+ * - otherwise: create the configured database and use it.
+ */
+export async function resolveDbName(nano: Nano.ServerScope, configured: string, log?: DbLog): Promise<string> {
   const dbList = await nano.db.list();
-  if (!dbList.includes(DB_NAME)) {
-    await nano.db.create(DB_NAME);
+  if (dbList.includes(configured)) return configured;
+  if (configured !== LEGACY_DB_NAME && dbList.includes(LEGACY_DB_NAME)) {
+    const legacy = await nano.db.get(LEGACY_DB_NAME);
+    if (legacy.doc_count > 0) {
+      log?.warn(
+        `[db] CouchDB database "${configured}" (COUCHDB_NAME) does not exist, but "${LEGACY_DB_NAME}" holds ` +
+          `${legacy.doc_count} documents — using "${LEGACY_DB_NAME}" so existing data stays visible. ` +
+          `"${configured}" was not created. To switch, copy the data into "${configured}" (or create it) and restart.`,
+      );
+      return LEGACY_DB_NAME;
+    }
   }
-  db = nano.use<ProductionDoc>(DB_NAME);
+  await nano.db.create(configured);
+  log?.info(`[db] Created CouchDB database "${configured}"`);
+  return configured;
+}
+
+export async function connectDb(log?: DbLog): Promise<void> {
+  const nano = Nano({ url: config.couchdbUrl, requestDefaults: { timeout: 10_000 } });
+  const dbName = await resolveDbName(nano, config.couchdbName, log);
+  db = nano.use<ProductionDoc>(dbName);
+  log?.info(`[db] Using CouchDB database "${dbName}"`);
 }
 
 export async function isDbReady(): Promise<boolean> {

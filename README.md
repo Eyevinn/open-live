@@ -77,7 +77,9 @@ pnpm dev                                  # this server, on http://localhost:300
 # in open-live-studio: OPEN_LIVE_URL=http://localhost:3000
 ```
 
-Create the `open-live` database in CouchDB before first start. Everything else in
+The database is named by `COUCHDB_NAME` (default `open-live`) and is created on first
+start if it is missing. On a CouchDB server shared by several studios, pre-create each
+studio's database and give each instance its own `COUCHDB_NAME`. Everything else in
 [Configuration](#configuration) is optional for local development — but read
 [Operating in production](#operating-in-production) before exposing this to a network.
 
@@ -101,6 +103,7 @@ and fill in the values:
 | `COUCHDB_URL` | Full CouchDB connection URL. Credentials may be embedded, or supplied via `COUCHDB_USER`/`COUCHDB_PASSWORD` | required |
 | `COUCHDB_USER` | CouchDB username, injected into `COUCHDB_URL` at startup when the URL has no embedded credentials (only applied if `COUCHDB_PASSWORD` is also set) | _(empty)_ |
 | `COUCHDB_PASSWORD` | CouchDB password, injected into `COUCHDB_URL` at startup when the URL has no embedded credentials | _(empty)_ |
+| `COUCHDB_NAME` | CouchDB database this instance keeps its data in. Must be a valid CouchDB name (lowercase letter first, then `a-z 0-9 _ $ ( ) + - /`, max 238 chars), or startup fails. Created on first start if missing — except that if it is missing and the `open-live` database exists with documents, the instance keeps using `open-live` (logging a warning) and does not create it, so an upgrade never hides existing data | `open-live` |
 | `CORS_ORIGIN` | Allowed CORS origin(s): a single origin, a comma-separated list, or `*` for wildcard. **When unset, cross-origin requests are disabled** (`origin: false`) and a `[security]` warning is logged — there is no default origin | _(empty — cross-origin disabled)_ |
 | `PUBLIC_BASE_URL` | Externally reachable base URL of this service, used to build WHIP callback URLs. **Required in production** (`NODE_ENV=production`): the server refuses to start without it, because otherwise WHIP URLs are derived from the `X-Forwarded-Host` header, enabling host-header injection. Outside production, logs a warning and falls back to request-derived URLs | _(empty)_ |
 | `TRUSTED_HOSTS` | Comma-separated allow-list of hostnames permitted when building request-derived WHIP URLs (used only when `PUBLIC_BASE_URL` is unset). A request whose derived host is not on this list is rejected rather than persisted | _(empty)_ |

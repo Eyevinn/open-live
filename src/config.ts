@@ -128,6 +128,31 @@ export function buildCouchdbUrl(): string {
   return url.toString();
 }
 
+/** Database used when `COUCHDB_NAME` is unset or empty (today's behaviour). */
+export const DEFAULT_COUCHDB_NAME = 'open-live';
+
+/** CouchDB's database-name rule; names are at most 238 characters. */
+const COUCHDB_NAME_PATTERN = /^[a-z][a-z0-9_$()+/-]*$/;
+const COUCHDB_NAME_MAX_LENGTH = 238;
+
+/**
+ * Parse `COUCHDB_NAME` (OL-49, issue #619): the CouchDB database this instance
+ * keeps its data in. Unset or empty means `open-live`. An invalid name fails
+ * here, at config load — `connectDb()` runs under the background retry loop
+ * (`post-connect-init.ts`), where a bad name would retry forever instead.
+ */
+export function buildCouchdbName(): string {
+  const name = optionalEnv('COUCHDB_NAME') ?? DEFAULT_COUCHDB_NAME;
+  if (name.length > COUCHDB_NAME_MAX_LENGTH || !COUCHDB_NAME_PATTERN.test(name)) {
+    throw new Error(
+      `Invalid COUCHDB_NAME: "${redactUrlCredentials(name)}". A CouchDB database name must start with a lowercase letter ` +
+        `(a-z), contain only lowercase letters, digits and the characters _ $ ( ) + - /, ` +
+        `and be at most ${COUCHDB_NAME_MAX_LENGTH} characters long.`,
+    );
+  }
+  return name;
+}
+
 /**
  * Parse `STROM_PUBLIC_URL`, trailing slashes removed. It is the base of the
  * WHEP URLs given to browsers, so it must be an absolute http(s) URL: without
@@ -165,6 +190,8 @@ const gpuMetering = resolveGpuMetering({
 export const config = {
   port: parseInt(process.env['PORT'] ?? '3000', 10),
   couchdbUrl: buildCouchdbUrl(),
+  /** CouchDB database name, from `COUCHDB_NAME` (default `open-live`). */
+  couchdbName: buildCouchdbName(),
   stromUrl: process.env['STROM_URL'] ?? 'http://localhost:7000',
   /**
    * Base URL browsers use to reach Strom, when it differs from `STROM_URL`
