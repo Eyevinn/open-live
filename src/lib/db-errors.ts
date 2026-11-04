@@ -13,3 +13,8 @@ export function isDocNotFoundError(err: unknown): boolean {
   if ((err as { statusCode?: number } | null)?.statusCode === 404) return true;
   return err instanceof Error && err.message.startsWith('Document type mismatch');
 }
+
+/** A CouchDB `.insert()` refused because the document's `_rev` is no longer current (409). */
+export function isDocConflictError(err: unknown): boolean {
+  return (err as { statusCode?: number } | null)?.statusCode === 409;
+}
