@@ -25,6 +25,7 @@ import { applyReturnMode, isInputOnProgram } from '../ws/controller.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { assertSameStromOrigin } from '../lib/url-validation.js';
 import { resolveGuestSession, slotTakesWhip } from '../lib/guest-scope.js';
+import { guestPreviewFeeds } from '../lib/commentator-preview.js';
 import {
   applyGuestSlotMixerLabel,
   guestSlotDefaultLabel,
@@ -715,7 +716,13 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         });
       }
       try {
-        return reply.send({ mixerInput: slot.mixerInput, returnOnly: !(await slotTakesWhip(slot)) });
+        return reply.send({
+          mixerInput: slot.mixerInput,
+          returnOnly: !(await slotTakesWhip(slot)),
+          // Commentator previews of this production (spec §"Commentator
+          // preview"); watchable once joined. Empty unless active.
+          previews: await guestPreviewFeeds(production, resolvePublicBaseUrl(req), req.params.inviteId),
+        });
       } catch (err) {
         fastify.log.warn({ err }, 'GET guests/:id/slot — source lookup failed');
         return reply.status(503).send({ error: 'Database unavailable', statusCode: 503 });
@@ -981,6 +988,10 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
             video: true,
           }]
         : [];
+      // Undelayed source previews for commentators (spec §"Commentator
+      // preview"), on the guest-scoped aliases like the return feed. Separate
+      // from `feeds`, which stays the guest's own return.
+      const previews = await guestPreviewFeeds(production, base, req.params.inviteId);
       // The page's ICE servers: Strom's list, so a guest off the network gets
       // the deployment's TURN server. Best effort, and bounded — without it
       // the page keeps its built-in STUN server.
@@ -999,6 +1010,7 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         ...(whipUrl ? { whipUrl } : {}),
         returnOnly: !takesWhip,
         feeds,
+        previews,
         ...(iceServers?.length ? { iceServers } : {}),
         modes: returnModesFor(mixerInput),
         defaultMode: 'program-minus',
