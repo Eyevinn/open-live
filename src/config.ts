@@ -144,8 +144,10 @@ const COUCHDB_NAME_MAX_LENGTH = 238;
 export function buildCouchdbName(): string {
   const name = optionalEnv('COUCHDB_NAME') ?? DEFAULT_COUCHDB_NAME;
   if (name.length > COUCHDB_NAME_MAX_LENGTH || !COUCHDB_NAME_PATTERN.test(name)) {
+    // The value is not echoed: on OSC it is the tail of `DatabaseUrl`, which for
+    // a URL with no database path can be part of the credentials.
     throw new Error(
-      `Invalid COUCHDB_NAME: "${redactUrlCredentials(name)}". A CouchDB database name must start with a lowercase letter ` +
+      `Invalid COUCHDB_NAME (value not shown, ${name.length} characters). A CouchDB database name must start with a lowercase letter ` +
         `(a-z), contain only lowercase letters, digits and the characters _ $ ( ) + - /, ` +
         `and be at most ${COUCHDB_NAME_MAX_LENGTH} characters long.`,
     );

@@ -78,8 +78,10 @@ pnpm dev                                  # this server, on http://localhost:300
 ```
 
 The database is named by `COUCHDB_NAME` (default `open-live`) and is created on first
-start if it is missing. On a CouchDB server shared by several studios, pre-create each
-studio's database and give each instance its own `COUCHDB_NAME`. Everything else in
+start if it is missing. On a CouchDB server shared by several studios, give each instance its
+own `COUCHDB_NAME`; if the server already has an `open-live` database with data, pre-create each
+new studio's database with a document in it, or that studio will use `open-live` (see
+`COUCHDB_NAME` in [Configuration](#configuration)). Everything else in
 [Configuration](#configuration) is optional for local development — but read
 [Operating in production](#operating-in-production) before exposing this to a network.
 
@@ -103,7 +105,7 @@ and fill in the values:
 | `COUCHDB_URL` | Full CouchDB connection URL. Credentials may be embedded, or supplied via `COUCHDB_USER`/`COUCHDB_PASSWORD` | required |
 | `COUCHDB_USER` | CouchDB username, injected into `COUCHDB_URL` at startup when the URL has no embedded credentials (only applied if `COUCHDB_PASSWORD` is also set) | _(empty)_ |
 | `COUCHDB_PASSWORD` | CouchDB password, injected into `COUCHDB_URL` at startup when the URL has no embedded credentials | _(empty)_ |
-| `COUCHDB_NAME` | CouchDB database this instance keeps its data in. Must be a valid CouchDB name (lowercase letter first, then `a-z 0-9 _ $ ( ) + - /`, max 238 chars), or startup fails. Created on first start if missing — except that if it is missing and the `open-live` database exists with documents, the instance keeps using `open-live` (logging a warning) and does not create it, so an upgrade never hides existing data | `open-live` |
+| `COUCHDB_NAME` | CouchDB database this instance keeps its data in. Must be a valid CouchDB name (lowercase letter first, then `a-z 0-9 _ $ ( ) + - /`, max 238 chars), or startup fails. **On a CouchDB server that already has an `open-live` database with data, you must pre-create this database with a document in it (e.g. `PUT /<name>/open-live-database` with body `{}`), or the instance will use `open-live` and share it with whichever instance owns that data** (logging a warning). This is the upgrade rule: while this database is missing or empty and `open-live` holds data, the instance keeps using `open-live`, so an existing instance never switches to an empty database. Otherwise the database is created if missing and used from then on | `open-live` |
 | `CORS_ORIGIN` | Allowed CORS origin(s): a single origin, a comma-separated list, or `*` for wildcard. **When unset, cross-origin requests are disabled** (`origin: false`) and a `[security]` warning is logged — there is no default origin | _(empty — cross-origin disabled)_ |
 | `PUBLIC_BASE_URL` | Externally reachable base URL of this service, used to build WHIP callback URLs. **Required in production** (`NODE_ENV=production`): the server refuses to start without it, because otherwise WHIP URLs are derived from the `X-Forwarded-Host` header, enabling host-header injection. Outside production, logs a warning and falls back to request-derived URLs | _(empty)_ |
 | `TRUSTED_HOSTS` | Comma-separated allow-list of hostnames permitted when building request-derived WHIP URLs (used only when `PUBLIC_BASE_URL` is unset). A request whose derived host is not on this list is rejected rather than persisted | _(empty)_ |

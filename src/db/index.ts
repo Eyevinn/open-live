@@ -192,6 +192,55 @@ export function getIntercomConnectionDb(): GuardedScope<IntercomConnectionDoc> {
 /** The database every instance used before `COUCHDB_NAME` was honoured (OL-49). */
 const LEGACY_DB_NAME = 'open-live';
 
+/**
+ * Marker document written into the configured database when an instance
+ * settles on it while it is still empty (OL-49). A configured database that
+ * holds any document is never given up for `open-live`, so this keeps a new
+ * instance on its own database once it has started there, and an operator can
+ * write it to claim a pre-created database (see README, `COUCHDB_NAME`).
+ */
+export const DATABASE_MARKER_DOC_ID = 'open-live-database';
+
+/**
+ * Documents every instance writes for itself on start, whether or not anyone
+ * has used it: the key bootstraps, the GPU-metering marker, migration state and
+ * the database marker. They are not "data" when deciding whether `open-live`
+ * holds an existing instance's productions, sources and settings. Literal ids,
+ * not imports, because those modules import this one (a test checks they match).
+ */
+export const BOOKKEEPING_DOC_IDS: ReadonlySet<string> = new Set([
+  'guest-invite-signing-key',
+  'credential-encryption-key',
+  'rtmp-credentials-key',
+  'gpu-metering-state',
+  DATABASE_MARKER_DOC_ID,
+]);
+
+function isDesignDoc(id: string): boolean {
+  return id.startsWith('_design/');
+}
+
+/** A document that holds an instance's data, not per-instance bookkeeping. */
+export function isDataDocId(id: string): boolean {
+  return !isDesignDoc(id) && !id.startsWith('migration:') && !BOOKKEEPING_DOC_IDS.has(id);
+}
+
+const ID_PAGE_SIZE = 100;
+
+/** True when the database has a document whose id satisfies `match` (ids only, paged). */
+async function hasDocMatching(nano: Nano.ServerScope, name: string, match: (id: string) => boolean): Promise<boolean> {
+  const scope = nano.use(name);
+  let startkey: string | undefined;
+  for (;;) {
+    const page = await scope.list(
+      startkey === undefined ? { limit: ID_PAGE_SIZE } : { limit: ID_PAGE_SIZE, startkey, skip: 1 },
+    );
+    if (page.rows.some((row) => match(row.id))) return true;
+    if (page.rows.length < ID_PAGE_SIZE) return false;
+    startkey = page.rows[page.rows.length - 1]!.id;
+  }
+}
+
 /** The logger methods the database-name resolution uses (a Fastify logger fits). */
 export type DbLog = Pick<FastifyBaseLogger, 'info' | 'warn'>;
 
@@ -199,30 +248,51 @@ export type DbLog = Pick<FastifyBaseLogger, 'info' | 'warn'>;
  * Pick the CouchDB database to use for the configured name (OL-49, issue #619),
  * creating it when needed:
  * - `open-live` configured: as before — use it, creating it if it is missing.
- * - configured database exists: use it.
- * - configured database missing, `open-live` exists and holds documents: use
- *   `open-live` and warn. The configured database is NOT created, so an
+ * - configured database exists and holds any document (design docs aside): use it.
+ * - configured database missing or empty, and `open-live` holds data (documents
+ *   other than design docs and bookkeeping, see `isDataDocId`): use `open-live`
+ *   and warn. The configured database is neither created nor written to, so an
  *   upgraded instance keeps its data and never later switches to an empty
- *   database (upgrade safety: on OSC `COUCHDB_NAME` comes from the
- *   `DatabaseUrl` path and may not be `open-live` on existing instances).
- * - otherwise: create the configured database and use it.
+ *   database. This covers an OSC instance whose `DatabaseUrl` path is not
+ *   `open-live`, also when a database of that name was created empty
+ *   beforehand (upgrade safety, #619 AC4).
+ * - otherwise: create the configured database if missing, write the marker
+ *   document so the instance stays on it, and use it.
  */
 export async function resolveDbName(nano: Nano.ServerScope, configured: string, log?: DbLog): Promise<string> {
   const dbList = await nano.db.list();
-  if (dbList.includes(configured)) return configured;
-  if (configured !== LEGACY_DB_NAME && dbList.includes(LEGACY_DB_NAME)) {
-    const legacy = await nano.db.get(LEGACY_DB_NAME);
-    if (legacy.doc_count > 0) {
-      log?.warn(
-        `[db] CouchDB database "${configured}" (COUCHDB_NAME) does not exist, but "${LEGACY_DB_NAME}" holds ` +
-          `${legacy.doc_count} documents — using "${LEGACY_DB_NAME}" so existing data stays visible. ` +
-          `"${configured}" was not created. To switch, copy the data into "${configured}" (or create it) and restart.`,
-      );
-      return LEGACY_DB_NAME;
+  if (configured === LEGACY_DB_NAME) {
+    if (!dbList.includes(configured)) {
+      await nano.db.create(configured);
+      log?.info(`[db] Created CouchDB database "${configured}"`);
     }
+    return configured;
   }
-  await nano.db.create(configured);
-  log?.info(`[db] Created CouchDB database "${configured}"`);
+  const configuredExists = dbList.includes(configured);
+  if (configuredExists && (await hasDocMatching(nano, configured, (id) => !isDesignDoc(id)))) return configured;
+  if (dbList.includes(LEGACY_DB_NAME) && (await hasDocMatching(nano, LEGACY_DB_NAME, isDataDocId))) {
+    log?.warn(
+      `[db] CouchDB database "${configured}" (COUCHDB_NAME) ${configuredExists ? 'is empty' : 'does not exist'}, ` +
+        `but "${LEGACY_DB_NAME}" holds data — using "${LEGACY_DB_NAME}" so an upgraded instance keeps its data; ` +
+        `"${configured}" was not ${configuredExists ? 'written to' : 'created'}. If this is a new instance on a shared ` +
+        `CouchDB server, it is now sharing "${LEGACY_DB_NAME}" with another instance, and each one's startup reconcile, ` +
+        `idle watchdog and sweeps will act on the other's productions. To give it its own database, create ` +
+        `"${configured}" with the document "${DATABASE_MARKER_DOC_ID}" in it and restart.`,
+    );
+    return LEGACY_DB_NAME;
+  }
+  if (!configuredExists) {
+    await nano.db.create(configured);
+    log?.info(`[db] Created CouchDB database "${configured}"`);
+  }
+  try {
+    await nano
+      .use<{ type: string; createdAt: string }>(configured)
+      .insert({ _id: DATABASE_MARKER_DOC_ID, type: 'database-marker', createdAt: new Date().toISOString() });
+  } catch (err) {
+    // Another instance or the operator wrote it first: the database is claimed either way.
+    if ((err as { statusCode?: number })?.statusCode !== 409) throw err;
+  }
   return configured;
 }
 
