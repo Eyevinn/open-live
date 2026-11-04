@@ -77,7 +77,17 @@ pnpm dev                                  # this server, on http://localhost:300
 # in open-live-studio: OPEN_LIVE_URL=http://localhost:3000
 ```
 
-Create the `open-live` database in CouchDB before first start. Everything else in
+The database is named by `COUCHDB_NAME` (default `open-live`) and is created on first
+start if it is missing. On a CouchDB server shared by several studios, give each instance its
+own `COUCHDB_NAME`; if the server already has an `open-live` database with data, pre-claim each
+new studio's database before its first start, or that studio will use `open-live` (see
+`COUCHDB_NAME` in [Configuration](#configuration)):
+
+```bash
+curl -X PUT "$COUCHDB_URL/<name>"                                  # create the database
+curl -X PUT "$COUCHDB_URL/<name>/open-live-database" -d '{}'       # claim it for Open Live
+```
+ Everything else in
 [Configuration](#configuration) is optional for local development — but read
 [Operating in production](#operating-in-production) before exposing this to a network.
 
@@ -101,6 +111,7 @@ and fill in the values:
 | `COUCHDB_URL` | Full CouchDB connection URL. Credentials may be embedded, or supplied via `COUCHDB_USER`/`COUCHDB_PASSWORD` | required |
 | `COUCHDB_USER` | CouchDB username, injected into `COUCHDB_URL` at startup when the URL has no embedded credentials (only applied if `COUCHDB_PASSWORD` is also set) | _(empty)_ |
 | `COUCHDB_PASSWORD` | CouchDB password, injected into `COUCHDB_URL` at startup when the URL has no embedded credentials | _(empty)_ |
+| `COUCHDB_NAME` | CouchDB database this instance keeps its data in. Must be a valid CouchDB name (lowercase letter first, then `a-z 0-9 _ $ ( ) + - /`, max 238 chars). An invalid name is a fatal startup error (not retried), **except** when the server's `open-live` database holds data: then the instance keeps using `open-live`, as it did before this setting was honoured, and logs an error naming `COUCHDB_NAME` and the rule. **On a CouchDB server that already has an `open-live` database with data, you must pre-claim this database by creating it with the marker document `open-live-database` in it (`PUT /<name>` then `PUT /<name>/open-live-database` with body `{}`), or the instance will use `open-live` and share it with whichever instance owns that data** (logging an error). This is the upgrade rule: while this database is missing or has no `open-live-database` document and `open-live` holds data, the instance keeps using `open-live` and does not create or write this database, so an existing instance never switches to an empty or foreign database. Otherwise the database is created if missing, the marker is written, and it is used from then on | `open-live` |
 | `CORS_ORIGIN` | Allowed CORS origin(s): a single origin, a comma-separated list, or `*` for wildcard. **When unset, cross-origin requests are disabled** (`origin: false`) and a `[security]` warning is logged — there is no default origin | _(empty — cross-origin disabled)_ |
 | `PUBLIC_BASE_URL` | Externally reachable base URL of this service, used to build WHIP callback URLs. **Required in production** (`NODE_ENV=production`): the server refuses to start without it, because otherwise WHIP URLs are derived from the `X-Forwarded-Host` header, enabling host-header injection. Outside production, logs a warning and falls back to request-derived URLs | _(empty)_ |
 | `TRUSTED_HOSTS` | Comma-separated allow-list of hostnames permitted when building request-derived WHIP URLs (used only when `PUBLIC_BASE_URL` is unset). A request whose derived host is not on this list is rejected rather than persisted | _(empty)_ |

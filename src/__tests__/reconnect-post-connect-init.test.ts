@@ -26,7 +26,7 @@ delete process.env['GUEST_INVITE_SECRET'];
 // Mock CouchDB: the first connect fails with a 401, later ones succeed.
 // ---------------------------------------------------------------------------
 
-const state = vi.hoisted(() => ({ connected: false, failNext: 0 }));
+const state = vi.hoisted(() => ({ connected: false, failNext: 0, throwNext: [] as Error[] }));
 
 function memDb() {
   const docs = new Map<string, Record<string, unknown>>();
@@ -57,6 +57,8 @@ vi.mock('../db/index.js', () => {
   };
   return {
     connectDb: vi.fn(async () => {
+      const next = state.throwNext.shift();
+      if (next) throw next;
       if (state.failNext > 0) {
         state.failNext--;
         throw Object.assign(new Error('unauthorized'), { statusCode: 401 });
@@ -126,6 +128,7 @@ let rtmpKey: typeof import('../lib/rtmp-credential-key.js');
 let guestKey: typeof import('../lib/guest-signing-key.js');
 let crypto: typeof import('../lib/srt-passphrase-crypto.js');
 let db: typeof import('../db/index.js');
+let fatal: typeof import('../lib/fatal-startup-error.js');
 const prevNodeEnv = process.env['NODE_ENV'];
 
 beforeAll(async () => {
@@ -135,6 +138,7 @@ beforeAll(async () => {
   guestKey = await import('../lib/guest-signing-key.js');
   crypto = await import('../lib/srt-passphrase-crypto.js');
   db = await import('../db/index.js');
+  fatal = await import('../lib/fatal-startup-error.js');
   const { buildServer } = await import('../server.js');
   app = await buildServer();
 });
@@ -142,6 +146,7 @@ beforeAll(async () => {
 beforeEach(() => {
   state.connected = false;
   state.failNext = 0;
+  state.throwNext = [];
   for (const k of Object.keys(dbs)) delete dbs[k];
   postConnect.__resetPostConnectInitForTests();
   credKey.__resetCredentialEncryptionKeyCacheForTests();
@@ -232,5 +237,31 @@ describe('post-connect init after a failed startup connect (#581)', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+  it('background retry stops on a FatalStartupError (OL-49: invalid COUCHDB_NAME) instead of retrying it', async () => {
+    vi.useFakeTimers();
+    try {
+      state.failNext = 1; // startup: CouchDB unreachable, so the name could not be judged yet
+      await expect(postConnect.connectDbAndInit(app.log)).rejects.toMatchObject({ statusCode: 401 });
+      const err = new fatal.FatalStartupError('Invalid COUCHDB_NAME (value not shown, 8 characters).');
+      state.throwNext = [err];
+      const onFatal = vi.fn();
+      postConnect.startDbConnectRetry(app.log, onFatal);
+      await vi.advanceTimersByTimeAsync(5_000); // attempt 2: fatal
+      expect(onFatal).toHaveBeenCalledTimes(1);
+      expect(onFatal).toHaveBeenCalledWith(err);
+      expect(db.connectDb).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(10 * 60_000); // no further attempts
+      expect(db.connectDb).toHaveBeenCalledTimes(2);
+      expect(state.connected).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects connectDbAndInit with the FatalStartupError so startup can exit (main.ts)', async () => {
+    state.throwNext = [new fatal.FatalStartupError('Invalid COUCHDB_NAME')];
+    const err = await postConnect.connectDbAndInit(app.log).catch((e: unknown) => e);
+    expect(fatal.isFatalStartupError(err)).toBe(true);
   });
 });
