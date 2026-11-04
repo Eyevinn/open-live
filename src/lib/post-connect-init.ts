@@ -25,6 +25,7 @@
 
 import type { FastifyBaseLogger } from 'fastify';
 import { connectDb, isDbConnected } from '../db/index.js';
+import { isFatalStartupError } from './fatal-startup-error.js';
 import { cleanLegacyFixtures } from '../db/seed.js';
 import { ensureGuestSigningKey } from './guest-signing-key.js';
 import { ensureCredentialEncryptionKey } from './credential-encryption-key.js';
@@ -145,8 +146,12 @@ export function connectDbAndInit(log: FastifyBaseLogger): Promise<void> {
  * (5 s doubling, capped at 5 min) until it succeeds. Used when the startup
  * connect fails, so the instance recovers without a restart or a manual
  * `/api/v1/reconnect`. Timers are unref'd so they never hold the process open.
+ *
+ * A `FatalStartupError` (a bad setting, e.g. an invalid `COUCHDB_NAME` with no
+ * `open-live` data to fall back to, OL-49) is not retried: the loop stops,
+ * logs it and calls `onFatal` (`main.ts` exits the process).
  */
-export function startDbConnectRetry(log: FastifyBaseLogger): void {
+export function startDbConnectRetry(log: FastifyBaseLogger, onFatal?: (err: Error) => void): void {
   if (retryTimer) return;
   retryStopped = false;
   let delay = RETRY_INITIAL_MS;
@@ -159,6 +164,12 @@ export function startDbConnectRetry(log: FastifyBaseLogger): void {
           log.info('[db] Background reconnect succeeded — post-connect init complete');
         },
         (err: any) => {
+          if (isFatalStartupError(err)) {
+            retryStopped = true;
+            log.fatal('[db] %s Not retrying.', err.message);
+            onFatal?.(err);
+            return;
+          }
           delay = Math.min(delay * 2, RETRY_MAX_MS);
           log.warn('[db] Background reconnect failed — retrying in %ds (reason: %s)', Math.round(delay / 1000), reason(err));
           schedule();

@@ -136,23 +136,32 @@ const COUCHDB_NAME_PATTERN = /^[a-z][a-z0-9_$()+/-]*$/;
 const COUCHDB_NAME_MAX_LENGTH = 238;
 
 /**
+ * Why `name` is not a valid CouchDB database name, or `null` when it is. The
+ * value itself is never part of the message: on OSC `COUCHDB_NAME` is the tail
+ * of `DatabaseUrl`, which for a URL with no database path can be part of the
+ * credentials.
+ */
+export function couchdbNameProblem(name: string): string | null {
+  if (name.length <= COUCHDB_NAME_MAX_LENGTH && COUCHDB_NAME_PATTERN.test(name)) return null;
+  return (
+    `Invalid COUCHDB_NAME (value not shown, ${name.length} characters). A CouchDB database name must start with a lowercase letter ` +
+    `(a-z), contain only lowercase letters, digits and the characters _ $ ( ) + - /, ` +
+    `and be at most ${COUCHDB_NAME_MAX_LENGTH} characters long.`
+  );
+}
+
+/**
  * Parse `COUCHDB_NAME` (OL-49, issue #619): the CouchDB database this instance
- * keeps its data in. Unset or empty means `open-live`. An invalid name fails
- * here, at config load — `connectDb()` runs under the background retry loop
- * (`post-connect-init.ts`), where a bad name would retry forever instead.
+ * keeps its data in. Unset or empty means `open-live`. The name is NOT
+ * validated here: an existing OSC instance whose `DatabaseUrl` tail is not a
+ * valid name (e.g. `/OpenLive`) ran on `open-live` before this setting was
+ * honoured and must keep doing so (#619 AC4), which needs a look at the server.
+ * `resolveDbName()` (`src/db/index.ts`) applies `couchdbNameProblem()`: it
+ * falls back to an `open-live` that holds data, and otherwise stops startup
+ * with a non-retried `FatalStartupError` (AC3).
  */
 export function buildCouchdbName(): string {
-  const name = optionalEnv('COUCHDB_NAME') ?? DEFAULT_COUCHDB_NAME;
-  if (name.length > COUCHDB_NAME_MAX_LENGTH || !COUCHDB_NAME_PATTERN.test(name)) {
-    // The value is not echoed: on OSC it is the tail of `DatabaseUrl`, which for
-    // a URL with no database path can be part of the credentials.
-    throw new Error(
-      `Invalid COUCHDB_NAME (value not shown, ${name.length} characters). A CouchDB database name must start with a lowercase letter ` +
-        `(a-z), contain only lowercase letters, digits and the characters _ $ ( ) + - /, ` +
-        `and be at most ${COUCHDB_NAME_MAX_LENGTH} characters long.`,
-    );
-  }
-  return name;
+  return optionalEnv('COUCHDB_NAME') ?? DEFAULT_COUCHDB_NAME;
 }
 
 /**

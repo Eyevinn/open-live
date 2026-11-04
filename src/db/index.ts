@@ -1,6 +1,7 @@
 import Nano from 'nano';
 import type { FastifyBaseLogger } from 'fastify';
-import { config } from '../config.js';
+import { config, couchdbNameProblem } from '../config.js';
+import { FatalStartupError } from '../lib/fatal-startup-error.js';
 import type { ProductionDoc, SourceDoc, ProductionConfigDoc, GraphicDoc, OutputDoc, GatewayDoc, RecordingDoc, GuestInviteDoc, GuestSessionDoc, GuestSigningKeyDoc, CredentialEncryptionKeyDoc, RtmpCredentialKeyDoc, MigrationStateDoc, GpuUsageLedgerDoc, GpuMeteringStateDoc, StorageConnectionDoc, IntercomConnectionDoc } from './types.js';
 
 
@@ -194,10 +195,12 @@ const LEGACY_DB_NAME = 'open-live';
 
 /**
  * Marker document written into the configured database when an instance
- * settles on it while it is still empty (OL-49). A configured database that
- * holds any document is never given up for `open-live`, so this keeps a new
- * instance on its own database once it has started there, and an operator can
- * write it to claim a pre-created database (see README, `COUCHDB_NAME`).
+ * settles on it (OL-49). While `open-live` holds data, only a configured
+ * database with this document in it is used instead — a database that merely
+ * holds documents may belong to another app on the same server. It keeps an
+ * instance on its own database once it has started there, and an operator
+ * pre-claims a new studio's database by writing it (`PUT /<name>/open-live-database`
+ * with `{}`; see README, `COUCHDB_NAME`).
  */
 export const DATABASE_MARKER_DOC_ID = 'open-live-database';
 
@@ -241,26 +244,57 @@ async function hasDocMatching(nano: Nano.ServerScope, name: string, match: (id: 
   }
 }
 
+/** True when the database holds the `open-live-database` marker document. */
+async function hasMarkerDoc(nano: Nano.ServerScope, name: string): Promise<boolean> {
+  try {
+    await nano.use(name).get(DATABASE_MARKER_DOC_ID);
+    return true;
+  } catch (err) {
+    if ((err as { statusCode?: number })?.statusCode === 404) return false;
+    throw err;
+  }
+}
+
 /** The logger methods the database-name resolution uses (a Fastify logger fits). */
-export type DbLog = Pick<FastifyBaseLogger, 'info' | 'warn'>;
+export type DbLog = Pick<FastifyBaseLogger, 'info' | 'warn' | 'error'>;
 
 /**
  * Pick the CouchDB database to use for the configured name (OL-49, issue #619),
- * creating it when needed:
+ * creating it when needed. "`open-live` holds data" means it has documents
+ * other than design docs and bookkeeping (see `isDataDocId`).
+ * - invalid name (`couchdbNameProblem`): before `COUCHDB_NAME` was honoured
+ *   such an instance ran on `open-live`, so when `open-live` holds data use it
+ *   and log an error naming `COUCHDB_NAME` and the rule (upgrade safety, AC4);
+ *   otherwise throw a `FatalStartupError`, which the retry loop does not retry
+ *   (fail fast, AC3). Nothing is created or written either way.
  * - `open-live` configured: as before — use it, creating it if it is missing.
- * - configured database exists and holds any document (design docs aside): use it.
- * - configured database missing or empty, and `open-live` holds data (documents
- *   other than design docs and bookkeeping, see `isDataDocId`): use `open-live`
- *   and warn. The configured database is neither created nor written to, so an
- *   upgraded instance keeps its data and never later switches to an empty
- *   database. This covers an OSC instance whose `DatabaseUrl` path is not
- *   `open-live`, also when a database of that name was created empty
- *   beforehand (upgrade safety, #619 AC4).
+ * - configured database holds the marker document: use it.
+ * - `open-live` holds data: use `open-live` and log an error. The configured
+ *   database is neither created nor written to, so an upgraded instance keeps
+ *   its data and never later switches to an empty or foreign database (AC4).
  * - otherwise: create the configured database if missing, write the marker
  *   document so the instance stays on it, and use it.
  */
 export async function resolveDbName(nano: Nano.ServerScope, configured: string, log?: DbLog): Promise<string> {
   const dbList = await nano.db.list();
+  const legacyHasData = async (): Promise<boolean> =>
+    dbList.includes(LEGACY_DB_NAME) && hasDocMatching(nano, LEGACY_DB_NAME, isDataDocId);
+
+  const problem = couchdbNameProblem(configured);
+  if (problem !== null) {
+    if (await legacyHasData()) {
+      log?.error(
+        `[db] ${problem} "${LEGACY_DB_NAME}" holds data, so this instance keeps using "${LEGACY_DB_NAME}" as it did before ` +
+          `COUCHDB_NAME was honoured. Set COUCHDB_NAME to a valid name (or unset it) to silence this error.`,
+      );
+      return LEGACY_DB_NAME;
+    }
+    throw new FatalStartupError(
+      `${problem} There is no existing "${LEGACY_DB_NAME}" data to fall back to, so startup stops. ` +
+        `Set COUCHDB_NAME to a valid name, or unset it to use "${LEGACY_DB_NAME}".`,
+    );
+  }
+
   if (configured === LEGACY_DB_NAME) {
     if (!dbList.includes(configured)) {
       await nano.db.create(configured);
@@ -269,15 +303,16 @@ export async function resolveDbName(nano: Nano.ServerScope, configured: string, 
     return configured;
   }
   const configuredExists = dbList.includes(configured);
-  if (configuredExists && (await hasDocMatching(nano, configured, (id) => !isDesignDoc(id)))) return configured;
-  if (dbList.includes(LEGACY_DB_NAME) && (await hasDocMatching(nano, LEGACY_DB_NAME, isDataDocId))) {
-    log?.warn(
-      `[db] CouchDB database "${configured}" (COUCHDB_NAME) ${configuredExists ? 'is empty' : 'does not exist'}, ` +
+  if (configuredExists && (await hasMarkerDoc(nano, configured))) return configured;
+  if (await legacyHasData()) {
+    log?.error(
+      `[db] CouchDB database "${configured}" (COUCHDB_NAME) ` +
+        `${configuredExists ? `has no "${DATABASE_MARKER_DOC_ID}" marker document` : 'does not exist'}, ` +
         `but "${LEGACY_DB_NAME}" holds data — using "${LEGACY_DB_NAME}" so an upgraded instance keeps its data; ` +
         `"${configured}" was not ${configuredExists ? 'written to' : 'created'}. If this is a new instance on a shared ` +
         `CouchDB server, it is now sharing "${LEGACY_DB_NAME}" with another instance, and each one's startup reconcile, ` +
         `idle watchdog and sweeps will act on the other's productions. To give it its own database, create ` +
-        `"${configured}" with the document "${DATABASE_MARKER_DOC_ID}" in it and restart.`,
+        `"${configured}" with the document "${DATABASE_MARKER_DOC_ID}" in it (PUT /${configured}/${DATABASE_MARKER_DOC_ID} with {}) and restart.`,
     );
     return LEGACY_DB_NAME;
   }

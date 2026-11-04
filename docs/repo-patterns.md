@@ -653,18 +653,22 @@ connection is resolved per call (`resolveIntercomConnection()`), so any new inte
 must take/resolve a connection — never read `config.intercom*` directly — and must use
 `redirect: 'manual'`.
 
-## Validate CouchDB-related env vars in `config.ts`, never inside `connectDb()`
+## A bad-setting error inside `connectDb()` must be a `FatalStartupError`
 
 `connectDb()` runs under the background retry loop in `src/lib/post-connect-init.ts`, so an error
-thrown there for a bad setting (rather than an unreachable server) is retried forever with backoff
-instead of stopping startup. `COUCHDB_NAME` (OL-49, #619) is therefore parsed and validated by
-`buildCouchdbName()` at config load. The database it names is picked by `resolveDbName()` in
-`src/db/index.ts`: while the configured database is missing or holds no documents (design docs
-aside) and `open-live` holds data (anything but design docs and the per-instance bookkeeping docs
-listed in `BOOKKEEPING_DOC_IDS` / `migration:*`), it keeps using `open-live` and neither creates
-nor writes the configured one, so an upgraded OSC instance whose `DatabaseUrl` path is not
-`open-live` keeps its data. When it settles on an empty configured database it writes the
-`open-live-database` marker doc, so it is never pulled back to `open-live` later. A new
-bookkeeping doc written on every start must be added to `BOOKKEEPING_DOC_IDS`, or a merely-started
-`open-live` counts as holding data. `vitest.config.ts` sets
+thrown there for a bad setting (rather than an unreachable server) would be retried forever with
+backoff instead of stopping startup. Validate in `config.ts` where you can; where the verdict needs
+the server, throw `FatalStartupError` (`src/lib/fatal-startup-error.ts`): `startDbConnectRetry()`
+does not retry it and `main.ts` exits. `COUCHDB_NAME` (OL-49, #619) is the case: it is read by
+`buildCouchdbName()` but judged in `resolveDbName()` (`src/db/index.ts`), because an existing OSC
+instance whose `DatabaseUrl` tail is not a valid name (e.g. `/OpenLive`) ran on `open-live` and
+must keep doing so — an invalid name with a data-bearing `open-live` uses `open-live` and logs an
+error; otherwise it is fatal. For a valid name: while the configured database is missing or lacks
+the `open-live-database` marker doc and `open-live` holds data (anything but design docs and the
+per-instance bookkeeping docs listed in `BOOKKEEPING_DOC_IDS` / `migration:*`), it keeps using
+`open-live` (error-level log) and neither creates nor writes the configured one. Only the marker
+claims a database — "has documents" is not enough, since the tail may name another app's DB. When it
+settles on the configured database it writes the marker, so it is never pulled back to `open-live`
+later. A new bookkeeping doc written on every start must be added to `BOOKKEEPING_DOC_IDS`, or a
+merely-started `open-live` counts as holding data. `vitest.config.ts` sets
 `COUCHDB_NAME=open-live-test`, so tests see that as `config.couchdbName`.

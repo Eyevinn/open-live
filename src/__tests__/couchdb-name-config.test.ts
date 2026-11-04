@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // OL-49 (issue #619): the CouchDB database name comes from COUCHDB_NAME
-// (default `open-live`), is validated at config load, and connectDb() keeps an
-// upgraded instance on its existing `open-live` data while the configured
-// database is missing or empty.
+// (default `open-live`). resolveDbName() keeps an upgraded instance on its
+// existing `open-live` data while the configured database is missing or has no
+// `open-live-database` marker, and for an invalid name falls back to an
+// `open-live` with data or else fails with a non-retried FatalStartupError.
 
 type Row = { id: string };
 
@@ -29,7 +30,8 @@ vi.mock('nano', () => ({
 }));
 
 import Nano from 'nano';
-import { buildCouchdbName, config } from '../config.js';
+import { buildCouchdbName, config, couchdbNameProblem } from '../config.js';
+import { FatalStartupError, isFatalStartupError } from '../lib/fatal-startup-error.js';
 import { BOOKKEEPING_DOC_IDS, DATABASE_MARKER_DOC_ID, connectDb, isDataDocId, resolveDbName } from '../db/index.js';
 import { GUEST_SIGNING_KEY_DOC_ID } from '../lib/guest-signing-key.js';
 import { CREDENTIAL_ENCRYPTION_KEY_DOC_ID } from '../lib/credential-encryption-key.js';
@@ -41,7 +43,7 @@ function server(): Nano.ServerScope {
 }
 
 function makeLog() {
-  return { info: vi.fn(), warn: vi.fn() };
+  return { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 }
 
 /** What every started instance writes for itself, whether used or not. */
@@ -75,6 +77,10 @@ beforeEach(() => {
     info: vi.fn(),
     list: (params: { limit: number; startkey?: string; skip?: number }) => nanoMock.docList(name, params),
     insert: (doc: { _id: string }) => nanoMock.insert(name, doc),
+    get: async (id: string) => {
+      if (!nanoMock.dbs[name]!.includes(id)) throw Object.assign(new Error('missing'), { statusCode: 404 });
+      return { _id: id };
+    },
   }));
   nanoMock.factory.mockClear();
 });
@@ -105,39 +111,79 @@ describe('buildCouchdbName (COUCHDB_NAME)', () => {
     expect(buildCouchdbName()).toBe('studios/a_b$(1)+2');
   });
 
-  it.each(['Studio-A', '1studio', 'host:5984', '_users', 'studio a'])('rejects the invalid name %j', (name) => {
-    process.env['COUCHDB_NAME'] = name;
-    expect(() => buildCouchdbName()).toThrow(/COUCHDB_NAME/);
-    expect(() => buildCouchdbName()).toThrow(/lowercase letter/);
+  it('returns an invalid name unchanged: it is judged against the server in resolveDbName (#619 AC4)', () => {
+    process.env['COUCHDB_NAME'] = 'OpenLive';
+    expect(buildCouchdbName()).toBe('OpenLive');
+  });
+  it('is resolved into config at load (vitest.config.ts sets open-live-test)', () => {
+    expect(config.couchdbName).toBe('open-live-test');
+  });
+});
+
+describe('couchdbNameProblem', () => {
+  it.each(['studio-a', 'open-live', 'studios/a_b$(1)+2', 'a'.repeat(238)])('accepts the valid name %j', (name) => {
+    expect(couchdbNameProblem(name)).toBeNull();
   });
 
+  it.each(['Studio-A', 'OpenLive', 'openlive.db', '1studio', 'host:5984', '_users', 'studio a', 'open-live?x=1'])(
+    'rejects the invalid name %j, naming COUCHDB_NAME and the rule',
+    (name) => {
+      const problem = couchdbNameProblem(name);
+      expect(problem).toMatch(/COUCHDB_NAME/);
+      expect(problem).toMatch(/lowercase letter/);
+    },
+  );
+
   it('rejects a name longer than 238 characters', () => {
-    process.env['COUCHDB_NAME'] = 'a'.repeat(238);
-    expect(buildCouchdbName()).toBe('a'.repeat(238));
-    process.env['COUCHDB_NAME'] = 'a'.repeat(239);
-    expect(() => buildCouchdbName()).toThrow(/COUCHDB_NAME.*238/s);
+    expect(couchdbNameProblem('a'.repeat(239))).toMatch(/COUCHDB_NAME.*238/s);
   });
 
   it('does not echo the invalid value, which on OSC can be part of the DatabaseUrl credentials', () => {
     // DatabaseUrl with no db path and a password containing "/": COUCHDB_NAME
     // becomes the tail of the password plus the host.
-    process.env['COUCHDB_NAME'] = '34secret@couch.example';
-    let message = '';
-    try {
-      buildCouchdbName();
-    } catch (err) {
-      message = (err as Error).message;
-    }
+    const message = couchdbNameProblem('34secret@couch.example')!;
     expect(message).toMatch(/COUCHDB_NAME/);
     expect(message).toContain('22 characters');
     expect(message).not.toContain('secret');
     expect(message).not.toContain('couch.example');
-    process.env['COUCHDB_NAME'] = 'admin:pw';
-    expect(() => buildCouchdbName()).toThrow(/^(?!.*pw).*COUCHDB_NAME/s);
+    expect(couchdbNameProblem('admin:pw')).toMatch(/^(?!.*pw).*COUCHDB_NAME/s);
+  });
+});
+
+describe('resolveDbName with an invalid COUCHDB_NAME (#619 AC3/AC4)', () => {
+  it.each(['OpenLive', 'openlive.db', '_users', 'open-live?x=1'])(
+    'keeps an upgraded instance with the DatabaseUrl tail %j on open-live with data, logging an error',
+    async (name) => {
+      givenDatabases({ 'open-live': ['prod-1', ...KEY_DOCS] });
+      const log = makeLog();
+      await expect(resolveDbName(server(), name, log)).resolves.toBe('open-live');
+      expect(nanoMock.create).not.toHaveBeenCalled();
+      expect(nanoMock.insert).not.toHaveBeenCalled();
+      expect(log.error).toHaveBeenCalledTimes(1);
+      const message = String(log.error.mock.calls[0]![0]);
+      expect(message).toContain('COUCHDB_NAME');
+      expect(message).toMatch(/lowercase letter/);
+      expect(message).toContain('"open-live"');
+      expect(message).not.toContain(name);
+    },
+  );
+
+  it('fails with a FatalStartupError when open-live is missing', async () => {
+    givenDatabases({ other: ['x'] });
+    const err = await resolveDbName(server(), 'OpenLive', makeLog()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(FatalStartupError);
+    expect(isFatalStartupError(err)).toBe(true);
+    expect((err as Error).message).toMatch(/COUCHDB_NAME.*lowercase letter/s);
+    expect((err as Error).message).not.toContain('OpenLive');
+    expect(nanoMock.create).not.toHaveBeenCalled();
+    expect(nanoMock.use).not.toHaveBeenCalledWith('OpenLive');
   });
 
-  it('is resolved into config at load (vitest.config.ts sets open-live-test)', () => {
-    expect(config.couchdbName).toBe('open-live-test');
+  it('fails with a FatalStartupError when open-live holds only bookkeeping documents', async () => {
+    givenDatabases({ 'open-live': ['_design/app', 'gpu-metering-state', ...KEY_DOCS] });
+    await expect(resolveDbName(server(), '_users', makeLog())).rejects.toBeInstanceOf(FatalStartupError);
+    expect(nanoMock.create).not.toHaveBeenCalled();
+    expect(nanoMock.insert).not.toHaveBeenCalled();
   });
 });
 
@@ -156,13 +202,31 @@ describe('resolveDbName', () => {
     expect(nanoMock.insert).not.toHaveBeenCalled();
   });
 
-  it('uses an existing custom database that holds documents, even when open-live holds data', async () => {
-    givenDatabases({ 'studio-a': [...KEY_DOCS], 'open-live': ['prod-1', ...KEY_DOCS] });
+  it('uses an existing custom database that holds the marker, even when open-live holds data', async () => {
+    givenDatabases({ 'studio-a': [DATABASE_MARKER_DOC_ID, 'prod-9', ...KEY_DOCS], 'open-live': ['prod-1', ...KEY_DOCS] });
     const log = makeLog();
     await expect(resolveDbName(server(), 'studio-a', log)).resolves.toBe('studio-a');
     expect(nanoMock.create).not.toHaveBeenCalled();
     expect(nanoMock.insert).not.toHaveBeenCalled();
-    expect(log.warn).not.toHaveBeenCalled();
+    expect(log.error).not.toHaveBeenCalled();
+  });
+
+  it('does not switch to a custom database with foreign documents but no marker while open-live holds data', async () => {
+    // Another app's database on the same CouchDB, named by the DatabaseUrl tail.
+    givenDatabases({ 'studio-a': ['user-1', 'invoice-7'], 'open-live': ['prod-1', ...KEY_DOCS] });
+    const log = makeLog();
+    await expect(resolveDbName(server(), 'studio-a', log)).resolves.toBe('open-live');
+    expect(nanoMock.insert).not.toHaveBeenCalled();
+    expect(nanoMock.dbs['studio-a']).toEqual(['user-1', 'invoice-7']);
+    const message = String(log.error.mock.calls[0]![0]);
+    expect(message).toContain(`has no "${DATABASE_MARKER_DOC_ID}" marker document`);
+    expect(message).toContain('was not written to');
+  });
+
+  it('claims a custom database with documents but no marker when open-live holds no data', async () => {
+    givenDatabases({ 'studio-a': ['prod-9'], 'open-live': [...KEY_DOCS] });
+    await expect(resolveDbName(server(), 'studio-a', makeLog())).resolves.toBe('studio-a');
+    expect(nanoMock.dbs['studio-a']).toContain(DATABASE_MARKER_DOC_ID);
   });
 
   it('uses a custom database that only holds the marker document (operator pre-claim)', async () => {
@@ -170,14 +234,15 @@ describe('resolveDbName', () => {
     await expect(resolveDbName(server(), 'studio-a', makeLog())).resolves.toBe('studio-a');
   });
 
-  it('falls back to open-live with data, warns, and creates nothing when the custom database is missing', async () => {
+  it('falls back to open-live with data, logs an error, and creates nothing when the custom database is missing', async () => {
     givenDatabases({ 'open-live': ['prod-1', ...KEY_DOCS] });
     const log = makeLog();
     await expect(resolveDbName(server(), 'studio-a', log)).resolves.toBe('open-live');
     expect(nanoMock.create).not.toHaveBeenCalled();
     expect(nanoMock.insert).not.toHaveBeenCalled();
-    expect(log.warn).toHaveBeenCalledTimes(1);
-    const message = String(log.warn.mock.calls[0]![0]);
+    expect(log.error).toHaveBeenCalledTimes(1);
+    expect(log.warn).not.toHaveBeenCalled();
+    const message = String(log.error.mock.calls[0]![0]);
     expect(message).toContain('"studio-a"');
     expect(message).toContain('does not exist');
     expect(message).toContain('"open-live"');
@@ -189,16 +254,17 @@ describe('resolveDbName', () => {
     await expect(resolveDbName(server(), 'studio-a', log)).resolves.toBe('open-live');
     expect(nanoMock.create).not.toHaveBeenCalled();
     expect(nanoMock.insert).not.toHaveBeenCalled();
-    const message = String(log.warn.mock.calls[0]![0]);
-    expect(message).toContain('is empty');
+    const message = String(log.error.mock.calls[0]![0]);
+    expect(message).toContain('marker document');
     expect(message).toContain('was not written to');
   });
 
-  it('names the shared-server risk and the remedy in the fallback warning', async () => {
+  it('names the shared-server risk and the pre-claim remedy in the fallback error', async () => {
     givenDatabases({ 'open-live': ['prod-1'] });
     const log = makeLog();
     await resolveDbName(server(), 'studio-a', log);
-    const message = String(log.warn.mock.calls[0]![0]);
+    const message = String(log.error.mock.calls[0]![0]);
+    expect(message).toContain(`PUT /studio-a/${DATABASE_MARKER_DOC_ID} with {}`);
     expect(message).toMatch(/shared/);
     expect(message).toMatch(/sharing "open-live"/);
     expect(message).toContain(`"${DATABASE_MARKER_DOC_ID}"`);
@@ -222,7 +288,7 @@ describe('resolveDbName', () => {
     await expect(resolveDbName(server(), 'studio-a', log)).resolves.toBe('studio-a');
     expect(nanoMock.create).toHaveBeenCalledWith('studio-a');
     expect(nanoMock.dbs['studio-a']).toEqual([DATABASE_MARKER_DOC_ID]);
-    expect(log.warn).not.toHaveBeenCalled();
+    expect(log.error).not.toHaveBeenCalled();
   });
 
   it('creates the custom database when open-live holds only bookkeeping documents (started once, never used)', async () => {
@@ -230,7 +296,7 @@ describe('resolveDbName', () => {
     const log = makeLog();
     await expect(resolveDbName(server(), 'studio-a', log)).resolves.toBe('studio-a');
     expect(nanoMock.create).toHaveBeenCalledWith('studio-a');
-    expect(log.warn).not.toHaveBeenCalled();
+    expect(log.error).not.toHaveBeenCalled();
   });
 
   it('claims an existing empty custom database when open-live holds no data', async () => {
