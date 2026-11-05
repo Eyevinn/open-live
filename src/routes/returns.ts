@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { getDb, getGuestSessionsDb } from '../db/index.js';
 import type { GuestSessionDoc, ProductionDoc, ProductionSourceAssignment } from '../db/types.js';
 import { getStromToken } from '../lib/strom-token.js';
+import { isDocConflictError } from '../lib/db-errors.js';
 import { assertSameStromOrigin } from '../lib/url-validation.js';
 import { config, isGuestCallingEnabled } from '../config.js';
 import { resolveGuestSession } from '../lib/guest-scope.js';
@@ -116,23 +117,71 @@ async function proxyReturnPictureWhep(args: {
   }
   // Bind this WHEP session id to the guest's live session (issue #380) so the
   // matching DELETE can verify a guest caller only tears down their OWN return
-  // session — never another guest's :sessionId. Best-effort: a persist failure
-  // here does not fail the (already-established) upstream session; the guest
-  // just fails closed on their next DELETE instead of silently trusting an
-  // unbound id (see the DELETE handlers below).
+  // session — never another guest's :sessionId.
   if (guestSession && sessionId) {
-    try {
-      await getGuestSessionsDb().insert({
-        ...guestSession,
-        returnWhepSessionId: sessionId,
-        updatedAt: new Date().toISOString(),
-      });
-    } catch (err) {
-      reply.log.warn({ err }, 'return picture WHEP: guest session-id bind failed');
-    }
+    await bindWhepSession(reply, 'return picture WHEP', {
+      session: guestSession,
+      apply: (doc, whepSessionId) => ({ ...doc, returnWhepSessionId: whepSessionId, updatedAt: new Date().toISOString() }),
+    }, sessionId);
   }
   reply.header('Content-Type', 'application/sdp');
   return reply.status(201).send(answerSdp);
+}
+
+/**
+ * How a guest-scoped WHEP POST records its session id: the guest's session doc
+ * as read at the start of the request, and the one change to make to it.
+ * `apply` must only set its own key, because it may be re-applied to a newer
+ * copy of the doc (see `bindWhepSession`).
+ */
+interface GuestSessionBinding {
+  session: GuestSessionDoc;
+  apply: (doc: GuestSessionDoc, whepSessionId: string) => GuestSessionDoc;
+}
+
+/** Attempts at writing a WHEP session id into a guest session doc (one write plus retries on conflict). */
+const MAX_BIND_ATTEMPTS = 4;
+
+/**
+ * Writes the WHEP session id into the guest's session doc. The request read
+ * that doc at its start; while the Strom round trip ran, other requests of the
+ * same guest page may have written it (the talkback WHIP/WHEP bindings at join,
+ * a mute or a status change), so the insert can get a CouchDB 409. On a
+ * conflict the doc is read again, still has to be live (`state !== 'left'`),
+ * and only this request's key is applied to it, so neither this binding nor the
+ * other request's change is lost. Best-effort after that: a failure does not
+ * fail the (already-established) upstream session; the guest just fails closed
+ * on their next DELETE instead of trusting an unbound id.
+ */
+async function bindWhepSession(
+  reply: FastifyReply,
+  logName: string,
+  binding: GuestSessionBinding,
+  whepSessionId: string,
+): Promise<void> {
+  const db = getGuestSessionsDb();
+  let doc = binding.session;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await db.insert(binding.apply(doc, whepSessionId));
+      return;
+    } catch (err) {
+      if (!isDocConflictError(err) || attempt >= MAX_BIND_ATTEMPTS) {
+        reply.log.warn({ err, attempt }, `${logName}: guest session-id bind failed`);
+        return;
+      }
+    }
+    try {
+      doc = await db.get(doc._id);
+    } catch (err) {
+      reply.log.warn({ err }, `${logName}: guest session re-read failed, session-id not bound`);
+      return;
+    }
+    if (doc.state === 'left') {
+      reply.log.info(`${logName}: guest left during the request, session-id not bound`);
+      return;
+    }
+  }
 }
 
 /**

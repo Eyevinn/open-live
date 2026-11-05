@@ -16,7 +16,7 @@
  * mocked — no live services required.
  */
 
-import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { GuestInviteDoc, GuestSessionDoc, ProductionDoc } from '../db/types.js';
 
@@ -349,6 +349,84 @@ describe('Return-picture WHEP guest-token auth (issue #380)', () => {
       headers: AUTH,
     });
     expect(res.statusCode).toBe(204);
+  });
+});
+
+describe('Return-picture session binding under concurrent writes to the guest session', () => {
+  const bearer = (token: string) => ({ authorization: `Bearer ${token}` });
+  const revNumber = (rev: string | undefined) => Number(rev?.split('-')[0] ?? 0);
+  const defaultInsert = sessionsDb.insert.getMockImplementation()!;
+
+  // Enforce `_rev` like CouchDB: an update must carry the stored doc's current
+  // `_rev` or it gets a 409; each write bumps the revision.
+  beforeEach(() => {
+    sessionsDb.insert.mockImplementation(async (doc: GuestSessionDoc) => {
+      const stored = sessionsStore.get(doc._id);
+      if (stored && doc._rev !== stored._rev) throw Object.assign(new Error('conflict'), { statusCode: 409 });
+      sessionsStore.set(doc._id, { ...doc, _rev: `${revNumber(stored?._rev) + 1}-x` });
+      return { ok: true };
+    });
+  });
+  afterEach(() => {
+    sessionsDb.insert.mockImplementation(defaultInsert);
+  });
+
+  /** Answers the Strom WHEP POST after `during` has changed the guest session, as a concurrent request would. */
+  function stromAnswersAfter(during: () => void) {
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => {
+      during();
+      return {
+        ok: true,
+        status: 201,
+        text: async () => 'v=0 mock-answer-sdp',
+        headers: { get: (name: string) => (name === 'Location' ? '/whep/session-picture' : null) },
+      };
+    }));
+  }
+
+  it('keeps the binding, and the other write, when the session changed during the Strom round trip', async () => {
+    seedActiveProduction();
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    const { guestId } = await joinGuest(invite.id, invite.token);
+    // The guest page's talkback WHIP binding (guests.ts) lands while the
+    // return-picture offer is with Strom: the session doc this request read
+    // is no longer current when it writes its own binding.
+    stromAnswersAfter(() => {
+      const stored = sessionsStore.get(guestId)!;
+      sessionsStore.set(guestId, { ...stored, talkbackWhipSessionId: 'tb-1', _rev: `${revNumber(stored._rev) + 1}-x` });
+    });
+
+    const { res, sessionId } = await postPicture('video_in_0', bearer(invite.token));
+    expect(res.statusCode).toBe(201);
+    const session = sessionsStore.get(guestId)!;
+    expect(session.returnWhepSessionId).toBe(sessionId);
+    expect(session.talkbackWhipSessionId).toBe('tb-1');
+
+    // So the guest can still tear their own return session down.
+    const del = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/productions/prod-1/returns/video_in_0/picture/whep/${sessionId}`,
+      headers: bearer(invite.token),
+    });
+    expect(del.statusCode).toBe(204);
+  });
+
+  it('does not bind for a guest who left while the offer was with Strom', async () => {
+    seedActiveProduction();
+    const invite = await createInvite('prod-1', { mixerInput: 'video_in_0' });
+    const { guestId } = await joinGuest(invite.id, invite.token);
+    stromAnswersAfter(() => {
+      const stored = sessionsStore.get(guestId)!;
+      sessionsStore.set(guestId, { ...stored, state: 'left', _rev: `${revNumber(stored._rev) + 1}-x` });
+    });
+
+    const { res } = await postPicture('video_in_0', bearer(invite.token));
+    // The upstream session already exists, so the offer still succeeds…
+    expect(res.statusCode).toBe(201);
+    // …but the left session is not brought back to life with a binding.
+    const session = sessionsStore.get(guestId)!;
+    expect(session.state).toBe('left');
+    expect(session.returnWhepSessionId).toBeUndefined();
   });
 });
 
