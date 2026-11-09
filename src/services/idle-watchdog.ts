@@ -16,15 +16,19 @@ import { deactivateStromFlow } from '../lib/flow-generator.js';
 import { recordingStateMessage } from '../lib/input-recording.js';
 import { getSubscriberCount } from './tally.service.js';
 import { clearProductionPflState } from './pfl-state.js';
-import { clearAudioState, clearPipState, clearFxState } from '../ws/controller.js';
+import { clearAudioState, clearPipState, clearFxState, clearClipStateForProduction } from '../ws/controller.js';
 import { forceStopMeterRelay } from './meter-relay.js';
 import { stopLiveRecordingUpload } from './live-recording-upload.js';
 import { forceStopClipRelay } from './clip-relay.js';
 import { broadcast } from './tally.service.js';
-import { activationAbortControllers, updateProductionDoc, emitProductionStatus, uploadRecordingBeforeTeardown } from '../routes/productions.js';
+import {
+  activationAbortControllers,
+  emitProductionStatus,
+  uploadRecordingBeforeTeardown,
+  teardownIntercomForProduction,
+  writeDeactivatedDoc,
+} from '../routes/productions.js';
 import { sweepGuestsOnProductionEnd } from './guest-sweep.js';
-import { stoppedStatus } from '../lib/production-health.js';
-import { settleOnStop } from './gpu-usage.js';
 import type { ProductionDoc, RecordingUploadSummary } from '../db/types.js';
 
 // Idle deadline is config-driven (issue #290, env IDLE_TIMEOUT_SEC, default 300s
@@ -244,6 +248,10 @@ export async function deactivateProduction(productionId: string, log: FastifyBas
   clearAudioState(doc._id);
   clearPipState(doc._id);
   clearFxState(doc._id);
+  // Stop any clip completion-poll timers and wipe the in-memory clip-state
+  // registry — live-only clip state must not survive the stop (#278, #625).
+  // A cued clip's cue point is not in this registry and is kept (#336, #307).
+  clearClipStateForProduction(doc._id);
   // Force-stop both relays regardless of refCount — same stale-relay hazard as
   // the explicit deactivate path (issue #416): controller sockets survive the
   // idle auto-deactivate, so the relays must be torn down here too or a connect
@@ -269,46 +277,27 @@ export async function deactivateProduction(productionId: string, log: FastifyBas
     }
   }
 
+  // End the talkback sessions and delete the Open Intercom grouping, same as
+  // the explicit deactivate (issue #625). Never throws; a repointed or cleared
+  // connection skips the teardown with a log (#617).
+  await teardownIntercomForProduction(doc, log);
+
   // Revoke guest invites and end live guest sessions (issue #414); best-effort.
   await sweepGuestsOnProductionEnd(doc._id, log);
 
-  // Transition rule (spec §1): an `active` production auto-deactivated for idle
-  // becomes `ended` (it broadcast and then stopped); one still `activating`
-  // becomes `inactive` (it never reached a live broadcast).
-  const nextStatus = stoppedStatus(doc.status);
-  // Settle shared-GPU usage up to now (final partial hour included) and clear the
-  // accrual start, same obligation as the explicit deactivate path (issue #500).
-  const settledGpuHours = settleOnStop(doc);
-  await updateProductionDoc(doc._id, {
-    status: nextStatus,
-    endedReason: nextStatus === 'ended' ? 'idle' : undefined,
-    autoDeactivated: true,
-    activatedAt: undefined,
-    ...(settledGpuHours ? { gpuHours: settledGpuHours } : {}),
-    // Replaced only when there was a recording to upload (issue #534, #596).
-    ...(lastRecordingUpload ? { lastRecordingUpload } : {}),
-    stromFlowId: undefined,
-    mixerBlockId: undefined,
-    audioMixerBlockId: undefined,
-    loudnessMainBlockId: undefined,
-    recorderBlockId: undefined,
-    recorderType: undefined,
-    recording: undefined,
-    sourceOffsetBlockIds: undefined,
-    sourceAudioOffsetBlockIds: undefined,
-    whepEndpoint: undefined,
-    pgmWhepEndpoint: undefined,
-    whipEndpoints: undefined,
-    srtOutputUri: undefined,
-    whepOutputUrls: undefined,
-    inputRecordings: undefined,
-    tally: { pgm: null, pvw: null },
-  });
+  // The same doc write as the explicit deactivate (issue #625): every
+  // live-session field is cleared (including the intercom grouping, clip-player
+  // blocks and return buses), shared-GPU usage is settled (#500), and the
+  // transition rule (spec §1) applies — `active` becomes `ended` with
+  // endedReason 'idle', `activating` becomes `inactive`. On a revision conflict
+  // it never drops a flow or grouping this run did not tear down; that conflict
+  // throws and the tick retries.
+  const { doc: stored } = await writeDeactivatedDoc(doc, log, lastRecordingUpload, 'idle');
   // Nothing records any more (OL-32, spec §2.8), before PRODUCTION_DEACTIVATED.
   broadcast(doc._id, recordingStateMessage(undefined));
   broadcast(doc._id, { type: 'PRODUCTION_DEACTIVATED' });
   // Emit the typed lifecycle event (spec §3). Flow is torn down, so all assigned
   // outputs derive as down.
-  emitProductionStatus({ _id: doc._id, status: nextStatus, stromFlowId: undefined, outputAssignments: doc.outputAssignments });
+  emitProductionStatus(stored);
   log.info({ productionId: doc._id, name: doc.name }, '[idle-watchdog] Production deactivated');
 }

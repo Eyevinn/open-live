@@ -672,3 +672,15 @@ settles on the configured database it writes the marker, so it is never pulled b
 later. A new bookkeeping doc written on every start must be added to `BOOKKEEPING_DOC_IDS`, or a
 merely-started `open-live` counts as holding data. `vitest.config.ts` sets
 `COUCHDB_NAME=open-live-test`, so tests see that as `config.couchdbName`.
+
+## There are two stop paths — the idle watchdog must share the explicit deactivate's teardown
+
+A production is stopped either by the explicit `deactivate()` in `src/routes/productions.ts` or
+by `deactivateProduction()` in `src/services/idle-watchdog.ts`. They drifted apart once already
+(issue #625: the idle stop skipped `clearClipStateForProduction()`, the Open Intercom sweep and
+teardown, and cleared fewer doc fields). Both now call the same exported helpers —
+`teardownIntercomForProduction()` (never throws) and `writeDeactivatedDoc(..., trigger)` (the
+`deactivatedDoc()` field set plus the revision-conflict guard). When you add a new piece of
+per-run teardown or a new live-session `ProductionDoc` field, put it in a shared helper or in
+`deactivatedDoc()` so both paths get it, and cover the idle path in
+`src/__tests__/idle-deactivate-intercom-clip.test.ts`.
