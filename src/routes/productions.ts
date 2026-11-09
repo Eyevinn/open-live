@@ -210,16 +210,24 @@ export interface DeactivateResult {
 const inFlightDeactivations = new Map<string, Promise<DeactivateResult>>();
 
 /**
+ * Which stop path is ending the production: an explicit Deactivate, or the
+ * idle watchdog (issue #625). Only the recorded `endedReason` and the
+ * `autoDeactivated` flag differ; the cleared live-session fields are the same.
+ */
+export type StopTrigger = 'deactivated' | 'idle';
+
+/**
  * `doc` with every live-session field cleared. Unless `stopped` carries the
  * status another stop path already recorded, the transition rule (spec §1)
  * applies: a production that was `active` (reached a live broadcast) becomes
- * `ended`; one that never reached `active` (still `activating`) becomes
- * `inactive`.
+ * `ended` (with `trigger` as its `endedReason`); one that never reached
+ * `active` (still `activating`) becomes `inactive`.
  */
 function deactivatedDoc(
   doc: ProductionDoc,
   stopped?: Pick<ProductionDoc, 'status' | 'endedReason'>,
   lastRecordingUpload?: RecordingUploadSummary,
+  trigger: StopTrigger = 'deactivated',
 ): ProductionDoc {
   const status = stopped?.status ?? stoppedStatus(doc.status);
   // Settle shared-GPU usage up to now (including the final partial hour) and
@@ -229,7 +237,10 @@ function deactivatedDoc(
   return {
     ...doc,
     status,
-    endedReason: stopped ? stopped.endedReason : status === 'ended' ? 'deactivated' : undefined,
+    endedReason: stopped ? stopped.endedReason : status === 'ended' ? trigger : undefined,
+    // Only this run's own idle stop marks the production auto-deactivated; when
+    // another stop path got there first its record is kept as it is.
+    autoDeactivated: !stopped && trigger === 'idle' ? true : doc.autoDeactivated,
     activatedAt: undefined,
     ...(settledGpuHours ? { gpuHours: settledGpuHours } : {}),
     stromFlowId: undefined,
@@ -261,6 +272,52 @@ function deactivatedDoc(
 }
 
 /**
+ * Tear down the Open Intercom talkback grouping (all its lines) with the
+ * production lifecycle (issue #302). Shared by the explicit deactivate and the
+ * idle watchdog (issue #625). Best-effort and never throws: a failed teardown
+ * must not block the stop, mirroring the Strom/recording teardown contract.
+ *
+ * First every WHIP/WHEP participant session on its lines is ended — guest and
+ * Studio crew talkback alike (guest-talkback spec §6, issue #600):
+ * intercom-manager v4.1.0 refuses `DELETE /production/:p` with 409 while any
+ * session is active. A 409 left after the sweep is logged and the manager's
+ * reaper takes over.
+ *
+ * Repointing safety (issue #617): only the manager the grouping was created on
+ * is called; if that manager is no longer the connection in effect (repointed
+ * or cleared), teardown is skipped with a log and the stop still completes.
+ */
+export async function teardownIntercomForProduction(doc: ProductionDoc, log: FastifyBaseLogger): Promise<void> {
+  const intercomProductionId = doc.intercomProductionId;
+  if (!intercomProductionId) return;
+  try {
+    const intercomConn = await activeIntercomConnection();
+    if (!(intercomConn && intercomRecordMatches(doc.intercomManagerOrigin, intercomConn))) {
+      log.info(
+        { productionId: doc._id, intercomProductionId },
+        'intercom teardown skipped: the manager this grouping was created on is no longer configured',
+      );
+      return;
+    }
+    await sweepTalkbackSessions(intercomProductionId, log, intercomConn);
+    await teardownIntercomProduction(intercomProductionId, intercomConn);
+    log.info({ productionId: doc._id, intercomProductionId }, 'intercom production deleted');
+  } catch (err) {
+    const status = err instanceof IntercomManagerError ? err.status : undefined;
+    if (status === 404) {
+      log.info({ productionId: doc._id, intercomProductionId }, 'intercom production already gone');
+    } else if (status === 409) {
+      log.warn(
+        { productionId: doc._id, intercomProductionId, status },
+        'intercom teardown refused (409: a talkback session is still active) — the manager reaper takes over; continuing deactivation',
+      );
+    } else {
+      log.warn({ err, productionId: doc._id }, 'intercom teardown failed — continuing deactivation');
+    }
+  }
+}
+
+/**
  * Persist the end of a deactivation whose teardown has already run against
  * `doc`. On a revision conflict the doc is re-read, and the write is retried
  * only if the stored doc still names no Strom flow or intercom grouping other
@@ -272,13 +329,17 @@ function deactivatedDoc(
  *    refs it left behind are cleared.
  * Anything else (a new activation, a guest's new intercom grouping) rethrows
  * the conflict rather than dropping a resource this run did not tear down.
+ *
+ * Shared by the explicit deactivate and the idle watchdog (issue #625), so both
+ * stop paths clear the same fields under the same conflict rules.
  */
-async function writeDeactivatedDoc(
+export async function writeDeactivatedDoc(
   doc: ProductionDoc,
   log: FastifyBaseLogger,
   lastRecordingUpload?: RecordingUploadSummary,
+  trigger: StopTrigger = 'deactivated',
 ): Promise<{ doc: ProductionDoc; rev: string }> {
-  let updated = deactivatedDoc(doc, undefined, lastRecordingUpload);
+  let updated = deactivatedDoc(doc, undefined, lastRecordingUpload, trigger);
   for (let attempt = 0; ; attempt++) {
     try {
       const response = await getDb().insert(updated);
@@ -293,10 +354,10 @@ async function writeDeactivatedDoc(
             current.intercomManagerOrigin === doc.intercomManagerOrigin));
       if (!tornDown) throw err;
       if (current.status === doc.status && current.stromFlowId === doc.stromFlowId) {
-        updated = deactivatedDoc(current, undefined, lastRecordingUpload);
+        updated = deactivatedDoc(current, undefined, lastRecordingUpload, trigger);
       } else if ((current.status === 'inactive' || current.status === 'ended') && !current.stromFlowId) {
         log.info({ productionId: doc._id, status: current.status }, 'Production already stopped by another writer — keeping its status');
-        updated = deactivatedDoc(current, current, lastRecordingUpload);
+        updated = deactivatedDoc(current, current, lastRecordingUpload, trigger);
       } else {
         throw err;
       }
@@ -1562,44 +1623,8 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       await deactivateStromFlow(doc.stromFlowId, strom);
     }
 
-    // Tear down the Open Intercom talkback grouping (all its lines) with the
-    // production lifecycle (issue #302). Best-effort: a failed teardown must not
-    // block deactivation, mirroring the Strom/recording teardown contract.
-    // First end every WHIP/WHEP participant session on its lines — guest and
-    // Studio crew talkback alike (guest-talkback spec §6, issue #600):
-    // intercom-manager v4.1.0 refuses `DELETE /production/:p` with 409 while
-    // any session is active. A 409 left after the sweep is logged and the
-    // manager's reaper takes over.
-    // Repointing safety (issue #617): only the manager the grouping was
-    // created on is called; if that manager is no longer the connection in
-    // effect (repointed or cleared), teardown is skipped with a log and the
-    // deactivation still completes.
-    const intercomConn = doc.intercomProductionId ? await activeIntercomConnection() : undefined;
-    if (doc.intercomProductionId && !(intercomConn && intercomRecordMatches(doc.intercomManagerOrigin, intercomConn))) {
-      log.info(
-        { productionId: doc._id, intercomProductionId: doc.intercomProductionId },
-        'intercom teardown skipped: the manager this grouping was created on is no longer configured',
-      );
-    } else if (doc.intercomProductionId && intercomConn) {
-      const intercomProductionId = doc.intercomProductionId;
-      await sweepTalkbackSessions(intercomProductionId, log, intercomConn);
-      await teardownIntercomProduction(intercomProductionId, intercomConn).then(
-        () => log.info({ productionId: doc._id, intercomProductionId }, 'intercom production deleted'),
-        (err) => {
-          const status = err instanceof IntercomManagerError ? err.status : undefined;
-          if (status === 404) {
-            log.info({ productionId: doc._id, intercomProductionId }, 'intercom production already gone');
-          } else if (status === 409) {
-            log.warn(
-              { productionId: doc._id, intercomProductionId, status },
-              'intercom teardown refused (409: a talkback session is still active) — the manager reaper takes over; continuing deactivation',
-            );
-          } else {
-            log.warn({ err, productionId: doc._id }, 'intercom teardown failed — continuing deactivation');
-          }
-        },
-      );
-    }
+    // Tear down the Open Intercom talkback grouping (issue #302, #600, #617).
+    await teardownIntercomForProduction(doc, log);
 
     // Revoke the production's outstanding guest invites and mark any live guest
     // sessions `left` (issue #325). A guest invite token is the security

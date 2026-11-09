@@ -34,13 +34,14 @@ vi.mock('../lib/strom-token.js', () => ({ getStromToken: vi.fn().mockResolvedVal
 vi.mock('../lib/flow-generator.js', () => ({ deactivateStromFlow: vi.fn() }));
 vi.mock('../routes/productions.js', () => ({
   activationAbortControllers: new Map(),
-  updateProductionDoc: vi.fn().mockResolvedValue(undefined),
   emitProductionStatus: vi.fn(),
   uploadRecordingBeforeTeardown: vi.fn().mockResolvedValue(undefined),
+  teardownIntercomForProduction: vi.fn().mockResolvedValue(undefined),
+  writeDeactivatedDoc: vi.fn(async (doc: { _id: string }) => ({ doc: { ...doc, status: 'ended' }, rev: '2-x' })),
 }));
 vi.mock('../services/pfl-state.js', () => ({ clearProductionPflState: vi.fn() }));
 vi.mock('../services/guest-sweep.js', () => ({ sweepGuestsOnProductionEnd: vi.fn().mockResolvedValue(undefined) }));
-vi.mock('../ws/controller.js', () => ({ clearAudioState: vi.fn(), clearPipState: vi.fn(), clearFxState: vi.fn() }));
+vi.mock('../ws/controller.js', () => ({ clearAudioState: vi.fn(), clearPipState: vi.fn(), clearFxState: vi.fn(), clearClipStateForProduction: vi.fn() }));
 
 type WsHandler = (...args: unknown[]) => void;
 const messageHandlers: WsHandler[] = [];
