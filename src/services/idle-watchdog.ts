@@ -215,7 +215,10 @@ async function tick(log: FastifyBaseLogger): Promise<void> {
     try {
       await deactivateProduction(productionId, log);
     } catch (err) {
-      log.error({ err, productionId }, '[idle-watchdog] Failed to deactivate production — will retry next tick');
+      // `idleSince` was cleared above, so the production is tracked again with a
+      // fresh idle period: it is retried once it has been idle for another full
+      // timeout, not on the next tick.
+      log.error({ err, productionId }, '[idle-watchdog] Failed to deactivate production — will retry after a fresh idle period');
       notifyProductionActivated(productionId);
     }
   }
@@ -289,10 +292,12 @@ export async function deactivateProduction(productionId: string, log: FastifyBas
   // live-session field is cleared (including the intercom grouping, clip-player
   // blocks and return buses), shared-GPU usage is settled (#500), and the
   // transition rule (spec §1) applies — `active` becomes `ended` with
-  // endedReason 'idle', `activating` becomes `inactive`. On a revision conflict
-  // it never drops a flow or grouping this run did not tear down; that conflict
-  // throws and the tick retries.
-  const { doc: stored } = await writeDeactivatedDoc(doc, log, lastRecordingUpload, 'idle');
+  // endedReason 'idle', `activating` becomes `inactive`. A revision conflict
+  // never drops a flow or grouping this run did not tear down: a grouping
+  // created meanwhile (a guest join) is torn down and the write retried in this
+  // run; a new activation is left alone (see writeIdleDeactivatedDoc).
+  const stored = await writeIdleDeactivatedDoc(doc, log, lastRecordingUpload);
+  if (!stored) return;
   // Nothing records any more (OL-32, spec §2.8), before PRODUCTION_DEACTIVATED.
   broadcast(doc._id, recordingStateMessage(undefined));
   broadcast(doc._id, { type: 'PRODUCTION_DEACTIVATED' });
@@ -300,4 +305,70 @@ export async function deactivateProduction(productionId: string, log: FastifyBas
   // outputs derive as down.
   emitProductionStatus(stored);
   log.info({ productionId: doc._id, name: doc.name }, '[idle-watchdog] Production deactivated');
+}
+
+/** CouchDB answers a stale `_rev` with 409. */
+function isConflict(err: unknown): boolean {
+  return err instanceof Error && 'statusCode' in err && (err as { statusCode?: number }).statusCode === 409;
+}
+
+/** Bound on the grouping-race retries below; each one is a fresh teardown + write. */
+const MAX_GROUPING_RACE_RETRIES = 3;
+
+/**
+ * The idle stop's doc write. `writeDeactivatedDoc` rethrows a revision conflict
+ * whenever the stored doc names a flow or grouping this run did not tear down.
+ * The idle path cannot leave that to a later tick: `tick()` has already dropped
+ * the idle timer, so the production would stay half-stopped (flow deleted, doc
+ * still `active`) for at least another full idle timeout (#625 review). So the
+ * two conflicts are resolved here:
+ *  - Grouping only (same status, same `stromFlowId`, a new or different
+ *    intercom grouping, e.g. a guest joined during the teardown): tear down the
+ *    new grouping and retry the write, bounded, so the production ends in this
+ *    run.
+ *  - New activation (status `active`/`activating` with a different
+ *    `stromFlowId`): nothing is torn down and nothing is written. The
+ *    production is tracked as active again with a fresh idle period. Returns
+ *    undefined.
+ * Any other conflict rethrows.
+ */
+async function writeIdleDeactivatedDoc(
+  doc: ProductionDoc,
+  log: FastifyBaseLogger,
+  lastRecordingUpload: RecordingUploadSummary | undefined,
+): Promise<ProductionDoc | undefined> {
+  let base = doc;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const { doc: stored } = await writeDeactivatedDoc(base, log, lastRecordingUpload, 'idle');
+      return stored;
+    } catch (err) {
+      if (!isConflict(err)) throw err;
+      const current = await getDb().get(doc._id) as ProductionDoc;
+      if (current.status === base.status && current.stromFlowId === base.stromFlowId) {
+        if (attempt >= MAX_GROUPING_RACE_RETRIES - 1) throw err;
+        const groupingChanged =
+          current.intercomProductionId !== base.intercomProductionId ||
+          current.intercomManagerOrigin !== base.intercomManagerOrigin;
+        if (groupingChanged) {
+          log.info(
+            { productionId: doc._id, intercomProductionId: current.intercomProductionId },
+            '[idle-watchdog] Intercom grouping created during the idle stop — tearing it down too',
+          );
+          await teardownIntercomForProduction(current, log);
+        }
+        base = current;
+        continue;
+      }
+      if ((current.status === 'active' || current.status === 'activating') && current.stromFlowId !== doc.stromFlowId) {
+        log.info(
+          { productionId: doc._id, stromFlowId: current.stromFlowId, status: current.status },
+          '[idle-watchdog] Production was re-activated during the idle stop — leaving the new activation alone',
+        );
+        notifyProductionActivated(doc._id);
+        return undefined;
+      }
+      throw err;
+    }
+  }
 }

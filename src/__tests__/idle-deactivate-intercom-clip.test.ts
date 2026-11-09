@@ -72,7 +72,15 @@ vi.mock('../lib/intercom-connection.js', async (importOriginal) => ({
   activeIntercomConnection: () => mockActiveConn(),
 }));
 
-const { deactivateProduction } = await import('../services/idle-watchdog.js');
+const {
+  deactivateProduction,
+  startIdleWatchdog,
+  stopIdleWatchdog,
+  notifyProductionActivated,
+  notifyProductionDeactivated,
+  getIdleSince,
+} = await import('../services/idle-watchdog.js');
+const { config } = await import('../config.js');
 const { IntercomManagerError } = await import('../lib/intercom-manager.js');
 const { startClipPoll } = await import('../ws/controller.js');
 const { setClipStateEntry, getAllClipStates } = await import('../services/clip-state.service.js');
@@ -173,16 +181,72 @@ describe('idle auto-deactivate tears down Open Intercom (issue #625)', () => {
     await expect(deactivateProduction(PROD, log)).resolves.toBeUndefined();
     expect(stored).toMatchObject({ status: 'ended', endedReason: 'idle' });
   });
+});
 
-  it('does not drop a grouping a guest created after the read (conflict guard)', async () => {
+describe('idle auto-deactivate revision conflicts, driven through the watchdog tick (issue #625)', () => {
+  const conflict = () => Object.assign(new Error('conflict'), { statusCode: 409 });
+  // One tick (10 s) starts the idle timer; the stop runs on the first tick
+  // at or past the idle timeout.
+  const timeoutMs = config.idleTimeoutSec * 1000;
+  const runUntilIdleStop = () => vi.advanceTimersByTimeAsync(10_000 + timeoutMs);
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    notifyProductionActivated(PROD);
+    startIdleWatchdog(log);
+  });
+
+  afterEach(() => {
+    stopIdleWatchdog();
+    notifyProductionDeactivated(PROD);
+  });
+
+  it('a guest grouping created during the stop is torn down and the production still ends in the same run', async () => {
     stored = liveDoc();
-    const conflict = Object.assign(new Error('conflict'), { statusCode: 409 });
     mockInsert.mockImplementationOnce(async () => {
+      // A guest joins between the read and the write and creates a new grouping.
       stored = { ...liveDoc(), _rev: '2-y', intercomProductionId: 'ic-new' };
-      throw conflict;
+      throw conflict();
     });
-    await expect(deactivateProduction(PROD, log)).rejects.toBe(conflict);
-    expect(stored!.intercomProductionId).toBe('ic-new');
+
+    await runUntilIdleStop();
+
+    expect(calls).toEqual(['sweep:ic-42', 'delete:ic-42', 'sweep:ic-new', 'delete:ic-new']);
+    expect(stored).toMatchObject({ status: 'ended', endedReason: 'idle', autoDeactivated: true });
+    expect(stored!.intercomProductionId).toBeUndefined();
+    expect(stored!.stromFlowId).toBeUndefined();
+    expect(broadcasts.map((m) => m.type)).toContain('PRODUCTION_DEACTIVATED');
+    expect(log.error).not.toHaveBeenCalled();
+
+    // Ended for good: no longer tracked, so later ticks start no idle timer.
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(getIdleSince(PROD)).toBeUndefined();
+  });
+
+  it('a new activation during the stop is left alone and gets a fresh idle period', async () => {
+    stored = liveDoc();
+    mockInsert.mockImplementationOnce(async () => {
+      // The user re-activates between the read and the write: a new flow.
+      stored = { ...liveDoc(), _rev: '2-y', stromFlowId: 'flow-B', intercomProductionId: undefined, intercomManagerOrigin: undefined };
+      throw conflict();
+    });
+
+    await runUntilIdleStop();
+
+    expect(stored).toMatchObject({ status: 'active', stromFlowId: 'flow-B' });
+    expect(mockInsert).toHaveBeenCalledOnce();
+    expect(mockDeactivateStromFlow).toHaveBeenCalledOnce();
+    expect(mockDeactivateStromFlow).toHaveBeenCalledWith('flow-A', expect.anything());
+    expect(broadcasts.map((m) => m.type)).not.toContain('PRODUCTION_DEACTIVATED');
+    expect(log.error).not.toHaveBeenCalled();
+
+    // Still tracked as active, with a fresh idle timer that starts now.
+    expect(getIdleSince(PROD)).toBe(Date.now());
+    // And nothing touches the new flow before that idle period runs out.
+    await vi.advanceTimersByTimeAsync(timeoutMs - 10_000);
+    expect(getIdleSince(PROD)).toBeDefined();
+    expect(mockDeactivateStromFlow).toHaveBeenCalledOnce();
+    expect(stored).toMatchObject({ status: 'active', stromFlowId: 'flow-B' });
   });
 });
 
