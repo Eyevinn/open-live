@@ -102,6 +102,7 @@ async function activate(): Promise<Record<string, unknown>> {
     clipPlayerBlockIds: {},
     returnBuses: [],
     returnWhepEntries: [{ mixerInput: 'video_in_1', endpointId: 'ret-ep' }],
+    previewWhepEntries: [{ mixerInput: 'video_in_2', endpointId: 'prev-ep' }],
     mixerInputMap: {},
     warnings: [],
   });
@@ -127,6 +128,10 @@ describe('activation with STROM_PUBLIC_URL', () => {
     // Return feeds are fetched server-side only; they stay on STROM_URL.
     expect(doc.returnWhepUrls).toEqual([
       { mixerInput: 'video_in_1', url: `${INTERNAL}/whep/ret-ep`, endpointId: 'ret-ep' },
+    ]);
+    // So are commentator previews.
+    expect(doc.previewWhepUrls).toEqual([
+      { mixerInput: 'video_in_2', url: `${INTERNAL}/whep/prev-ep`, endpointId: 'prev-ep' },
     ]);
   });
 
