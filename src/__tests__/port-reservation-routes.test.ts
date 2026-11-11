@@ -145,7 +145,7 @@ describe('GET /api/v1/server-info', () => {
       stromHost: 'localhost',
       srtPorts: RESERVATION.ports,
       srtPortState: 'reserved',
-      srtRelay: { configured: false, public: null },
+      srtRelay: { configured: false, public: null, state: 'ok' },
     });
   });
 
@@ -153,7 +153,7 @@ describe('GET /api/v1/server-info', () => {
     _resetPortReservationState({ status });
     const res = await app.inject({ method: 'GET', url: '/api/v1/server-info' });
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ stromHost: 'localhost', srtPorts: null, srtPortState: status, srtRelay: { configured: false, public: null } });
+    expect(res.json()).toEqual({ stromHost: 'localhost', srtPorts: null, srtPortState: status, srtRelay: { configured: false, public: null, state: 'ok' } });
   });
 });
 

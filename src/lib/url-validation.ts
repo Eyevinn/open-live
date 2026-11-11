@@ -8,7 +8,7 @@
  *                or srt+relay://<id> (an SRT relay session Strom resolves)
  */
 
-import { SRT_RELAY_AUTO_ID, SRT_RELAY_EXPLICIT_ID_RE, SRT_RELAY_FORBIDDEN_PARAMS } from './srt-relay.js';
+import { isSrtRelayAddress, SRT_RELAY_AUTO_ID, SRT_RELAY_EXPLICIT_ID_RE, SRT_RELAY_FORBIDDEN_PARAMS } from './srt-relay.js';
 
 /**
  * Returns true if the given host is an IP literal in a private, loopback,
@@ -379,7 +379,8 @@ const SRT_PASSPHRASE_RE = /[?&]passphrase=([^&]*)/i;
 
 // srt+relay://<id>[?params]: same query charset as SRT_URL_RE. The id is
 // checked separately (SRT_RELAY_EXPLICIT_ID_RE) so its error can be specific.
-const SRT_RELAY_URL_RE = /^srt\+relay:\/\/([^?#]*)(\?[A-Za-z0-9._\-=&%+]+)?$/;
+// The scheme is case-insensitive, as in parseSrtRelayAddress() and in Strom.
+const SRT_RELAY_URL_RE = /^srt\+relay:\/\/([^?#]*)(\?[A-Za-z0-9._\-=&%+]+)?$/i;
 
 /**
  * Throws if the value is not a valid SRT URL.
@@ -403,7 +404,7 @@ export function srtUrl(url: string): void {
   if (/[\x00-\x1f\x7f]/.test(url)) {
     throw new Error('Control characters not allowed in SRT URL');
   }
-  if (url.startsWith('srt+relay://')) {
+  if (isSrtRelayAddress(url)) {
     srtRelayUrl(url);
     return;
   }

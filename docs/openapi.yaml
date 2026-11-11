@@ -568,8 +568,13 @@ components:
           description: Relay addresses only — the streamid the external side must use.
         reason:
           type: string
-          enum: [srt-host-not-configured, srt-host-not-loopback-reachable, strom-url-not-parseable, srt-relay-not-configured, srt-relay-public-unknown]
-          description: Present only when `uri` is null — why the address could not be resolved.
+          enum: [srt-host-not-configured, srt-host-not-loopback-reachable, strom-url-not-parseable, srt-relay-not-configured, srt-relay-unreachable, srt-relay-public-unknown]
+          description: >-
+            Present only when `uri` is null — why the address could not be resolved.
+            `srt-relay-not-configured`: Strom reports no SRT relay.
+            `srt-relay-unreachable`: Strom could not be asked (or has not answered yet), so
+            whether there is a relay is unknown. `srt-relay-public-unknown`: Strom has a
+            relay but does not report its public address.
 
     OutputInput:
       type: object
@@ -1641,18 +1646,28 @@ paths:
                       ports are not enforced.
                   srtRelay:
                     type: object
-                    required: [configured, public]
+                    required: [configured, public, state]
                     description: >-
-                      The SRT relay Strom fronts (Strom's GET /api/srt-relay, cached
-                      ~30 s; a Strom without relay support reads as not configured).
-                      Offer `srt+relay://auto` addresses only when `configured`.
+                      The SRT relay Strom fronts (Strom's GET /api/srt-relay). Served from
+                      a cache refreshed in the background (~30 s, ~5 s after a failure), so
+                      this endpoint never waits on Strom; a Strom without relay support
+                      reads as not configured. Offer `srt+relay://auto` addresses only when
+                      `configured`.
                     properties:
                       configured:
                         type: boolean
+                        description: Whether Strom has an SRT relay (last known when `state` is not `ok`).
                       public:
                         type: string
                         nullable: true
                         description: The relay's public host:port that outside SRT callers dial.
+                      state:
+                        type: string
+                        enum: [ok, unreachable, unknown]
+                        description: >-
+                          `ok`: Strom answered the last check. `unreachable`: the last check
+                          failed; `configured`/`public` are the last known values.
+                          `unknown`: Strom has not answered yet since startup.
 
   /api/v1/reconnect:
     post:
@@ -1724,7 +1739,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '422':
-          description: Hostless SRT listener port is outside this instance's leased range (see /api/v1/server-info)
+          description: >-
+            Hostless SRT listener port is outside this instance's leased range (see
+            /api/v1/server-info), or the address is an SRT relay address
+            (`srt+relay://`) and Strom reports that it has no SRT relay. (While Strom
+            cannot be asked, relay addresses are accepted and `connect.reason` is
+            `srt-relay-unreachable`.)
           content:
             application/json:
               schema:
@@ -1791,7 +1811,12 @@ paths:
         '404':
           description: Not found
         '422':
-          description: Hostless SRT listener port is outside this instance's leased range (see /api/v1/server-info)
+          description: >-
+            Hostless SRT listener port is outside this instance's leased range (see
+            /api/v1/server-info), or the address is an SRT relay address
+            (`srt+relay://`) and Strom reports that it has no SRT relay. (While Strom
+            cannot be asked, relay addresses are accepted and `connect.reason` is
+            `srt-relay-unreachable`.)
           content:
             application/json:
               schema:
@@ -1966,7 +1991,12 @@ paths:
         '400':
           description: Validation error
         '422':
-          description: Hostless SRT listener port is outside this instance's leased range (see /api/v1/server-info)
+          description: >-
+            Hostless SRT listener port is outside this instance's leased range (see
+            /api/v1/server-info), or the address is an SRT relay address
+            (`srt+relay://`) and Strom reports that it has no SRT relay. (While Strom
+            cannot be asked, relay addresses are accepted and `connect.reason` is
+            `srt-relay-unreachable`.)
           content:
             application/json:
               schema:
@@ -2026,7 +2056,12 @@ paths:
         '404':
           description: Not found
         '422':
-          description: Hostless SRT listener port is outside this instance's leased range (see /api/v1/server-info)
+          description: >-
+            Hostless SRT listener port is outside this instance's leased range (see
+            /api/v1/server-info), or the address is an SRT relay address
+            (`srt+relay://`) and Strom reports that it has no SRT relay. (While Strom
+            cannot be asked, relay addresses are accepted and `connect.reason` is
+            `srt-relay-unreachable`.)
           content:
             application/json:
               schema:

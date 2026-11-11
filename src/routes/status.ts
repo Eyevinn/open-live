@@ -25,12 +25,15 @@ const statusRoutes: FastifyPluginAsync = async (fastify) => {
     // are not necessarily contiguous.
     const reservation = getPortReservation();
     const srtPorts = reservation.status === 'reserved' ? reservation.reservation.ports : null;
-    // The SRT relay Strom fronts, if any (cached ~30 s; a Strom without relay
+    // The SRT relay Strom fronts, if any (served from cache and refreshed in
+    // the background, so this never waits on Strom; a Strom without relay
     // support reads as not configured). Clients offer `srt+relay://auto`
     // addresses only when `configured`; `public` is the relay's public
-    // host:port. Where the relay is internally stays Strom's business.
+    // host:port; `state` says whether Strom answered the last check (`ok`) or
+    // the values are last known (`unreachable`) or not known yet (`unknown`).
+    // Where the relay is internally stays Strom's business.
     const relay = await getSrtRelayStatus();
-    const srtRelay = { configured: relay.configured, public: relay.public };
+    const srtRelay = { configured: relay.configured, public: relay.public, state: relay.state };
     return reply.send({ stromHost, srtPorts, srtPortState: reservation.status, srtRelay });
   });
 

@@ -122,6 +122,16 @@ describe('srtUrl() — relay addresses', () => {
     expect(() => srtUrl('srt+relay://auto?passphrase=')).not.toThrow();
   });
 
+  it('matches the scheme case-insensitively, like the parser and Strom', () => {
+    for (const url of ['SRT+RELAY://auto', 'Srt+Relay://cam1-studio-a-0001?latency=200']) {
+      expect(isSrtRelayAddress(url)).toBe(true);
+      expect(() => srtUrl(url)).not.toThrow();
+    }
+    // Validated as a relay address, not as a malformed srt:// URL.
+    expect(() => srtUrl('SRT+RELAY://cam1')).toThrow(/16–64 characters/);
+    expect(() => srtUrl('SRT+RELAY://auto?mode=caller')).toThrow(/not allowed on an SRT relay address/);
+  });
+
   it('control characters are rejected before anything else', () => {
     expect(() => srtUrl('srt+relay://cam1\n')).toThrow(/Control characters/);
   });
@@ -196,13 +206,38 @@ describe('resolveSrtConnect() — relay addresses', () => {
     });
   });
 
-  it('null uri with a reason when Strom has no relay (or was not asked)', () => {
-    for (const srtRelay of [undefined, { configured: false, public: null }]) {
+  it('null uri with srt-relay-not-configured when Strom positively reports no relay', () => {
+    expect(resolveSrtConnect('srt+relay://cam1', { ...CFG, srtRelay: { configured: false, public: null, state: 'ok' } })).toMatchObject({
+      uri: null,
+      source: 'srt-relay',
+      reason: 'srt-relay-not-configured',
+    });
+  });
+
+  it('null uri with srt-relay-unreachable when Strom could not be asked (or was not)', () => {
+    for (const srtRelay of [
+      undefined,
+      { configured: false, public: null, state: 'unreachable' as const },
+      { configured: false, public: null, state: 'unknown' as const },
+      { configured: true, public: null, state: 'unreachable' as const },
+    ]) {
       expect(resolveSrtConnect('srt+relay://cam1', { ...CFG, srtRelay })).toMatchObject({
         uri: null,
         source: 'srt-relay',
-        reason: 'srt-relay-not-configured',
+        streamid: 'cam1',
+        reason: 'srt-relay-unreachable',
       });
+    }
+  });
+
+  it('serves the last known public address while Strom is unreachable', () => {
+    const c = resolveSrtConnect('srt+relay://cam1', { ...CFG, srtRelay: { configured: true, public: 'relay.example.com:9000', state: 'unreachable' } });
+    expect(c?.uri).toBe('srt://relay.example.com:9000?streamid=cam1');
+  });
+
+  it('a malformed public address reads as unknown', () => {
+    for (const pub of ['relay.example.com', ':9000', 'relay.example.com:99999']) {
+      expect(resolveSrtConnect('srt+relay://cam1', { ...CFG, srtRelay: { configured: true, public: pub } })?.reason).toBe('srt-relay-public-unknown');
     }
   });
 

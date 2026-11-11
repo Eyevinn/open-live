@@ -112,10 +112,9 @@ vi.mock('../services/port-reservation.js', () => ({
 }));
 
 vi.mock('../services/listener-ports.js', () => ({
-  usedListenerPorts: vi.fn().mockResolvedValue([]),
-  clashesAfterWrite: vi.fn().mockReturnValue(undefined),
-  listenerPortRequest: vi.fn().mockReturnValue(9000),
-  resolveListenerAddress: vi.fn((address: string) => ({ ok: true, address, port: 9000 })),
+  usedSrtBindings: vi.fn().mockResolvedValue({ ports: [], relayIds: [] }),
+  srtClashAfterWrite: vi.fn().mockReturnValue(undefined),
+  resolveSrtAddress: vi.fn((address: string) => ({ ok: true, address, port: 9000, relayId: null, assigned: false })),
 }));
 
 const AUTH = { authorization: `Bearer ${TEST_API_KEY}` };

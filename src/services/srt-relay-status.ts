@@ -7,36 +7,49 @@
  * and whether a relay exists at all (`server-info.srtRelay.configured`, which
  * the studio uses to offer the "via relay" choice).
  *
- * - Cached for 30 s; concurrent lookups share one request.
- * - A 404 (Strom without relay support) reads as "not configured" and is
- *   cached like any answer.
- * - Any other failure (Strom down, timeout, bad token) serves the last good
- *   answer for up to 5 min; with none, it reads as not configured, with the
- *   error, and is retried after 5 s rather than on every request.
+ * Requests never wait on Strom (stale-while-revalidate):
+ * - The answer is fresh for 30 s. After that the cached answer is still served
+ *   at once and one background request refreshes it.
+ * - It is warmed at startup (`warmSrtRelayStatus`). Only a lookup with nothing
+ *   cached at all (the very first one, if the warm-up has not finished) waits,
+ *   and at most FIRST_WAIT_MS; past that it reads as `state: 'unknown'`.
+ * - A 404 (Strom without relay support) is a definite answer: not configured.
+ * - Any other failure (Strom down, timeout, bad token) keeps `configured` and
+ *   `public` as last known, with `state: 'unreachable'` and the error, and is
+ *   retried after 5 s rather than every 30 s.
  */
 
 import { StromClient, StromClientError, type SrtRelayStatusResponse } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
 import { isSrtRelayAddress } from '../lib/srt-relay.js';
+import type { SrtRelayInfo } from '../lib/srt-connect.js';
 
-export type SrtRelayStatus = SrtRelayStatusResponse;
+/**
+ * How current the answer is: `ok` when Strom answered the last request,
+ * `unreachable` when it failed (configured/public are then the last known
+ * values), `unknown` when Strom has not answered yet at all.
+ */
+export type SrtRelayState = 'ok' | 'unreachable' | 'unknown';
+
+export interface SrtRelayStatus extends SrtRelayStatusResponse {
+  state: SrtRelayState;
+}
 
 const TTL_MS = 30_000;
 const ERROR_TTL_MS = 5_000;
-const STALE_MAX_MS = 5 * 60_000;
 const TIMEOUT_MS = 3_000;
+/** The longest a request waits when nothing is cached yet. */
+const FIRST_WAIT_MS = 3_000;
 
-const NOT_CONFIGURED: SrtRelayStatus = { configured: false, relay: null, public: null, error: null };
+const UNKNOWN: SrtRelayStatus = { configured: false, relay: null, public: null, error: null, state: 'unknown' };
 
 let cached: { value: SrtRelayStatus; expiresAt: number } | null = null;
-let lastGood: { value: SrtRelayStatus; at: number } | null = null;
 let inflight: Promise<SrtRelayStatus> | null = null;
 
 /** Test-only: forget every cached answer. */
 export function resetSrtRelayStatusCache(): void {
   cached = null;
-  lastGood = null;
   inflight = null;
 }
 
@@ -47,40 +60,37 @@ function normalise(body: Partial<SrtRelayStatusResponse> | undefined): SrtRelayS
     relay: str(body?.relay),
     public: str(body?.public),
     error: str(body?.error),
+    state: 'ok',
   };
 }
 
 async function lookup(): Promise<SrtRelayStatus> {
-  const now = Date.now();
+  let value: SrtRelayStatus;
+  let ttl = TTL_MS;
   try {
     const token = await getStromToken(config.stromToken).catch(() => undefined);
     const strom = new StromClient({ baseUrl: config.stromUrl, token: token ?? undefined });
-    const value = normalise(await strom.system.srtRelay(TIMEOUT_MS));
-    cached = { value, expiresAt: now + TTL_MS };
-    lastGood = { value, at: now };
-    return value;
+    value = normalise(await strom.system.srtRelay(TIMEOUT_MS));
   } catch (err) {
     if (err instanceof StromClientError && err.status === 404) {
-      cached = { value: NOT_CONFIGURED, expiresAt: now + TTL_MS };
-      lastGood = { value: NOT_CONFIGURED, at: now };
-      return NOT_CONFIGURED;
+      value = { configured: false, relay: null, public: null, error: null, state: 'ok' };
+    } else {
+      const last = cached?.value ?? UNKNOWN;
+      value = {
+        configured: last.configured,
+        relay: last.relay,
+        public: last.public,
+        error: `Could not read the SRT relay status from Strom: ${err instanceof Error ? err.message : String(err)}`,
+        state: 'unreachable',
+      };
+      ttl = ERROR_TTL_MS;
     }
-    if (lastGood && now - lastGood.at <= STALE_MAX_MS) {
-      cached = { value: lastGood.value, expiresAt: now + ERROR_TTL_MS };
-      return lastGood.value;
-    }
-    const value: SrtRelayStatus = {
-      ...NOT_CONFIGURED,
-      error: `Could not read the SRT relay status from Strom: ${err instanceof Error ? err.message : String(err)}`,
-    };
-    cached = { value, expiresAt: now + ERROR_TTL_MS };
-    return value;
   }
+  cached = { value, expiresAt: Date.now() + ttl };
+  return value;
 }
 
-/** Strom's SRT relay status. Never throws. */
-export function getSrtRelayStatus(): Promise<SrtRelayStatus> {
-  if (cached && Date.now() < cached.expiresAt) return Promise.resolve(cached.value);
+function refresh(): Promise<SrtRelayStatus> {
   inflight ??= lookup().finally(() => {
     inflight = null;
   });
@@ -88,14 +98,34 @@ export function getSrtRelayStatus(): Promise<SrtRelayStatus> {
 }
 
 /**
+ * Strom's SRT relay status. Never throws, and never waits on Strom when an
+ * answer is cached (a stale one is served while a refresh runs behind it).
+ */
+export function getSrtRelayStatus(): Promise<SrtRelayStatus> {
+  if (cached) {
+    if (Date.now() >= cached.expiresAt) void refresh();
+    return Promise.resolve(cached.value);
+  }
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<SrtRelayStatus>((resolve) => {
+    timer = setTimeout(() => resolve(UNKNOWN), FIRST_WAIT_MS);
+    timer.unref?.();
+  });
+  return Promise.race([refresh(), timeout]).finally(() => clearTimeout(timer));
+}
+
+/** Start the first lookup without waiting for it (called at startup). */
+export function warmSrtRelayStatus(): void {
+  if (!cached) void refresh();
+}
+
+/**
  * The relay info needed to resolve the dial-in address of these addresses, or
  * undefined when none of them is a relay address (so listing plain SRT docs
  * never waits on Strom).
  */
-export async function srtRelayInfoFor(
-  addresses: ReadonlyArray<string | undefined | null>,
-): Promise<{ configured: boolean; public: string | null } | undefined> {
+export async function srtRelayInfoFor(addresses: ReadonlyArray<string | undefined | null>): Promise<SrtRelayInfo | undefined> {
   if (!addresses.some((a) => isSrtRelayAddress(a))) return undefined;
   const status = await getSrtRelayStatus();
-  return { configured: status.configured, public: status.public };
+  return { configured: status.configured, public: status.public, state: status.state };
 }

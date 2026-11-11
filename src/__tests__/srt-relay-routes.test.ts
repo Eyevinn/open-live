@@ -120,14 +120,34 @@ describe('GET /api/v1/server-info — srtRelay', () => {
   it('reports a configured relay and its public address', async () => {
     const res = await app.inject({ method: 'GET', url: '/api/v1/server-info' });
     expect(res.statusCode).toBe(200);
-    expect(res.json().srtRelay).toEqual({ configured: true, public: 'relay.example.com:9000' });
+    expect(res.json().srtRelay).toEqual({ configured: true, public: 'relay.example.com:9000', state: 'ok' });
   });
 
   it('reports not configured on a Strom without relay support (404)', async () => {
     const { StromClientError } = await import('../lib/strom.js');
     mockSrtRelay.mockRejectedValue(new StromClientError(404, 'Not Found'));
     const res = await app.inject({ method: 'GET', url: '/api/v1/server-info' });
-    expect(res.json().srtRelay).toEqual({ configured: false, public: null });
+    expect(res.json().srtRelay).toEqual({ configured: false, public: null, state: 'ok' });
+  });
+
+  it('reports Strom unreachable as such, not as "not configured"', async () => {
+    const { StromClientError } = await import('../lib/strom.js');
+    mockSrtRelay.mockRejectedValue(new StromClientError(0, 'Strom unreachable'));
+    const res = await app.inject({ method: 'GET', url: '/api/v1/server-info' });
+    expect(res.json().srtRelay).toEqual({ configured: false, public: null, state: 'unreachable' });
+  });
+
+  it('serves the cached answer without waiting on a slow Strom', async () => {
+    await app.inject({ method: 'GET', url: '/api/v1/server-info' });
+    mockSrtRelay.mockReturnValue(new Promise(() => {}));
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(Date.now() + 60_000); // the cached answer is stale now
+      const res = await app.inject({ method: 'GET', url: '/api/v1/server-info' });
+      expect(res.json().srtRelay).toEqual({ configured: true, public: 'relay.example.com:9000', state: 'ok' });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -342,5 +362,88 @@ describe('relay id uniqueness and explicit ids', () => {
     expect(mockOutputsInsert).toHaveBeenCalledTimes(2);
     const secondId = ID_RE.exec((mockOutputsInsert.mock.calls[1]![0] as OutputDoc).url!)![1];
     expect(secondId).not.toBe(firstId);
+  });
+});
+
+describe('PATCH re-checks a relay address whenever the effective address is one', () => {
+  const LONG = 'explicit-id-0123456789';
+
+  it('a stream-type-only patch (whip -> srt) still resolves `auto`', async () => {
+    mockSourcesGet.mockResolvedValue(source('srt+relay://auto', 'whip'));
+    const res = await app.inject({ method: 'PATCH', url: '/api/v1/sources/src-relay', payload: { streamType: 'srt' } });
+    expect(res.statusCode).toBe(200);
+    const stored = (mockSourcesInsert.mock.calls[0]![0] as SourceDoc).address;
+    expect(stored).toMatch(ID_RE);
+    expect(stored).not.toBe('srt+relay://auto');
+  });
+
+  it('a stream-type-only patch (whip -> srt) still refuses an id another document holds', async () => {
+    mockSourcesGet.mockResolvedValue(source(`srt+relay://${LONG}`, 'whip'));
+    mockOutputsFind.mockResolvedValue({ docs: [output(`srt+relay://${LONG}`)] });
+    const res = await app.inject({ method: 'PATCH', url: '/api/v1/sources/src-relay', payload: { streamType: 'srt' } });
+    expect(res.statusCode).toBe(409);
+    expect(mockSourcesInsert).not.toHaveBeenCalled();
+  });
+
+  it('source: an id taken between the check and the write is undone and refused', async () => {
+    const original = source('srt+relay://sticky-id-0123456789');
+    mockSourcesGet.mockResolvedValue(original);
+    const rival = { ...output(`srt+relay://${LONG}`), _id: 'output-rival', name: 'Rival' };
+    mockOutputsFind.mockResolvedValueOnce({ docs: [] }).mockResolvedValue({ docs: [rival] });
+    mockSourcesInsert.mockResolvedValueOnce({ ok: true, rev: '2-new' }).mockResolvedValue({ ok: true, rev: '3-undo' });
+    const res = await app.inject({ method: 'PATCH', url: '/api/v1/sources/src-relay', payload: { address: `srt+relay://${LONG}` } });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toMatch(/output "Rival"/);
+    expect(mockSourcesInsert).toHaveBeenCalledTimes(2);
+    // The undo writes the document back as it was, on top of our revision.
+    expect(mockSourcesInsert.mock.calls[1]![0]).toEqual({ ...original, _rev: '2-new' });
+  });
+
+  it('output: an id taken between the check and the write is undone and refused', async () => {
+    const original = output('srt+relay://out-sticky-0123456789');
+    mockOutputsGet.mockResolvedValue(original);
+    const rival = { ...source(`srt+relay://${LONG}`), _id: 'src-rival', name: 'Rival' };
+    mockSourcesFind.mockResolvedValueOnce({ docs: [] }).mockResolvedValue({ docs: [rival] });
+    mockOutputsInsert.mockResolvedValueOnce({ ok: true, rev: '2-new' }).mockResolvedValue({ ok: true, rev: '3-undo' });
+    const res = await app.inject({ method: 'PATCH', url: '/api/v1/outputs/output-relay', payload: { url: `srt+relay://${LONG}` } });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toMatch(/source "Rival"/);
+    expect(mockOutputsInsert).toHaveBeenCalledTimes(2);
+    expect(mockOutputsInsert.mock.calls[1]![0]).toEqual({ ...original, _rev: '2-new' });
+  });
+});
+
+describe('relay addresses when Strom has no relay', () => {
+  const NONE = { configured: false, relay: null, public: null, error: null };
+
+  it('POST source and output: 422 when Strom positively reports no relay', async () => {
+    mockSrtRelay.mockResolvedValue(NONE);
+    const src = await app.inject({ method: 'POST', url: '/api/v1/sources', payload: { name: 'Cam', streamType: 'srt', address: 'srt+relay://auto' } });
+    expect(src.statusCode).toBe(422);
+    expect(src.json().error).toMatch(/no SRT relay configured/);
+    const out = await app.inject({ method: 'POST', url: '/api/v1/outputs', payload: { name: 'Out', outputType: 'mpegtssrt', url: 'srt+relay://auto' } });
+    expect(out.statusCode).toBe(422);
+    expect(mockSourcesInsert).not.toHaveBeenCalled();
+    expect(mockOutputsInsert).not.toHaveBeenCalled();
+  });
+
+  it('PATCH to a relay address: 422 when Strom positively reports no relay; a rename still works', async () => {
+    mockSrtRelay.mockResolvedValue(NONE);
+    mockSourcesGet.mockResolvedValue(source('srt+relay://sticky-id-0123456789'));
+    const res = await app.inject({ method: 'PATCH', url: '/api/v1/sources/src-relay', payload: { address: 'srt+relay://auto' } });
+    expect(res.statusCode).toBe(422);
+    const rename = await app.inject({ method: 'PATCH', url: '/api/v1/sources/src-relay', payload: { name: 'Renamed' } });
+    expect(rename.statusCode).toBe(200);
+    mockOutputsGet.mockResolvedValue(output('srt://:47100?mode=listener'));
+    const out = await app.inject({ method: 'PATCH', url: '/api/v1/outputs/output-relay', payload: { url: 'srt+relay://auto' } });
+    expect(out.statusCode).toBe(422);
+  });
+
+  it('accepted while Strom is unreachable, with the reason on connect', async () => {
+    const { StromClientError } = await import('../lib/strom.js');
+    mockSrtRelay.mockRejectedValue(new StromClientError(0, 'Strom unreachable'));
+    const res = await app.inject({ method: 'POST', url: '/api/v1/sources', payload: { name: 'Cam', streamType: 'srt', address: 'srt+relay://auto' } });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().connect).toMatchObject({ uri: null, source: 'srt-relay', reason: 'srt-relay-unreachable' });
   });
 });

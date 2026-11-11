@@ -27,8 +27,10 @@ export type SrtConnectReason =
   | 'srt-host-not-configured'
   | 'srt-host-not-loopback-reachable'
   | 'strom-url-not-parseable'
-  /** A relay address, but Strom reports no SRT relay (or cannot be asked). */
+  /** A relay address, but Strom reports no SRT relay. */
   | 'srt-relay-not-configured'
+  /** A relay address, and Strom could not be asked (or has not answered yet). */
+  | 'srt-relay-unreachable'
   /** Strom has a relay but does not report its public address. */
   | 'srt-relay-public-unknown';
 
@@ -61,6 +63,12 @@ export interface SrtRelayInfo {
   configured: boolean;
   /** The relay's public `host:port`, or null when unknown. */
   public: string | null;
+  /**
+   * Whether Strom answered the last request (`ok`); otherwise configured and
+   * public are the last known values (`unreachable`) or nothing is known yet
+   * (`unknown`). Absent reads as `ok`.
+   */
+  state?: 'ok' | 'unreachable' | 'unknown';
 }
 
 export interface SrtConnectConfig {
@@ -68,7 +76,7 @@ export interface SrtConnectConfig {
   stromUrl: string;
   /** Optional dedicated SRT-facing public host override (`config.srtPublicHost`). */
   srtPublicHost?: string | undefined;
-  /** Strom's SRT relay, for relay addresses. Absent reads as not configured. */
+  /** Strom's SRT relay, for relay addresses. Absent reads as unknown. */
   srtRelay?: SrtRelayInfo | undefined;
 }
 
@@ -81,8 +89,19 @@ export interface SrtConnectConfig {
  */
 function parseSrtAuthority(url: string): { host: string; port: number; mode: string | null } | null {
   const rest = url.trim().slice('srt://'.length);
-  const authority = rest.split(/[/?#]/, 1)[0] ?? '';
+  const hostPort = parseHostPort(rest.split(/[/?#]/, 1)[0] ?? '');
+  if (!hostPort) return null;
+  const q = url.indexOf('?');
+  const mode = q === -1 ? null : new URLSearchParams(url.slice(q + 1)).get('mode');
+  return { ...hostPort, mode: mode === null ? null : mode.toLowerCase() };
+}
 
+/**
+ * Split `host:port` (IPv6 bracketed; host may be empty), or null when there is
+ * no valid port. Used for authored SRT authorities and the relay's public
+ * address alike.
+ */
+function parseHostPort(authority: string): { host: string; port: number } | null {
   let host = '';
   let portStr = '';
   const bracketed = authority.match(/^\[([^\]]*)\](?::(\d+))?$/); // IPv6 literal, e.g. [::1]:9000
@@ -95,13 +114,14 @@ function parseSrtAuthority(url: string): { host: string; port: number; mode: str
     host = m[1] ?? '';
     portStr = m[2] ?? '';
   }
-
   const port = Number(portStr);
   if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return { host, port };
+}
 
-  const q = url.indexOf('?');
-  const mode = q === -1 ? null : new URLSearchParams(url.slice(q + 1)).get('mode');
-  return { host, port, mode: mode === null ? null : mode.toLowerCase() };
+/** `host:port`, bracketing an IPv6 host. */
+function formatHostPort(host: string, port: number): string {
+  return `${host.includes(':') ? `[${host}]` : host}:${port}`;
 }
 
 /** Hostname of an http(s) base URL, or null when it cannot be parsed. */
@@ -116,8 +136,7 @@ function hostnameOf(baseUrl: string): string | null {
 
 /** Assemble the dial-in `srt://host:port?mode=…` string, bracketing IPv6 hosts. */
 function buildUri(host: string, port: number, mode: 'caller' | 'listener'): string {
-  const authority = host.includes(':') ? `[${host}]` : host;
-  return `srt://${authority}:${port}?mode=${mode}`;
+  return `srt://${formatHostPort(host, port)}?mode=${mode}`;
 }
 
 /**
@@ -191,15 +210,6 @@ export function resolveSrtConnect(authoredUrl: string, cfg: SrtConnectConfig): S
   };
 }
 
-/** Split a relay's public `host:port` (IPv6 bracketed), or null when it is not one. */
-function splitHostPort(hostPort: string): { host: string; port: number } | null {
-  const m = /^(?:\[([0-9A-Fa-f:.]+)\]|([^:\[\]/?#]+)):(\d{1,5})$/.exec(hostPort.trim());
-  if (!m) return null;
-  const port = Number(m[3]);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
-  return { host: (m[1] ?? m[2])!, port };
-}
-
 /**
  * Dial-in address for a relay address (`srt+relay://<id>`): the outside party
  * always calls the relay's public `host:port` with `streamid=<id>`. The
@@ -210,16 +220,16 @@ export function resolveSrtRelayConnect(address: string, relay: SrtRelayInfo | un
   const parsed = parseSrtRelayAddress(address);
   if (!parsed) return null;
   const streamid = parsed.id;
-  if (!relay?.configured) {
-    return { uri: null, host: null, port: null, mode: 'caller', source: 'srt-relay', streamid, reason: 'srt-relay-not-configured' };
-  }
-  const split = relay.public ? splitHostPort(relay.public) : null;
-  if (!relay.public || !split) {
-    return { uri: null, host: null, port: null, mode: 'caller', source: 'srt-relay', streamid, reason: 'srt-relay-public-unknown' };
-  }
-  const authority = split.host.includes(':') ? `[${split.host}]` : split.host;
+  const unresolved = (reason: SrtConnectReason): SrtConnect =>
+    ({ uri: null, host: null, port: null, mode: 'caller', source: 'srt-relay', streamid, reason });
+  // Strom not answering (or not asked yet) is not the same as Strom saying
+  // there is no relay. A last-known public address is still served.
+  const known = relay !== undefined && (relay.state ?? 'ok') === 'ok';
+  if (!relay?.configured) return unresolved(known ? 'srt-relay-not-configured' : 'srt-relay-unreachable');
+  const split = relay.public ? parseHostPort(relay.public.trim()) : null;
+  if (!split || !split.host) return unresolved(known ? 'srt-relay-public-unknown' : 'srt-relay-unreachable');
   return {
-    uri: `srt://${authority}:${split.port}?streamid=${encodeURIComponent(streamid)}`,
+    uri: `srt://${formatHostPort(split.host, split.port)}?streamid=${encodeURIComponent(streamid)}`,
     host: split.host,
     port: split.port,
     mode: 'caller',
