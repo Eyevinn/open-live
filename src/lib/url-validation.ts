@@ -4,8 +4,11 @@
  * Rules:
  * - httpUrlOnly: allow only http/https schemes with no private-IP targets
  * - graphicUrl:  httpUrlOnly OR safe data: image URIs (no svg, no text/html)
- * - srtUrl:      srt:// scheme only; reject private/internal hosts (listener form allowed)
+ * - srtUrl:      srt:// scheme (reject private/internal hosts; listener form allowed)
+ *                or srt+relay://<id> (an SRT relay session Strom resolves)
  */
+
+import { SRT_RELAY_FORBIDDEN_PARAMS, SRT_RELAY_ID_RE } from './srt-relay.js';
 
 /**
  * Returns true if the given host is an IP literal in a private, loopback,
@@ -374,12 +377,23 @@ const SRT_PASSPHRASE_MAX = 79;
 /** Matches the passphrase param in an SRT URI query string (case-insensitive). */
 const SRT_PASSPHRASE_RE = /[?&]passphrase=([^&]*)/i;
 
+// srt+relay://<id>[?params]: same query charset as SRT_URL_RE. The id is
+// checked separately (SRT_RELAY_ID_RE) so its error can be specific.
+const SRT_RELAY_URL_RE = /^srt\+relay:\/\/([^?#]*)(\?[A-Za-z0-9._\-=&%+]+)?$/;
+
 /**
  * Throws if the value is not a valid SRT URL.
  *
  * The hostless listener form (`srt://:PORT`, binds all interfaces) is allowed.
  * URLs whose host is a private/loopback/link-local/internal IP are rejected to
  * prevent SSRF from the GStreamer pipeline to internal services.
+ *
+ * A relay address (`srt+relay://<id>[?params]`, see `lib/srt-relay.ts`) is
+ * accepted too, including `srt+relay://auto` (server generates the id). It has
+ * no host, so there is nothing to SSRF-check; its query follows the same
+ * charset and passphrase rules, but `mode`, `streamid`, `localaddress` and
+ * `localport` are rejected: Strom always calls the relay with the id as its
+ * streamid, so those would either conflict or mean nothing.
  */
 export function srtUrl(url: string): void {
   if (url.length > 512) {
@@ -388,6 +402,10 @@ export function srtUrl(url: string): void {
   // Reject control characters before regex (covers CR, LF, tab, NUL, etc.)
   if (/[\x00-\x1f\x7f]/.test(url)) {
     throw new Error('Control characters not allowed in SRT URL');
+  }
+  if (url.startsWith('srt+relay://')) {
+    srtRelayUrl(url);
+    return;
   }
   if (!SRT_URL_RE.test(url)) {
     throw new Error('Invalid SRT URL format — expected srt://host:port or srt://:port with safe query params');
@@ -411,9 +429,15 @@ export function srtUrl(url: string): void {
     throw new Error('SRT URL must not target private, loopback, or link-local addresses');
   }
 
-  // Enforce the SRT passphrase length at the edge. An absent or empty passphrase
-  // means "no encryption" and is allowed (mirrors the crypto helpers, which skip
-  // an empty value); only a present, non-empty value is range-checked.
+  checkSrtPassphrase(url);
+}
+
+/**
+ * Enforce the SRT passphrase length at the edge. An absent or empty passphrase
+ * means "no encryption" and is allowed (mirrors the crypto helpers, which skip
+ * an empty value); only a present, non-empty value is range-checked.
+ */
+function checkSrtPassphrase(url: string): void {
   const passphraseMatch = url.match(SRT_PASSPHRASE_RE);
   if (passphraseMatch) {
     const passphrase = passphraseMatch[1] ?? '';
@@ -424,4 +448,22 @@ export function srtUrl(url: string): void {
       );
     }
   }
+}
+
+/** The relay branch of `srtUrl()`. */
+function srtRelayUrl(url: string): void {
+  const m = SRT_RELAY_URL_RE.exec(url);
+  if (!m) {
+    throw new Error('Invalid SRT relay address format — expected srt+relay://<id> with safe query params');
+  }
+  if (!SRT_RELAY_ID_RE.test(m[1] ?? '')) {
+    throw new Error('Invalid SRT relay id — use 1–64 characters of A–Z, a–z, 0–9, "_" or "-", or "auto" to have one generated');
+  }
+  const params = new URLSearchParams((m[2] ?? '').slice(1));
+  for (const key of params.keys()) {
+    if (SRT_RELAY_FORBIDDEN_PARAMS.has(key.toLowerCase())) {
+      throw new Error(`"${key}" is not allowed on an SRT relay address; Strom sets it when it calls the relay`);
+    }
+  }
+  checkSrtPassphrase(url);
 }

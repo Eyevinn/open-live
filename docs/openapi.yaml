@@ -208,6 +208,16 @@ components:
           type: string
         address:
           type: string
+          description: >-
+            For srt/efp: `srt://host:port[?params]`, the hostless listener form
+            `srt://:PORT?mode=listener` (`srt://:0` assigns a reserved port), or an
+            SRT relay address `srt+relay://<id>[?params]` (id `[A-Za-z0-9_-]{1,64}`;
+            `srt+relay://auto` generates the id once, and a later `auto` keeps the
+            stored id). Relay addresses bind no port; `mode`, `streamid`,
+            `localaddress` and `localport` are not allowed on them. Passphrases are
+            masked as `***` in responses.
+        connect:
+          $ref: '#/components/schemas/SrtConnect'
         streamType:
           $ref: '#/components/schemas/StreamType'
         status:
@@ -367,7 +377,9 @@ components:
         url:
           type: string
           description: >-
-            Operator-authored SRT bind/listen URI (e.g. srt://:43524?mode=listener).
+            Operator-authored SRT bind/listen URI (e.g. srt://:43524?mode=listener),
+            or an SRT relay address `srt+relay://<id>[?params]`
+            (`srt+relay://auto` generates the id once; a later `auto` keeps it).
             Undefined for whep outputs. Round-tripped by POST/PATCH.
         connect:
           $ref: '#/components/schemas/SrtConnect'
@@ -514,35 +526,46 @@ components:
     SrtConnect:
       type: object
       description: >-
-        Read-only, server-derived dial-in address an external SRT caller uses to
-        reach this output. Present only on mpegtssrt/efpsrt outputs that have a
-        well-formed bind URL. `uri`/`host` are null (with a `reason`) when the
-        Strom SRT host cannot be resolved server-side; `port` is always present.
+        Read-only, server-derived dial-in address an external SRT party uses to
+        reach this output or source. Present only on mpegtssrt/efpsrt outputs and
+        srt/efp sources that have a well-formed address. `uri`/`host` are null
+        (with a `reason`) when the address cannot be resolved server-side. For an
+        SRT relay address (`srt+relay://<id>`) it is the relay's public address
+        as Strom reports it, `srt://<public host:port>?streamid=<id>`, with
+        `source: srt-relay` and `mode: caller`. Never carries the passphrase.
       required: [uri, host, port, mode, source]
       properties:
         uri:
           type: string
           nullable: true
-          description: Assembled srt://host:port?mode=… dial-in string, or null when host is unresolved.
+          description: >-
+            Assembled srt://host:port?mode=… (or, for a relay address,
+            srt://host:port?streamid=<id>) dial-in string, or null when unresolved.
         host:
           type: string
           nullable: true
           description: Resolved SRT host external callers dial, or null when unresolved.
         port:
           type: integer
-          description: SRT port parsed from the authored bind URI.
+          nullable: true
+          description: >-
+            SRT port parsed from the authored bind URI; for a relay address the
+            relay's public port, or null when that is unknown.
         mode:
           type: string
           enum: [caller, listener]
-          description: The SRT mode the EXTERNAL side should use (inverse of the authored mode).
+          description: The SRT mode the EXTERNAL side should use (inverse of the authored mode; always caller for a relay).
         source:
           type: string
-          enum: [authored-host, srt-public-host, strom-host, unknown]
+          enum: [authored-host, srt-public-host, strom-host, srt-relay, unknown]
           description: Provenance of the resolved host.
+        streamid:
+          type: string
+          description: Relay addresses only — the streamid the external side must use.
         reason:
           type: string
-          enum: [srt-host-not-configured, srt-host-not-loopback-reachable, strom-url-not-parseable]
-          description: Present only when `uri` is null — why the host could not be resolved.
+          enum: [srt-host-not-configured, srt-host-not-loopback-reachable, strom-url-not-parseable, srt-relay-not-configured, srt-relay-public-unknown]
+          description: Present only when `uri` is null — why the address could not be resolved.
 
     OutputInput:
       type: object
@@ -1584,7 +1607,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [stromHost, srtPorts, srtPortState]
+                required: [stromHost, srtPorts, srtPortState, srtRelay]
                 properties:
                   stromHost:
                     type: string
@@ -1612,6 +1635,20 @@ paths:
                       enforced and Strom is re-checked every 10 min; `disabled` — turned off
                       via STROM_PORT_LEASE_DISABLED, or Strom has no port pool configured;
                       ports are not enforced.
+                  srtRelay:
+                    type: object
+                    required: [configured, public]
+                    description: >-
+                      The SRT relay Strom fronts (Strom's GET /api/srt-relay, cached
+                      ~30 s; a Strom without relay support reads as not configured).
+                      Offer `srt+relay://auto` addresses only when `configured`.
+                    properties:
+                      configured:
+                        type: boolean
+                      public:
+                        type: string
+                        nullable: true
+                        description: The relay's public host:port that outside SRT callers dial.
 
   /api/v1/reconnect:
     post:

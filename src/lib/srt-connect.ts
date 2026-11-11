@@ -17,29 +17,50 @@
  */
 
 import { isPrivateHost } from './url-validation.js';
+import { isSrtRelayAddress, parseSrtRelayAddress } from './srt-relay.js';
 
 /** Provenance of the resolved connect host. */
-export type SrtConnectSource = 'authored-host' | 'srt-public-host' | 'strom-host' | 'unknown';
+export type SrtConnectSource = 'authored-host' | 'srt-public-host' | 'strom-host' | 'srt-relay' | 'unknown';
 
 /** Why `uri`/`host` could not be resolved (present only when `uri` is null). */
 export type SrtConnectReason =
   | 'srt-host-not-configured'
   | 'srt-host-not-loopback-reachable'
-  | 'strom-url-not-parseable';
+  | 'strom-url-not-parseable'
+  /** A relay address, but Strom reports no SRT relay (or cannot be asked). */
+  | 'srt-relay-not-configured'
+  /** Strom has a relay but does not report its public address. */
+  | 'srt-relay-public-unknown';
 
 export interface SrtConnect {
-  /** Fully-assembled `srt://host:port?mode=…`, or null when host is unresolved. */
+  /**
+   * Fully-assembled dial-in address, or null when it cannot be resolved:
+   * `srt://host:port?mode=…`, or for a relay address
+   * `srt://<relay public host:port>?streamid=<id>`. Never carries a passphrase.
+   */
   uri: string | null;
   /** Resolved SRT host external callers dial, or null when unresolved. */
   host: string | null;
-  /** SRT port parsed from the authored bind URI. */
-  port: number;
-  /** The mode the EXTERNAL side should use (inverse of the authored mode). */
+  /**
+   * SRT port parsed from the authored bind URI; for a relay address the
+   * relay's public port, or null when that is unknown.
+   */
+  port: number | null;
+  /** The mode the EXTERNAL side should use (inverse of the authored mode; always caller for a relay). */
   mode: 'caller' | 'listener';
   /** Provenance of `host`. */
   source: SrtConnectSource;
+  /** Relay addresses only: the streamid the external side must use. */
+  streamid?: string;
   /** Present only when `uri` is null. */
   reason?: SrtConnectReason;
+}
+
+/** What Strom reports about its SRT relay (see services/srt-relay-status.ts). */
+export interface SrtRelayInfo {
+  configured: boolean;
+  /** The relay's public `host:port`, or null when unknown. */
+  public: string | null;
 }
 
 export interface SrtConnectConfig {
@@ -47,6 +68,8 @@ export interface SrtConnectConfig {
   stromUrl: string;
   /** Optional dedicated SRT-facing public host override (`config.srtPublicHost`). */
   srtPublicHost?: string | undefined;
+  /** Strom's SRT relay, for relay addresses. Absent reads as not configured. */
+  srtRelay?: SrtRelayInfo | undefined;
 }
 
 /**
@@ -109,6 +132,7 @@ function buildUri(host: string, port: number, mode: 'caller' | 'listener'): stri
  *   4. Otherwise host:null + a reason (never a guessed host).
  */
 export function resolveSrtConnect(authoredUrl: string, cfg: SrtConnectConfig): SrtConnect | null {
+  if (isSrtRelayAddress(authoredUrl)) return resolveSrtRelayConnect(authoredUrl, cfg.srtRelay);
   const parsed = parseSrtAuthority(authoredUrl);
   if (!parsed) return null;
   const { host: authoredHost, port, mode: authoredMode } = parsed;
@@ -164,5 +188,42 @@ export function resolveSrtConnect(authoredUrl: string, cfg: SrtConnectConfig): S
     port,
     mode: externalMode,
     source: 'strom-host',
+  };
+}
+
+/** Split a relay's public `host:port` (IPv6 bracketed), or null when it is not one. */
+function splitHostPort(hostPort: string): { host: string; port: number } | null {
+  const m = /^(?:\[([0-9A-Fa-f:.]+)\]|([^:\[\]/?#]+)):(\d{1,5})$/.exec(hostPort.trim());
+  if (!m) return null;
+  const port = Number(m[3]);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return { host: (m[1] ?? m[2])!, port };
+}
+
+/**
+ * Dial-in address for a relay address (`srt+relay://<id>`): the outside party
+ * always calls the relay's public `host:port` with `streamid=<id>`. The
+ * passphrase is never included (the UI says "with the passphrase"). Null when
+ * the relay id is malformed.
+ */
+export function resolveSrtRelayConnect(address: string, relay: SrtRelayInfo | undefined): SrtConnect | null {
+  const parsed = parseSrtRelayAddress(address);
+  if (!parsed) return null;
+  const streamid = parsed.id;
+  if (!relay?.configured) {
+    return { uri: null, host: null, port: null, mode: 'caller', source: 'srt-relay', streamid, reason: 'srt-relay-not-configured' };
+  }
+  const split = relay.public ? splitHostPort(relay.public) : null;
+  if (!relay.public || !split) {
+    return { uri: null, host: null, port: null, mode: 'caller', source: 'srt-relay', streamid, reason: 'srt-relay-public-unknown' };
+  }
+  const authority = split.host.includes(':') ? `[${split.host}]` : split.host;
+  return {
+    uri: `srt://${authority}:${split.port}?streamid=${encodeURIComponent(streamid)}`,
+    host: split.host,
+    port: split.port,
+    mode: 'caller',
+    source: 'srt-relay',
+    streamid,
   };
 }

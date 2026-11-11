@@ -653,6 +653,20 @@ export interface IceServersResponse {
   ice_servers: IceServer[]
 }
 
+// --- SRT relay ---
+
+/**
+ * Strom's view of the SRT relay it fronts (GET /api/srt-relay). `public` is
+ * the relay's public `host:port` that outside callers dial; `relay` is the
+ * address Strom itself uses. Older Strom answers 404 (no relay support).
+ */
+export interface SrtRelayStatusResponse {
+  configured: boolean
+  relay: string | null
+  public: string | null
+  error: string | null
+}
+
 // --- Port pool ---
 
 /** Port numbers reserved for one owner on a shared Strom instance. */
@@ -916,6 +930,9 @@ export class StromClient {
     iceServers: (timeoutMs?: number) =>
       this.request<IceServersResponse>('GET', '/api/ice-servers', undefined, timeoutMs),
     networkInterfaces: () => this.get<NetworkInterfacesResponse>('/api/network/interfaces'),
+    /** The SRT relay Strom fronts. 404 on a Strom without relay support. */
+    srtRelay: (timeoutMs?: number) =>
+      this.request<SrtRelayStatusResponse>('GET', '/api/srt-relay', undefined, timeoutMs),
   }
 
   // -------------------------------------------------------------------------

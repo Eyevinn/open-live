@@ -11,6 +11,10 @@ import { encryptHtmlAuthValue } from '../lib/html-auth-crypto.js';
 import { getPortReservation } from '../services/port-reservation.js';
 import { clashesAfterWrite, listenerPortRequest, resolveListenerAddress, usedListenerPorts } from '../services/listener-ports.js';
 import { getWhipIngestState } from '../services/whip-ingest-state.js';
+import { srtRelayInfoFor } from '../services/srt-relay-status.js';
+import { isSrtRelayAddress, resolveSrtRelayAddress } from '../lib/srt-relay.js';
+import { resolveSrtConnect, type SrtRelayInfo } from '../lib/srt-connect.js';
+import { config } from '../config.js';
 import { getAllClipStates } from '../services/clip-state.service.js';
 
 /**
@@ -256,7 +260,7 @@ async function gatewayExists(gatewayId: string): Promise<boolean> {
   }
 }
 
-function toApi(doc: SourceDoc) {
+function toApi(doc: SourceDoc, srtRelay?: SrtRelayInfo) {
   // Strip internal-only fields: `_rev`/`type` (CouchDB bookkeeping) and
   // `authHeaderValueEnc` (the encrypted header credential — NEVER returned).
   const { _id, _rev, type, authHeaderValueEnc, auth, ...rest } = doc;
@@ -268,6 +272,18 @@ function toApi(doc: SourceDoc) {
     // plaintext passphrases pass through decryption unchanged.
     address: maskSrtPassphrase(decryptAddressPassphrase(rest.address)),
   };
+  // Read-only, derived dial-in address for SRT/EFP sources, the same shape as
+  // on SRT outputs (lib/srt-connect.ts): where the outside party sends to.
+  // For a relay address (`srt+relay://<id>`) that is the relay's public
+  // address with `streamid=<id>`; never carries the passphrase.
+  if ((doc.streamType === 'srt' || doc.streamType === 'efp') && rest.address) {
+    const connect = resolveSrtConnect(decryptAddressPassphrase(rest.address), {
+      stromUrl: config.stromUrl,
+      srtPublicHost: config.srtPublicHost,
+      srtRelay,
+    });
+    if (connect) api['connect'] = connect;
+  }
   if (auth !== undefined) {
     // Echo the masked auth: `header.valueSet` reflects whether a credential is
     // stored; the value itself is write-only and never included (issue #314).
@@ -329,7 +345,9 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       fastify.log.warn({ err }, 'GET /api/v1/sources — DB query failed');
       return reply.status(503).send({ error: 'Database unavailable' });
     }
-    return reply.send((Array.isArray(result?.docs) ? result.docs : []).map(toApi));
+    const docs = Array.isArray(result?.docs) ? result.docs : [];
+    const srtRelay = await srtRelayInfoFor(docs.map((d) => d.address));
+    return reply.send(docs.map((doc) => toApi(doc, srtRelay)));
   });
 
   // Create a source
@@ -346,15 +364,19 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.status(400).send({ error: 'audioStreamIndex is only valid for srt/efp sources', statusCode: 400 });
     }
     const id = `src-${randomUUID()}`;
+    // A relay source (`srt+relay://<id>`) binds no port: Strom calls the relay.
+    // `srt+relay://auto` gets a generated id, stored once and kept from then on.
+    const isRelay = isSrt && isSrtRelayAddress(body.address);
+    if (isRelay) body.address = resolveSrtRelayAddress(body.address);
     // A listener source binds a port on the shared Strom: it must lie inside this
     // instance's lease and no other source or output may hold it. Port 0 asks
     // for the lowest free one. Written, then checked again, because two clients
     // registering at once can both be handed the same free port.
-    let used = isSrt ? await usedListenerPorts() : [];
+    let used = isSrt && !isRelay ? await usedListenerPorts() : [];
     for (let attempt = 0; ; attempt++) {
       let address = body.address;
       let port: number | null = null;
-      if (isSrt) {
+      if (isSrt && !isRelay) {
         const resolved = resolveListenerAddress(body.address, getPortReservation(), used);
         if (!resolved.ok) {
           return reply.status(resolved.statusCode).send({ error: resolved.error, statusCode: resolved.statusCode });
@@ -385,7 +407,7 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
         updatedAt: now,
       };
       const written = await getSourcesDb().insert(doc);
-      if (port === null) return reply.status(201).send(toApi(doc));
+      if (port === null) return reply.status(201).send(toApi(doc, await srtRelayInfoFor([doc.address])));
       used = await usedListenerPorts();
       const clash = clashesAfterWrite(used, { kind: 'source', id }, port);
       if (!clash) return reply.status(201).send(toApi(doc));
@@ -401,7 +423,7 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get<{ Params: { id: string } }>('/api/v1/sources/:id', async (req, reply) => {
     try {
       const doc = await getSourcesDb().get(req.params.id);
-      return reply.send(toApi(doc));
+      return reply.send(toApi(doc, await srtRelayInfoFor([doc.address])));
     } catch {
       return reply.status(404).send({ error: 'Source not found', statusCode: 404 });
     }
@@ -442,6 +464,17 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
         // rename must not fail because an older source predates the lease. Port 0
         // keeps the port the source already has when that is still valid.
         if (
+          (body.address !== undefined || body.streamType !== undefined) &&
+          (effectiveStreamType === 'srt' || effectiveStreamType === 'efp') &&
+          isSrtRelayAddress(effectiveAddress)
+        ) {
+          // A relay address binds no port. `auto` keeps the relay id the source
+          // already has, so the address the outside party dials never changes.
+          if (body.address !== undefined) {
+            const storedSrt = doc.streamType === 'srt' || doc.streamType === 'efp';
+            body.address = resolveSrtRelayAddress(body.address, storedSrt ? doc.address : null);
+          }
+        } else if (
           (body.address !== undefined || body.streamType !== undefined) &&
           (effectiveStreamType === 'srt' || effectiveStreamType === 'efp')
         ) {
@@ -524,7 +557,7 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
         }
       }
       await getSourcesDb().insert(updated);
-      return reply.send(toApi(updated));
+      return reply.send(toApi(updated, await srtRelayInfoFor([updated.address])));
     } catch (err: unknown) {
       if (err && typeof err === 'object' && 'statusCode' in err && (err as { statusCode: number }).statusCode === 404) {
         return reply.status(404).send({ error: 'Source not found', statusCode: 404 });

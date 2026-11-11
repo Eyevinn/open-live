@@ -5,6 +5,7 @@ import { StromClient } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
 import { getPortReservation } from '../services/port-reservation.js';
+import { getSrtRelayStatus } from '../services/srt-relay-status.js';
 
 const statusRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get('/api/v1/ping', async (_req, reply) => {
@@ -24,7 +25,13 @@ const statusRoutes: FastifyPluginAsync = async (fastify) => {
     // are not necessarily contiguous.
     const reservation = getPortReservation();
     const srtPorts = reservation.status === 'reserved' ? reservation.reservation.ports : null;
-    return reply.send({ stromHost, srtPorts, srtPortState: reservation.status });
+    // The SRT relay Strom fronts, if any (cached ~30 s; a Strom without relay
+    // support reads as not configured). Clients offer `srt+relay://auto`
+    // addresses only when `configured`; `public` is the relay's public
+    // host:port. Where the relay is internally stays Strom's business.
+    const relay = await getSrtRelayStatus();
+    const srtRelay = { configured: relay.configured, public: relay.public };
+    return reply.send({ stromHost, srtPorts, srtPortState: reservation.status, srtRelay });
   });
 
   fastify.post(
