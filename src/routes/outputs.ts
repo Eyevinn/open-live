@@ -10,7 +10,8 @@ import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-p
 import { encryptStreamKey } from '../lib/rtmp-credentials-crypto.js';
 import { resolveIngestUrl, validateStreamKey } from '../lib/rtmp.js';
 import { resolveSrtConnect, type SrtRelayInfo } from '../lib/srt-connect.js';
-import { isSrtRelayAddress, resolveSrtRelayAddress } from '../lib/srt-relay.js';
+import { isSrtRelayAddress, parseSrtRelayAddress, resolveSrtRelayAddress, SRT_RELAY_AUTO_ID } from '../lib/srt-relay.js';
+import { relayIdClashMessage, relayIdHolder, usedRelayIds } from '../services/relay-ids.js';
 import { srtRelayInfoFor } from '../services/srt-relay-status.js';
 import { config, isObjectStorageConfigured } from '../config.js';
 import { DEFAULT_CONNECTION_ID } from '../lib/storage-connection.js';
@@ -279,19 +280,34 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
     }
     // A relay output (`srt+relay://<id>`) binds no port: Strom calls the relay.
     // `srt+relay://auto` gets a generated id, stored once and kept from then on.
+    // The id must be free across all sources and outputs; like a port, it is
+    // checked before the write and again after it.
     if (SRT_OUTPUT_TYPES.has(body.outputType) && isSrtRelayAddress(body.url)) {
-      const now = new Date().toISOString();
-      const doc: OutputDoc = {
-        _id: id,
-        type: 'output',
-        name: body.name,
-        outputType: body.outputType,
-        url: encryptAddressPassphrase(resolveSrtRelayAddress(body.url!)),
-        createdAt: now,
-        updatedAt: now,
-      };
-      await getOutputsDb().insert(doc);
-      return reply.status(201).send(toApi(doc, undefined, await srtRelayInfoFor([doc.url])));
+      const relayAuto = parseSrtRelayAddress(body.url!)?.id === SRT_RELAY_AUTO_ID;
+      for (let attempt = 0; ; attempt++) {
+        const url = resolveSrtRelayAddress(body.url!);
+        const relayId = parseSrtRelayAddress(url)!.id;
+        const holder = relayIdHolder(await usedRelayIds(), relayId);
+        if (holder) return reply.status(409).send({ error: relayIdClashMessage(holder), statusCode: 409 });
+        const now = new Date().toISOString();
+        const doc: OutputDoc = {
+          _id: id,
+          type: 'output',
+          name: body.name,
+          outputType: body.outputType,
+          url: encryptAddressPassphrase(url),
+          createdAt: now,
+          updatedAt: now,
+        };
+        const written = await getOutputsDb().insert(doc);
+        const clash = relayIdHolder(await usedRelayIds(), relayId, { kind: 'output', id });
+        if (!clash) return reply.status(201).send(toApi(doc, undefined, await srtRelayInfoFor([doc.url])));
+        await getOutputsDb().destroy(id, written.rev);
+        if (!relayAuto || attempt >= 3) {
+          return reply.status(409).send({ error: relayIdClashMessage(clash), statusCode: 409 });
+        }
+        fastify.log.warn({ clash: { kind: clash.kind, id: clash.id } }, 'relay id was taken while assigning it, generating another');
+      }
     }
     const isSrt = SRT_OUTPUT_TYPES.has(body.outputType) && !!body.url;
     // A listener output binds a port on the shared Strom, like a listener source
@@ -423,6 +439,8 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
         // already has, so the address the outside party dials never changes.
         if (body.url !== undefined && isSrtRelayAddress(body.url)) {
           body.url = resolveSrtRelayAddress(body.url, doc.url);
+          const holder = relayIdHolder(await usedRelayIds(), parseSrtRelayAddress(body.url)!.id, { kind: 'output', id: doc._id });
+          if (holder) return reply.status(409).send({ error: relayIdClashMessage(holder), statusCode: 409 });
         } else if (body.url !== undefined) {
           const resolved = resolveListenerAddress(effectiveUrl, getPortReservation(), await usedListenerPorts(), {
             exclude: { kind: 'output', id: doc._id },

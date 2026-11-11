@@ -12,7 +12,8 @@ import { getPortReservation } from '../services/port-reservation.js';
 import { clashesAfterWrite, listenerPortRequest, resolveListenerAddress, usedListenerPorts } from '../services/listener-ports.js';
 import { getWhipIngestState } from '../services/whip-ingest-state.js';
 import { srtRelayInfoFor } from '../services/srt-relay-status.js';
-import { isSrtRelayAddress, resolveSrtRelayAddress } from '../lib/srt-relay.js';
+import { isSrtRelayAddress, parseSrtRelayAddress, resolveSrtRelayAddress, SRT_RELAY_AUTO_ID } from '../lib/srt-relay.js';
+import { relayIdClashMessage, relayIdHolder, usedRelayIds } from '../services/relay-ids.js';
 import { resolveSrtConnect, type SrtRelayInfo } from '../lib/srt-connect.js';
 import { config } from '../config.js';
 import { getAllClipStates } from '../services/clip-state.service.js';
@@ -366,8 +367,10 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
     const id = `src-${randomUUID()}`;
     // A relay source (`srt+relay://<id>`) binds no port: Strom calls the relay.
     // `srt+relay://auto` gets a generated id, stored once and kept from then on.
+    // The id must be free across all sources and outputs; like a port, it is
+    // checked before the write and again after it.
     const isRelay = isSrt && isSrtRelayAddress(body.address);
-    if (isRelay) body.address = resolveSrtRelayAddress(body.address);
+    const relayAuto = isRelay && parseSrtRelayAddress(body.address)?.id === SRT_RELAY_AUTO_ID;
     // A listener source binds a port on the shared Strom: it must lie inside this
     // instance's lease and no other source or output may hold it. Port 0 asks
     // for the lowest free one. Written, then checked again, because two clients
@@ -376,6 +379,13 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
     for (let attempt = 0; ; attempt++) {
       let address = body.address;
       let port: number | null = null;
+      let relayId: string | null = null;
+      if (isRelay) {
+        address = resolveSrtRelayAddress(body.address);
+        relayId = parseSrtRelayAddress(address)!.id;
+        const holder = relayIdHolder(await usedRelayIds(), relayId);
+        if (holder) return reply.status(409).send({ error: relayIdClashMessage(holder), statusCode: 409 });
+      }
       if (isSrt && !isRelay) {
         const resolved = resolveListenerAddress(body.address, getPortReservation(), used);
         if (!resolved.ok) {
@@ -407,7 +417,17 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
         updatedAt: now,
       };
       const written = await getSourcesDb().insert(doc);
-      if (port === null) return reply.status(201).send(toApi(doc, await srtRelayInfoFor([doc.address])));
+      if (relayId !== null) {
+        const relayClash = relayIdHolder(await usedRelayIds(), relayId, { kind: 'source', id });
+        if (!relayClash) return reply.status(201).send(toApi(doc, await srtRelayInfoFor([doc.address])));
+        await getSourcesDb().destroy(id, written.rev);
+        if (!relayAuto || attempt >= 3) {
+          return reply.status(409).send({ error: relayIdClashMessage(relayClash), statusCode: 409 });
+        }
+        fastify.log.warn({ clash: { kind: relayClash.kind, id: relayClash.id } }, 'relay id was taken while assigning it, generating another');
+        continue;
+      }
+      if (port === null) return reply.status(201).send(toApi(doc));
       used = await usedListenerPorts();
       const clash = clashesAfterWrite(used, { kind: 'source', id }, port);
       if (!clash) return reply.status(201).send(toApi(doc));
@@ -473,6 +493,8 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
           if (body.address !== undefined) {
             const storedSrt = doc.streamType === 'srt' || doc.streamType === 'efp';
             body.address = resolveSrtRelayAddress(body.address, storedSrt ? doc.address : null);
+            const holder = relayIdHolder(await usedRelayIds(), parseSrtRelayAddress(body.address)!.id, { kind: 'source', id: doc._id });
+            if (holder) return reply.status(409).send({ error: relayIdClashMessage(holder), statusCode: 409 });
           }
         } else if (
           (body.address !== undefined || body.streamType !== undefined) &&

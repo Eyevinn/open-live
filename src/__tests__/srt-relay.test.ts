@@ -85,8 +85,9 @@ describe('srtUrl() — relay addresses', () => {
   it.each([
     'srt+relay://auto',
     'srt+relay://auto?passphrase=abcdefghij',
-    'srt+relay://cam1',
-    'srt+relay://Cam_1-2?latency=200&pbkeylen=32',
+    'srt+relay://cam1-studio-a-0001',
+    'srt+relay://Cam_1-2_aaaaaaaaaa?latency=200&pbkeylen=32',
+    `srt+relay://${'a'.repeat(16)}`,
     `srt+relay://${'a'.repeat(64)}`,
   ])('accepts %s', (url) => {
     expect(() => srtUrl(url)).not.toThrow();
@@ -95,7 +96,7 @@ describe('srtUrl() — relay addresses', () => {
   it.each([
     ['empty id', 'srt+relay://'],
     ['id too long', `srt+relay://${'a'.repeat(65)}`],
-    ['dot in id', 'srt+relay://cam.1'],
+    ['dot in id', 'srt+relay://cam.1-studio-a-0001'],
     ['host:port instead of id', 'srt+relay://relay.example.com:9000'],
     ['unsafe query char', 'srt+relay://cam1?x="y"'],
     ['path', 'srt+relay://cam1/x'],
@@ -106,9 +107,13 @@ describe('srtUrl() — relay addresses', () => {
   it.each(['mode=caller', 'streamid=other', 'MODE=listener', 'localport=5000', 'localaddress=1.2.3.4', '%73treamid=x'])(
     'rejects the plain-SRT-only param %s',
     (q) => {
-      expect(() => srtUrl(`srt+relay://cam1?${q}`)).toThrow(/not allowed on an SRT relay address/);
+      expect(() => srtUrl(`srt+relay://cam1-studio-a-0001?${q}`)).toThrow(/not allowed on an SRT relay address/);
     },
   );
+
+  it.each(['cam1', 'a', `${'a'.repeat(15)}`])('rejects the explicit id %s as too short (guessable)', (id) => {
+    expect(() => srtUrl(`srt+relay://${id}`)).toThrow(/16–64 characters.*guesses the id/);
+  });
 
   it('applies the 10–79 passphrase rule', () => {
     expect(() => srtUrl('srt+relay://auto?passphrase=short')).toThrow(/10–79/);

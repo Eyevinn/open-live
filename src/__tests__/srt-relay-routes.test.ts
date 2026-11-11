@@ -20,12 +20,14 @@ const mockSourcesFind = vi.fn();
 const mockOutputsGet = vi.fn();
 const mockOutputsInsert = vi.fn();
 const mockOutputsFind = vi.fn();
+const mockSourcesDestroy = vi.fn();
+const mockOutputsDestroy = vi.fn();
 const mockSrtRelay = vi.fn();
 
 vi.mock('../db/index.js', () => ({
   getDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn().mockResolvedValue({ docs: [] }), findTrusted: vi.fn().mockResolvedValue({ docs: [] }) }),
-  getSourcesDb: () => ({ get: mockSourcesGet, insert: mockSourcesInsert, find: mockSourcesFind, destroy: vi.fn() }),
-  getOutputsDb: () => ({ get: mockOutputsGet, insert: mockOutputsInsert, find: mockOutputsFind, destroy: vi.fn() }),
+  getSourcesDb: () => ({ get: mockSourcesGet, insert: mockSourcesInsert, find: mockSourcesFind, destroy: mockSourcesDestroy }),
+  getOutputsDb: () => ({ get: mockOutputsGet, insert: mockOutputsInsert, find: mockOutputsFind, destroy: mockOutputsDestroy }),
   connectDb: vi.fn().mockResolvedValue(undefined),
   isDbReady: vi.fn().mockResolvedValue(true),
   isDbConnected: vi.fn().mockReturnValue(true),
@@ -93,7 +95,7 @@ beforeEach(() => {
   _resetPortReservationState({ status: 'pending' });
   mockSrtRelay.mockReset();
   mockSrtRelay.mockResolvedValue(RELAY);
-  for (const m of [mockSourcesGet, mockSourcesInsert, mockSourcesFind, mockOutputsGet, mockOutputsInsert, mockOutputsFind]) m.mockReset();
+  for (const m of [mockSourcesGet, mockSourcesInsert, mockSourcesFind, mockSourcesDestroy, mockOutputsGet, mockOutputsInsert, mockOutputsFind, mockOutputsDestroy]) m.mockReset();
   mockSourcesInsert.mockResolvedValue({ ok: true, rev: '1-new' });
   mockOutputsInsert.mockResolvedValue({ ok: true, rev: '1-new' });
   mockSourcesFind.mockResolvedValue({ docs: [] });
@@ -141,9 +143,8 @@ describe('sources with a relay address', () => {
     const id = ID_RE.exec(stored.address)![1]!;
     expect(stored.address).toMatch(/passphrase=encv1:/);
     expect(stored.address).not.toContain(SECRET);
-    // No listener-port bookkeeping at all.
-    expect(mockSourcesFind).not.toHaveBeenCalled();
-    expect(mockOutputsFind).not.toHaveBeenCalled();
+    // No listener-port bookkeeping: the reservation is pending, which would
+    // refuse any listener address with 503.
 
     const body = res.json();
     expect(body.address).toBe(`srt+relay://${id}?passphrase=***&latency=200`);
@@ -167,7 +168,7 @@ describe('sources with a relay address', () => {
   });
 
   it('PATCH with auto keeps the stored relay id and takes the new passphrase', async () => {
-    mockSourcesGet.mockResolvedValue(source('srt+relay://sticky-id?latency=200'));
+    mockSourcesGet.mockResolvedValue(source('srt+relay://sticky-id-0123456789?latency=200'));
     const res = await app.inject({
       method: 'PATCH',
       url: '/api/v1/sources/src-relay',
@@ -175,8 +176,8 @@ describe('sources with a relay address', () => {
     });
     expect(res.statusCode).toBe(200);
     const stored = mockSourcesInsert.mock.calls[0]![0] as SourceDoc;
-    expect(stored.address).toMatch(/^srt\+relay:\/\/sticky-id\?passphrase=encv1:/);
-    expect(res.json().connect.uri).toBe('srt://relay.example.com:9000?streamid=sticky-id');
+    expect(stored.address).toMatch(/^srt\+relay:\/\/sticky-id-0123456789\?passphrase=encv1:/);
+    expect(res.json().connect.uri).toBe('srt://relay.example.com:9000?streamid=sticky-id-0123456789');
   });
 
   it('PATCH from a listener address to auto generates an id without touching ports', async () => {
@@ -184,14 +185,13 @@ describe('sources with a relay address', () => {
     const res = await app.inject({ method: 'PATCH', url: '/api/v1/sources/src-relay', payload: { address: 'srt+relay://auto' } });
     expect(res.statusCode).toBe(200);
     expect((mockSourcesInsert.mock.calls[0]![0] as SourceDoc).address).toMatch(ID_RE);
-    expect(mockSourcesFind).not.toHaveBeenCalled();
   });
 
   it('a rename keeps the relay address as stored', async () => {
-    mockSourcesGet.mockResolvedValue(source('srt+relay://sticky-id'));
+    mockSourcesGet.mockResolvedValue(source('srt+relay://sticky-id-0123456789'));
     const res = await app.inject({ method: 'PATCH', url: '/api/v1/sources/src-relay', payload: { name: 'Renamed' } });
     expect(res.statusCode).toBe(200);
-    expect((mockSourcesInsert.mock.calls[0]![0] as SourceDoc).address).toBe('srt+relay://sticky-id');
+    expect((mockSourcesInsert.mock.calls[0]![0] as SourceDoc).address).toBe('srt+relay://sticky-id-0123456789');
   });
 
   it('rejects mode/streamid on a relay address', async () => {
@@ -238,31 +238,109 @@ describe('outputs with a relay address', () => {
     const stored = mockOutputsInsert.mock.calls[0]![0] as OutputDoc;
     const id = ID_RE.exec(stored.url!)![1]!;
     expect(stored.url).toMatch(/passphrase=encv1:/);
-    expect(mockSourcesFind).not.toHaveBeenCalled();
-    expect(mockOutputsFind).not.toHaveBeenCalled();
     expect(res.json().url).toBe(`srt+relay://${id}?passphrase=***`);
     expect(res.json().connect).toMatchObject({ uri: `srt://relay.example.com:9000?streamid=${id}`, source: 'srt-relay', mode: 'caller' });
     expect(res.body).not.toContain(SECRET);
   });
 
   it('PATCH with auto keeps the stored relay id', async () => {
-    mockOutputsGet.mockResolvedValue(output('srt+relay://out-sticky'));
+    mockOutputsGet.mockResolvedValue(output('srt+relay://out-sticky-0123456789'));
     const res = await app.inject({ method: 'PATCH', url: '/api/v1/outputs/output-relay', payload: { url: 'srt+relay://auto?latency=300' } });
     expect(res.statusCode).toBe(200);
-    expect((mockOutputsInsert.mock.calls[0]![0] as OutputDoc).url).toBe('srt+relay://out-sticky?latency=300');
-    expect(res.json().connect.streamid).toBe('out-sticky');
+    expect((mockOutputsInsert.mock.calls[0]![0] as OutputDoc).url).toBe('srt+relay://out-sticky-0123456789?latency=300');
+    expect(res.json().connect.streamid).toBe('out-sticky-0123456789');
   });
 
   it('PATCH with an invalid relay address is a 400', async () => {
-    mockOutputsGet.mockResolvedValue(output('srt+relay://out-sticky'));
+    mockOutputsGet.mockResolvedValue(output('srt+relay://out-sticky-0123456789'));
     const res = await app.inject({ method: 'PATCH', url: '/api/v1/outputs/output-relay', payload: { url: 'srt+relay://auto?mode=caller' } });
     expect(res.statusCode).toBe(400);
   });
 
   it('GET reports a null dial-in when the relay public address is unknown', async () => {
     mockSrtRelay.mockResolvedValue({ configured: true, relay: 'srt-splice:9000', public: null, error: null });
-    mockOutputsGet.mockResolvedValue(output('srt+relay://out-sticky'));
+    mockOutputsGet.mockResolvedValue(output('srt+relay://out-sticky-0123456789'));
     const res = await app.inject({ method: 'GET', url: '/api/v1/outputs/output-relay' });
     expect(res.json().connect).toMatchObject({ uri: null, reason: 'srt-relay-public-unknown' });
+  });
+});
+
+describe('relay id uniqueness and explicit ids', () => {
+  const LONG = 'explicit-id-0123456789';
+
+  it('accepts an explicit id of 16+ characters as given', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/v1/sources', payload: { name: 'Cam', streamType: 'srt', address: `srt+relay://${LONG}` } });
+    expect(res.statusCode).toBe(201);
+    expect((mockSourcesInsert.mock.calls[0]![0] as SourceDoc).address).toBe(`srt+relay://${LONG}`);
+  });
+
+  it('refuses a short explicit id with 400, saying it is guessable', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/v1/outputs', payload: { name: 'Out', outputType: 'mpegtssrt', url: 'srt+relay://cam1' } });
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toMatch(/16–64 characters/);
+    expect(res.body).toMatch(/guesses the id/);
+    expect(mockOutputsInsert).not.toHaveBeenCalled();
+  });
+
+  it('POST source: 409 when an output already holds the id (shared namespace)', async () => {
+    mockOutputsFind.mockResolvedValue({ docs: [{ ...output(`srt+relay://${LONG}`), name: 'Program' }] });
+    const res = await app.inject({ method: 'POST', url: '/api/v1/sources', payload: { name: 'Cam', streamType: 'srt', address: `srt+relay://${LONG}` } });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toBe('SRT relay id is already used by output "Program"; every source and output needs its own relay id');
+    expect(mockSourcesInsert).not.toHaveBeenCalled();
+  });
+
+  it('POST output: 409 when a source already holds the id', async () => {
+    mockSourcesFind.mockResolvedValue({ docs: [source(`srt+relay://${LONG}?passphrase=encv1:AAAA`)] });
+    const res = await app.inject({ method: 'POST', url: '/api/v1/outputs', payload: { name: 'Out', outputType: 'efpsrt', url: `srt+relay://${LONG}` } });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toMatch(/already used by source "Cam"/);
+    expect(mockOutputsInsert).not.toHaveBeenCalled();
+  });
+
+  it('PATCH source: 409 when another doc holds the new id; its own id does not count', async () => {
+    mockSourcesGet.mockResolvedValue(source(`srt+relay://${LONG}`));
+    mockSourcesFind.mockResolvedValue({ docs: [source(`srt+relay://${LONG}`)] });
+    mockOutputsFind.mockResolvedValue({ docs: [output('srt+relay://taken-by-output-0123')] });
+    const own = await app.inject({ method: 'PATCH', url: '/api/v1/sources/src-relay', payload: { address: 'srt+relay://auto?latency=200' } });
+    expect(own.statusCode).toBe(200);
+    const taken = await app.inject({ method: 'PATCH', url: '/api/v1/sources/src-relay', payload: { address: 'srt+relay://taken-by-output-0123' } });
+    expect(taken.statusCode).toBe(409);
+    expect(mockSourcesInsert).toHaveBeenCalledTimes(1);
+  });
+
+  it('PATCH output: 409 when a source holds the new id', async () => {
+    mockOutputsGet.mockResolvedValue(output('srt+relay://out-sticky-0123456789'));
+    mockSourcesFind.mockResolvedValue({ docs: [source(`srt+relay://${LONG}`)] });
+    const res = await app.inject({ method: 'PATCH', url: '/api/v1/outputs/output-relay', payload: { url: `srt+relay://${LONG}` } });
+    expect(res.statusCode).toBe(409);
+    expect(mockOutputsInsert).not.toHaveBeenCalled();
+  });
+
+  it('post-write re-check: an explicit id taken meanwhile is undone and refused', async () => {
+    const rival = { ...output(`srt+relay://${LONG}`), _id: 'output-rival', name: 'Rival' };
+    mockOutputsFind.mockResolvedValueOnce({ docs: [] }).mockResolvedValue({ docs: [rival] });
+    const res = await app.inject({ method: 'POST', url: '/api/v1/sources', payload: { name: 'Cam', streamType: 'srt', address: `srt+relay://${LONG}` } });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toMatch(/output "Rival"/);
+    expect(mockSourcesDestroy).toHaveBeenCalledTimes(1);
+  });
+
+  it('post-write re-check: an auto id taken meanwhile is regenerated', async () => {
+    // The rival "takes" whatever id the first attempt wrote.
+    let firstId: string | undefined;
+    mockOutputsInsert.mockImplementation(async (doc: OutputDoc) => {
+      firstId ??= ID_RE.exec(doc.url!)![1];
+      return { ok: true, rev: '1-new' };
+    });
+    mockSourcesFind.mockImplementation(async () => ({
+      docs: firstId && mockOutputsInsert.mock.calls.length === 1 ? [source(`srt+relay://${firstId}`)] : [],
+    }));
+    const res = await app.inject({ method: 'POST', url: '/api/v1/outputs', payload: { name: 'Out', outputType: 'mpegtssrt', url: 'srt+relay://auto' } });
+    expect(res.statusCode).toBe(201);
+    expect(mockOutputsDestroy).toHaveBeenCalledTimes(1);
+    expect(mockOutputsInsert).toHaveBeenCalledTimes(2);
+    const secondId = ID_RE.exec((mockOutputsInsert.mock.calls[1]![0] as OutputDoc).url!)![1];
+    expect(secondId).not.toBe(firstId);
   });
 });

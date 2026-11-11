@@ -211,9 +211,11 @@ components:
           description: >-
             For srt/efp: `srt://host:port[?params]`, the hostless listener form
             `srt://:PORT?mode=listener` (`srt://:0` assigns a reserved port), or an
-            SRT relay address `srt+relay://<id>[?params]` (id `[A-Za-z0-9_-]{1,64}`;
+            SRT relay address `srt+relay://<id>[?params]` (an explicit id is
+            `[A-Za-z0-9_-]{16,64}`, shorter ids are refused as guessable;
             `srt+relay://auto` generates the id once, and a later `auto` keeps the
-            stored id). Relay addresses bind no port; `mode`, `streamid`,
+            stored id). A relay id may be held by one source or output only
+            (409 otherwise). Relay addresses bind no port; `mode`, `streamid`,
             `localaddress` and `localport` are not allowed on them. Passphrases are
             masked as `***` in responses.
         connect:
@@ -379,7 +381,9 @@ components:
           description: >-
             Operator-authored SRT bind/listen URI (e.g. srt://:43524?mode=listener),
             or an SRT relay address `srt+relay://<id>[?params]`
-            (`srt+relay://auto` generates the id once; a later `auto` keeps it).
+            (`srt+relay://auto` generates the id once; a later `auto` keeps it;
+            explicit ids are 16-64 characters and unique across sources and
+            outputs, 409 otherwise).
             Undefined for whep outputs. Round-tripped by POST/PATCH.
         connect:
           $ref: '#/components/schemas/SrtConnect'

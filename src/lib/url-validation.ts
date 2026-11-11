@@ -8,7 +8,7 @@
  *                or srt+relay://<id> (an SRT relay session Strom resolves)
  */
 
-import { SRT_RELAY_FORBIDDEN_PARAMS, SRT_RELAY_ID_RE } from './srt-relay.js';
+import { SRT_RELAY_AUTO_ID, SRT_RELAY_EXPLICIT_ID_RE, SRT_RELAY_FORBIDDEN_PARAMS } from './srt-relay.js';
 
 /**
  * Returns true if the given host is an IP literal in a private, loopback,
@@ -378,7 +378,7 @@ const SRT_PASSPHRASE_MAX = 79;
 const SRT_PASSPHRASE_RE = /[?&]passphrase=([^&]*)/i;
 
 // srt+relay://<id>[?params]: same query charset as SRT_URL_RE. The id is
-// checked separately (SRT_RELAY_ID_RE) so its error can be specific.
+// checked separately (SRT_RELAY_EXPLICIT_ID_RE) so its error can be specific.
 const SRT_RELAY_URL_RE = /^srt\+relay:\/\/([^?#]*)(\?[A-Za-z0-9._\-=&%+]+)?$/;
 
 /**
@@ -456,8 +456,12 @@ function srtRelayUrl(url: string): void {
   if (!m) {
     throw new Error('Invalid SRT relay address format — expected srt+relay://<id> with safe query params');
   }
-  if (!SRT_RELAY_ID_RE.test(m[1] ?? '')) {
-    throw new Error('Invalid SRT relay id — use 1–64 characters of A–Z, a–z, 0–9, "_" or "-", or "auto" to have one generated');
+  const id = m[1] ?? '';
+  if (id !== SRT_RELAY_AUTO_ID && !SRT_RELAY_EXPLICIT_ID_RE.test(id)) {
+    throw new Error(
+      'Invalid SRT relay id — use 16–64 characters of A–Z, a–z, 0–9, "_" or "-" (anyone who guesses the id ' +
+        'can connect to the public relay port, so short ids are refused), or "auto" to have one generated',
+    );
   }
   const params = new URLSearchParams((m[2] ?? '').slice(1));
   for (const key of params.keys()) {

@@ -24,8 +24,15 @@ export const SRT_RELAY_SCHEME = 'srt+relay://';
 /** The id placeholder that asks the server to generate one. */
 export const SRT_RELAY_AUTO_ID = 'auto';
 
-/** A relay id: URL-safe and short enough for an SRT streamid. */
+/** A relay id as stored: URL-safe and short enough for an SRT streamid. */
 export const SRT_RELAY_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+/**
+ * An explicit relay id a client may submit: at least 16 characters. The id is
+ * the only thing standing between a public relay port and the stream when no
+ * passphrase is set, so short, guessable ids are refused. Generated ids are 22.
+ */
+export const SRT_RELAY_EXPLICIT_ID_RE = /^[A-Za-z0-9_-]{16,64}$/;
 
 /**
  * Query parameters that make no sense on a relay address: Strom sets the mode
