@@ -8,6 +8,7 @@
  *                or srt+relay://<id> (an SRT relay session Strom resolves)
  */
 
+import { checkSrtUriAsGStreamerReads, gstUnescape } from './srt-uri-check.js';
 import { isSrtRelayAddress, SRT_RELAY_AUTO_ID, SRT_RELAY_EXPLICIT_ID_RE, SRT_RELAY_FORBIDDEN_PARAMS } from './srt-relay.js';
 
 /**
@@ -368,11 +369,13 @@ export function graphicUrl(url: string): void {
 // Query: alphanumeric and safe URL chars only — no control characters, no quotes, no backslash
 const SRT_URL_RE = /^srt:\/\/(([A-Za-z0-9.\-]|\[[0-9a-fA-F:]+\])*:\d{1,5})(\?[A-Za-z0-9._\-=&%+]+)?$/;
 
-// SRT (libsrt) requires the stream-encryption passphrase to be 10–79 characters.
+// SRT (libsrt) requires the stream-encryption passphrase to be 10–80 bytes.
 // Enforcing this at the API boundary turns a generic GStreamer "Pipeline state
 // change failed" 500 at activation into a clear 400 at create/patch (issue #261).
+// Measured in decoded UTF-8 bytes. A new address also gets the full GStreamer
+// check in srt-uri-check.ts; a stored one only this check.
 const SRT_PASSPHRASE_MIN = 10;
-const SRT_PASSPHRASE_MAX = 79;
+const SRT_PASSPHRASE_MAX = 80;
 
 /** Matches the passphrase param in an SRT URI query string (case-insensitive). */
 const SRT_PASSPHRASE_RE = /[?&]passphrase=([^&]*)/i;
@@ -395,8 +398,15 @@ const SRT_RELAY_URL_RE = /^srt\+relay:\/\/([^?#]*)(\?[A-Za-z0-9._\-=&%+]+)?$/i;
  * charset and passphrase rules, but `mode`, `streamid`, `localaddress` and
  * `localport` are rejected: Strom always calls the relay with the id as its
  * streamid, so those would either conflict or mean nothing.
+ *
+ * `opts.newValue`: the address is being written (create, or a PATCH that sends
+ * it), so it is also checked the way GStreamer reads it
+ * (`checkSrtUriAsGStreamerReads`): a key or mode in the wrong case, a key given
+ * twice, a bad escape, a raw `#`, a passphrase outside 10–80 bytes or a bad
+ * pbkeylen is refused. A stored address (a PATCH that does not send one) is
+ * held only to the older, lenient rules, so existing documents keep working.
  */
-export function srtUrl(url: string): void {
+export function srtUrl(url: string, opts: { newValue?: boolean } = {}): void {
   if (url.length > 512) {
     throw new Error('SRT URL too long');
   }
@@ -405,7 +415,7 @@ export function srtUrl(url: string): void {
     throw new Error('Control characters not allowed in SRT URL');
   }
   if (isSrtRelayAddress(url)) {
-    srtRelayUrl(url);
+    srtRelayUrl(url, opts);
     return;
   }
   if (!SRT_URL_RE.test(url)) {
@@ -430,7 +440,13 @@ export function srtUrl(url: string): void {
     throw new Error('SRT URL must not target private, loopback, or link-local addresses');
   }
 
-  checkSrtPassphrase(url);
+  checkSrtParams(url, opts);
+}
+
+/** The passphrase and GStreamer checks shared by plain and relay addresses. */
+function checkSrtParams(url: string, opts: { newValue?: boolean }): void {
+  if (opts.newValue) checkSrtUriAsGStreamerReads(url);
+  else checkSrtPassphrase(url);
 }
 
 /**
@@ -441,18 +457,25 @@ export function srtUrl(url: string): void {
 function checkSrtPassphrase(url: string): void {
   const passphraseMatch = url.match(SRT_PASSPHRASE_RE);
   if (passphraseMatch) {
-    const passphrase = passphraseMatch[1] ?? '';
-    if (passphrase.length > 0 && (passphrase.length < SRT_PASSPHRASE_MIN || passphrase.length > SRT_PASSPHRASE_MAX)) {
+    const raw = passphraseMatch[1] ?? '';
+    if (raw.length === 0) return;
+    // Measured as libsrt sees it: decoded UTF-8 bytes, so `%20` counts as one.
+    // A stored address that passed the older rule (length as written) still
+    // passes, so no existing document is blocked by this change.
+    const decoded = gstUnescape(raw);
+    const bytes = decoded === null ? raw.length : Buffer.byteLength(decoded, 'utf8');
+    const inRange = (n: number) => n >= SRT_PASSPHRASE_MIN && n <= SRT_PASSPHRASE_MAX;
+    if (!inRange(bytes) && !inRange(raw.length)) {
       throw new Error(
-        `SRT passphrase must be ${SRT_PASSPHRASE_MIN}–${SRT_PASSPHRASE_MAX} characters ` +
-          `(got ${passphrase.length}); shorter values are silently rejected by SRT at activation`,
+        `SRT passphrase must be ${SRT_PASSPHRASE_MIN}–${SRT_PASSPHRASE_MAX} bytes ` +
+          `(got ${bytes}); other lengths are silently rejected by SRT at activation`,
       );
     }
   }
 }
 
 /** The relay branch of `srtUrl()`. */
-function srtRelayUrl(url: string): void {
+function srtRelayUrl(url: string, opts: { newValue?: boolean }): void {
   const m = SRT_RELAY_URL_RE.exec(url);
   if (!m) {
     throw new Error('Invalid SRT relay address format — expected srt+relay://<id> with safe query params');
@@ -470,5 +493,5 @@ function srtRelayUrl(url: string): void {
       throw new Error(`"${key}" is not allowed on an SRT relay address; Strom sets it when it calls the relay`);
     }
   }
-  checkSrtPassphrase(url);
+  checkSrtParams(url, opts);
 }

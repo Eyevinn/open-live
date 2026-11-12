@@ -447,3 +447,53 @@ describe('relay addresses when Strom has no relay', () => {
     expect(res.json().connect).toMatchObject({ uri: null, source: 'srt-relay', reason: 'srt-relay-unreachable' });
   });
 });
+
+describe('save-time SRT address check (GStreamer reads keys and modes exactly)', () => {
+  it('POST source refuses a key in the wrong case with 400, naming the right spelling', async () => {
+    const res = await app.inject({
+      method: 'POST', url: '/api/v1/sources',
+      payload: { name: 'Cam', streamType: 'srt', address: 'srt://cdn.example.com:9000?Mode=caller' },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toContain("use 'mode'");
+    expect(mockSourcesInsert).not.toHaveBeenCalled();
+  });
+
+  it('PATCH source refuses a sent address with a mode in the wrong case', async () => {
+    mockSourcesGet.mockResolvedValue(source('srt://cdn.example.com:9000?mode=caller'));
+    const res = await app.inject({
+      method: 'PATCH', url: '/api/v1/sources/src-relay',
+      payload: { address: 'srt://cdn.example.com:9000?mode=Caller' },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toContain("use 'caller'");
+  });
+
+  it('PATCH source without an address does not re-check a stored one', async () => {
+    mockSourcesGet.mockResolvedValue(source('srt://cdn.example.com:9000?Mode=Caller'));
+    const res = await app.inject({ method: 'PATCH', url: '/api/v1/sources/src-relay', payload: { name: 'Renamed' } });
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('POST output refuses a relay address with a misspelt passphrase key', async () => {
+    const res = await app.inject({
+      method: 'POST', url: '/api/v1/outputs',
+      payload: { name: 'Program', outputType: 'mpegtssrt', url: `srt+relay://auto?PassPhrase=${SECRET}` },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toContain("use 'passphrase'");
+    expect(res.body).not.toContain(SECRET);
+  });
+
+  it('PATCH output refuses a sent URL with a key given twice; a rename keeps the stored one', async () => {
+    mockOutputsGet.mockResolvedValue(output('srt://cdn.example.com:9000?mode=caller&mode=caller'));
+    const bad = await app.inject({
+      method: 'PATCH', url: '/api/v1/outputs/output-relay',
+      payload: { url: 'srt://cdn.example.com:9000?mode=caller&mode=caller' },
+    });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.body).toContain("'mode' is given more than once");
+    const rename = await app.inject({ method: 'PATCH', url: '/api/v1/outputs/output-relay', payload: { name: 'Renamed' } });
+    expect(rename.statusCode).toBe(200);
+  });
+});

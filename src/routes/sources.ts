@@ -74,7 +74,7 @@ function validateSourceAddress(
   } else if (streamType === 'srt' || streamType === 'efp') {
     // SRT/EFP sources: must be a valid srt:// URI pointing to a non-private host
     try {
-      srtUrl(address);
+      srtUrl(address, { newValue: true });
     } catch (err) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['address'], message: err instanceof Error ? err.message : 'Invalid SRT source address' });
     }
@@ -443,7 +443,9 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
           if (effectiveStreamType === 'html') {
             graphicUrl(effectiveAddress);
           } else if (effectiveStreamType === 'srt' || effectiveStreamType === 'efp') {
-            srtUrl(effectiveAddress);
+            // A sent address is checked as GStreamer reads it; the stored one
+            // (a patch without an address) only by the older, lenient rules.
+            srtUrl(effectiveAddress, { newValue: body.address !== undefined });
           } else if (effectiveStreamType === 'clip') {
             // clip sources carry a serialized typed ClipReference (JSON) in address.
             deserializeClipReference(effectiveAddress);

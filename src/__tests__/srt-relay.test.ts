@@ -115,10 +115,10 @@ describe('srtUrl() — relay addresses', () => {
     expect(() => srtUrl(`srt+relay://${id}`)).toThrow(/16–64 characters.*guesses the id/);
   });
 
-  it('applies the 10–79 passphrase rule', () => {
-    expect(() => srtUrl('srt+relay://auto?passphrase=short')).toThrow(/10–79/);
-    expect(() => srtUrl(`srt+relay://auto?passphrase=${'p'.repeat(80)}`)).toThrow(/10–79/);
-    expect(() => srtUrl(`srt+relay://auto?passphrase=${'p'.repeat(79)}`)).not.toThrow();
+  it('applies the 10–80 passphrase rule', () => {
+    expect(() => srtUrl('srt+relay://auto?passphrase=short')).toThrow(/10–80/);
+    expect(() => srtUrl(`srt+relay://auto?passphrase=${'p'.repeat(81)}`)).toThrow(/10–80/);
+    expect(() => srtUrl(`srt+relay://auto?passphrase=${'p'.repeat(80)}`)).not.toThrow();
     expect(() => srtUrl('srt+relay://auto?passphrase=')).not.toThrow();
   });
 

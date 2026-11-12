@@ -140,7 +140,7 @@ const OutputInput = z.object({
   }
   if (SRT_OUTPUT_TYPES.has(data.outputType) && data.url) {
     try {
-      srtUrl(data.url);
+      srtUrl(data.url, { newValue: true });
     } catch (err) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['url'], message: err instanceof Error ? err.message : 'Invalid SRT URL' });
     }
@@ -393,7 +393,9 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       const effectiveUrl = body.url ?? (doc.url ? decryptAddressPassphrase(doc.url) : doc.url);
       if (SRT_OUTPUT_TYPES.has(doc.outputType) && effectiveUrl) {
         try {
-          srtUrl(effectiveUrl);
+          // A sent URL is checked as GStreamer reads it; the stored one (a
+          // patch without a url) only by the older, lenient rules.
+          srtUrl(effectiveUrl, { newValue: body.url !== undefined });
         } catch (err) {
           return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid SRT URL' });
         }

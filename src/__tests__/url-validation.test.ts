@@ -226,20 +226,20 @@ describe('srtUrl', () => {
 
     it('rejects a passphrase shorter than 10 chars with an actionable message', () => {
       // 6 chars — the reproduction from the issue ("hejsan").
-      expect(() => srtUrl('srt://example.com:9999?passphrase=hejsan')).toThrow(/passphrase must be 10–79 characters/i);
-      expect(() => srtUrl(withPass(9))).toThrow(/passphrase must be 10–79 characters/i);
+      expect(() => srtUrl('srt://example.com:9999?passphrase=hejsan')).toThrow(/passphrase must be 10–80 bytes/i);
+      expect(() => srtUrl(withPass(9))).toThrow(/passphrase must be 10–80 bytes/i);
     });
 
     it('accepts a passphrase at the lower boundary (10 chars)', () => {
       expect(() => srtUrl(withPass(10))).not.toThrow();
     });
 
-    it('accepts a passphrase at the upper boundary (79 chars)', () => {
-      expect(() => srtUrl(withPass(79))).not.toThrow();
+    it('accepts a passphrase at the upper boundary (80 chars, libsrt HAICRYPT_SECRET_MAX_SZ)', () => {
+      expect(() => srtUrl(withPass(80))).not.toThrow();
     });
 
-    it('rejects a passphrase longer than 79 chars', () => {
-      expect(() => srtUrl(withPass(80))).toThrow(/passphrase must be 10–79 characters/i);
+    it('rejects a passphrase longer than 80 chars', () => {
+      expect(() => srtUrl(withPass(81))).toThrow(/passphrase must be 10–80 bytes/i);
     });
 
     it('allows an SRT URL with no passphrase param', () => {
@@ -251,7 +251,7 @@ describe('srtUrl', () => {
     });
 
     it('applies the same rule to the listener form used by outputs', () => {
-      expect(() => srtUrl('srt://:47110?mode=listener&passphrase=short')).toThrow(/passphrase must be 10–79 characters/i);
+      expect(() => srtUrl('srt://:47110?mode=listener&passphrase=short')).toThrow(/passphrase must be 10–80 bytes/i);
       expect(() => srtUrl('srt://:47110?mode=listener&passphrase=longenough1')).not.toThrow();
     });
   });
