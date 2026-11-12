@@ -366,8 +366,14 @@ export function graphicUrl(url: string): void {
 // Strict allowlist: srt://<host>:<port>[?params] or srt://:<port>[?params] (bind all interfaces)
 // Host: alphanumeric, dots, hyphens, or IPv6 bracketed address
 // Port: 1–5 digits
-// Query: alphanumeric and safe URL chars only — no control characters, no quotes, no backslash
-const SRT_URL_RE = /^srt:\/\/(([A-Za-z0-9.\-]|\[[0-9a-fA-F:]+\])*:\d{1,5})(\?[A-Za-z0-9._\-=&%+]+)?$/;
+// Query: alphanumeric and safe URL chars only — no control characters, no double
+// quote, no backslash, no space, no angle brackets. ! * ' ( ) ~ are allowed:
+// encodeURIComponent leaves them unescaped (RFC 3986 unreserved/sub-delims), so
+// a passphrase that contains them arrives as written from the studio, gateways
+// and Companion; GStreamer and Strom pass them through unchanged. The address
+// only ever travels as JSON (to CouchDB and Strom), never into a shell or HTML.
+const SRT_QUERY_CHARS = "A-Za-z0-9._\\-=&%+!*'()~";
+const SRT_URL_RE = new RegExp(`^srt:\\/\\/(([A-Za-z0-9.\\-]|\\[[0-9a-fA-F:]+\\])*:\\d{1,5})(\\?[${SRT_QUERY_CHARS}]+)?$`);
 
 // SRT (libsrt) requires the stream-encryption passphrase to be 10–80 bytes.
 // Enforcing this at the API boundary turns a generic GStreamer "Pipeline state
@@ -383,7 +389,7 @@ const SRT_PASSPHRASE_RE = /[?&]passphrase=([^&]*)/i;
 // srt+relay://<id>[?params]: same query charset as SRT_URL_RE. The id is
 // checked separately (SRT_RELAY_EXPLICIT_ID_RE) so its error can be specific.
 // The scheme is case-insensitive, as in parseSrtRelayAddress() and in Strom.
-const SRT_RELAY_URL_RE = /^srt\+relay:\/\/([^?#]*)(\?[A-Za-z0-9._\-=&%+]+)?$/i;
+const SRT_RELAY_URL_RE = new RegExp(`^srt\\+relay:\\/\\/([^?#]*)(\\?[${SRT_QUERY_CHARS}]+)?$`, 'i');
 
 /**
  * Throws if the value is not a valid SRT URL.

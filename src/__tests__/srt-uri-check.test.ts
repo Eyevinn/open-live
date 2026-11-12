@@ -118,3 +118,21 @@ describe('srtUrl: GStreamer rules only for a new value', () => {
     expect(() => srtUrl('srt://cdn.example.com:9000?passphrase=%41%41%41%41', { newValue: true })).toThrow(/got 4/);
   });
 });
+
+describe("srtUrl: ! * ' ( ) ~ in the query (left unescaped by encodeURIComponent)", () => {
+  const pass = encodeURIComponent("my!secret*(it's)~1");
+
+  it('accepts them in a plain and a relay address, new or stored', () => {
+    expect(pass).toContain('!');
+    expect(() => srtUrl(`srt://cdn.example.com:9000?mode=caller&passphrase=${pass}`, { newValue: true })).not.toThrow();
+    expect(() => srtUrl(`srt+relay://auto?passphrase=${pass}`, { newValue: true })).not.toThrow();
+    expect(() => srtUrl(`srt+relay://auto?passphrase=${pass}`)).not.toThrow();
+  });
+
+  it('still refuses a double quote, backslash, space or angle bracket', () => {
+    for (const c of ['"', '\\', ' ', '<', '>']) {
+      expect(() => srtUrl(`srt://cdn.example.com:9000?passphrase=abcdefghij${c}`)).toThrow(/Invalid SRT URL format/);
+      expect(() => srtUrl(`srt+relay://auto?passphrase=abcdefghij${c}`)).toThrow(/Invalid SRT relay address format/);
+    }
+  });
+});

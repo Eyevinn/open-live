@@ -497,3 +497,15 @@ describe('save-time SRT address check (GStreamer reads keys and modes exactly)',
     expect(rename.statusCode).toBe(200);
   });
 });
+
+describe("relay passphrase with ! * ' ( ) ~ (as encodeURIComponent sends it)", () => {
+  it('POST output stores it and never returns it', async () => {
+    const pass = encodeURIComponent("my!secret(2024)~*'");
+    const res = await app.inject({
+      method: 'POST', url: '/api/v1/outputs',
+      payload: { name: 'Program', outputType: 'mpegtssrt', url: `srt+relay://auto?passphrase=${pass}` },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.body).not.toContain('secret');
+  });
+});
