@@ -105,10 +105,10 @@ not used as the capability signal), and any change to flow generation or activat
 | `server-info.srtRelay { configured, public, state }` | `src/routes/status.ts` on #629 | **removed before release**, replaced by `server-info.srt` (#629) |
 | Relay status cache (stale-while-revalidate, 30 s TTL, 5 s error TTL, 3 s timeout, 3 s first wait, warm at startup, 404 = not configured) | `src/services/srt-relay-status.ts` on #629 | **replaced** by `src/services/strom-capabilities.ts` (same timings) |
 | `StromClient.system.srtRelay()` → `GET /api/srt-relay` → `{ configured, relay, public, error }` | `src/lib/strom.ts` on #629; Strom side strom#1258 | **removed**: strom#1258 closed unmerged; Strom ships `GET /api/capabilities` instead (strom#1260/#1262), read by `StromClient.system.capabilities()` |
-| One resolver for stored SRT addresses, relay 422 when `relay.state === 'ok' && !relay.configured` | `resolveSrtAddress()` in `src/services/listener-ports.ts` on #629 | draft PR |
+| One resolver for stored SRT addresses, relay 422 when Strom definitely has no such relay (`code` `srt-relay-not-configured` / `srt-relay-unknown`, `relays`) | `resolveSrtAddress()` in `src/services/listener-ports.ts` | in #629 |
 | Error body shape for these refusals: `{ error: string, statusCode: number }` | `src/services/listener-ports.ts`, routes | merged + #629 |
 | Derived read-only `connect` on SRT outputs | `resolveSrtConnect()` `src/lib/srt-connect.ts`, `src/routes/outputs.ts:205-215` (main) | merged |
-| `connect` on SRT sources too, plus relay reasons (`srt-relay-not-configured`, `srt-relay-unreachable`, `srt-relay-public-unknown`) | `src/routes/sources.ts`, `src/lib/srt-connect.ts` on #629 | draft PR |
+| `connect` on SRT sources too, plus relay reasons (`srt-relay-not-configured`, `srt-relay-unreachable`, `srt-relay-public-unknown`) | `src/routes/sources.ts`, `src/lib/srt-connect.ts` | in #629 (plus `srt-relay-unknown`) |
 | Listener detection: hostless `srt://:PORT`, `mode` absent or `listener` | `listenerPortRequest()` `src/services/listener-ports.ts` | merged |
 | Strom capabilities endpoint | — | *(at spec time)* did not exist; now `GET /api/capabilities` (strom#1260/#1262, Strom v0.8.2) |
 
@@ -148,6 +148,13 @@ the relay, and other listening blocks (RIST, UDP/RTP, RTMP/RTSP server) will rea
 
 ### 3.2 How Open Live reads it (tolerant of either upstream choice)
 
+> **Superseded (amendment):** `GET /api/srt-relay` is gone, so there is no fallback (step 2).
+> Open Live makes one fetch, `GET /api/capabilities` (`StromClient.system.capabilities()`):
+> 200 → `normaliseCapabilities()` (`state: ok`); 404 → older Strom (`state: unsupported`, every
+> mode, no relay); any other failure → `unreachable` with the last-known values. Fail-open
+> parsing still holds: a mode is unsupported only when Strom says exactly `false`, and a
+> malformed relay entry or port span is dropped. See `src/services/strom-capabilities.ts`.
+
 The parser accepts the capabilities object from either place, so whichever option strom#1257
 picks needs only a one-line change in the client, not a spec change:
 
@@ -166,6 +173,16 @@ treated as `null`.
 ## 4. Backend design (open-live)
 
 ### 4.1 One cached poller: `services/strom-srt-status.ts`
+
+> **Superseded (amendment):** shipped as `src/services/strom-capabilities.ts`, one cache over
+> **one** fetch of `GET /api/capabilities` (no `GET /api/srt-relay`, no parallel halves, no
+> `srt-relay-status.ts`). Same timings: fresh 30 s, stale-while-revalidate, 5 s retry after a
+> failure, one in-flight refresh, warmed at startup by `warmStromCapabilities()` in
+> `src/main.ts`, first lookup waits at most 3 s then reads as `unknown`. Readers:
+> `getStromCapabilities()` and `srtCapabilitiesFor(addresses)`. One `state`
+> (`ok | unsupported | unreachable | unknown`) and the shape
+> `{ state, inboundReachable, ports: [{first, last}] | null, srt: { modes, relays }, error }`.
+> The text below is the original design.
 
 #629's `srt-relay-status.ts` is generalised (renamed, or kept as a thin re-export) into one
 module that holds **one** cached answer for everything Open Live asks Strom about SRT:
@@ -199,6 +216,10 @@ No new dependency (plain `fetch` through the existing `StromClient`).
 
 ### 4.2 Direction of a stored address
 
+> **Amended:** shipped as `srtAddressMode(address): 'listener' | 'caller' | 'rendezvous' | null`
+> in `src/lib/srt-connect.ts`, used for `connect.warning` only (no write gate). Relay addresses
+> are detected separately (`isSrtRelayAddress()`); hostless `mode=caller` is a listener.
+
 A new pure helper `srtDirection(address): 'listener' | 'caller' | 'relay' | null` in
 `src/lib/srt-connect.ts` (next to `parseSrtAuthority`), used by the write gate and `connect`:
 
@@ -214,6 +235,10 @@ Applies to sources with `streamType` `srt`/`efp` and outputs with `outputType`
 
 ### 4.3 Effective directions and "positively unsupported"
 
+*Amended:* the last column no longer applies — the API never refuses a listener; where it said
+"yes, 422" (and for `unreachable` with a last-known `false`) the write succeeds with
+`connect.warning: srt-listener-unsupported`; `unknown` and `unsupported` give no warning.
+
 | Capabilities state | `listener` (offered / in server-info) | API refuses a new listener? |
 |--------------------|---------------------------------------|-----------------------------|
 | `ok`, `srt.listener: true` | `true` | no |
@@ -222,10 +247,14 @@ Applies to sources with `streamType` `srt`/`efp` and outputs with `outputType`
 | `unreachable` (timeout, 5xx, auth) | last known value, `true` if none | no (accept, flag `connect`) |
 | `unknown` (no answer yet) | `true` | no (accept, flag `connect`) |
 
-Relay keeps #629's rule unchanged: offered when `relay.configured`; refused with 422 only when
+~~Relay keeps #629's rule unchanged: offered when `relay.configured`; refused with 422 only when
 `relay.state === 'ok' && !relay.configured`. When the capabilities object also reports
 `srt.relay`, `/api/srt-relay` stays authoritative for relay (it also carries `public`); a
-disagreement is logged at `warn` once per change.
+disagreement is logged at `warn` once per change.~~ *Superseded (amendment):* `/api/srt-relay`
+is gone; `GET /api/capabilities` is the only source, and its `srt.relays` (`[{ name, public }]`)
+carry the public address. Via relay is offered when `relays` is non-empty; a relay address is
+refused with 422 (`srt-relay-not-configured` / `srt-relay-unknown`) only when Strom definitely
+lacks it (`state` `ok` or `unsupported`).
 
 Caller is always offered and never refused.
 
@@ -280,6 +309,11 @@ the relay status and is the one resolver every SRT write goes through; it gains 
 ## 5. API contract
 
 ### 5.1 `GET /api/v1/server-info` (unauthenticated, unchanged status codes: 200, 500 on bad `STROM_URL`)
+
+> **Superseded (amendment):** shipped as `{ stromHost, srtPorts, srtPortState, srt: { state,
+> modes: { listener, caller, rendezvous }, relays: [{ name, public }], inboundReachable, ports } }`
+> (`src/routes/status.ts`); `srtRelay` was removed before release and `ports` are `{first, last}`
+> spans. The example and table below are the original design.
 
 Additive. `stromHost`, `srtPorts`, `srtPortState` (main) and `srtRelay` (#629) are kept verbatim
 for existing clients; `srt` is new.
@@ -375,7 +409,9 @@ Relay addresses keep #629's `reason` values unchanged. Listing never waits on St
 
 ## 6. Studio (open-live-studio)
 
-Reads `server-info.srt` (fetched as today, plus a refetch when a create/edit dialog opens):
+Reads `server-info.srt` (fetched as today, plus a refetch when a create/edit dialog opens).
+*Amended:* the shipped shape is `srt.modes.listener` / `srt.relays` (non-empty = Via relay),
+see §5.1:
 
 - **Direction picker** (source and output dialogs): Caller always; Listener only when
   `srt.listener`; Via relay only when `srt.relay`. If `srt` is absent (older backend), offer
@@ -384,12 +420,18 @@ Reads `server-info.srt` (fetched as today, plus a refetch when a create/edit dia
   Else if `srt.ports` is non-null, offer ports from those ranges (default: lowest port not used
   by a listed source/output) and allow free entry with an inline warning when outside them.
   Else free entry, as today.
-- **Edit dialog** for a record whose stored direction is now unsupported: show the stored
+- **Edit dialog** for a record whose stored direction is now unsupported: ~~show the stored
   direction selected and labelled "not supported by this Strom"; switching away is allowed,
-  switching back is not offered.
+  switching back is not offered.~~ *Superseded (amendment, studio decision):* a stored listener
+  record whose Strom reports `listener: false` shows the `connect.warning` line and keeps
+  Listener selectable in Edit; new records, and records in other directions, get Listener
+  disabled.
 - **List views**: show `connect.warning` as a hint next to the dial-in address.
-- **422 `srt-direction-unsupported`**: show `error` and refetch `server-info` (the cache may
-  have changed under the dialog).
+- ~~**422 `srt-direction-unsupported`**: show `error` and refetch `server-info` (the cache may
+  have changed under the dialog).~~ *Superseded (amendment):* that 422 does not exist; a
+  create/PATCH in an unsupported mode succeeds (201/200) and the dialog shows the response's
+  `connect.warning`. The only SRT 422s are the relay refusals (`srt-relay-not-configured` /
+  `srt-relay-unknown`) and the legacy "port not reserved".
 
 Builds on studio #259 (which already reads `srtRelay.configured`).
 
@@ -405,38 +447,46 @@ migration.
 
 ## 8. Service interactions
 
+> **Amended:** updated to the shipped behaviour — one fetch of `GET /api/capabilities` (no
+> `GET /api/srt-relay`), and no `422 srt-direction-unsupported` branch: an unsupported mode is
+> accepted with `connect.warning`. The only refusal shown is the relay 422.
+
 ```mermaid
 sequenceDiagram
     autonumber
     participant ST as Studio
     participant OL as open-live API
-    participant C as strom-srt-status cache
+    participant C as strom-capabilities cache
     participant S as Strom
 
-    Note over OL,S: Startup: warmStromSrtStatus()
+    Note over OL,S: Startup: warmStromCapabilities()
     OL->>C: warm()
-    par one refresh
-        C->>S: GET /api/srt-relay
-        S-->>C: 200 {configured, relay, public, error} | 404
-    and
-        C->>S: GET /api/capabilities
-        S-->>C: 200 {inbound_reachable, ports, srt} | 404 (older Strom)
-    end
+    C->>S: GET /api/capabilities
+    S-->>C: 200 {network:{inbound_reachable, ports}, protocols:{srt:{modes, relays}}} | 404 (older Strom)
     C->>C: store one entry (fresh 30 s, 5 s after a failure)
 
     ST->>OL: GET /api/v1/server-info
     OL->>C: get() (never waits when cached)
     C-->>OL: cached value (refresh in background if stale)
-    OL-->>ST: 200 {..., srtRelay, srt:{listener, caller, relay, ports, state}}
-    ST->>ST: offer Caller, Listener iff srt.listener, Via relay iff srt.relay
+    OL-->>ST: 200 {..., srt:{state, modes, relays, inboundReachable, ports}}
+    ST->>ST: offer Caller, Listener iff srt.modes.listener, Via relay iff srt.relays non-empty
 
     ST->>OL: POST /api/v1/sources {address: "srt://:47110?mode=listener"}
     OL->>C: get()
-    alt capabilities.state = ok and listener = false
-        OL-->>ST: 422 {error, statusCode, code: srt-direction-unsupported, direction: listener}
-    else ok + listener true, or unsupported / unreachable / unknown
-        OL->>OL: resolveSrtAddress() port checks, write CouchDB
-        OL-->>ST: 201 {..., connect: {uri, ..., warning?}}
+    OL->>OL: resolveSrtAddress() port checks, write CouchDB
+    alt modes.listener = false (ok, or unreachable with last-known false)
+        OL-->>ST: 201 {..., connect: {uri, ..., warning: srt-listener-unsupported}}
+    else listener port outside Strom's ports (no reservation)
+        OL-->>ST: 201 {..., connect: {uri, ..., warning: srt-port-outside-strom-ports}}
+    else otherwise (incl. unsupported / unknown)
+        OL-->>ST: 201 {..., connect: {uri, ...}}
+    end
+
+    ST->>OL: POST /api/v1/sources {address: "srt+relay://auto@<name>"}
+    alt Strom definitely has no such relay (state ok or unsupported)
+        OL-->>ST: 422 {error, statusCode, code: srt-relay-not-configured | srt-relay-unknown, relays}
+    else
+        OL-->>ST: 201 {..., connect: {uri: srt://<public>?streamid=<id>, ...}}
     end
 
     Note over OL,S: Activation of existing records: unchanged, no capability check
@@ -454,7 +504,7 @@ sequenceDiagram
 |---------|---------|--------------------------|
 | `STROM_INBOUND_REACHABLE` | `true` | `false` → `srt.modes.listener: false` → Listener not offered for new records; the API accepts it with `connect.warning: srt-listener-unsupported` (amended: originally "hidden and refused") |
 | `STROM_PORTS` | unset | reported as `srt.ports` → listener port picker |
-| `STROM_SRT_RELAY_PUBLIC`, `STROM_SRT_RELAYS` | unset | `srt.relay: true` (and `/api/srt-relay` `configured`) → Via relay offered |
+| `STROM_SRT_RELAY_PUBLIC`, `STROM_SRT_RELAYS` | unset | `srt.relays` non-empty (`[{ name, public }]`) → Via relay offered |
 
 No Strom pipeline JSON change: the flow generator is untouched.
 
@@ -470,11 +520,13 @@ No new library. Everything is own code on top of the existing `StromClient` and 
 ## 11. Open questions (each with a proposed answer)
 
 1. **Capabilities source and the shared poller.** New `GET /api/capabilities`, or extend
-   `GET /api/srt-relay`?
+   `GET /api/srt-relay`? *Superseded (amendment):* Strom shipped `GET /api/capabilities` and
+   removed `/api/srt-relay`; one cache, one fetch (§4.1).
    *Proposed:* ask strom#1257 for `GET /api/capabilities` (not SRT-relay-specific). Open Live
    parses either (§3.2), and fetches both in one refresh of one cache that generalises #629's
    `srt-relay-status.ts` (§4.1), so there is exactly one poller.
-2. **`server-info` shape.**
+2. **`server-info` shape.** *Superseded (amendment):* `srt: { state, modes, relays,
+   inboundReachable, ports }`; `srtRelay` removed before release (§5.1).
    *Proposed:* add `srt: { listener, caller, relay, ports, state }`; keep `srtPorts`,
    `srtPortState`, `srtRelay` unchanged for existing clients (§5.1).
 3. **Refusal code and body.** *Superseded (amendment):* no mode refusal; relay 422 uses its own
@@ -490,20 +542,23 @@ No new library. Everything is own code on top of the existing `StromClient` and 
    present only when `uri` is null.
    *Proposed:* a new optional `connect.warning` alongside `uri`, rather than overloading `reason`
    (§5.3).
-6. **PATCH semantics.**
+6. **PATCH semantics.** *Superseded (amendment):* no PATCH is refused for its mode; a PATCH into
+   an unsupported mode is 200 with `connect.warning`.
    *Proposed:* refuse only a PATCH that changes the direction into an unsupported one; a PATCH
    that keeps the stored direction is accepted (§4.4).
 7. **Existing records.**
    *Proposed:* still listed, still activate, no change to flow generation; `connect.warning`
    explains (§4.6).
-8. **Older Strom detection.**
+8. **Older Strom detection.** *Amended:* 404 on `/api/capabilities` → `unsupported`
+   (`/api/srt-relay` is not read); any other failure → `unreachable`.
    *Proposed:* 404 on `/api/capabilities` and no capability fields on `/api/srt-relay` →
    `state: "unsupported"`, offer everything. Any other failure is `unreachable` (§3.2, §4.3).
 9. **Listener port outside `STROM_PORTS`.** *Implemented:* `connect.warning:
    srt-port-outside-strom-ports` (§4.5).
    *Proposed:* warn, not refuse (`connect.warning`, studio inline warning), unless the legacy
    reservation is active, where today's 422 stands (§4.5).
-10. **Relay source of truth when both endpoints report it.**
+10. **Relay source of truth when both endpoints report it.** *Superseded (amendment):* moot,
+    `GET /api/capabilities` (`srt.relays` with `public`) is the only source.
     *Proposed:* `/api/srt-relay` stays authoritative (it carries `public`); log a disagreement
     (§4.3).
 11. **Sequencing with #629.**
@@ -525,7 +580,8 @@ No new library. Everything is own code on top of the existing `StromClient` and 
   test "listener refused on `STROM_INBOUND_REACHABLE=false`" needs a stubbed Strom until then.
 - **#629 not merged.** *(Resolved: implemented inside #629.)* This spec reuses its cache, resolver, `connect` on sources, and studio
   #259. If #629 changes shape, §4.1 and §4.4 follow it.
-- **Stale cache refuses a write.** A Strom that flips `STROM_INBOUND_REACHABLE` back to `true`
+- **Stale cache refuses a write.** *(Superseded: modes are never refused; a stale cache can
+  only show a stale `connect.warning` for up to 30 s.)* A Strom that flips `STROM_INBOUND_REACHABLE` back to `true`
   can be refused for up to 30 s. Acceptable: the change needs a Strom restart anyway; the studio
   refetches on 422.
 - **Fail-open parsing** means a malformed Strom answer offers Listener. Deliberate: it matches
@@ -541,10 +597,10 @@ No new library. Everything is own code on top of the existing `StromClient` and 
 
 | # | Strom | Expectation |
 |---|-------|-------------|
-| T1 | capabilities `{inbound_reachable:false, srt:{listener:false, caller:true, relay:true}}`, relay configured | `server-info.srt = {listener:false, caller:true, relay:true, state:"ok"}`; `POST /sources` with `srt://:47110?mode=listener` → 422 `srt-direction-unsupported`/`listener`; `srt+relay://auto` → 201 |
+| T1 | capabilities `{network:{inbound_reachable:false}, protocols:{srt:{modes:{listener:false, caller:true, …}, relays:[{name:"default", public:…}]}}}` | `server-info.srt = {state:"ok", modes:{listener:false, caller:true, …}, relays:[{name:"default", public:…}], inboundReachable:false, …}`; `POST /sources` with `srt://:47110?mode=listener` → **201** with `connect.warning:"srt-listener-unsupported"` (*amended:* originally 422 `srt-direction-unsupported`); `srt+relay://auto` → 201 |
 | T2 | defaults (`listener:true`) | unchanged behaviour; no `connect.warning` |
-| T3 | older Strom (404 on capabilities, 404 or relay-only body on srt-relay) | `srt.state:"unsupported"`, `listener:true`; listener create → 201 |
-| T4 | capabilities `ports:["47100-47199"]`, no reservation | `server-info.srt.ports` echoes it; listener on 48000 → 201 with `connect.warning:"srt-listener-port-outside-strom-ports"` |
-| T5 | existing listener source; Strom later reports `listener:false` | listed; `connect.warning:"srt-listener-unsupported"`; activation builds the same flow as before; PATCH rename → 200; PATCH caller→listener on another record → 422 |
-| T6 | Strom timing out | `srt.state:"unreachable"`, listener create → 201 with `connect.warning:"srt-capabilities-unknown"`; request latency unaffected after warm-up |
-| T7 | studio, T1 Strom | direction picker shows Caller and Via relay only |
+| T3 | older Strom (404 on `GET /api/capabilities`; *amended:* `/api/srt-relay` is not read) | `srt.state:"unsupported"`, every mode true, `relays:[]`; listener create → 201, no warning |
+| T4 | capabilities `ports:[{first:47100, last:47199}]`, no reservation | `server-info.srt.ports` echoes it; listener on 48000 → 201 (PATCH → 200) with `connect.warning:"srt-port-outside-strom-ports"` (*amended:* shipped name; originally `srt-listener-port-outside-strom-ports`); with an active reservation the existing 422 applies instead |
+| T5 | existing listener source; Strom later reports `listener:false` | listed; `connect.warning:"srt-listener-unsupported"`; activation builds the same flow as before; PATCH rename → 200; PATCH caller→listener on another record → **200** with `connect.warning:"srt-listener-unsupported"` (*amended:* originally 422) |
+| T6 | Strom timing out | `srt.state:"unreachable"` (last-known values), listener create → **201**; no `srt-capabilities-unknown` (*amended:* dropped); a warning only from the last-known modes/ports (e.g. `srt-listener-unsupported` if Strom last said `listener:false`); no answer yet (`unknown`) → no warning; request latency unaffected after warm-up |
+| T7 | studio, T1 Strom | direction picker for a new record shows Caller and Via relay only (a stored listener keeps Listener selectable in Edit, §6) |

@@ -39,12 +39,16 @@ This changes the cross-service contract (Strom → open-live → studio), so it 
 
 1. **Strom is the source of truth.** Open Live adds no env var for SRT reachability. It reads
    Strom's capabilities (proposed `GET /api/capabilities`; the parser also accepts the same fields
-   on `GET /api/srt-relay` if strom#1257 picks that option).
+   on `GET /api/srt-relay` if strom#1257 picks that option). *(Amended 2026-11-13: Strom shipped
+   `GET /api/capabilities` and removed `GET /api/srt-relay`, which Open Live no longer reads.)*
 2. **One cached poller.** #629's relay-status cache is generalised to fetch relay status and
    capabilities in the same refresh, with the same timings, one cache entry, and a separate state
-   for each half.
-3. **Additive `server-info.srt { listener, caller, relay, ports, state }`.** Existing fields
-   (`srtPorts`, `srtPortState`, `srtRelay`) stay.
+   for each half. *(Amended 2026-11-13: one cache, `src/services/strom-capabilities.ts`, over one
+   fetch of `GET /api/capabilities`, with one `state`; same timings.)*
+3. **Additive `server-info.srt`.** *(Amended 2026-11-13.)* Shipped as `server-info.srt { state,
+   modes: { listener, caller, rendezvous }, relays: [{ name, public }], inboundReachable, ports }`
+   (originally `{ listener, caller, relay, ports, state }`). `srtPorts` and `srtPortState` stay;
+   `srtRelay` was removed before release (it never shipped).
 4. **Modes are reported; only relays are refused, and only on a definite answer.** *(Amended
    2026-11-13.)*
    - **Modes** (listener, rendezvous): a create or PATCH to a mode Strom reports as unsupported
