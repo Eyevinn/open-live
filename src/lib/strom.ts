@@ -653,6 +653,43 @@ export interface IceServersResponse {
   ice_servers: IceServer[]
 }
 
+// --- Capabilities ---
+
+/** An inclusive run of ports (`first == last` for a single port). */
+export interface StromPortSpan {
+  first: number
+  last: number
+}
+
+/** A relay a flow can use instead of listening itself. Never the internal address. */
+export interface StromRelayEndpoint {
+  /** `default` or `[a-z0-9-]{1,32}`. */
+  name: string
+  /** The `host:port` remote parties dial. */
+  public: string
+}
+
+/**
+ * What a Strom can do on the network it runs on (GET /api/capabilities,
+ * strom `types/src/capabilities.rs`). Older Strom answers 404.
+ */
+export interface StromCapabilitiesResponse {
+  network: {
+    /** Whether a port Strom binds can be reached from outside. */
+    inbound_reachable: boolean
+    /** The ports meant for remote parties (`STROM_PORTS`), or null for any port. */
+    ports: StromPortSpan[] | null
+  }
+  protocols: {
+    srt: {
+      modes: { listener: boolean; caller: boolean; rendezvous: boolean }
+      /** Configured relays, `default` first. Empty when none is configured. */
+      relays: StromRelayEndpoint[]
+    }
+    webrtc?: { ice_servers: boolean; ice_transport_policy: string }
+  }
+}
+
 // --- Port pool ---
 
 /** Port numbers reserved for one owner on a shared Strom instance. */
@@ -916,6 +953,9 @@ export class StromClient {
     iceServers: (timeoutMs?: number) =>
       this.request<IceServersResponse>('GET', '/api/ice-servers', undefined, timeoutMs),
     networkInterfaces: () => this.get<NetworkInterfacesResponse>('/api/network/interfaces'),
+    /** What this Strom can do on its network (SRT modes, relays, ports). 404 on an older Strom. */
+    capabilities: (timeoutMs?: number) =>
+      this.request<StromCapabilitiesResponse>('GET', '/api/capabilities', undefined, timeoutMs),
   }
 
   // -------------------------------------------------------------------------

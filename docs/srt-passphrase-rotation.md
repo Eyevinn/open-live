@@ -63,7 +63,7 @@ handshake and the source will not connect.
 ### Steps
 
 1. **Pick a new passphrase** on the upstream encoder/sender. SRT requires
-   10–79 characters. Generate a strong random value, for example:
+   10–80 bytes. Generate a strong random value, for example:
 
    ```bash
    openssl rand -base64 24

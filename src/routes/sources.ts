@@ -8,9 +8,11 @@ import { graphicUrl, srtUrl } from '../lib/url-validation.js';
 import { deserializeClipReference } from '../lib/clip-reference.js';
 import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
 import { encryptHtmlAuthValue } from '../lib/html-auth-crypto.js';
-import { getPortReservation } from '../services/port-reservation.js';
-import { clashesAfterWrite, listenerPortRequest, resolveListenerAddress, usedListenerPorts } from '../services/listener-ports.js';
+import { srtWriteErrorBody, writeWithSrtAddress } from '../services/srt-address-write.js';
 import { getWhipIngestState } from '../services/whip-ingest-state.js';
+import { srtCapabilitiesFor } from '../services/strom-capabilities.js';
+import { resolveSrtConnect, type SrtStromInfo } from '../lib/srt-connect.js';
+import { config } from '../config.js';
 import { getAllClipStates } from '../services/clip-state.service.js';
 
 /**
@@ -72,7 +74,7 @@ function validateSourceAddress(
   } else if (streamType === 'srt' || streamType === 'efp') {
     // SRT/EFP sources: must be a valid srt:// URI pointing to a non-private host
     try {
-      srtUrl(address);
+      srtUrl(address, { newValue: true });
     } catch (err) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['address'], message: err instanceof Error ? err.message : 'Invalid SRT source address' });
     }
@@ -256,7 +258,7 @@ async function gatewayExists(gatewayId: string): Promise<boolean> {
   }
 }
 
-function toApi(doc: SourceDoc) {
+function toApi(doc: SourceDoc, strom?: SrtStromInfo) {
   // Strip internal-only fields: `_rev`/`type` (CouchDB bookkeeping) and
   // `authHeaderValueEnc` (the encrypted header credential — NEVER returned).
   const { _id, _rev, type, authHeaderValueEnc, auth, ...rest } = doc;
@@ -268,6 +270,18 @@ function toApi(doc: SourceDoc) {
     // plaintext passphrases pass through decryption unchanged.
     address: maskSrtPassphrase(decryptAddressPassphrase(rest.address)),
   };
+  // Read-only, derived dial-in address for SRT/EFP sources, the same shape as
+  // on SRT outputs (lib/srt-connect.ts): where the outside party sends to.
+  // For a relay address (`srt+relay://<id>[@<relay>]`) that is that relay's public
+  // address with `streamid=<id>`; never carries the passphrase.
+  if ((doc.streamType === 'srt' || doc.streamType === 'efp') && rest.address) {
+    const connect = resolveSrtConnect(decryptAddressPassphrase(rest.address), {
+      stromUrl: config.stromUrl,
+      srtPublicHost: config.srtPublicHost,
+      strom,
+    });
+    if (connect) api['connect'] = connect;
+  }
   if (auth !== undefined) {
     // Echo the masked auth: `header.valueSet` reflects whether a credential is
     // stored; the value itself is write-only and never included (issue #314).
@@ -329,7 +343,9 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       fastify.log.warn({ err }, 'GET /api/v1/sources — DB query failed');
       return reply.status(503).send({ error: 'Database unavailable' });
     }
-    return reply.send((Array.isArray(result?.docs) ? result.docs : []).map(toApi));
+    const docs = Array.isArray(result?.docs) ? result.docs : [];
+    const strom = await srtCapabilitiesFor(docs.map((d) => d.address));
+    return reply.send(docs.map((doc) => toApi(doc, strom)));
   });
 
   // Create a source
@@ -346,26 +362,12 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.status(400).send({ error: 'audioStreamIndex is only valid for srt/efp sources', statusCode: 400 });
     }
     const id = `src-${randomUUID()}`;
-    // A listener source binds a port on the shared Strom: it must lie inside this
-    // instance's lease and no other source or output may hold it. Port 0 asks
-    // for the lowest free one. Written, then checked again, because two clients
-    // registering at once can both be handed the same free port.
-    let used = isSrt ? await usedListenerPorts() : [];
-    for (let attempt = 0; ; attempt++) {
-      let address = body.address;
-      let port: number | null = null;
-      if (isSrt) {
-        const resolved = resolveListenerAddress(body.address, getPortReservation(), used);
-        if (!resolved.ok) {
-          return reply.status(resolved.statusCode).send({ error: resolved.error, statusCode: resolved.statusCode });
-        }
-        ({ address, port } = resolved);
-      }
+    const buildDoc = (address: string): SourceDoc => {
       const now = new Date().toISOString();
       // Translate any auth material into its stored form (header value encrypted
       // at rest, bound to the source id via GCM AAD; profile server-issued).
       const stored = body.auth !== undefined ? buildStoredAuth(body.auth, id, {}) : undefined;
-      const doc: SourceDoc = {
+      return {
         _id: id,
         type: 'source',
         name: body.name,
@@ -384,24 +386,35 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
         createdAt: now,
         updatedAt: now,
       };
-      const written = await getSourcesDb().insert(doc);
-      if (port === null) return reply.status(201).send(toApi(doc));
-      used = await usedListenerPorts();
-      const clash = clashesAfterWrite(used, { kind: 'source', id }, port);
-      if (!clash) return reply.status(201).send(toApi(doc));
-      await getSourcesDb().destroy(id, written.rev);
-      if (listenerPortRequest(body.address) !== 0 || attempt >= 3) {
-        return reply.status(409).send({ error: `SRT listener port ${port} is already used by ${clash.kind} "${clash.name}"`, statusCode: 409 });
-      }
-      fastify.log.warn({ port, clash }, 'listener port was taken while assigning it, choosing another');
+    };
+    if (!isSrt) {
+      const doc = buildDoc(body.address);
+      await getSourcesDb().insert(doc);
+      return reply.status(201).send(toApi(doc));
     }
+    // An SRT source may hold something on the shared Strom: a listener port
+    // (inside this instance's lease, `srt://:0` assigns the lowest free one) or
+    // a relay id (`srt+relay://auto` generates one, stored once and kept from
+    // then on). Neither may be held by another source or output.
+    const result = await writeWithSrtAddress({
+      address: body.address,
+      self: { kind: 'source', id },
+      log: fastify.log,
+      write: async (address) => {
+        const doc = buildDoc(address);
+        const written = await getSourcesDb().insert(doc);
+        return { value: doc, undo: async () => { await getSourcesDb().destroy(id, written.rev); } };
+      },
+    });
+    if (!result.ok) return reply.status(result.statusCode).send(srtWriteErrorBody(result));
+    return reply.status(201).send(toApi(result.value, await srtCapabilitiesFor([result.value.address])));
   });
 
   // Get a source
   fastify.get<{ Params: { id: string } }>('/api/v1/sources/:id', async (req, reply) => {
     try {
       const doc = await getSourcesDb().get(req.params.id);
-      return reply.send(toApi(doc));
+      return reply.send(toApi(doc, await srtCapabilitiesFor([doc.address])));
     } catch {
       return reply.status(404).send({ error: 'Source not found', statusCode: 404 });
     }
@@ -430,7 +443,9 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
           if (effectiveStreamType === 'html') {
             graphicUrl(effectiveAddress);
           } else if (effectiveStreamType === 'srt' || effectiveStreamType === 'efp') {
-            srtUrl(effectiveAddress);
+            // A sent address is checked as GStreamer reads it; the stored one
+            // (a patch without an address) only by the older, lenient rules.
+            srtUrl(effectiveAddress, { newValue: body.address !== undefined });
           } else if (effectiveStreamType === 'clip') {
             // clip sources carry a serialized typed ClipReference (JSON) in address.
             deserializeClipReference(effectiveAddress);
@@ -438,24 +453,19 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
         } catch (err) {
           return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid source address' });
         }
-        // Re-check the port only when the address or stream type changes — a
-        // rename must not fail because an older source predates the lease. Port 0
-        // keeps the port the source already has when that is still valid.
-        if (
-          (body.address !== undefined || body.streamType !== undefined) &&
-          (effectiveStreamType === 'srt' || effectiveStreamType === 'efp')
-        ) {
-          const stored = doc.streamType === 'srt' || doc.streamType === 'efp' ? listenerPortRequest(doc.address) : null;
-          const resolved = resolveListenerAddress(effectiveAddress, getPortReservation(), await usedListenerPorts(), {
-            exclude: { kind: 'source', id: doc._id },
-            keep: stored,
-          });
-          if (!resolved.ok) {
-            return reply.status(resolved.statusCode).send({ error: resolved.error, statusCode: resolved.statusCode });
-          }
-          if (body.address !== undefined) body.address = resolved.address;
-        }
       }
+      // An SRT address that holds something on the shared Strom (listener port,
+      // relay id) is resolved and checked whenever the address or the stream
+      // type changes, against the EFFECTIVE address: a patch that only turns a
+      // whip source into srt must not store `srt+relay://auto` literally or an id
+      // another document holds. A rename is not checked, so it never fails
+      // because an older source predates the lease. `:0` / `auto` keep what the
+      // source already holds.
+      const storedSrt = doc.streamType === 'srt' || doc.streamType === 'efp';
+      const resolveSrt =
+        !!effectiveAddress &&
+        (body.address !== undefined || body.streamType !== undefined) &&
+        (effectiveStreamType === 'srt' || effectiveStreamType === 'efp');
       // Auth material (issue #314): validated procedurally here because the
       // schema-level cross-check only fires when both address+streamType are in
       // the body. `auth` is only valid on an html source, and mode/shape must be
@@ -523,8 +533,31 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
           delete updated.authHeaderValueEnc;
         }
       }
+      if (resolveSrt) {
+        let rev = doc._rev;
+        const result = await writeWithSrtAddress({
+          address: effectiveAddress,
+          self: { kind: 'source', id: doc._id },
+          keepFrom: storedSrt ? doc.address : null,
+          log: fastify.log,
+          write: async (address) => {
+            // Unchanged and not re-submitted: keep the stored ciphertext as-is.
+            const keepStored = body.address === undefined && address === effectiveAddress;
+            const next: SourceDoc = { ...updated, _rev: rev, address: keepStored ? doc.address : encryptAddressPassphrase(address) };
+            rev = (await getSourcesDb().insert(next))?.rev ?? rev;
+            return {
+              value: next,
+              undo: async () => {
+                rev = (await getSourcesDb().insert({ ...doc, _rev: rev }))?.rev ?? rev;
+              },
+            };
+          },
+        });
+        if (!result.ok) return reply.status(result.statusCode).send(srtWriteErrorBody(result));
+        return reply.send(toApi(result.value, await srtCapabilitiesFor([result.value.address])));
+      }
       await getSourcesDb().insert(updated);
-      return reply.send(toApi(updated));
+      return reply.send(toApi(updated, await srtCapabilitiesFor([updated.address])));
     } catch (err: unknown) {
       if (err && typeof err === 'object' && 'statusCode' in err && (err as { statusCode: number }).statusCode === 404) {
         return reply.status(404).send({ error: 'Source not found', statusCode: 404 });

@@ -9,12 +9,12 @@ import { srtUrl } from '../lib/url-validation.js';
 import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
 import { encryptStreamKey } from '../lib/rtmp-credentials-crypto.js';
 import { resolveIngestUrl, validateStreamKey } from '../lib/rtmp.js';
-import { resolveSrtConnect } from '../lib/srt-connect.js';
+import { resolveSrtConnect, type SrtStromInfo } from '../lib/srt-connect.js';
+import { srtCapabilitiesFor } from '../services/strom-capabilities.js';
 import { config, isObjectStorageConfigured } from '../config.js';
 import { DEFAULT_CONNECTION_ID } from '../lib/storage-connection.js';
 import { isDocNotFoundError } from '../lib/db-errors.js';
-import { getPortReservation } from '../services/port-reservation.js';
-import { clashesAfterWrite, listenerPortRequest, resolveListenerAddress, usedListenerPorts } from '../services/listener-ports.js';
+import { srtWriteErrorBody, writeWithSrtAddress } from '../services/srt-address-write.js';
 
 const SRT_OUTPUT_TYPES = new Set(['mpegtssrt', 'efpsrt']);
 
@@ -140,7 +140,7 @@ const OutputInput = z.object({
   }
   if (SRT_OUTPUT_TYPES.has(data.outputType) && data.url) {
     try {
-      srtUrl(data.url);
+      srtUrl(data.url, { newValue: true });
     } catch (err) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['url'], message: err instanceof Error ? err.message : 'Invalid SRT URL' });
     }
@@ -179,7 +179,7 @@ function maskSrtPassphrase(url: string): string {
   return url.replace(/([?&]passphrase=)[^&]*/gi, '$1***');
 }
 
-function toApi(doc: OutputDoc, status?: OutputStatus) {
+function toApi(doc: OutputDoc, status?: OutputStatus, strom?: SrtStromInfo) {
   // Destructure `rtmp` out of the spread so the stored object (which holds
   // `streamKeyEnc`) is NEVER echoed. We re-add an explicit, key-free projection
   // below — the API only ever exposes platform, ingestUrl, and a streamKeySet
@@ -205,9 +205,12 @@ function toApi(doc: OutputDoc, status?: OutputStatus) {
   // Derive from the decrypted URL — resolveSrtConnect only reads host/port/mode,
   // which are cleartext, and its output never carries the passphrase param.
   if (SRT_OUTPUT_TYPES.has(doc.outputType) && doc.url) {
+    // A relay address (`srt+relay://<id>[@<relay>]`) resolves to that relay's public
+    // address plus `streamid=<id>`; a mode Strom reports as unsupported adds `warning`.
     const connect = resolveSrtConnect(decryptAddressPassphrase(doc.url), {
       stromUrl: config.stromUrl,
       srtPublicHost: config.srtPublicHost,
+      strom,
     });
     if (connect) api['connect'] = connect;
   }
@@ -227,12 +230,9 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       fastify.log.warn({ err }, 'GET /api/v1/outputs — DB query failed');
       return reply.status(503).send({ error: 'Database unavailable' });
     }
-    const live = await liveOutputIds(fastify.log);
-    return reply.send(
-      (Array.isArray(result?.docs) ? result.docs : []).map((doc) =>
-        toApi(doc, outputStatusFor(doc._id, live)),
-      ),
-    );
+    const docs = Array.isArray(result?.docs) ? result.docs : [];
+    const [live, strom] = await Promise.all([liveOutputIds(fastify.log), srtCapabilitiesFor(docs.map((d) => d.url))]);
+    return reply.send(docs.map((doc) => toApi(doc, outputStatusFor(doc._id, live), strom)));
   });
 
   fastify.post('/api/v1/outputs', async (req, reply) => {
@@ -275,22 +275,9 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       await getOutputsDb().insert(doc);
       return reply.status(201).send(toApi(doc));
     }
-    const isSrt = SRT_OUTPUT_TYPES.has(body.outputType) && !!body.url;
-    // A listener output binds a port on the shared Strom, like a listener source
-    // does: same range, same uniqueness, same port-0 assignment, same re-check.
-    let used = isSrt ? await usedListenerPorts() : [];
-    for (let attempt = 0; ; attempt++) {
-      let url = body.url;
-      let port: number | null = null;
-      if (isSrt && url) {
-        const resolved = resolveListenerAddress(url, getPortReservation(), used);
-        if (!resolved.ok) {
-          return reply.status(resolved.statusCode).send({ error: resolved.error, statusCode: resolved.statusCode });
-        }
-        ({ address: url, port } = resolved);
-      }
+    const buildDoc = (url: string | undefined): OutputDoc => {
       const now = new Date().toISOString();
-      const doc: OutputDoc = {
+      return {
         _id: id,
         type: 'output',
         name: body.name,
@@ -302,24 +289,35 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
         createdAt: now,
         updatedAt: now,
       };
-      const written = await getOutputsDb().insert(doc);
-      if (port === null) return reply.status(201).send(toApi(doc));
-      used = await usedListenerPorts();
-      const clash = clashesAfterWrite(used, { kind: 'output', id }, port);
-      if (!clash) return reply.status(201).send(toApi(doc));
-      await getOutputsDb().destroy(id, written.rev);
-      if (listenerPortRequest(body.url ?? '') !== 0 || attempt >= 3) {
-        return reply.status(409).send({ error: `SRT listener port ${port} is already used by ${clash.kind} "${clash.name}"`, statusCode: 409 });
-      }
-      fastify.log.warn({ port, clash }, 'listener port was taken while assigning it, choosing another');
+    };
+    if (!SRT_OUTPUT_TYPES.has(body.outputType) || !body.url) {
+      const doc = buildDoc(body.url);
+      await getOutputsDb().insert(doc);
+      return reply.status(201).send(toApi(doc));
     }
+    // An SRT output may hold something on the shared Strom, like an SRT source:
+    // a listener port (same lease, same `srt://:0` assignment) or a relay id
+    // (`srt+relay://auto` generates one, stored once and kept from then on).
+    // Neither may be held by another source or output.
+    const result = await writeWithSrtAddress({
+      address: body.url,
+      self: { kind: 'output', id },
+      log: fastify.log,
+      write: async (url) => {
+        const doc = buildDoc(url);
+        const written = await getOutputsDb().insert(doc);
+        return { value: doc, undo: async () => { await getOutputsDb().destroy(id, written.rev); } };
+      },
+    });
+    if (!result.ok) return reply.status(result.statusCode).send(srtWriteErrorBody(result));
+    return reply.status(201).send(toApi(result.value, undefined, await srtCapabilitiesFor([result.value.url])));
   });
 
   fastify.get<{ Params: { id: string } }>('/api/v1/outputs/:id', async (req, reply) => {
     try {
       const doc = await getOutputsDb().get(req.params.id);
-      const live = await liveOutputIds(fastify.log);
-      return reply.send(toApi(doc, outputStatusFor(doc._id, live)));
+      const [live, strom] = await Promise.all([liveOutputIds(fastify.log), srtCapabilitiesFor([doc.url])]);
+      return reply.send(toApi(doc, outputStatusFor(doc._id, live), strom));
     } catch {
       return reply.status(404).send({ error: 'Output not found', statusCode: 404 });
     }
@@ -395,23 +393,18 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       const effectiveUrl = body.url ?? (doc.url ? decryptAddressPassphrase(doc.url) : doc.url);
       if (SRT_OUTPUT_TYPES.has(doc.outputType) && effectiveUrl) {
         try {
-          srtUrl(effectiveUrl);
+          // A sent URL is checked as GStreamer reads it; the stored one (a
+          // patch without a url) only by the older, lenient rules.
+          srtUrl(effectiveUrl, { newValue: body.url !== undefined });
         } catch (err) {
           return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid SRT URL' });
         }
-        // Re-check the port only when the URL changes — a rename must not fail
-        // because an older output predates the lease. Port 0 keeps the current one.
-        if (body.url !== undefined) {
-          const resolved = resolveListenerAddress(effectiveUrl, getPortReservation(), await usedListenerPorts(), {
-            exclude: { kind: 'output', id: doc._id },
-            keep: doc.url ? listenerPortRequest(doc.url) : null,
-          });
-          if (!resolved.ok) {
-            return reply.status(resolved.statusCode).send({ error: resolved.error, statusCode: resolved.statusCode });
-          }
-          body.url = resolved.address;
-        }
       }
+      // A new SRT URL that holds something on the shared Strom (listener port,
+      // relay id) is resolved and checked like on create. A rename is not, so it
+      // never fails because an older output predates the lease. `:0` / `auto`
+      // keep what the output already holds, so the dial-in address never changes.
+      const resolveSrt = SRT_OUTPUT_TYPES.has(doc.outputType) && body.url !== undefined && !!effectiveUrl;
       // Encrypt the passphrase in an updated URL before persisting. When the
       // patch leaves the URL untouched, keep the already-stored value as-is.
       const urlPatch = body.url !== undefined
@@ -423,8 +416,29 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       // a cleared key does not linger.
       const rtmpUpdate = doc.outputType === 'rtmp' ? { rtmp: rtmpDoc } : {};
       const updated: OutputDoc = { ...doc, ...scalarPatch, ...urlPatch, ...rtmpUpdate, updatedAt: new Date().toISOString() };
+      if (resolveSrt) {
+        let rev = doc._rev;
+        const result = await writeWithSrtAddress({
+          address: effectiveUrl!,
+          self: { kind: 'output', id: doc._id },
+          keepFrom: doc.url ?? null,
+          log: fastify.log,
+          write: async (url) => {
+            const next: OutputDoc = { ...updated, _rev: rev, url: encryptAddressPassphrase(url) };
+            rev = (await getOutputsDb().insert(next))?.rev ?? rev;
+            return {
+              value: next,
+              undo: async () => {
+                rev = (await getOutputsDb().insert({ ...doc, _rev: rev }))?.rev ?? rev;
+              },
+            };
+          },
+        });
+        if (!result.ok) return reply.status(result.statusCode).send(srtWriteErrorBody(result));
+        return reply.send(toApi(result.value, undefined, await srtCapabilitiesFor([result.value.url])));
+      }
       await getOutputsDb().insert(updated);
-      return reply.send(toApi(updated));
+      return reply.send(toApi(updated, undefined, await srtCapabilitiesFor([updated.url])));
     } catch (err: unknown) {
       if (err && typeof err === 'object' && 'statusCode' in err && (err as { statusCode: number }).statusCode === 404) {
         return reply.status(404).send({ error: 'Output not found', statusCode: 404 });

@@ -1216,7 +1216,13 @@ export async function activateStromFlow(
   let recorderOutputDir: string | undefined;
   let outputBlockIndex = 0;
   if (outputDocs && outputDocs.length > 0) {
-    for (const outputDoc of outputDocs) {
+    for (const storedOutputDoc of outputDocs) {
+      // SRT output URLs are stored with the passphrase encrypted (encv1:…, issue
+      // #260), exactly like source addresses. Decrypt a copy so Strom receives a
+      // usable srt_uri and the caller's doc is left as stored.
+      const outputDoc: OutputDoc = storedOutputDoc.url && (storedOutputDoc.outputType === 'mpegtssrt' || storedOutputDoc.outputType === 'efpsrt')
+        ? { ...storedOutputDoc, url: decryptAddressPassphrase(storedOutputDoc.url) }
+        : storedOutputDoc;
       // Sanitize the output doc ID for use in block/endpoint IDs: strip non-alphanumeric chars,
       // take the last 8 chars. This matters for '__whep__' (virtual) which contains underscores
       // that Strom may reject in endpoint_id.
