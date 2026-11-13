@@ -1,5 +1,5 @@
 /**
- * SRT relay addresses (`srt+relay://<id>[?<query>]`).
+ * SRT relay addresses (`srt+relay://<id>[@<relay>][?<query>]`).
  *
  * A relay address names a session on the SRT relay (srt-splice) that Strom
  * knows about: one public UDP port where two SRT callers using the same
@@ -12,9 +12,17 @@
  * never regenerated on activation, restart, flow regeneration or Strom
  * redeploy) and the passphrase (encrypted at rest like any SRT passphrase).
  *
- * `srt+relay://auto[?query]` on create/patch asks the server to generate the
- * id, the same way `srt://:0` asks for a listener port; on a patch of a doc
- * that already has a relay id, `auto` keeps that id.
+ * `@<relay>` names one of the relays Strom reports (`GET /api/capabilities`,
+ * `protocols.srt.relays`); without it the address uses the relay called
+ * `default`, as in Strom. Open Live writes the default relay without `@`.
+ *
+ * `srt+relay://auto[@<relay>][?query]` on create/patch asks the server to
+ * generate the id, the same way `srt://:0` asks for a listener port. On a
+ * patch of a doc that already has a relay id, `auto` keeps that id, and
+ * `auto` without `@` also keeps the stored relay (so renewing the passphrase
+ * with `srt+relay://auto?passphrase=…` never moves the stream to another
+ * relay). `auto@<relay>` moves it to that relay, `auto@default` back to the
+ * default one, keeping the id either way.
  */
 
 import { randomBytes } from 'crypto';
@@ -23,6 +31,17 @@ export const SRT_RELAY_SCHEME = 'srt+relay://';
 
 /** The id placeholder that asks the server to generate one. */
 export const SRT_RELAY_AUTO_ID = 'auto';
+
+/** The relay an address without `@<relay>` uses. */
+export const DEFAULT_SRT_RELAY = 'default';
+
+/** A relay name, as Strom accepts it: 1–32 characters from `a-z 0-9 -`. */
+export const SRT_RELAY_NAME_RE = /^[a-z0-9-]{1,32}$/;
+
+/** Whether `name` is a valid relay name. */
+export function isValidSrtRelayName(name: string): boolean {
+  return SRT_RELAY_NAME_RE.test(name);
+}
 
 /** A relay id as stored: URL-safe and short enough for an SRT streamid. */
 export const SRT_RELAY_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -46,19 +65,37 @@ export function isSrtRelayAddress(address: string | undefined | null): boolean {
   return typeof address === 'string' && address.trim().toLowerCase().startsWith(SRT_RELAY_SCHEME);
 }
 
+/** A parsed relay address. */
+export interface SrtRelayAddress {
+  id: string;
+  /** The relay named after `@`, or null for the default relay. */
+  relay: string | null;
+  /** The raw query without `?`, or ''. */
+  query: string;
+}
+
+/** The relay an address uses: its `@<relay>`, or `default`. */
+export function srtRelayName(parsed: Pick<SrtRelayAddress, 'relay'>): string {
+  return parsed.relay ?? DEFAULT_SRT_RELAY;
+}
+
 /**
- * The id and raw query of a relay address, or null when it is not one or the
- * id is malformed. The query is not validated here (a stored query holds an
- * `encv1:` passphrase), only split off.
+ * The id, relay name and raw query of a relay address, or null when it is
+ * not one, or the id or relay name is malformed. The query is not validated
+ * here (a stored query holds an `encv1:` passphrase), only split off.
  */
-export function parseSrtRelayAddress(address: string): { id: string; query: string } | null {
+export function parseSrtRelayAddress(address: string): SrtRelayAddress | null {
   if (!isSrtRelayAddress(address)) return null;
   const rest = address.trim().slice(SRT_RELAY_SCHEME.length);
   const q = rest.indexOf('?');
-  const id = q === -1 ? rest : rest.slice(0, q);
+  const authority = q === -1 ? rest : rest.slice(0, q);
   const query = q === -1 ? '' : rest.slice(q + 1);
+  const at = authority.indexOf('@');
+  const id = at === -1 ? authority : authority.slice(0, at);
+  const relay = at === -1 ? null : authority.slice(at + 1);
   if (!SRT_RELAY_ID_RE.test(id)) return null;
-  return { id, query };
+  if (relay !== null && !isValidSrtRelayName(relay)) return null;
+  return { id, relay, query };
 }
 
 /** A fresh random relay id: 128 bits, base64url (22 chars, `[A-Za-z0-9_-]`). */
@@ -66,8 +103,13 @@ export function generateSrtRelayId(): string {
   return randomBytes(16).toString('base64url');
 }
 
-function buildAddress(id: string, query: string): string {
-  return `${SRT_RELAY_SCHEME}${id}${query ? `?${query}` : ''}`;
+/**
+ * Write a relay address. The default relay is written without `@`, as Strom
+ * writes it.
+ */
+export function buildSrtRelayAddress(id: string, relay: string | null, query: string): string {
+  const at = relay && relay !== DEFAULT_SRT_RELAY ? `@${relay}` : '';
+  return `${SRT_RELAY_SCHEME}${id}${at}${query ? `?${query}` : ''}`;
 }
 
 /**
@@ -77,12 +119,15 @@ function buildAddress(id: string, query: string): string {
  * `keepFrom` is the address the document holds today (stored form, possibly
  * with an encrypted passphrase). When it is a relay address with a real id,
  * that id is kept so a re-submitted `auto` never changes the session the
- * outside party dials. Otherwise a new id is generated.
+ * outside party dials, and so is its relay unless the new address names one.
+ * Otherwise a new id is generated and the address's own relay is used.
  */
 export function resolveSrtRelayAddress(address: string, keepFrom?: string | null): string {
   const parsed = parseSrtRelayAddress(address);
   if (!parsed || parsed.id !== SRT_RELAY_AUTO_ID) return address;
   const kept = keepFrom ? parseSrtRelayAddress(keepFrom) : null;
-  const id = kept && kept.id !== SRT_RELAY_AUTO_ID ? kept.id : generateSrtRelayId();
-  return buildAddress(id, parsed.query);
+  const keep = kept && kept.id !== SRT_RELAY_AUTO_ID ? kept : null;
+  const id = keep ? keep.id : generateSrtRelayId();
+  const relay = parsed.relay ?? keep?.relay ?? null;
+  return buildSrtRelayAddress(id, relay, parsed.query);
 }

@@ -8,10 +8,10 @@ import { graphicUrl, srtUrl } from '../lib/url-validation.js';
 import { deserializeClipReference } from '../lib/clip-reference.js';
 import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
 import { encryptHtmlAuthValue } from '../lib/html-auth-crypto.js';
-import { writeWithSrtAddress } from '../services/srt-address-write.js';
+import { srtWriteErrorBody, writeWithSrtAddress } from '../services/srt-address-write.js';
 import { getWhipIngestState } from '../services/whip-ingest-state.js';
-import { srtRelayInfoFor } from '../services/srt-relay-status.js';
-import { resolveSrtConnect, type SrtRelayInfo } from '../lib/srt-connect.js';
+import { srtCapabilitiesFor } from '../services/strom-capabilities.js';
+import { resolveSrtConnect, type SrtStromInfo } from '../lib/srt-connect.js';
 import { config } from '../config.js';
 import { getAllClipStates } from '../services/clip-state.service.js';
 
@@ -258,7 +258,7 @@ async function gatewayExists(gatewayId: string): Promise<boolean> {
   }
 }
 
-function toApi(doc: SourceDoc, srtRelay?: SrtRelayInfo) {
+function toApi(doc: SourceDoc, strom?: SrtStromInfo) {
   // Strip internal-only fields: `_rev`/`type` (CouchDB bookkeeping) and
   // `authHeaderValueEnc` (the encrypted header credential — NEVER returned).
   const { _id, _rev, type, authHeaderValueEnc, auth, ...rest } = doc;
@@ -272,13 +272,13 @@ function toApi(doc: SourceDoc, srtRelay?: SrtRelayInfo) {
   };
   // Read-only, derived dial-in address for SRT/EFP sources, the same shape as
   // on SRT outputs (lib/srt-connect.ts): where the outside party sends to.
-  // For a relay address (`srt+relay://<id>`) that is the relay's public
+  // For a relay address (`srt+relay://<id>[@<relay>]`) that is that relay's public
   // address with `streamid=<id>`; never carries the passphrase.
   if ((doc.streamType === 'srt' || doc.streamType === 'efp') && rest.address) {
     const connect = resolveSrtConnect(decryptAddressPassphrase(rest.address), {
       stromUrl: config.stromUrl,
       srtPublicHost: config.srtPublicHost,
-      srtRelay,
+      strom,
     });
     if (connect) api['connect'] = connect;
   }
@@ -344,8 +344,8 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.status(503).send({ error: 'Database unavailable' });
     }
     const docs = Array.isArray(result?.docs) ? result.docs : [];
-    const srtRelay = await srtRelayInfoFor(docs.map((d) => d.address));
-    return reply.send(docs.map((doc) => toApi(doc, srtRelay)));
+    const strom = await srtCapabilitiesFor(docs.map((d) => d.address));
+    return reply.send(docs.map((doc) => toApi(doc, strom)));
   });
 
   // Create a source
@@ -406,15 +406,15 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
         return { value: doc, undo: async () => { await getSourcesDb().destroy(id, written.rev); } };
       },
     });
-    if (!result.ok) return reply.status(result.statusCode).send({ error: result.error, statusCode: result.statusCode });
-    return reply.status(201).send(toApi(result.value, await srtRelayInfoFor([result.value.address])));
+    if (!result.ok) return reply.status(result.statusCode).send(srtWriteErrorBody(result));
+    return reply.status(201).send(toApi(result.value, await srtCapabilitiesFor([result.value.address])));
   });
 
   // Get a source
   fastify.get<{ Params: { id: string } }>('/api/v1/sources/:id', async (req, reply) => {
     try {
       const doc = await getSourcesDb().get(req.params.id);
-      return reply.send(toApi(doc, await srtRelayInfoFor([doc.address])));
+      return reply.send(toApi(doc, await srtCapabilitiesFor([doc.address])));
     } catch {
       return reply.status(404).send({ error: 'Source not found', statusCode: 404 });
     }
@@ -553,11 +553,11 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
             };
           },
         });
-        if (!result.ok) return reply.status(result.statusCode).send({ error: result.error, statusCode: result.statusCode });
-        return reply.send(toApi(result.value, await srtRelayInfoFor([result.value.address])));
+        if (!result.ok) return reply.status(result.statusCode).send(srtWriteErrorBody(result));
+        return reply.send(toApi(result.value, await srtCapabilitiesFor([result.value.address])));
       }
       await getSourcesDb().insert(updated);
-      return reply.send(toApi(updated, await srtRelayInfoFor([updated.address])));
+      return reply.send(toApi(updated, await srtCapabilitiesFor([updated.address])));
     } catch (err: unknown) {
       if (err && typeof err === 'object' && 'statusCode' in err && (err as { statusCode: number }).statusCode === 404) {
         return reply.status(404).send({ error: 'Source not found', statusCode: 404 });

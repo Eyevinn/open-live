@@ -1,11 +1,12 @@
 /**
- * Route tests for SRT relay addresses (`srt+relay://<id>`) on sources and
- * outputs, and `srtRelay` on /api/v1/server-info.
+ * Route tests for SRT relay addresses (`srt+relay://<id>[@<relay>]`) on
+ * sources and outputs, and `srt` (Strom's capabilities) on /api/v1/server-info.
  *
- * - `srt+relay://auto` gets a generated id once; a later `auto` patch keeps it.
+ * - `srt+relay://auto` gets a generated id once; a later `auto` patch keeps it,
+ *   and keeps the stored relay unless the patch names one.
  * - Relay addresses take no part in listener-port reservation.
- * - The API carries a `connect` dial-in address built from Strom's relay
- *   public address, never the passphrase.
+ * - The API carries a `connect` dial-in address built from the named relay's
+ *   public address (from Strom's GET /api/capabilities), never the passphrase.
  *
  * CouchDB, Strom client and the WS controller are mocked.
  */
@@ -22,7 +23,7 @@ const mockOutputsInsert = vi.fn();
 const mockOutputsFind = vi.fn();
 const mockSourcesDestroy = vi.fn();
 const mockOutputsDestroy = vi.fn();
-const mockSrtRelay = vi.fn();
+const mockCapabilities = vi.fn();
 
 vi.mock('../db/index.js', () => ({
   getDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn().mockResolvedValue({ docs: [] }), findTrusted: vi.fn().mockResolvedValue({ docs: [] }) }),
@@ -48,7 +49,7 @@ vi.mock('../lib/flow-generator.js', () => ({
 vi.mock('../lib/strom.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/strom.js')>();
   class MockStromClient {
-    system = { version: vi.fn(), iceServers: vi.fn(), srtRelay: mockSrtRelay };
+    system = { version: vi.fn(), iceServers: vi.fn(), capabilities: mockCapabilities };
     flows = { get: vi.fn(), start: vi.fn(), stop: vi.fn(), delete: vi.fn() };
     mixer = { multiviewEndpoint: vi.fn() };
     ports = { pool: vi.fn(), reservations: { create: vi.fn(), renew: vi.fn(), release: vi.fn(), list: vi.fn(), get: vi.fn(), assign: vi.fn(), unassign: vi.fn() } };
@@ -62,12 +63,19 @@ vi.mock('../lib/strom-token.js', () => ({
 
 const KEY_B64 = Buffer.from(Array.from({ length: 32 }, (_, i) => i + 1)).toString('base64');
 const SECRET = 'supersecretpass';
-const RELAY = { configured: true, relay: 'srt-splice:9000', public: 'relay.example.com:9000', error: null };
+const caps = (relays: Array<{ name: string; public: string }>, modes = { listener: true, caller: true, rendezvous: true }) => ({
+  network: { inbound_reachable: modes.listener, ports: null },
+  protocols: { srt: { modes, relays }, webrtc: { ice_servers: false, ice_transport_policy: 'all' } },
+});
+const RELAY = caps([
+  { name: 'default', public: 'relay.example.com:9000' },
+  { name: 'eu-north', public: 'srt-eu.example.com:9100' },
+]);
 const ID_RE = /^srt\+relay:\/\/([A-Za-z0-9_-]{22})(\?|$)/;
 const originalEnv = { ...process.env };
 
 let app: FastifyInstance;
-let resetSrtRelayStatusCache: () => void;
+let resetStromCapabilitiesCache: () => void;
 let resetKeyCache: () => void;
 let _resetPortReservationState: typeof import('../services/port-reservation.js')._resetPortReservationState;
 
@@ -76,7 +84,7 @@ beforeAll(async () => {
   delete process.env['NODE_ENV'];
   ({ resetKeyCache } = await import('../lib/srt-passphrase-crypto.js'));
   resetKeyCache();
-  ({ resetSrtRelayStatusCache } = await import('../services/srt-relay-status.js'));
+  ({ resetStromCapabilitiesCache } = await import('../services/strom-capabilities.js'));
   ({ _resetPortReservationState } = await import('../services/port-reservation.js'));
   const { buildServer } = await import('../server.js');
   app = await buildServer();
@@ -89,12 +97,12 @@ afterAll(async () => {
 });
 
 beforeEach(() => {
-  resetSrtRelayStatusCache();
+  resetStromCapabilitiesCache();
   // Pending reservation: any listener-port address would be refused with 503,
   // so a 201 for a relay address proves it skipped the port logic entirely.
   _resetPortReservationState({ status: 'pending' });
-  mockSrtRelay.mockReset();
-  mockSrtRelay.mockResolvedValue(RELAY);
+  mockCapabilities.mockReset();
+  mockCapabilities.mockResolvedValue(RELAY);
   for (const m of [mockSourcesGet, mockSourcesInsert, mockSourcesFind, mockSourcesDestroy, mockOutputsGet, mockOutputsInsert, mockOutputsFind, mockOutputsDestroy]) m.mockReset();
   mockSourcesInsert.mockResolvedValue({ ok: true, rev: '1-new' });
   mockOutputsInsert.mockResolvedValue({ ok: true, rev: '1-new' });
@@ -116,35 +124,57 @@ function output(url: string): OutputDoc {
   };
 }
 
-describe('GET /api/v1/server-info — srtRelay', () => {
-  it('reports a configured relay and its public address', async () => {
+describe('GET /api/v1/server-info — srt (Strom capabilities)', () => {
+  it('reports the SRT modes, relays (name + public), inbound reachability and ports', async () => {
+    mockCapabilities.mockResolvedValue({
+      ...RELAY,
+      network: { inbound_reachable: false, ports: [{ first: 47100, last: 47199 }] },
+      protocols: { ...RELAY.protocols, srt: { ...RELAY.protocols.srt, modes: { listener: false, caller: true, rendezvous: false } } },
+    });
     const res = await app.inject({ method: 'GET', url: '/api/v1/server-info' });
     expect(res.statusCode).toBe(200);
-    expect(res.json().srtRelay).toEqual({ configured: true, public: 'relay.example.com:9000', state: 'ok' });
+    expect(res.json().srt).toEqual({
+      state: 'ok',
+      modes: { listener: false, caller: true, rendezvous: false },
+      relays: [
+        { name: 'default', public: 'relay.example.com:9000' },
+        { name: 'eu-north', public: 'srt-eu.example.com:9100' },
+      ],
+      inboundReachable: false,
+      ports: [{ first: 47100, last: 47199 }],
+    });
+    expect(res.json()).not.toHaveProperty('srtRelay');
   });
 
-  it('reports not configured on a Strom without relay support (404)', async () => {
+  it('an older Strom without capabilities (404): unsupported, every mode, no relay', async () => {
     const { StromClientError } = await import('../lib/strom.js');
-    mockSrtRelay.mockRejectedValue(new StromClientError(404, 'Not Found'));
+    mockCapabilities.mockRejectedValue(new StromClientError(404, 'Not Found'));
     const res = await app.inject({ method: 'GET', url: '/api/v1/server-info' });
-    expect(res.json().srtRelay).toEqual({ configured: false, public: null, state: 'ok' });
+    expect(res.json().srt).toEqual({
+      state: 'unsupported',
+      modes: { listener: true, caller: true, rendezvous: true },
+      relays: [],
+      inboundReachable: null,
+      ports: null,
+    });
   });
 
-  it('reports Strom unreachable as such, not as "not configured"', async () => {
+  it('reports Strom unreachable as such, offering every mode, not as "no relay"', async () => {
     const { StromClientError } = await import('../lib/strom.js');
-    mockSrtRelay.mockRejectedValue(new StromClientError(0, 'Strom unreachable'));
+    mockCapabilities.mockRejectedValue(new StromClientError(0, 'Strom unreachable'));
     const res = await app.inject({ method: 'GET', url: '/api/v1/server-info' });
-    expect(res.json().srtRelay).toEqual({ configured: false, public: null, state: 'unreachable' });
+    expect(res.json().srt).toMatchObject({ state: 'unreachable', modes: { listener: true, caller: true, rendezvous: true }, relays: [] });
+    expect(res.json().srt).not.toHaveProperty('error');
   });
 
   it('serves the cached answer without waiting on a slow Strom', async () => {
     await app.inject({ method: 'GET', url: '/api/v1/server-info' });
-    mockSrtRelay.mockReturnValue(new Promise(() => {}));
+    mockCapabilities.mockReturnValue(new Promise(() => {}));
     vi.useFakeTimers({ toFake: ['Date'] });
     try {
       vi.setSystemTime(Date.now() + 60_000); // the cached answer is stale now
       const res = await app.inject({ method: 'GET', url: '/api/v1/server-info' });
-      expect(res.json().srtRelay).toEqual({ configured: true, public: 'relay.example.com:9000', state: 'ok' });
+      expect(res.json().srt).toMatchObject({ state: 'ok', relays: RELAY.protocols.srt.relays });
     } finally {
       vi.useRealTimers();
     }
@@ -175,8 +205,55 @@ describe('sources with a relay address', () => {
       mode: 'caller',
       source: 'srt-relay',
       streamid: id,
+      relay: 'default',
     });
     expect(res.body).not.toContain(SECRET);
+  });
+
+  it('POST auto@<relay> stores the relay name and dials that relay', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/sources',
+      payload: { name: 'Cam', streamType: 'srt', address: `srt+relay://auto@eu-north?passphrase=${SECRET}` },
+    });
+    expect(res.statusCode).toBe(201);
+    const stored = (mockSourcesInsert.mock.calls[0]![0] as SourceDoc).address;
+    const id = /^srt\+relay:\/\/([A-Za-z0-9_-]{22})@eu-north\?passphrase=encv1:/.exec(stored)![1]!;
+    expect(res.json().address).toBe(`srt+relay://${id}@eu-north?passphrase=***`);
+    expect(res.json().connect).toMatchObject({ uri: `srt://srt-eu.example.com:9100?streamid=${id}`, relay: 'eu-north' });
+  });
+
+  it('POST with a relay name Strom does not report: 422 srt-relay-unknown with the configured names', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/v1/sources', payload: { name: 'Cam', streamType: 'srt', address: 'srt+relay://auto@us' } });
+    expect(res.statusCode).toBe(422);
+    expect(res.json()).toEqual({
+      statusCode: 422,
+      code: 'srt-relay-unknown',
+      relays: ['default', 'eu-north'],
+      error: 'Strom has no SRT relay named "us"; configured: default, eu-north',
+    });
+    expect(mockSourcesInsert).not.toHaveBeenCalled();
+  });
+
+  it('POST with a malformed relay name: 400', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/v1/sources', payload: { name: 'Cam', streamType: 'srt', address: 'srt+relay://auto@EU_North' } });
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toMatch(/Invalid SRT relay name/);
+  });
+
+  it('PATCH with auto (passphrase renewal) keeps the stored id and relay', async () => {
+    mockSourcesGet.mockResolvedValue(source('srt+relay://sticky-id-0123456789@eu-north?passphrase=encv1:AAAA'));
+    const res = await app.inject({ method: 'PATCH', url: '/api/v1/sources/src-relay', payload: { address: `srt+relay://auto?passphrase=${SECRET}` } });
+    expect(res.statusCode).toBe(200);
+    expect((mockSourcesInsert.mock.calls[0]![0] as SourceDoc).address).toMatch(/^srt\+relay:\/\/sticky-id-0123456789@eu-north\?passphrase=encv1:/);
+    expect(res.json().connect).toMatchObject({ uri: 'srt://srt-eu.example.com:9100?streamid=sticky-id-0123456789', relay: 'eu-north' });
+  });
+
+  it('PATCH with auto@default moves the stored id back to the default relay', async () => {
+    mockSourcesGet.mockResolvedValue(source('srt+relay://sticky-id-0123456789@eu-north'));
+    const res = await app.inject({ method: 'PATCH', url: '/api/v1/sources/src-relay', payload: { address: 'srt+relay://auto@default' } });
+    expect(res.statusCode).toBe(200);
+    expect((mockSourcesInsert.mock.calls[0]![0] as SourceDoc).address).toBe('srt+relay://sticky-id-0123456789');
   });
 
   it('two auto creates get different ids', async () => {
@@ -234,16 +311,33 @@ describe('sources with a relay address', () => {
   });
 
   it('GET reports a null dial-in with a reason when Strom has no relay', async () => {
-    mockSrtRelay.mockResolvedValue({ configured: false, relay: null, public: null, error: null });
+    mockCapabilities.mockResolvedValue(caps([]));
     mockSourcesGet.mockResolvedValue(source('srt+relay://cam1'));
     const res = await app.inject({ method: 'GET', url: '/api/v1/sources/src-relay' });
     expect(res.json().connect).toMatchObject({ uri: null, source: 'srt-relay', streamid: 'cam1', reason: 'srt-relay-not-configured' });
   });
 
-  it('listing plain SRT sources never asks Strom about the relay', async () => {
-    mockSourcesFind.mockResolvedValue({ docs: [source('srt://:47105?mode=listener')] });
+  it('GET reports srt-relay-unknown for a stored relay Strom no longer reports', async () => {
+    mockSourcesGet.mockResolvedValue(source('srt+relay://cam1@gone'));
+    const res = await app.inject({ method: 'GET', url: '/api/v1/sources/src-relay' });
+    expect(res.json().connect).toMatchObject({ uri: null, relay: 'gone', reason: 'srt-relay-unknown' });
+  });
+
+  it('listing non-SRT sources never asks Strom', async () => {
+    mockSourcesFind.mockResolvedValue({ docs: [{ ...source('https://example.com/whip', 'whip') }] });
     await app.inject({ method: 'GET', url: '/api/v1/sources' });
-    expect(mockSrtRelay).not.toHaveBeenCalled();
+    expect(mockCapabilities).not.toHaveBeenCalled();
+  });
+
+  it('a listener source on a Strom that reports listener unsupported is accepted, with a warning on connect', async () => {
+    _resetPortReservationState({ status: 'disabled' });
+    mockCapabilities.mockResolvedValue(caps([], { listener: false, caller: true, rendezvous: false }));
+    const res = await app.inject({ method: 'POST', url: '/api/v1/sources', payload: { name: 'Cam', streamType: 'srt', address: 'srt://:47105?mode=listener' } });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().connect).toMatchObject({ port: 47105, warning: 'srt-listener-unsupported' });
+    const caller = await app.inject({ method: 'POST', url: '/api/v1/sources', payload: { name: 'Cam', streamType: 'srt', address: 'srt://cdn.example.com:9000' } });
+    expect(caller.statusCode).toBe(201);
+    expect(caller.json().connect).not.toHaveProperty('warning');
   });
 });
 
@@ -277,8 +371,8 @@ describe('outputs with a relay address', () => {
     expect(res.statusCode).toBe(400);
   });
 
-  it('GET reports a null dial-in when the relay public address is unknown', async () => {
-    mockSrtRelay.mockResolvedValue({ configured: true, relay: 'srt-splice:9000', public: null, error: null });
+  it('GET reports a null dial-in when the relay public address is unusable', async () => {
+    mockCapabilities.mockResolvedValue(caps([{ name: 'default', public: 'no-port.example.com' }]));
     mockOutputsGet.mockResolvedValue(output('srt+relay://out-sticky-0123456789'));
     const res = await app.inject({ method: 'GET', url: '/api/v1/outputs/output-relay' });
     expect(res.json().connect).toMatchObject({ uri: null, reason: 'srt-relay-public-unknown' });
@@ -414,12 +508,13 @@ describe('PATCH re-checks a relay address whenever the effective address is one'
 });
 
 describe('relay addresses when Strom has no relay', () => {
-  const NONE = { configured: false, relay: null, public: null, error: null };
+  const NONE = caps([]);
 
   it('POST source and output: 422 when Strom positively reports no relay', async () => {
-    mockSrtRelay.mockResolvedValue(NONE);
+    mockCapabilities.mockResolvedValue(NONE);
     const src = await app.inject({ method: 'POST', url: '/api/v1/sources', payload: { name: 'Cam', streamType: 'srt', address: 'srt+relay://auto' } });
     expect(src.statusCode).toBe(422);
+    expect(src.json()).toMatchObject({ code: 'srt-relay-not-configured', relays: [] });
     expect(src.json().error).toMatch(/no SRT relay configured/);
     const out = await app.inject({ method: 'POST', url: '/api/v1/outputs', payload: { name: 'Out', outputType: 'mpegtssrt', url: 'srt+relay://auto' } });
     expect(out.statusCode).toBe(422);
@@ -428,7 +523,7 @@ describe('relay addresses when Strom has no relay', () => {
   });
 
   it('PATCH to a relay address: 422 when Strom positively reports no relay; a rename still works', async () => {
-    mockSrtRelay.mockResolvedValue(NONE);
+    mockCapabilities.mockResolvedValue(NONE);
     mockSourcesGet.mockResolvedValue(source('srt+relay://sticky-id-0123456789'));
     const res = await app.inject({ method: 'PATCH', url: '/api/v1/sources/src-relay', payload: { address: 'srt+relay://auto' } });
     expect(res.statusCode).toBe(422);
@@ -439,9 +534,17 @@ describe('relay addresses when Strom has no relay', () => {
     expect(out.statusCode).toBe(422);
   });
 
+  it('POST: 422 on an older Strom without capabilities (404), which cannot resolve relay addresses', async () => {
+    const { StromClientError } = await import('../lib/strom.js');
+    mockCapabilities.mockRejectedValue(new StromClientError(404, 'Not Found'));
+    const res = await app.inject({ method: 'POST', url: '/api/v1/sources', payload: { name: 'Cam', streamType: 'srt', address: 'srt+relay://auto' } });
+    expect(res.statusCode).toBe(422);
+    expect(res.json().code).toBe('srt-relay-not-configured');
+  });
+
   it('accepted while Strom is unreachable, with the reason on connect', async () => {
     const { StromClientError } = await import('../lib/strom.js');
-    mockSrtRelay.mockRejectedValue(new StromClientError(0, 'Strom unreachable'));
+    mockCapabilities.mockRejectedValue(new StromClientError(0, 'Strom unreachable'));
     const res = await app.inject({ method: 'POST', url: '/api/v1/sources', payload: { name: 'Cam', streamType: 'srt', address: 'srt+relay://auto' } });
     expect(res.statusCode).toBe(201);
     expect(res.json().connect).toMatchObject({ uri: null, source: 'srt-relay', reason: 'srt-relay-unreachable' });
@@ -495,6 +598,17 @@ describe('save-time SRT address check (GStreamer reads keys and modes exactly)',
     expect(bad.body).toContain("'mode' is given more than once");
     const rename = await app.inject({ method: 'PATCH', url: '/api/v1/outputs/output-relay', payload: { name: 'Renamed' } });
     expect(rename.statusCode).toBe(200);
+  });
+});
+
+describe('save-time SRT address check: a key without a value (crashes GStreamer)', () => {
+  it('POST source and output refuse it with 400, naming the key', async () => {
+    const src = await app.inject({ method: 'POST', url: '/api/v1/sources', payload: { name: 'Cam', streamType: 'srt', address: 'srt://cdn.example.com:9000?latency' } });
+    expect(src.statusCode).toBe(400);
+    expect(src.body).toContain("'latency' has no value");
+    const out = await app.inject({ method: 'POST', url: '/api/v1/outputs', payload: { name: 'Out', outputType: 'mpegtssrt', url: 'srt+relay://auto?passphrase' } });
+    expect(out.statusCode).toBe(400);
+    expect(out.body).toContain("'passphrase' has no value");
   });
 });
 

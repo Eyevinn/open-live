@@ -9,12 +9,12 @@ import { srtUrl } from '../lib/url-validation.js';
 import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
 import { encryptStreamKey } from '../lib/rtmp-credentials-crypto.js';
 import { resolveIngestUrl, validateStreamKey } from '../lib/rtmp.js';
-import { resolveSrtConnect, type SrtRelayInfo } from '../lib/srt-connect.js';
-import { srtRelayInfoFor } from '../services/srt-relay-status.js';
+import { resolveSrtConnect, type SrtStromInfo } from '../lib/srt-connect.js';
+import { srtCapabilitiesFor } from '../services/strom-capabilities.js';
 import { config, isObjectStorageConfigured } from '../config.js';
 import { DEFAULT_CONNECTION_ID } from '../lib/storage-connection.js';
 import { isDocNotFoundError } from '../lib/db-errors.js';
-import { writeWithSrtAddress } from '../services/srt-address-write.js';
+import { srtWriteErrorBody, writeWithSrtAddress } from '../services/srt-address-write.js';
 
 const SRT_OUTPUT_TYPES = new Set(['mpegtssrt', 'efpsrt']);
 
@@ -179,7 +179,7 @@ function maskSrtPassphrase(url: string): string {
   return url.replace(/([?&]passphrase=)[^&]*/gi, '$1***');
 }
 
-function toApi(doc: OutputDoc, status?: OutputStatus, srtRelay?: SrtRelayInfo) {
+function toApi(doc: OutputDoc, status?: OutputStatus, strom?: SrtStromInfo) {
   // Destructure `rtmp` out of the spread so the stored object (which holds
   // `streamKeyEnc`) is NEVER echoed. We re-add an explicit, key-free projection
   // below — the API only ever exposes platform, ingestUrl, and a streamKeySet
@@ -205,12 +205,12 @@ function toApi(doc: OutputDoc, status?: OutputStatus, srtRelay?: SrtRelayInfo) {
   // Derive from the decrypted URL — resolveSrtConnect only reads host/port/mode,
   // which are cleartext, and its output never carries the passphrase param.
   if (SRT_OUTPUT_TYPES.has(doc.outputType) && doc.url) {
-    // A relay address (`srt+relay://<id>`) resolves to the relay's public
-    // address plus `streamid=<id>` (`srtRelay`, from Strom).
+    // A relay address (`srt+relay://<id>[@<relay>]`) resolves to that relay's public
+    // address plus `streamid=<id>`; a mode Strom reports as unsupported adds `warning`.
     const connect = resolveSrtConnect(decryptAddressPassphrase(doc.url), {
       stromUrl: config.stromUrl,
       srtPublicHost: config.srtPublicHost,
-      srtRelay,
+      strom,
     });
     if (connect) api['connect'] = connect;
   }
@@ -231,8 +231,8 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.status(503).send({ error: 'Database unavailable' });
     }
     const docs = Array.isArray(result?.docs) ? result.docs : [];
-    const [live, srtRelay] = await Promise.all([liveOutputIds(fastify.log), srtRelayInfoFor(docs.map((d) => d.url))]);
-    return reply.send(docs.map((doc) => toApi(doc, outputStatusFor(doc._id, live), srtRelay)));
+    const [live, strom] = await Promise.all([liveOutputIds(fastify.log), srtCapabilitiesFor(docs.map((d) => d.url))]);
+    return reply.send(docs.map((doc) => toApi(doc, outputStatusFor(doc._id, live), strom)));
   });
 
   fastify.post('/api/v1/outputs', async (req, reply) => {
@@ -309,15 +309,15 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
         return { value: doc, undo: async () => { await getOutputsDb().destroy(id, written.rev); } };
       },
     });
-    if (!result.ok) return reply.status(result.statusCode).send({ error: result.error, statusCode: result.statusCode });
-    return reply.status(201).send(toApi(result.value, undefined, await srtRelayInfoFor([result.value.url])));
+    if (!result.ok) return reply.status(result.statusCode).send(srtWriteErrorBody(result));
+    return reply.status(201).send(toApi(result.value, undefined, await srtCapabilitiesFor([result.value.url])));
   });
 
   fastify.get<{ Params: { id: string } }>('/api/v1/outputs/:id', async (req, reply) => {
     try {
       const doc = await getOutputsDb().get(req.params.id);
-      const [live, srtRelay] = await Promise.all([liveOutputIds(fastify.log), srtRelayInfoFor([doc.url])]);
-      return reply.send(toApi(doc, outputStatusFor(doc._id, live), srtRelay));
+      const [live, strom] = await Promise.all([liveOutputIds(fastify.log), srtCapabilitiesFor([doc.url])]);
+      return reply.send(toApi(doc, outputStatusFor(doc._id, live), strom));
     } catch {
       return reply.status(404).send({ error: 'Output not found', statusCode: 404 });
     }
@@ -434,11 +434,11 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
             };
           },
         });
-        if (!result.ok) return reply.status(result.statusCode).send({ error: result.error, statusCode: result.statusCode });
-        return reply.send(toApi(result.value, undefined, await srtRelayInfoFor([result.value.url])));
+        if (!result.ok) return reply.status(result.statusCode).send(srtWriteErrorBody(result));
+        return reply.send(toApi(result.value, undefined, await srtCapabilitiesFor([result.value.url])));
       }
       await getOutputsDb().insert(updated);
-      return reply.send(toApi(updated, undefined, await srtRelayInfoFor([updated.url])));
+      return reply.send(toApi(updated, undefined, await srtCapabilitiesFor([updated.url])));
     } catch (err: unknown) {
       if (err && typeof err === 'object' && 'statusCode' in err && (err as { statusCode: number }).statusCode === 404) {
         return reply.status(404).send({ error: 'Output not found', statusCode: 404 });

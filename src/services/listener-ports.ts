@@ -20,9 +20,9 @@
 
 import { getOutputsDb, getSourcesDb } from '../db/index.js';
 import { isPortReserved } from './port-reservation.js';
-import { parseSrtRelayAddress, resolveSrtRelayAddress, SRT_RELAY_AUTO_ID } from '../lib/srt-relay.js';
+import { parseSrtRelayAddress, resolveSrtRelayAddress, SRT_RELAY_AUTO_ID, srtRelayName } from '../lib/srt-relay.js';
 import type { PortReservationState } from './port-reservation.js';
-import type { SrtRelayStatus } from './srt-relay-status.js';
+import type { StromCapabilities } from './strom-capabilities.js';
 
 /** The value of PORT in `srt://:PORT` that asks the server to choose. */
 export const ASSIGN_PORT = 0;
@@ -215,7 +215,17 @@ export type SrtAddressResolution =
       /** True when the server chose the port or id (`srt://:0`, `srt+relay://auto`), so a clash may be retried. */
       assigned: boolean;
     }
-  | { ok: false; statusCode: 400 | 409 | 422 | 503; error: string };
+  | {
+      ok: false;
+      statusCode: 400 | 409 | 422 | 503;
+      error: string;
+      /** Machine-readable cause, for relay refusals: `srt-relay-not-configured` or `srt-relay-unknown`. */
+      code?: SrtRelayRefusalCode;
+      /** With `code`: the relay names Strom reports (empty when none). */
+      relays?: string[];
+    };
+
+export type SrtRelayRefusalCode = 'srt-relay-not-configured' | 'srt-relay-unknown';
 
 export interface SrtResolveOptions {
   /** The document being written; what it holds itself does not count as taken. */
@@ -226,19 +236,25 @@ export interface SrtResolveOptions {
    * so a re-submitted request never changes what the outside party dials.
    */
   keepFrom?: string | null;
-  /** Strom's relay status; a definite "no relay" refuses relay addresses. */
-  relay?: Pick<SrtRelayStatus, 'configured' | 'state'>;
+  /**
+   * Strom's capabilities; a definite answer that the relay an address names
+   * is not there (no relays at all, or none of that name) refuses it.
+   */
+  strom?: Pick<StromCapabilities, 'state' | 'srt'>;
 }
 
 /**
  * Decide the address an SRT source or output may be stored with: the one
  * resolver for listener ports and relay ids alike.
  *
- * - A relay address (`srt+relay://<id>`) binds no port. `auto` gets a
- *   generated id (or keeps the stored one); the id must not be held by any
- *   other source or output (409). When Strom positively reports that it has no
- *   relay the address is refused (422); when Strom cannot be asked it is
- *   accepted, and the dial-in address says why it is unknown.
+ * - A relay address (`srt+relay://<id>[@<relay>]`) binds no port. `auto` gets
+ *   a generated id (or keeps the stored one, and the stored relay unless the
+ *   address names one); the id must not be held by any other source or output
+ *   (409), whichever relay either uses. When Strom positively reports that it
+ *   has no relay of that name (or none at all, or is too old to have any) the
+ *   address is refused (422, with `code` and the relay names Strom has); when
+ *   Strom cannot be asked it is accepted, and the dial-in address says why it
+ *   is unknown. SRT modes are never refused here: they are only reported.
  * - Anything else goes through `resolveListenerAddress`.
  */
 export function resolveSrtAddress(
@@ -249,15 +265,11 @@ export function resolveSrtAddress(
 ): SrtAddressResolution {
   const relay = parseSrtRelayAddress(address);
   if (relay) {
-    if (opts.relay && opts.relay.state === 'ok' && !opts.relay.configured) {
-      return {
-        ok: false,
-        statusCode: 422,
-        error: 'Strom reports no SRT relay configured, so srt+relay:// addresses cannot be used; use an srt:// listener or caller address',
-      };
-    }
     const resolved = resolveSrtRelayAddress(address, opts.keepFrom);
-    const relayId = parseSrtRelayAddress(resolved)!.id;
+    const parsed = parseSrtRelayAddress(resolved)!;
+    const refusal = relayRefusal(srtRelayName(parsed), opts.strom);
+    if (refusal) return refusal;
+    const relayId = parsed.id;
     const holder = used.relayIds.find((u) => u.relayId === relayId && !isSelf(u, opts.self));
     if (holder) return { ok: false, statusCode: 409, error: relayIdClashMessage(holder) };
     return { ok: true, address: resolved, port: null, relayId, assigned: relay.id === SRT_RELAY_AUTO_ID };
@@ -266,6 +278,29 @@ export function resolveSrtAddress(
   const resolved = resolveListenerAddress(address, reservation, used.ports, { exclude: opts.self, keep });
   if (!resolved.ok) return resolved;
   return { ...resolved, relayId: null, assigned: listenerPortRequest(address) === ASSIGN_PORT };
+}
+
+/** The 422 for a relay Strom definitely does not have, or undefined. */
+function relayRefusal(name: string, strom: SrtResolveOptions['strom']): SrtAddressResolution | undefined {
+  if (!strom || (strom.state !== 'ok' && strom.state !== 'unsupported')) return undefined;
+  const names = strom.srt.relays.map((r) => r.name);
+  if (names.includes(name)) return undefined;
+  if (names.length === 0) {
+    return {
+      ok: false,
+      statusCode: 422,
+      code: 'srt-relay-not-configured',
+      relays: [],
+      error: 'Strom reports no SRT relay configured, so srt+relay:// addresses cannot be used; use an srt:// listener or caller address',
+    };
+  }
+  return {
+    ok: false,
+    statusCode: 422,
+    code: 'srt-relay-unknown',
+    relays: names,
+    error: `Strom has no SRT relay named "${name}"; configured: ${names.join(', ')}`,
+  };
 }
 
 /**

@@ -58,7 +58,7 @@ vi.mock('../lib/strom.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/strom.js')>();
   class MockStromClient {
     // An older Strom: no SRT relay endpoint.
-    system = { version: vi.fn(), iceServers: vi.fn(), srtRelay: vi.fn().mockRejectedValue(new actual.StromClientError(404, 'Not Found')) };
+    system = { version: vi.fn(), iceServers: vi.fn(), capabilities: vi.fn().mockRejectedValue(new actual.StromClientError(404, 'Not Found')) };
     flows = {
       get: vi.fn(),
       start: vi.fn().mockResolvedValue({}),
@@ -145,7 +145,7 @@ describe('GET /api/v1/server-info', () => {
       stromHost: 'localhost',
       srtPorts: RESERVATION.ports,
       srtPortState: 'reserved',
-      srtRelay: { configured: false, public: null, state: 'ok' },
+      srt: { state: 'unsupported', modes: { listener: true, caller: true, rendezvous: true }, relays: [], inboundReachable: null, ports: null },
     });
   });
 
@@ -153,7 +153,7 @@ describe('GET /api/v1/server-info', () => {
     _resetPortReservationState({ status });
     const res = await app.inject({ method: 'GET', url: '/api/v1/server-info' });
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ stromHost: 'localhost', srtPorts: null, srtPortState: status, srtRelay: { configured: false, public: null, state: 'ok' } });
+    expect(res.json()).toEqual({ stromHost: 'localhost', srtPorts: null, srtPortState: status, srt: { state: 'unsupported', modes: { listener: true, caller: true, rendezvous: true }, relays: [], inboundReachable: null, ports: null } });
   });
 });
 

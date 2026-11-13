@@ -5,11 +5,11 @@
  * - httpUrlOnly: allow only http/https schemes with no private-IP targets
  * - graphicUrl:  httpUrlOnly OR safe data: image URIs (no svg, no text/html)
  * - srtUrl:      srt:// scheme (reject private/internal hosts; listener form allowed)
- *                or srt+relay://<id> (an SRT relay session Strom resolves)
+ *                or srt+relay://<id>[@<relay>] (an SRT relay session Strom resolves)
  */
 
 import { checkSrtUriAsGStreamerReads, gstUnescape } from './srt-uri-check.js';
-import { isSrtRelayAddress, SRT_RELAY_AUTO_ID, SRT_RELAY_EXPLICIT_ID_RE, SRT_RELAY_FORBIDDEN_PARAMS } from './srt-relay.js';
+import { isSrtRelayAddress, isValidSrtRelayName, SRT_RELAY_AUTO_ID, SRT_RELAY_EXPLICIT_ID_RE, SRT_RELAY_FORBIDDEN_PARAMS } from './srt-relay.js';
 
 /**
  * Returns true if the given host is an IP literal in a private, loopback,
@@ -386,8 +386,9 @@ const SRT_PASSPHRASE_MAX = 80;
 /** Matches the passphrase param in an SRT URI query string (case-insensitive). */
 const SRT_PASSPHRASE_RE = /[?&]passphrase=([^&]*)/i;
 
-// srt+relay://<id>[?params]: same query charset as SRT_URL_RE. The id is
-// checked separately (SRT_RELAY_EXPLICIT_ID_RE) so its error can be specific.
+// srt+relay://<id>[@<relay>][?params]: same query charset as SRT_URL_RE. The
+// id and relay name are checked separately (SRT_RELAY_EXPLICIT_ID_RE,
+// isValidSrtRelayName) so their errors can be specific.
 // The scheme is case-insensitive, as in parseSrtRelayAddress() and in Strom.
 const SRT_RELAY_URL_RE = new RegExp(`^srt\\+relay:\\/\\/([^?#]*)(\\?[${SRT_QUERY_CHARS}]+)?$`, 'i');
 
@@ -398,8 +399,9 @@ const SRT_RELAY_URL_RE = new RegExp(`^srt\\+relay:\\/\\/([^?#]*)(\\?[${SRT_QUERY
  * URLs whose host is a private/loopback/link-local/internal IP are rejected to
  * prevent SSRF from the GStreamer pipeline to internal services.
  *
- * A relay address (`srt+relay://<id>[?params]`, see `lib/srt-relay.ts`) is
- * accepted too, including `srt+relay://auto` (server generates the id). It has
+ * A relay address (`srt+relay://<id>[@<relay>][?params]`, see `lib/srt-relay.ts`)
+ * is accepted too, including `srt+relay://auto` (server generates the id). The
+ * relay name is 1–32 characters of `a-z 0-9 -`, as Strom requires. It has
  * no host, so there is nothing to SSRF-check; its query follows the same
  * charset and passphrase rules, but `mode`, `streamid`, `localaddress` and
  * `localport` are rejected: Strom always calls the relay with the id as its
@@ -484,9 +486,14 @@ function checkSrtPassphrase(url: string): void {
 function srtRelayUrl(url: string, opts: { newValue?: boolean }): void {
   const m = SRT_RELAY_URL_RE.exec(url);
   if (!m) {
-    throw new Error('Invalid SRT relay address format — expected srt+relay://<id> with safe query params');
+    throw new Error('Invalid SRT relay address format — expected srt+relay://<id>[@<relay>] with safe query params');
   }
-  const id = m[1] ?? '';
+  const authority = m[1] ?? '';
+  const at = authority.indexOf('@');
+  const id = at === -1 ? authority : authority.slice(0, at);
+  if (at !== -1 && !isValidSrtRelayName(authority.slice(at + 1))) {
+    throw new Error('Invalid SRT relay name after "@" — use 1–32 characters of a–z, 0–9 or "-" (or leave it out for the default relay)');
+  }
   if (id !== SRT_RELAY_AUTO_ID && !SRT_RELAY_EXPLICIT_ID_RE.test(id)) {
     throw new Error(
       'Invalid SRT relay id — use 16–64 characters of A–Z, a–z, 0–9, "_" or "-" (anyone who guesses the id ' +

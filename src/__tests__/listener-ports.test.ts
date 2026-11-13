@@ -145,12 +145,44 @@ describe('resolveSrtAddress (one resolver for ports and relay ids)', () => {
     expect(resolveSrtAddress('srt+relay://held-by-output-0123', reserved, bindings, { self: { kind: 'output', id: 'o2' } })).toMatchObject({ ok: true });
   });
 
-  it('refuses relay addresses only when Strom positively reports no relay', () => {
-    expect(resolveSrtAddress('srt+relay://auto', reserved, bindings, { relay: { configured: false, state: 'ok' } }))
-      .toMatchObject({ ok: false, statusCode: 422 });
-    for (const state of ['unreachable', 'unknown'] as const) {
-      expect(resolveSrtAddress('srt+relay://auto', reserved, bindings, { relay: { configured: false, state } })).toMatchObject({ ok: true });
+  const caps = (state: 'ok' | 'unsupported' | 'unreachable' | 'unknown', names: string[]) => ({
+    state,
+    srt: { modes: { listener: true, caller: true, rendezvous: true }, relays: names.map((name) => ({ name, public: `${name}.example.com:9000` })) },
+  });
+
+  it('refuses relay addresses only when Strom positively reports no relay (or is too old to have any)', () => {
+    for (const state of ['ok', 'unsupported'] as const) {
+      expect(resolveSrtAddress('srt+relay://auto', reserved, bindings, { strom: caps(state, []) }))
+        .toMatchObject({ ok: false, statusCode: 422, code: 'srt-relay-not-configured', relays: [] });
     }
+    for (const state of ['unreachable', 'unknown'] as const) {
+      expect(resolveSrtAddress('srt+relay://auto', reserved, bindings, { strom: caps(state, []) })).toMatchObject({ ok: true });
+    }
+  });
+
+  it('refuses a relay name Strom definitely does not have, naming the ones it has', () => {
+    const r = resolveSrtAddress('srt+relay://auto@us', reserved, bindings, { strom: caps('ok', ['default', 'eu-north']) });
+    expect(r).toMatchObject({ ok: false, statusCode: 422, code: 'srt-relay-unknown', relays: ['default', 'eu-north'] });
+    expect(!r.ok && r.error).toMatch(/no SRT relay named "us"; configured: default, eu-north/);
+    // Without @ the address wants `default`.
+    expect(resolveSrtAddress('srt+relay://auto', reserved, bindings, { strom: caps('ok', ['eu-north']) }))
+      .toMatchObject({ ok: false, code: 'srt-relay-unknown' });
+    expect(resolveSrtAddress('srt+relay://auto@eu-north', reserved, bindings, { strom: caps('ok', ['default', 'eu-north']) }))
+      .toMatchObject({ ok: true });
+    expect(resolveSrtAddress('srt+relay://auto@us', reserved, bindings, { strom: caps('unreachable', ['default']) }))
+      .toMatchObject({ ok: true });
+  });
+
+  it('checks the relay a kept auto address ends up on', () => {
+    // `auto` without @ keeps the stored relay, so that is the one checked.
+    expect(resolveSrtAddress('srt+relay://auto', reserved, bindings, {
+      keepFrom: 'srt+relay://kept-id-0123456789@eu-north',
+      strom: caps('ok', ['default', 'eu-north']),
+    })).toMatchObject({ ok: true, address: 'srt+relay://kept-id-0123456789@eu-north' });
+    expect(resolveSrtAddress('srt+relay://auto', reserved, bindings, {
+      keepFrom: 'srt+relay://kept-id-0123456789@gone',
+      strom: caps('ok', ['default']),
+    })).toMatchObject({ ok: false, code: 'srt-relay-unknown' });
   });
 
   it('srtClashAfterWrite reports a port or relay id another document now holds', () => {

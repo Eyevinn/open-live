@@ -1,19 +1,21 @@
 /**
- * SRT relay addresses (`srt+relay://<id>[?query]`): parsing, id generation,
+ * SRT relay addresses (`srt+relay://<id>[@<relay>][?query]`): parsing, id generation,
  * `auto` resolution with keep, validation, passphrase encryption at rest, and
  * the dial-in (`connect`) resolution.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
+  buildSrtRelayAddress,
   generateSrtRelayId,
   isSrtRelayAddress,
+  isValidSrtRelayName,
   parseSrtRelayAddress,
   resolveSrtRelayAddress,
   SRT_RELAY_ID_RE,
 } from '../lib/srt-relay.js';
 import { srtUrl } from '../lib/url-validation.js';
-import { resolveSrtConnect } from '../lib/srt-connect.js';
+import { resolveSrtConnect, srtAddressMode } from '../lib/srt-connect.js';
 import { listenerPortRequest } from '../services/listener-ports.js';
 import {
   decryptAddressPassphrase,
@@ -33,11 +35,40 @@ describe('relay address parsing', () => {
   it('splits id and query', () => {
     expect(parseSrtRelayAddress('srt+relay://cam_1-x?passphrase=abcdefghij&latency=200')).toEqual({
       id: 'cam_1-x',
+      relay: null,
       query: 'passphrase=abcdefghij&latency=200',
     });
-    expect(parseSrtRelayAddress('srt+relay://cam1')).toEqual({ id: 'cam1', query: '' });
+    expect(parseSrtRelayAddress('srt+relay://cam1')).toEqual({ id: 'cam1', relay: null, query: '' });
     expect(parseSrtRelayAddress('srt+relay://bad.id')).toBeNull();
     expect(parseSrtRelayAddress('srt+relay://')).toBeNull();
+  });
+
+  it('splits off a named relay after @', () => {
+    expect(parseSrtRelayAddress('srt+relay://cam1@eu-north?passphrase=abcdefghij')).toEqual({
+      id: 'cam1',
+      relay: 'eu-north',
+      query: 'passphrase=abcdefghij',
+    });
+    expect(parseSrtRelayAddress('srt+relay://cam1@default')).toEqual({ id: 'cam1', relay: 'default', query: '' });
+    expect(parseSrtRelayAddress('srt+relay://auto@us')).toEqual({ id: 'auto', relay: 'us', query: '' });
+  });
+
+  it.each(['srt+relay://cam1@', 'srt+relay://cam1@EU', 'srt+relay://cam1@eu_north', `srt+relay://cam1@${'a'.repeat(33)}`, 'srt+relay://@eu', 'srt+relay://cam1@a@b'])(
+    'refuses a malformed relay name or id: %s',
+    (address) => {
+      expect(parseSrtRelayAddress(address)).toBeNull();
+    },
+  );
+
+  it('validates relay names as Strom does', () => {
+    for (const good of ['default', 'eu-north', 'a', '0', 'a'.repeat(32)]) expect(isValidSrtRelayName(good)).toBe(true);
+    for (const bad of ['', 'EU', 'eu_north', 'eu.north', 'a'.repeat(33), 'é']) expect(isValidSrtRelayName(bad)).toBe(false);
+  });
+
+  it('writes the default relay without @, others with it', () => {
+    expect(buildSrtRelayAddress('cam1', null, '')).toBe('srt+relay://cam1');
+    expect(buildSrtRelayAddress('cam1', 'default', 'latency=200')).toBe('srt+relay://cam1?latency=200');
+    expect(buildSrtRelayAddress('cam1', 'eu-north', 'latency=200')).toBe('srt+relay://cam1@eu-north?latency=200');
   });
 
   it('a relay address binds no listener port', () => {
@@ -70,6 +101,26 @@ describe('relay id generation and auto/keep', () => {
     expect(resolveSrtRelayAddress('srt+relay://auto', stored)).toBe('srt+relay://kept-id');
   });
 
+  it('auto@<relay> picks that relay for a new id', () => {
+    const out = resolveSrtRelayAddress('srt+relay://auto@eu-north?latency=200');
+    expect(parseSrtRelayAddress(out)).toMatchObject({ relay: 'eu-north', query: 'latency=200' });
+    expect(parseSrtRelayAddress(resolveSrtRelayAddress('srt+relay://auto@default'))!.relay).toBeNull();
+  });
+
+  it('auto without @ keeps the stored relay as well as the id (renewing the passphrase)', () => {
+    const stored = 'srt+relay://kept-id@eu-north?passphrase=encv1:AAAA_bbb-ccc';
+    expect(resolveSrtRelayAddress('srt+relay://auto?passphrase=newpassphrase', stored))
+      .toBe('srt+relay://kept-id@eu-north?passphrase=newpassphrase');
+    expect(resolveSrtRelayAddress('srt+relay://auto', stored)).toBe('srt+relay://kept-id@eu-north');
+  });
+
+  it('auto@<relay> moves a stored id to that relay, and auto@default back to the default one', () => {
+    const stored = 'srt+relay://kept-id@eu-north';
+    expect(resolveSrtRelayAddress('srt+relay://auto@us', stored)).toBe('srt+relay://kept-id@us');
+    expect(resolveSrtRelayAddress('srt+relay://auto@default', stored)).toBe('srt+relay://kept-id');
+    expect(resolveSrtRelayAddress('srt+relay://auto@us', 'srt+relay://kept-id')).toBe('srt+relay://kept-id@us');
+  });
+
   it('generates a new id when the stored address is not a relay address', () => {
     const out = resolveSrtRelayAddress('srt+relay://auto', 'srt://:47100?mode=listener');
     expect(parseSrtRelayAddress(out)!.id).not.toBe('auto');
@@ -87,6 +138,10 @@ describe('srtUrl() — relay addresses', () => {
     'srt+relay://auto?passphrase=abcdefghij',
     'srt+relay://cam1-studio-a-0001',
     'srt+relay://Cam_1-2_aaaaaaaaaa?latency=200&pbkeylen=32',
+    'srt+relay://auto@eu-north',
+    'srt+relay://auto@default?passphrase=abcdefghij',
+    'srt+relay://cam1-studio-a-0001@us-east-1',
+    `srt+relay://auto@${'a'.repeat(32)}`,
     `srt+relay://${'a'.repeat(16)}`,
     `srt+relay://${'a'.repeat(64)}`,
   ])('accepts %s', (url) => {
@@ -102,6 +157,21 @@ describe('srtUrl() — relay addresses', () => {
     ['path', 'srt+relay://cam1/x'],
   ])('rejects %s', (_label, url) => {
     expect(() => srtUrl(url)).toThrow();
+  });
+
+  it.each(['srt+relay://auto@', 'srt+relay://auto@EU', 'srt+relay://auto@eu_north', `srt+relay://auto@${'a'.repeat(33)}`, 'srt+relay://auto@a@b'])(
+    'rejects the relay name in %s',
+    (url) => {
+      expect(() => srtUrl(url)).toThrow(/Invalid SRT relay name/);
+    },
+  );
+
+  it('checks the id before @ like any other id', () => {
+    expect(() => srtUrl('srt+relay://cam1@eu-north')).toThrow(/16–64 characters/);
+  });
+
+  it('refuses a query key without a value on a new address (it crashes GStreamer)', () => {
+    expect(() => srtUrl('srt+relay://auto?latency', { newValue: true })).toThrow(/'latency' has no value/);
   });
 
   it.each(['mode=caller', 'streamid=other', 'MODE=listener', 'localport=5000', 'localaddress=1.2.3.4', '%73treamid=x'])(
@@ -162,12 +232,18 @@ describe('relay addresses — passphrase encryption at rest', () => {
   });
 });
 
+const RELAYS = [
+  { name: 'default', public: 'relay.example.com:9000' },
+  { name: 'eu-north', public: 'srt-eu.example.com:9100' },
+];
+const strom = (relays: Array<{ name: string; public: string }>, state?: 'ok' | 'unsupported' | 'unreachable' | 'unknown') => ({
+  ...(state ? { state } : {}),
+  srt: { relays },
+});
+
 describe('resolveSrtConnect() — relay addresses', () => {
-  it('builds the dial-in address from the relay public host:port, without the passphrase', () => {
-    const c = resolveSrtConnect('srt+relay://cam1?passphrase=supersecretpass&latency=200', {
-      ...CFG,
-      srtRelay: { configured: true, public: 'relay.example.com:9000' },
-    });
+  it('builds the dial-in address from the default relay public host:port, without the passphrase', () => {
+    const c = resolveSrtConnect('srt+relay://cam1?passphrase=supersecretpass&latency=200', { ...CFG, strom: strom(RELAYS) });
     expect(c).toEqual({
       uri: 'srt://relay.example.com:9000?streamid=cam1',
       host: 'relay.example.com',
@@ -175,53 +251,67 @@ describe('resolveSrtConnect() — relay addresses', () => {
       mode: 'caller',
       source: 'srt-relay',
       streamid: 'cam1',
+      relay: 'default',
     });
     expect(JSON.stringify(c)).not.toContain('supersecretpass');
   });
 
-  it('brackets an IPv6 public host', () => {
-    const c = resolveSrtConnect('srt+relay://cam1', { ...CFG, srtRelay: { configured: true, public: '[2001:db8::1]:9000' } });
-    expect(c?.uri).toBe('srt://[2001:db8::1]:9000?streamid=cam1');
-    expect(c?.host).toBe('2001:db8::1');
-  });
-
-  it('ignores SRT_PUBLIC_HOST and the Strom host for relay addresses', () => {
-    const c = resolveSrtConnect('srt+relay://cam1', {
-      ...CFG,
-      srtPublicHost: 'srt.example.com',
-      srtRelay: { configured: true, public: 'relay.example.com:9000' },
+  it('uses the named relay public address for @<relay>', () => {
+    const c = resolveSrtConnect('srt+relay://cam1@eu-north?passphrase=supersecretpass', { ...CFG, strom: strom(RELAYS) });
+    expect(c).toMatchObject({
+      uri: 'srt://srt-eu.example.com:9100?streamid=cam1',
+      host: 'srt-eu.example.com',
+      port: 9100,
+      relay: 'eu-north',
     });
-    expect(c?.host).toBe('relay.example.com');
+    expect(resolveSrtConnect('srt+relay://cam1@default', { ...CFG, strom: strom(RELAYS) })?.uri).toBe('srt://relay.example.com:9000?streamid=cam1');
   });
 
-  it('null uri with a reason when the relay public address is unknown', () => {
-    expect(resolveSrtConnect('srt+relay://cam1', { ...CFG, srtRelay: { configured: true, public: null } })).toEqual({
+  it('srt-relay-unknown for a relay name Strom does not report', () => {
+    expect(resolveSrtConnect('srt+relay://cam1@us', { ...CFG, strom: strom(RELAYS) })).toEqual({
       uri: null,
       host: null,
       port: null,
       mode: 'caller',
       source: 'srt-relay',
       streamid: 'cam1',
-      reason: 'srt-relay-public-unknown',
+      relay: 'us',
+      reason: 'srt-relay-unknown',
     });
+    // Only named relays configured: an address without @ wants `default`.
+    expect(resolveSrtConnect('srt+relay://cam1', { ...CFG, strom: strom([RELAYS[1]!]) })?.reason).toBe('srt-relay-unknown');
   });
 
-  it('null uri with srt-relay-not-configured when Strom positively reports no relay', () => {
-    expect(resolveSrtConnect('srt+relay://cam1', { ...CFG, srtRelay: { configured: false, public: null, state: 'ok' } })).toMatchObject({
-      uri: null,
-      source: 'srt-relay',
-      reason: 'srt-relay-not-configured',
-    });
+  it('brackets an IPv6 public host', () => {
+    const c = resolveSrtConnect('srt+relay://cam1', { ...CFG, strom: strom([{ name: 'default', public: '[2001:db8::1]:9000' }]) });
+    expect(c?.uri).toBe('srt://[2001:db8::1]:9000?streamid=cam1');
+    expect(c?.host).toBe('2001:db8::1');
+  });
+
+  it('tolerates an srt:// prefix on the public address', () => {
+    const c = resolveSrtConnect('srt+relay://cam1', { ...CFG, strom: strom([{ name: 'default', public: 'srt://relay.example.com:9000' }]) });
+    expect(c?.uri).toBe('srt://relay.example.com:9000?streamid=cam1');
+  });
+
+  it('ignores SRT_PUBLIC_HOST and the Strom host for relay addresses', () => {
+    const c = resolveSrtConnect('srt+relay://cam1', { ...CFG, srtPublicHost: 'srt.example.com', strom: strom(RELAYS) });
+    expect(c?.host).toBe('relay.example.com');
+  });
+
+  it('null uri with srt-relay-not-configured when Strom positively reports no relay, or is too old to have any', () => {
+    for (const state of ['ok', 'unsupported'] as const) {
+      expect(resolveSrtConnect('srt+relay://cam1@eu-north', { ...CFG, strom: strom([], state) })).toMatchObject({
+        uri: null,
+        source: 'srt-relay',
+        relay: 'eu-north',
+        reason: 'srt-relay-not-configured',
+      });
+    }
   });
 
   it('null uri with srt-relay-unreachable when Strom could not be asked (or was not)', () => {
-    for (const srtRelay of [
-      undefined,
-      { configured: false, public: null, state: 'unreachable' as const },
-      { configured: false, public: null, state: 'unknown' as const },
-      { configured: true, public: null, state: 'unreachable' as const },
-    ]) {
-      expect(resolveSrtConnect('srt+relay://cam1', { ...CFG, srtRelay })).toMatchObject({
+    for (const info of [undefined, strom([], 'unreachable'), strom([], 'unknown'), strom([RELAYS[1]!], 'unreachable')]) {
+      expect(resolveSrtConnect('srt+relay://cam1', { ...CFG, strom: info })).toMatchObject({
         uri: null,
         source: 'srt-relay',
         streamid: 'cam1',
@@ -231,13 +321,13 @@ describe('resolveSrtConnect() — relay addresses', () => {
   });
 
   it('serves the last known public address while Strom is unreachable', () => {
-    const c = resolveSrtConnect('srt+relay://cam1', { ...CFG, srtRelay: { configured: true, public: 'relay.example.com:9000', state: 'unreachable' } });
-    expect(c?.uri).toBe('srt://relay.example.com:9000?streamid=cam1');
+    const c = resolveSrtConnect('srt+relay://cam1@eu-north', { ...CFG, strom: strom(RELAYS, 'unreachable') });
+    expect(c?.uri).toBe('srt://srt-eu.example.com:9100?streamid=cam1');
   });
 
   it('a malformed public address reads as unknown', () => {
     for (const pub of ['relay.example.com', ':9000', 'relay.example.com:99999']) {
-      expect(resolveSrtConnect('srt+relay://cam1', { ...CFG, srtRelay: { configured: true, public: pub } })?.reason).toBe('srt-relay-public-unknown');
+      expect(resolveSrtConnect('srt+relay://cam1', { ...CFG, strom: strom([{ name: 'default', public: pub }]) })?.reason).toBe('srt-relay-public-unknown');
     }
   });
 
@@ -246,5 +336,45 @@ describe('resolveSrtConnect() — relay addresses', () => {
       uri: 'srt://strom.example.com:47100?mode=caller',
       source: 'strom-host',
     });
+  });
+});
+
+describe('resolveSrtConnect() — SRT modes Strom reports (reported, not enforced)', () => {
+  const modes = (listener: boolean, rendezvous = listener) => ({ state: 'ok' as const, srt: { modes: { listener, caller: true, rendezvous }, relays: [] } });
+
+  it('warns on a listener address when Strom reports listener unsupported, and still resolves it', () => {
+    for (const address of ['srt://:47100?mode=listener', 'srt://:47100', 'srt://0.0.0.0:47100?mode=listener', 'srt://:47100?mode=caller']) {
+      const c = resolveSrtConnect(address, { ...CFG, strom: modes(false) });
+      expect(c?.warning).toBe('srt-listener-unsupported');
+      expect(c?.port).toBe(47100);
+    }
+    expect(resolveSrtConnect('srt://:47100?mode=listener', { ...CFG, strom: modes(false) })?.uri).toBe('srt://strom.example.com:47100?mode=caller');
+  });
+
+  it('warns on a rendezvous address when Strom reports rendezvous unsupported', () => {
+    expect(resolveSrtConnect('srt://peer.example.com:9000?mode=rendezvous', { ...CFG, strom: modes(false) })?.warning).toBe('srt-rendezvous-unsupported');
+    expect(resolveSrtConnect('srt://peer.example.com:9000?mode=rendezvous', { ...CFG, strom: modes(true) })?.warning).toBeUndefined();
+  });
+
+  it('never warns on a caller address, nor when the modes are supported or not known', () => {
+    expect(resolveSrtConnect('srt://cdn.example.com:9000', { ...CFG, strom: modes(false) })?.warning).toBeUndefined();
+    expect(resolveSrtConnect('srt://cdn.example.com:9000?mode=caller', { ...CFG, strom: modes(false) })?.warning).toBeUndefined();
+    expect(resolveSrtConnect('srt://:47100?mode=listener', { ...CFG, strom: modes(true) })?.warning).toBeUndefined();
+    expect(resolveSrtConnect('srt://:47100?mode=listener', CFG)?.warning).toBeUndefined();
+  });
+});
+
+describe('srtAddressMode()', () => {
+  it.each([
+    ['srt://:47100', 'listener'],
+    ['srt://:47100?mode=caller', 'listener'],
+    ['srt://host.example:1?mode=listener', 'listener'],
+    ['srt://host.example:1', 'caller'],
+    ['srt://host.example:1?mode=caller', 'caller'],
+    ['srt://host.example:1?mode=rendezvous', 'rendezvous'],
+    ['srt+relay://cam1', null],
+    ['srt://nonsense', null],
+  ])('%s -> %s', (address, mode) => {
+    expect(srtAddressMode(address)).toBe(mode);
   });
 });

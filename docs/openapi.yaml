@@ -211,11 +211,16 @@ components:
           description: >-
             For srt/efp: `srt://host:port[?params]`, the hostless listener form
             `srt://:PORT?mode=listener` (`srt://:0` assigns a reserved port), or an
-            SRT relay address `srt+relay://<id>[?params]` (an explicit id is
+            SRT relay address `srt+relay://<id>[@<relay>][?params]` (an explicit id is
             `[A-Za-z0-9_-]{16,64}`, shorter ids are refused as guessable;
             `srt+relay://auto` generates the id once, and a later `auto` keeps the
-            stored id). A relay id may be held by one source or output only
-            (409 otherwise). Relay addresses bind no port; `mode`, `streamid`,
+            stored id). `@<relay>` names one of the relays in server-info
+            `srt.relays` (`[a-z0-9-]{1,32}`); without it the default relay is used,
+            and Open Live stores the default relay without `@`. A later `auto`
+            without `@` also keeps the stored relay (so renewing the passphrase
+            never moves the stream); `auto@<relay>` moves the stored id to that
+            relay, `auto@default` back to the default one. A relay id may be held
+            by one source or output only, whichever relay either uses (409 otherwise). Relay addresses bind no port; `mode`, `streamid`,
             `localaddress` and `localport` are not allowed on them. Passphrases are
             masked as `***` in responses.
         connect:
@@ -380,10 +385,11 @@ components:
           type: string
           description: >-
             Operator-authored SRT bind/listen URI (e.g. srt://:43524?mode=listener),
-            or an SRT relay address `srt+relay://<id>[?params]`
-            (`srt+relay://auto` generates the id once; a later `auto` keeps it;
-            explicit ids are 16-64 characters and unique across sources and
-            outputs, 409 otherwise).
+            or an SRT relay address `srt+relay://<id>[@<relay>][?params]`
+            (`srt+relay://auto` generates the id once; a later `auto` keeps it,
+            and keeps the stored relay unless it names one; explicit ids are 16-64
+            characters and unique across sources and outputs, 409 otherwise;
+            `@<relay>` as on sources, default relay when absent).
             Undefined for whep outputs. Round-tripped by POST/PATCH.
         connect:
           $ref: '#/components/schemas/SrtConnect'
@@ -534,9 +540,10 @@ components:
         reach this output or source. Present only on mpegtssrt/efpsrt outputs and
         srt/efp sources that have a well-formed address. `uri`/`host` are null
         (with a `reason`) when the address cannot be resolved server-side. For an
-        SRT relay address (`srt+relay://<id>`) it is the relay's public address
-        as Strom reports it, `srt://<public host:port>?streamid=<id>`, with
-        `source: srt-relay` and `mode: caller`. Never carries the passphrase.
+        SRT relay address (`srt+relay://<id>[@<relay>]`) it is that relay's public
+        address as Strom reports it, `srt://<public host:port>?streamid=<id>`, with
+        `source: srt-relay`, `mode: caller` and `relay`. Never carries the passphrase.
+        `warning` reports a direction Strom says cannot work here (never enforced).
       required: [uri, host, port, mode, source]
       properties:
         uri:
@@ -566,15 +573,31 @@ components:
         streamid:
           type: string
           description: Relay addresses only — the streamid the external side must use.
+        relay:
+          type: string
+          description: >-
+            Relay addresses only — the relay's name (`default` when the address has no
+            `@<relay>`).
         reason:
           type: string
-          enum: [srt-host-not-configured, srt-host-not-loopback-reachable, strom-url-not-parseable, srt-relay-not-configured, srt-relay-unreachable, srt-relay-public-unknown]
+          enum: [srt-host-not-configured, srt-host-not-loopback-reachable, strom-url-not-parseable, srt-relay-not-configured, srt-relay-unknown, srt-relay-unreachable, srt-relay-public-unknown]
           description: >-
             Present only when `uri` is null — why the address could not be resolved.
-            `srt-relay-not-configured`: Strom reports no SRT relay.
-            `srt-relay-unreachable`: Strom could not be asked (or has not answered yet), so
-            whether there is a relay is unknown. `srt-relay-public-unknown`: Strom has a
-            relay but does not report its public address.
+            `srt-relay-not-configured`: Strom reports no SRT relay (or is an older Strom
+            without capabilities). `srt-relay-unknown`: Strom does not report a relay of
+            this name; the names it has are in server-info `srt.relays`.
+            `srt-relay-unreachable`: Strom could not be asked (or has not answered yet), and
+            the relay is not among the last known ones. `srt-relay-public-unknown`: Strom
+            reports the relay, but its public address is not a usable host:port.
+        warning:
+          type: string
+          enum: [srt-listener-unsupported, srt-rendezvous-unsupported]
+          description: >-
+            Strom reports (server-info `srt.modes`) that the mode this address needs
+            cannot work on this Strom: a listener (hostless `srt://:PORT`, or
+            `mode=listener`) or a rendezvous address. The address is still stored and
+            resolved; the operator may know better. Absent when the mode is supported or
+            Strom's capabilities are not known.
 
     OutputInput:
       type: object
@@ -1233,6 +1256,42 @@ components:
         statusCode:
           type: integer
 
+    SrtRelayError:
+      type: object
+      description: >-
+        422 body when a relay address names a relay Strom definitely does not have.
+        Other 422s on the same route carry only `error` and `statusCode`.
+      required: [error, statusCode]
+      properties:
+        error:
+          type: string
+        statusCode:
+          type: integer
+        code:
+          type: string
+          enum: [srt-relay-not-configured, srt-relay-unknown]
+          description: >-
+            `srt-relay-not-configured`: Strom reports no SRT relay (or is an older Strom
+            without capabilities). `srt-relay-unknown`: no relay of the name after `@`
+            (or `default`, without `@`).
+        relays:
+          type: array
+          items:
+            type: string
+          description: The relay names Strom reports (empty for `srt-relay-not-configured`).
+
+    SrtRelayEndpoint:
+      type: object
+      required: [name, public]
+      properties:
+        name:
+          type: string
+          pattern: '^[a-z0-9-]{1,32}$'
+          description: The relay's name, used as `srt+relay://<id>@<name>` (`default` needs no `@`).
+        public:
+          type: string
+          description: The relay's public host:port that outside SRT callers dial.
+
     RecordingDeleteError:
       type: object
       description: Error body of DELETE /api/v1/recordings/{id} for 409 and 502 (issue #550).
@@ -1616,7 +1675,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [stromHost, srtPorts, srtPortState, srtRelay]
+                required: [stromHost, srtPorts, srtPortState, srt]
                 properties:
                   stromHost:
                     type: string
@@ -1644,30 +1703,68 @@ paths:
                       enforced and Strom is re-checked every 10 min; `disabled` — turned off
                       via STROM_PORT_LEASE_DISABLED, or Strom has no port pool configured;
                       ports are not enforced.
-                  srtRelay:
+                  srt:
                     type: object
-                    required: [configured, public, state]
+                    required: [state, modes, relays, inboundReachable, ports]
                     description: >-
-                      The SRT relay Strom fronts (Strom's GET /api/srt-relay). Served from
-                      a cache refreshed in the background (~30 s, ~5 s after a failure), so
-                      this endpoint never waits on Strom; a Strom without relay support
-                      reads as not configured. Offer `srt+relay://auto` addresses only when
-                      `configured`.
+                      What SRT can do on this Strom, from Strom's GET /api/capabilities.
+                      Served from a cache refreshed in the background (~30 s, ~5 s after a
+                      failure), so this endpoint never waits on Strom. Offer only the
+                      directions whose mode is true (reported, never enforced by the API:
+                      a listener address on a Strom that reports `listener: false` is still
+                      accepted, with `connect.warning`). Offer `srt+relay://auto[@<name>]`
+                      only when `relays` is non-empty, with a picker when there is more than
+                      one. Strom's own host for listener addresses is resolved as before
+                      (authored host, then SRT_PUBLIC_HOST, then the STROM_URL host).
                     properties:
-                      configured:
-                        type: boolean
-                        description: Whether Strom has an SRT relay (last known when `state` is not `ok`).
-                      public:
-                        type: string
-                        nullable: true
-                        description: The relay's public host:port that outside SRT callers dial.
                       state:
                         type: string
-                        enum: [ok, unreachable, unknown]
+                        enum: [ok, unsupported, unreachable, unknown]
                         description: >-
-                          `ok`: Strom answered the last check. `unreachable`: the last check
-                          failed; `configured`/`public` are the last known values.
-                          `unknown`: Strom has not answered yet since startup.
+                          `ok`: Strom answered the last check. `unsupported`: an older Strom
+                          without GET /api/capabilities (404): every mode, no relay.
+                          `unreachable`: the last check failed; the values are the last known
+                          ones (every mode and no relay if none). `unknown`: Strom has not
+                          answered yet since startup: every mode, no relay.
+                      modes:
+                        type: object
+                        required: [listener, caller, rendezvous]
+                        description: SRT modes that can work on this Strom (true unless Strom says false).
+                        properties:
+                          listener:
+                            type: boolean
+                            description: Strom binds a port and the outside party dials it (needs inbound reachability).
+                          caller:
+                            type: boolean
+                            description: Strom dials the outside party.
+                          rendezvous:
+                            type: boolean
+                            description: Both sides dial each other (needs inbound reachability).
+                      relays:
+                        type: array
+                        description: >-
+                          The SRT relays Strom can use, `default` first. Empty when none is
+                          configured (or not known). Never the relays' internal addresses.
+                        items:
+                          $ref: '#/components/schemas/SrtRelayEndpoint'
+                      inboundReachable:
+                        type: boolean
+                        nullable: true
+                        description: Whether a port Strom binds can be reached from outside; null when not known.
+                      ports:
+                        type: array
+                        nullable: true
+                        description: >-
+                          Strom's STROM_PORTS as inclusive spans; null for any port (or not
+                          known). Separate from `srtPorts` (this instance's legacy reservation).
+                        items:
+                          type: object
+                          required: [first, last]
+                          properties:
+                            first:
+                              type: integer
+                            last:
+                              type: integer
 
   /api/v1/reconnect:
     post:
@@ -1742,13 +1839,15 @@ paths:
           description: >-
             Hostless SRT listener port is outside this instance's leased range (see
             /api/v1/server-info), or the address is an SRT relay address
-            (`srt+relay://`) and Strom reports that it has no SRT relay. (While Strom
+            (`srt+relay://`) naming a relay Strom definitely does not have: none at all
+            (`code: srt-relay-not-configured`) or none of that name
+            (`code: srt-relay-unknown`, `relays` lists the names it has). (While Strom
             cannot be asked, relay addresses are accepted and `connect.reason` is
-            `srt-relay-unreachable`.)
+            `srt-relay-unreachable`.) SRT modes are never refused: see `connect.warning`.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/SrtRelayError'
         '409':
           description: >-
             Hostless SRT listener port is already held by another source or output, or no
@@ -1814,13 +1913,15 @@ paths:
           description: >-
             Hostless SRT listener port is outside this instance's leased range (see
             /api/v1/server-info), or the address is an SRT relay address
-            (`srt+relay://`) and Strom reports that it has no SRT relay. (While Strom
+            (`srt+relay://`) naming a relay Strom definitely does not have: none at all
+            (`code: srt-relay-not-configured`) or none of that name
+            (`code: srt-relay-unknown`, `relays` lists the names it has). (While Strom
             cannot be asked, relay addresses are accepted and `connect.reason` is
-            `srt-relay-unreachable`.)
+            `srt-relay-unreachable`.) SRT modes are never refused: see `connect.warning`.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/SrtRelayError'
         '409':
           description: >-
             Hostless SRT listener port is already held by another source or output, or no
@@ -1994,13 +2095,15 @@ paths:
           description: >-
             Hostless SRT listener port is outside this instance's leased range (see
             /api/v1/server-info), or the address is an SRT relay address
-            (`srt+relay://`) and Strom reports that it has no SRT relay. (While Strom
+            (`srt+relay://`) naming a relay Strom definitely does not have: none at all
+            (`code: srt-relay-not-configured`) or none of that name
+            (`code: srt-relay-unknown`, `relays` lists the names it has). (While Strom
             cannot be asked, relay addresses are accepted and `connect.reason` is
-            `srt-relay-unreachable`.)
+            `srt-relay-unreachable`.) SRT modes are never refused: see `connect.warning`.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/SrtRelayError'
         '409':
           description: >-
             Hostless SRT listener port is already held by another source or output, or no
@@ -2059,13 +2162,15 @@ paths:
           description: >-
             Hostless SRT listener port is outside this instance's leased range (see
             /api/v1/server-info), or the address is an SRT relay address
-            (`srt+relay://`) and Strom reports that it has no SRT relay. (While Strom
+            (`srt+relay://`) naming a relay Strom definitely does not have: none at all
+            (`code: srt-relay-not-configured`) or none of that name
+            (`code: srt-relay-unknown`, `relays` lists the names it has). (While Strom
             cannot be asked, relay addresses are accepted and `connect.reason` is
-            `srt-relay-unreachable`.)
+            `srt-relay-unreachable`.) SRT modes are never refused: see `connect.warning`.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/SrtRelayError'
         '409':
           description: >-
             Hostless SRT listener port is already held by another source or output, or no

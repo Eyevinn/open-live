@@ -2,7 +2,7 @@ import { config, objectStorageMissingVars } from './config.js';
 import { startIdleWatchdog } from './services/idle-watchdog.js';
 import { startGpuUsageSweep, stopGpuUsageSweep } from './services/gpu-usage.js';
 import { startPortReservation, stopPortReservation } from './services/port-reservation.js';
-import { warmSrtRelayStatus } from './services/srt-relay-status.js';
+import { warmStromCapabilities } from './services/strom-capabilities.js';
 import { connectDbAndInit, startDbConnectRetry, stopDbConnectRetry } from './lib/post-connect-init.js';
 import { buildServer } from './server.js';
 import { isFatalStartupError } from './lib/fatal-startup-error.js';
@@ -121,8 +121,8 @@ async function main() {
   // metering was enabled on this instance is ever reported.
   await startGpuUsageSweep(app.log);
   startPortReservation(app.log);
-  // Ask Strom about its SRT relay now, so no request has to wait for it.
-  warmSrtRelayStatus();
+  // Ask Strom about its capabilities (SRT modes, relays) now, so no request has to wait for it.
+  warmStromCapabilities();
   await app.listen({ port: config.port, host: '0.0.0.0' });
 
   // Graceful shutdown: release the Strom port lease so the range is free for

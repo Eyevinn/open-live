@@ -12,10 +12,22 @@
 import type { FastifyBaseLogger } from 'fastify';
 import { isSrtRelayAddress } from '../lib/srt-relay.js';
 import { getPortReservation } from './port-reservation.js';
-import { getSrtRelayStatus } from './srt-relay-status.js';
-import { resolveSrtAddress, srtClashAfterWrite, usedSrtBindings } from './listener-ports.js';
+import { getStromCapabilities } from './strom-capabilities.js';
+import { resolveSrtAddress, srtClashAfterWrite, usedSrtBindings, type SrtRelayRefusalCode } from './listener-ports.js';
 
-export type SrtWriteResult<T> = { ok: true; value: T } | { ok: false; statusCode: number; error: string };
+export type SrtWriteResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; statusCode: number; error: string; code?: SrtRelayRefusalCode; relays?: string[] };
+
+/** The reply body for a refused write: `{ error, statusCode }`, plus `code` and `relays` for a relay refusal. */
+export function srtWriteErrorBody(result: { statusCode: number; error: string; code?: string; relays?: string[] }) {
+  return {
+    error: result.error,
+    statusCode: result.statusCode,
+    ...(result.code ? { code: result.code } : {}),
+    ...(result.relays ? { relays: result.relays } : {}),
+  };
+}
 
 export interface SrtWriteOptions<T> {
   /** The requested address, plaintext (`srt://:0`, `srt+relay://auto`, …). */
@@ -35,13 +47,13 @@ export interface SrtWriteOptions<T> {
 const MAX_RETRIES = 3;
 
 export async function writeWithSrtAddress<T>(opts: SrtWriteOptions<T>): Promise<SrtWriteResult<T>> {
-  // Only relay addresses need Strom's relay status (served from cache).
-  const relay = isSrtRelayAddress(opts.address) ? await getSrtRelayStatus() : undefined;
+  // Only relay addresses need Strom's capabilities here (served from cache).
+  const strom = isSrtRelayAddress(opts.address) ? await getStromCapabilities() : undefined;
   for (let attempt = 0; ; attempt++) {
     const resolved = resolveSrtAddress(opts.address, getPortReservation(), await usedSrtBindings(), {
       self: opts.self,
       keepFrom: opts.keepFrom,
-      relay,
+      strom,
     });
     if (!resolved.ok) return resolved;
     const { value, undo } = await opts.write(resolved.address);

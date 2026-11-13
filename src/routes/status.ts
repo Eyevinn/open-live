@@ -5,7 +5,7 @@ import { StromClient } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
 import { getPortReservation } from '../services/port-reservation.js';
-import { getSrtRelayStatus } from '../services/srt-relay-status.js';
+import { getStromCapabilities } from '../services/strom-capabilities.js';
 
 const statusRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get('/api/v1/ping', async (_req, reply) => {
@@ -25,16 +25,23 @@ const statusRoutes: FastifyPluginAsync = async (fastify) => {
     // are not necessarily contiguous.
     const reservation = getPortReservation();
     const srtPorts = reservation.status === 'reserved' ? reservation.reservation.ports : null;
-    // The SRT relay Strom fronts, if any (served from cache and refreshed in
-    // the background, so this never waits on Strom; a Strom without relay
-    // support reads as not configured). Clients offer `srt+relay://auto`
-    // addresses only when `configured`; `public` is the relay's public
-    // host:port; `state` says whether Strom answered the last check (`ok`) or
-    // the values are last known (`unreachable`) or not known yet (`unknown`).
-    // Where the relay is internally stays Strom's business.
-    const relay = await getSrtRelayStatus();
-    const srtRelay = { configured: relay.configured, public: relay.public, state: relay.state };
-    return reply.send({ stromHost, srtPorts, srtPortState: reservation.status, srtRelay });
+    // What SRT can do on this Strom, from Strom's GET /api/capabilities
+    // (served from cache and refreshed in the background, so this never waits
+    // on Strom). Clients offer only the `modes` that are true (#628; reported,
+    // never enforced by the API) and offer `srt+relay://auto[@<name>]` only
+    // when `relays` is non-empty, with a picker when there is more than one.
+    // `state`: `ok` (Strom answered), `unsupported` (older Strom: every mode,
+    // no relay), `unreachable` (last known values), `unknown` (not asked yet:
+    // every mode, no relay). Relay internal addresses stay Strom's business.
+    const caps = await getStromCapabilities();
+    const srt = {
+      state: caps.state,
+      modes: caps.srt.modes,
+      relays: caps.srt.relays,
+      inboundReachable: caps.inboundReachable,
+      ports: caps.ports,
+    };
+    return reply.send({ stromHost, srtPorts, srtPortState: reservation.status, srt });
   });
 
   fastify.post(
