@@ -410,6 +410,54 @@ describe('resolveSrtConnect() — SRT modes Strom reports (reported, not enforce
   });
 });
 
+describe('resolveSrtConnect() — listener port outside the ports Strom reports', () => {
+  const PORTS = [{ first: 47100, last: 47199 }, { first: 48000, last: 48000 }];
+  const info = (
+    over: { listener?: boolean; ports?: Array<{ first: number; last: number }> | null; srtPortsReserved?: boolean; state?: 'ok' | 'unreachable' } = {},
+  ) => ({
+    state: over.state ?? ('ok' as const),
+    srt: { modes: { listener: over.listener ?? true, caller: true, rendezvous: true }, relays: [] },
+    ports: over.ports === undefined ? PORTS : over.ports,
+    ...(over.srtPortsReserved ? { srtPortsReserved: true } : {}),
+  });
+
+  it('no warning for a listener port inside a span', () => {
+    for (const address of ['srt://:47100?mode=listener', 'srt://:47199', 'srt://:48000?mode=listener']) {
+      expect(resolveSrtConnect(address, { ...CFG, strom: info() })?.warning).toBeUndefined();
+    }
+  });
+
+  it('warns for a listener port outside every span, and still resolves the address', () => {
+    for (const address of ['srt://:47099?mode=listener', 'srt://:47200', 'srt://0.0.0.0:48001?mode=listener', 'srt://:9000?mode=caller']) {
+      const c = resolveSrtConnect(address, { ...CFG, strom: info() });
+      expect(c?.warning).toBe('srt-port-outside-strom-ports');
+      expect(c?.uri).not.toBeNull();
+    }
+  });
+
+  it('warns from the last-known ports while Strom is unreachable', () => {
+    expect(resolveSrtConnect('srt://:9000', { ...CFG, strom: info({ state: 'unreachable' }) })?.warning).toBe('srt-port-outside-strom-ports');
+  });
+
+  it('no warning while the legacy srtPorts reservation is active (its own 422 checks the port)', () => {
+    expect(resolveSrtConnect('srt://:9000', { ...CFG, strom: info({ srtPortsReserved: true }) })?.warning).toBeUndefined();
+  });
+
+  it('srt-listener-unsupported wins when Listener is unsupported and the port is outside too', () => {
+    expect(resolveSrtConnect('srt://:9000', { ...CFG, strom: info({ listener: false }) })?.warning).toBe('srt-listener-unsupported');
+  });
+
+  it('no warning when Strom reports no port list (any port)', () => {
+    expect(resolveSrtConnect('srt://:9000', { ...CFG, strom: info({ ports: null }) })?.warning).toBeUndefined();
+    expect(resolveSrtConnect('srt://:9000', CFG)?.warning).toBeUndefined();
+  });
+
+  it('never warns on a caller or rendezvous address, whatever its port', () => {
+    expect(resolveSrtConnect('srt://cdn.example.com:9000', { ...CFG, strom: info() })?.warning).toBeUndefined();
+    expect(resolveSrtConnect('srt://peer.example.com:9000?mode=rendezvous', { ...CFG, strom: info() })?.warning).toBeUndefined();
+  });
+});
+
 describe('srtAddressMode()', () => {
   it.each([
     ['srt://:47100', 'listener'],

@@ -359,6 +359,61 @@ describe('sources with a relay address', () => {
     expect(caller.statusCode).toBe(201);
     expect(caller.json().connect).not.toHaveProperty('warning');
   });
+
+  it('PATCH to a listener address on a Strom that reports listener unsupported: 200 with the warning on connect', async () => {
+    _resetPortReservationState({ status: 'disabled' });
+    mockCapabilities.mockResolvedValue(caps([], { listener: false, caller: true, rendezvous: false }));
+    mockSourcesGet.mockResolvedValue(source('srt://cdn.example.com:9000'));
+    const res = await app.inject({ method: 'PATCH', url: '/api/v1/sources/src-relay', payload: { address: 'srt://:47106?mode=listener' } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().connect).toMatchObject({ port: 47106, warning: 'srt-listener-unsupported' });
+  });
+
+  it('POST and PATCH a listener port outside the ports Strom reports: accepted, with srt-port-outside-strom-ports', async () => {
+    _resetPortReservationState({ status: 'disabled' });
+    mockCapabilities.mockResolvedValue({ ...RELAY, network: { inbound_reachable: true, ports: [{ first: 47100, last: 47199 }] } });
+    const inside = await app.inject({ method: 'POST', url: '/api/v1/sources', payload: { name: 'Cam', streamType: 'srt', address: 'srt://:47105?mode=listener' } });
+    expect(inside.statusCode).toBe(201);
+    expect(inside.json().connect).not.toHaveProperty('warning');
+    const outside = await app.inject({ method: 'POST', url: '/api/v1/sources', payload: { name: 'Cam', streamType: 'srt', address: 'srt://:48000?mode=listener' } });
+    expect(outside.statusCode).toBe(201);
+    expect(outside.json().connect).toMatchObject({ port: 48000, warning: 'srt-port-outside-strom-ports' });
+    mockSourcesGet.mockResolvedValue(source('srt://:47105?mode=listener'));
+    const patched = await app.inject({ method: 'PATCH', url: '/api/v1/sources/src-relay', payload: { address: 'srt://:48001?mode=listener' } });
+    expect(patched.statusCode).toBe(200);
+    expect(patched.json().connect).toMatchObject({ port: 48001, warning: 'srt-port-outside-strom-ports' });
+  });
+});
+
+describe('listener outputs on a Strom that reports listener unsupported', () => {
+  it('POST: 201 with the warning on connect', async () => {
+    _resetPortReservationState({ status: 'disabled' });
+    mockCapabilities.mockResolvedValue(caps([], { listener: false, caller: true, rendezvous: false }));
+    const res = await app.inject({ method: 'POST', url: '/api/v1/outputs', payload: { name: 'Program', outputType: 'mpegtssrt', url: 'srt://:47107?mode=listener' } });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().connect).toMatchObject({ port: 47107, warning: 'srt-listener-unsupported' });
+  });
+
+  it('PATCH: 200 with the warning on connect', async () => {
+    _resetPortReservationState({ status: 'disabled' });
+    mockCapabilities.mockResolvedValue(caps([], { listener: false, caller: true, rendezvous: false }));
+    mockOutputsGet.mockResolvedValue(output('srt://cdn.example.com:9000'));
+    const res = await app.inject({ method: 'PATCH', url: '/api/v1/outputs/output-relay', payload: { url: 'srt://:47108?mode=listener' } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().connect).toMatchObject({ port: 47108, warning: 'srt-listener-unsupported' });
+  });
+
+  it('POST and PATCH a listener port outside the ports Strom reports: srt-port-outside-strom-ports', async () => {
+    _resetPortReservationState({ status: 'disabled' });
+    mockCapabilities.mockResolvedValue({ ...RELAY, network: { inbound_reachable: true, ports: [{ first: 47100, last: 47199 }] } });
+    const res = await app.inject({ method: 'POST', url: '/api/v1/outputs', payload: { name: 'Program', outputType: 'mpegtssrt', url: 'srt://:48000?mode=listener' } });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().connect).toMatchObject({ port: 48000, warning: 'srt-port-outside-strom-ports' });
+    mockOutputsGet.mockResolvedValue(output('srt://:47105?mode=listener'));
+    const patched = await app.inject({ method: 'PATCH', url: '/api/v1/outputs/output-relay', payload: { url: 'srt://:47150?mode=listener' } });
+    expect(patched.statusCode).toBe(200);
+    expect(patched.json().connect).not.toHaveProperty('warning');
+  });
 });
 
 describe('outputs with a relay address', () => {

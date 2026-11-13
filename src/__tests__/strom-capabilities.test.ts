@@ -204,4 +204,20 @@ describe('getStromCapabilities', () => {
     expect(await srtCapabilitiesFor(['srt+relay://cam1'])).toEqual(OK);
     expect(await srtCapabilitiesFor(['srt://:47100?mode=listener'])).toEqual(OK);
   });
+
+  it('srtCapabilitiesFor flags an active legacy port reservation (no port warning then)', async () => {
+    const { _resetPortReservationState } = await import('../services/port-reservation.js');
+    capabilities.mockResolvedValue(BODY);
+    try {
+      _resetPortReservationState({
+        status: 'reserved',
+        reservation: { id: 'r1', owner_id: 'o1', ports: [47100], created_at: '2026-01-01T00:00:00Z', expires_at: '2026-01-02T00:00:00Z' },
+      });
+      expect(await srtCapabilitiesFor(['srt://:47100?mode=listener'])).toEqual({ ...OK, srtPortsReserved: true });
+      _resetPortReservationState({ status: 'disabled' });
+      expect(await srtCapabilitiesFor(['srt://:47100?mode=listener'])).not.toHaveProperty('srtPortsReserved');
+    } finally {
+      _resetPortReservationState();
+    }
+  });
 });

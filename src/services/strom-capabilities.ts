@@ -33,6 +33,7 @@ import { StromClient, StromClientError, type StromPortSpan, type StromRelayEndpo
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
 import { isSrtRelayAddress, isValidSrtRelayName } from '../lib/srt-relay.js';
+import { getPortReservation } from './port-reservation.js';
 
 /**
  * How current the answer is: `ok` when Strom answered the last request,
@@ -197,12 +198,15 @@ export function warmStromCapabilities(): void {
  * Strom's capabilities for resolving the dial-in address of these SRT
  * addresses, or undefined when there are none (so a page without SRT never
  * waits on Strom). Relay addresses need the relays, listener and rendezvous
- * addresses the modes.
+ * addresses the modes, listener addresses the port spans. `srtPortsReserved`
+ * is set while the legacy port reservation holds ports (its 422 then checks
+ * listener ports, so `connect` does not warn about Strom's `ports`).
  */
 export async function srtCapabilitiesFor(
   addresses: ReadonlyArray<string | undefined | null>,
-): Promise<StromCapabilities | undefined> {
+): Promise<(StromCapabilities & { srtPortsReserved?: boolean }) | undefined> {
   const srt = (a: string | undefined | null) => typeof a === 'string' && (isSrtRelayAddress(a) || a.trim().startsWith('srt://'));
   if (!addresses.some(srt)) return undefined;
-  return getStromCapabilities();
+  const caps = await getStromCapabilities();
+  return getPortReservation().status === 'reserved' ? { ...caps, srtPortsReserved: true } : caps;
 }

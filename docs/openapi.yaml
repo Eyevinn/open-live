@@ -550,7 +550,8 @@ components:
         SRT relay address (`srt+relay://<id>[@<relay>]`) it is that relay's public
         address as Strom reports it, `srt://<public host:port>?streamid=<id>`, with
         `source: srt-relay`, `mode: caller` and `relay`. Never carries the passphrase.
-        `warning` reports a direction Strom says cannot work here (never enforced).
+        `warning` reports a direction Strom says cannot work here, or a listener port
+        outside Strom's reported port ranges (never enforced).
       required: [uri, host, port, mode, source]
       properties:
         uri:
@@ -598,13 +599,18 @@ components:
             reports the relay, but its public address is not a usable host:port.
         warning:
           type: string
-          enum: [srt-listener-unsupported, srt-rendezvous-unsupported]
+          enum: [srt-listener-unsupported, srt-rendezvous-unsupported, srt-port-outside-strom-ports]
           description: >-
-            Strom reports (server-info `srt.modes`) that the mode this address needs
-            cannot work on this Strom: a listener (hostless `srt://:PORT`, or
-            `mode=listener`) or a rendezvous address. The address is still stored and
-            resolved; the operator may know better. Absent when the mode is supported or
-            Strom's capabilities are not known.
+            Reported, never enforced: the address is still stored and resolved, and
+            create (201) and PATCH (200) responses carry it too. `srt-listener-unsupported`
+            / `srt-rendezvous-unsupported`: Strom reports (server-info `srt.modes`) that
+            the mode this address needs cannot work on this Strom: a listener (hostless
+            `srt://:PORT`, or `mode=listener`) or a rendezvous address.
+            `srt-port-outside-strom-ports`: a listener whose port is outside every span in
+            server-info `srt.ports` (the last known ones while Strom is unreachable);
+            only when no legacy port reservation is active (`srtPorts` null) and Strom
+            reports a port list. One value: an unsupported mode wins over the port.
+            Absent when nothing applies or Strom's capabilities are not known.
 
     OutputInput:
       type: object
@@ -1850,7 +1856,10 @@ paths:
             (`code: srt-relay-not-configured`) or none of that name
             (`code: srt-relay-unknown`, `relays` lists the names it has). (While Strom
             cannot be asked, relay addresses are accepted and `connect.reason` is
-            `srt-relay-unreachable`.) SRT modes are never refused: see `connect.warning`.
+            `srt-relay-unreachable`.) SRT modes, and a listener port outside Strom's
+            reported `srt.ports`, are never refused: the 2xx response carries
+            `connect.warning` (`srt-listener-unsupported`, `srt-rendezvous-unsupported`,
+            `srt-port-outside-strom-ports`).
           content:
             application/json:
               schema:
@@ -1924,7 +1933,10 @@ paths:
             (`code: srt-relay-not-configured`) or none of that name
             (`code: srt-relay-unknown`, `relays` lists the names it has). (While Strom
             cannot be asked, relay addresses are accepted and `connect.reason` is
-            `srt-relay-unreachable`.) SRT modes are never refused: see `connect.warning`.
+            `srt-relay-unreachable`.) SRT modes, and a listener port outside Strom's
+            reported `srt.ports`, are never refused: the 2xx response carries
+            `connect.warning` (`srt-listener-unsupported`, `srt-rendezvous-unsupported`,
+            `srt-port-outside-strom-ports`).
           content:
             application/json:
               schema:
@@ -2106,7 +2118,10 @@ paths:
             (`code: srt-relay-not-configured`) or none of that name
             (`code: srt-relay-unknown`, `relays` lists the names it has). (While Strom
             cannot be asked, relay addresses are accepted and `connect.reason` is
-            `srt-relay-unreachable`.) SRT modes are never refused: see `connect.warning`.
+            `srt-relay-unreachable`.) SRT modes, and a listener port outside Strom's
+            reported `srt.ports`, are never refused: the 2xx response carries
+            `connect.warning` (`srt-listener-unsupported`, `srt-rendezvous-unsupported`,
+            `srt-port-outside-strom-ports`).
           content:
             application/json:
               schema:
@@ -2173,7 +2188,10 @@ paths:
             (`code: srt-relay-not-configured`) or none of that name
             (`code: srt-relay-unknown`, `relays` lists the names it has). (While Strom
             cannot be asked, relay addresses are accepted and `connect.reason` is
-            `srt-relay-unreachable`.) SRT modes are never refused: see `connect.warning`.
+            `srt-relay-unreachable`.) SRT modes, and a listener port outside Strom's
+            reported `srt.ports`, are never refused: the 2xx response carries
+            `connect.warning` (`srt-listener-unsupported`, `srt-rendezvous-unsupported`,
+            `srt-port-outside-strom-ports`).
           content:
             application/json:
               schema:

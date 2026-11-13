@@ -39,10 +39,15 @@ export type SrtConnectReason =
 /**
  * A resolved address that may still not work: Strom reports the direction
  * it needs as unsupported (`srt-listener-unsupported`,
- * `srt-rendezvous-unsupported`). Reported, never enforced: present alongside
- * `uri`, or alongside `reason`.
+ * `srt-rendezvous-unsupported`), or a listener binds a port outside the port
+ * ranges Strom reports (`srt-port-outside-strom-ports`). Reported, never
+ * enforced: present alongside `uri`, or alongside `reason`. Single-valued: an
+ * unsupported mode wins over the port warning.
  */
-export type SrtConnectWarning = 'srt-listener-unsupported' | 'srt-rendezvous-unsupported';
+export type SrtConnectWarning =
+  | 'srt-listener-unsupported'
+  | 'srt-rendezvous-unsupported'
+  | 'srt-port-outside-strom-ports';
 
 export interface SrtConnect {
   /**
@@ -68,7 +73,10 @@ export interface SrtConnect {
   relay?: string;
   /** Present only when `uri` is null. */
   reason?: SrtConnectReason;
-  /** Strom reports the direction this address needs as unsupported. */
+  /**
+   * Strom reports the direction this address needs as unsupported, or a
+   * listener port is outside Strom's reported port ranges.
+   */
   warning?: SrtConnectWarning;
 }
 
@@ -87,6 +95,16 @@ export interface SrtStromInfo {
     modes?: { listener: boolean; caller: boolean; rendezvous: boolean };
     relays: ReadonlyArray<{ name: string; public: string }>;
   };
+  /**
+   * Strom's `STROM_PORTS` as inclusive spans, or null/absent (any port, or
+   * not known). With `state: 'unreachable'` these are the last known ones.
+   */
+  ports?: ReadonlyArray<{ first: number; last: number }> | null;
+  /**
+   * True while the legacy port reservation holds ports (`server-info.srtPorts`
+   * non-null). Its own 422 then checks listener ports, so no port warning.
+   */
+  srtPortsReserved?: boolean;
 }
 
 export interface SrtConnectConfig {
@@ -172,7 +190,7 @@ export function resolveSrtConnect(authoredUrl: string, cfg: SrtConnectConfig): S
   if (isSrtRelayAddress(authoredUrl)) return resolveSrtRelayConnect(authoredUrl, cfg.strom);
   const connect = resolveSrtDirectConnect(authoredUrl, cfg);
   if (!connect) return connect;
-  const warning = srtModeWarning(authoredUrl, cfg.strom);
+  const warning = srtModeWarning(authoredUrl, cfg.strom) ?? srtPortWarning(authoredUrl, cfg.strom);
   return warning ? { ...connect, warning } : connect;
 }
 
@@ -198,6 +216,20 @@ function srtModeWarning(address: string, strom: SrtStromInfo | undefined): SrtCo
   if (mode === 'listener' && !modes.listener) return 'srt-listener-unsupported';
   if (mode === 'rendezvous' && !modes.rendezvous) return 'srt-rendezvous-unsupported';
   return undefined;
+}
+
+/**
+ * The warning for a listener whose port is outside every port span Strom
+ * reports (#628 spec §4.5). Only when no legacy reservation is active (that
+ * one refuses with its own 422) and Strom reports a port list at all.
+ */
+function srtPortWarning(address: string, strom: SrtStromInfo | undefined): SrtConnectWarning | undefined {
+  const spans = strom?.ports;
+  if (!spans || strom.srtPortsReserved) return undefined;
+  if (srtAddressMode(address) !== 'listener') return undefined;
+  const port = parseSrtAuthority(address)?.port;
+  if (!port) return undefined; // port 0: the server picks one
+  return spans.some((s) => port >= s.first && port <= s.last) ? undefined : 'srt-port-outside-strom-ports';
 }
 
 function resolveSrtDirectConnect(authoredUrl: string, cfg: SrtConnectConfig): SrtConnect | null {
