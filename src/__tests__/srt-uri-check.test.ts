@@ -42,10 +42,18 @@ describe('checkSrtUriAsGStreamerReads (rules of Strom validate_srt_uri)', () => 
   });
 
   it('refuses a mode in the wrong case, and an unknown mode', () => {
-    bad('srt://h.example:1?mode=Caller', /mode 'Caller' is not read by GStreamer: use 'caller'/);
+    bad('srt://h.example:1?mode=Caller', /mode 'Caller' behaves differently across GLib versions.*: use 'caller'/);
     bad('srt://h.example:1?mode=LISTENER', /use 'listener'/);
     bad('srt://h.example:1?mode=push', /mode 'push' is not one of caller, listener, rendezvous/);
-    bad('srt://h.example:1?mode', /mode '' is not one of/);
+    bad('srt://h.example:1?mode=', /mode '' is not one of/);
+  });
+
+  it('refuses a key without = (GStreamer 1.28.6 crashes on it), known or not', () => {
+    bad('srt://h.example:1?mode', /'mode' has no value, which crashes GStreamer: write 'mode=<value>' or remove it/);
+    bad('srt://:5000?latency', /'latency' has no value/);
+    bad('srt://h.example:1?passphrase=abcdefghij&foo', /'foo' has no value/);
+    bad('srt+relay://auto?latency', /'latency' has no value/);
+    ok('srt://h.example:1?latency=&foo=1');
   });
 
   it('refuses a key given twice, also when one is escaped', () => {

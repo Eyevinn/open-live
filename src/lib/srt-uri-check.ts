@@ -3,10 +3,12 @@
  * so an address that would run differently from how it is written is refused
  * when it is saved, not first when the production is activated.
  *
- * GStreamer drops most problems without a word: keys and `mode` values are
- * matched exactly (`PassPhrase=` and `mode=Caller` are ignored, so a URI that
- * looks encrypted runs unencrypted), a value with a malformed escape or `%00`
- * is not set, and a raw `#` cuts the rest of the URI off. Strom refuses such a
+ * GStreamer drops most problems without a word: keys are matched exactly
+ * (`PassPhrase=` is ignored, so a URI that looks encrypted runs unencrypted),
+ * a `mode` in another case (`mode=Caller`) is read by GLib 2.88 and later but
+ * ignored by older GLib, a value with a malformed escape or `%00` is not set,
+ * and a raw `#` cuts the rest of the URI off. A key without `=` (`?latency`)
+ * crashes GStreamer 1.28.6 when the element starts. Strom refuses such a
  * URI when it builds the flow (`validate_srt_uri` in Strom's
  * `types/src/srt_uri.rs`, the source of truth for these rules); this is the
  * same check at Open Live's API edge.
@@ -98,7 +100,10 @@ export function checkSrtUriAsGStreamerReads(address: string): void {
       new Error(`SRT parameter '${key}' has a malformed %-escape or %00, so GStreamer does not set it: write '%' as %25`);
     const key = gstUnescape(rawKey);
     if (key === null) throw badEscape(rawKey);
-    const value = rawValue === null ? '' : gstUnescape(rawValue);
+    if (rawValue === null) {
+      throw new Error(`SRT parameter '${key}' has no value, which crashes GStreamer: write '${key}=<value>' or remove it`);
+    }
+    const value = gstUnescape(rawValue);
     if (value === null) throw badEscape(key);
 
     if (!GST_SRT_URI_KEYS.includes(key)) {
@@ -111,7 +116,7 @@ export function checkSrtUriAsGStreamerReads(address: string): void {
       const expected = GST_SRT_MODES.find((m) => m.toLowerCase() === value.toLowerCase());
       throw new Error(
         expected
-          ? `SRT mode '${value}' is not read by GStreamer: use '${expected}'`
+          ? `SRT mode '${value}' behaves differently across GLib versions (older ones ignore it): use '${expected}'`
           : `SRT mode '${value}' is not one of ${GST_SRT_MODES.join(', ')}`,
       );
     }
