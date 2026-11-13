@@ -23,6 +23,19 @@
  * with `srt+relay://auto?passphrase=…` never moves the stream to another
  * relay). `auto@<relay>` moves it to that relay, `auto@default` back to the
  * default one, keeping the id either way.
+ *
+ * The passphrase on such a patch (`auto`, with or without `@`, of a doc that
+ * already holds a relay address):
+ * - no `passphrase` key in the query keeps the stored passphrase (the stored,
+ *   encrypted value as is) and the stored `pbkeylen` unless the query has one,
+ *   so moving a stream to another relay never asks for the passphrase again.
+ *   The passphrase protects the stream end to end and the relay never sees
+ *   it, so there is no reason to make the operator type it again;
+ * - `passphrase=` (empty) removes it;
+ * - `passphrase=<value>` sets it.
+ * An empty `passphrase=` is never stored or handed to Strom on any relay
+ * address. Explicit ids are taken as written, apart from dropping an empty
+ * `passphrase=`; plain `srt://` addresses are not touched here.
  */
 
 import { randomBytes } from 'crypto';
@@ -112,22 +125,67 @@ export function buildSrtRelayAddress(id: string, relay: string | null, query: st
   return `${SRT_RELAY_SCHEME}${id}${at}${query ? `?${query}` : ''}`;
 }
 
+/** The raw `key=value` pairs of a query (not decoded). */
+function queryPairs(query: string): string[] {
+  return query.split('&').filter((p) => p !== '');
+}
+
+/** The key of a raw query pair, lower-cased. */
+function pairKey(pair: string): string {
+  const eq = pair.indexOf('=');
+  return (eq === -1 ? pair : pair.slice(0, eq)).toLowerCase();
+}
+
+/** True for a `passphrase=` pair with an empty value. */
+function isEmptyPassphrase(pair: string): boolean {
+  return pairKey(pair) === 'passphrase' && pair.indexOf('=') === pair.length - 1;
+}
+
+/** A query without any empty `passphrase=` (the way to remove a passphrase). */
+export function withoutEmptyPassphrase(query: string): string {
+  return queryPairs(query).filter((p) => !isEmptyPassphrase(p)).join('&');
+}
+
+/**
+ * The query an `auto` patch stores, given the query the document holds today
+ * (stored form). No `passphrase` key keeps the stored passphrase, and the
+ * stored `pbkeylen` unless the new query has one; an empty `passphrase=`
+ * removes it; any other value replaces it.
+ */
+export function mergeSrtRelayQuery(query: string, storedQuery: string): string {
+  const pairs = queryPairs(query);
+  if (pairs.some((p) => pairKey(p) === 'passphrase')) return withoutEmptyPassphrase(query);
+  const stored = queryPairs(storedQuery);
+  const passphrase = stored.find((p) => pairKey(p) === 'passphrase' && !isEmptyPassphrase(p));
+  if (!passphrase) return pairs.join('&');
+  const pbkeylen = pairs.some((p) => pairKey(p) === 'pbkeylen') ? undefined : stored.find((p) => pairKey(p) === 'pbkeylen');
+  return [...pairs, passphrase, ...(pbkeylen ? [pbkeylen] : [])].join('&');
+}
+
 /**
  * Replace an `auto` id with a real one. Any other address (plain SRT, or a
- * relay address with an explicit id) is returned unchanged.
+ * relay address with an explicit id) is returned unchanged, except that an
+ * empty `passphrase=` is dropped from a relay address.
  *
  * `keepFrom` is the address the document holds today (stored form, possibly
  * with an encrypted passphrase). When it is a relay address with a real id,
  * that id is kept so a re-submitted `auto` never changes the session the
- * outside party dials, and so is its relay unless the new address names one.
- * Otherwise a new id is generated and the address's own relay is used.
+ * outside party dials, and so is its relay unless the new address names one,
+ * and its passphrase unless the new address has a `passphrase` key (see
+ * `mergeSrtRelayQuery`). Otherwise a new id is generated and the address's
+ * own relay and query are used.
  */
 export function resolveSrtRelayAddress(address: string, keepFrom?: string | null): string {
   const parsed = parseSrtRelayAddress(address);
-  if (!parsed || parsed.id !== SRT_RELAY_AUTO_ID) return address;
+  if (!parsed) return address;
+  if (parsed.id !== SRT_RELAY_AUTO_ID) {
+    const query = withoutEmptyPassphrase(parsed.query);
+    return query === parsed.query ? address : buildSrtRelayAddress(parsed.id, parsed.relay, query);
+  }
   const kept = keepFrom ? parseSrtRelayAddress(keepFrom) : null;
   const keep = kept && kept.id !== SRT_RELAY_AUTO_ID ? kept : null;
   const id = keep ? keep.id : generateSrtRelayId();
   const relay = parsed.relay ?? keep?.relay ?? null;
-  return buildSrtRelayAddress(id, relay, parsed.query);
+  const query = keep ? mergeSrtRelayQuery(parsed.query, keep.query) : withoutEmptyPassphrase(parsed.query);
+  return buildSrtRelayAddress(id, relay, query);
 }

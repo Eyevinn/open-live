@@ -256,6 +256,26 @@ describe('sources with a relay address', () => {
     expect((mockSourcesInsert.mock.calls[0]![0] as SourceDoc).address).toBe('srt+relay://sticky-id-0123456789');
   });
 
+  it('PATCH with auto@<relay> and no passphrase moves the stream and keeps the stored passphrase', async () => {
+    const { encryptAddressPassphrase } = await import('../lib/srt-passphrase-crypto.js');
+    const storedAddress = encryptAddressPassphrase(`srt+relay://sticky-id-0123456789@eu-north?passphrase=${SECRET}&pbkeylen=32`);
+    mockSourcesGet.mockResolvedValue(source(storedAddress));
+    const res = await app.inject({ method: 'PATCH', url: '/api/v1/sources/src-relay', payload: { address: 'srt+relay://auto@default?latency=200' } });
+    expect(res.statusCode).toBe(200);
+    const stored = (mockSourcesInsert.mock.calls[0]![0] as SourceDoc).address;
+    // The stored ciphertext is carried over as is, not re-encrypted or dropped.
+    expect(stored).toBe(`srt+relay://sticky-id-0123456789?latency=200&${storedAddress.split('?')[1]}`);
+    expect(res.json().address).toBe('srt+relay://sticky-id-0123456789?latency=200&passphrase=***&pbkeylen=32');
+    expect(res.body).not.toContain(SECRET);
+  });
+
+  it('PATCH with auto and an empty passphrase= removes the passphrase, and never stores the empty key', async () => {
+    mockSourcesGet.mockResolvedValue(source('srt+relay://sticky-id-0123456789@eu-north?passphrase=encv1:AAAA&pbkeylen=32'));
+    const res = await app.inject({ method: 'PATCH', url: '/api/v1/sources/src-relay', payload: { address: 'srt+relay://auto@default?passphrase=' } });
+    expect(res.statusCode).toBe(200);
+    expect((mockSourcesInsert.mock.calls[0]![0] as SourceDoc).address).toBe('srt+relay://sticky-id-0123456789');
+  });
+
   it('two auto creates get different ids', async () => {
     for (let i = 0; i < 2; i++) {
       await app.inject({ method: 'POST', url: '/api/v1/sources', payload: { name: 'Cam', streamType: 'srt', address: 'srt+relay://auto' } });
@@ -363,6 +383,19 @@ describe('outputs with a relay address', () => {
     expect(res.statusCode).toBe(200);
     expect((mockOutputsInsert.mock.calls[0]![0] as OutputDoc).url).toBe('srt+relay://out-sticky-0123456789?latency=300');
     expect(res.json().connect.streamid).toBe('out-sticky-0123456789');
+  });
+
+  it('PATCH with auto@<relay> keeps the stored passphrase; passphrase= removes it', async () => {
+    const { encryptAddressPassphrase } = await import('../lib/srt-passphrase-crypto.js');
+    const storedUrl = encryptAddressPassphrase(`srt+relay://out-sticky-0123456789?passphrase=${SECRET}`);
+    mockOutputsGet.mockResolvedValue(output(storedUrl));
+    let res = await app.inject({ method: 'PATCH', url: '/api/v1/outputs/output-relay', payload: { url: 'srt+relay://auto@eu-north' } });
+    expect(res.statusCode).toBe(200);
+    expect((mockOutputsInsert.mock.calls[0]![0] as OutputDoc).url).toBe(storedUrl.replace('0123456789?', '0123456789@eu-north?'));
+    expect(res.json().url).toBe('srt+relay://out-sticky-0123456789@eu-north?passphrase=***');
+    res = await app.inject({ method: 'PATCH', url: '/api/v1/outputs/output-relay', payload: { url: 'srt+relay://auto@eu-north?passphrase=' } });
+    expect(res.statusCode).toBe(200);
+    expect((mockOutputsInsert.mock.calls[1]![0] as OutputDoc).url).toBe('srt+relay://out-sticky-0123456789@eu-north');
   });
 
   it('PATCH with an invalid relay address is a 400', async () => {

@@ -248,8 +248,9 @@ export interface SrtResolveOptions {
  * resolver for listener ports and relay ids alike.
  *
  * - A relay address (`srt+relay://<id>[@<relay>]`) binds no port. `auto` gets
- *   a generated id (or keeps the stored one, and the stored relay unless the
- *   address names one); the id must not be held by any other source or output
+ *   a generated id (or keeps the stored one, the stored relay unless the
+ *   address names one, and the stored passphrase unless the address has a
+ *   `passphrase` key; `passphrase=` removes it); the id must not be held by any other source or output
  *   (409), whichever relay either uses. When Strom positively reports that it
  *   has no relay of that name (or none at all, or is too old to have any) the
  *   address is refused (422, with `code` and the relay names Strom has); when

@@ -98,7 +98,8 @@ describe('relay id generation and auto/keep', () => {
     const stored = 'srt+relay://kept-id?passphrase=encv1:AAAA_bbb-ccc&latency=120';
     expect(resolveSrtRelayAddress('srt+relay://auto?passphrase=newpassphrase', stored))
       .toBe('srt+relay://kept-id?passphrase=newpassphrase');
-    expect(resolveSrtRelayAddress('srt+relay://auto', stored)).toBe('srt+relay://kept-id');
+    // No passphrase key: the stored (encrypted) passphrase stays as is.
+    expect(resolveSrtRelayAddress('srt+relay://auto', stored)).toBe('srt+relay://kept-id?passphrase=encv1:AAAA_bbb-ccc');
   });
 
   it('auto@<relay> picks that relay for a new id', () => {
@@ -111,7 +112,7 @@ describe('relay id generation and auto/keep', () => {
     const stored = 'srt+relay://kept-id@eu-north?passphrase=encv1:AAAA_bbb-ccc';
     expect(resolveSrtRelayAddress('srt+relay://auto?passphrase=newpassphrase', stored))
       .toBe('srt+relay://kept-id@eu-north?passphrase=newpassphrase');
-    expect(resolveSrtRelayAddress('srt+relay://auto', stored)).toBe('srt+relay://kept-id@eu-north');
+    expect(resolveSrtRelayAddress('srt+relay://auto', stored)).toBe('srt+relay://kept-id@eu-north?passphrase=encv1:AAAA_bbb-ccc');
   });
 
   it('auto@<relay> moves a stored id to that relay, and auto@default back to the default one', () => {
@@ -121,6 +122,41 @@ describe('relay id generation and auto/keep', () => {
     expect(resolveSrtRelayAddress('srt+relay://auto@us', 'srt+relay://kept-id')).toBe('srt+relay://kept-id@us');
   });
 
+  it('a relay switch without a passphrase key keeps the stored passphrase and pbkeylen', () => {
+    const stored = 'srt+relay://kept-id@eu-north?passphrase=encv1:AAAA_bbb-ccc&pbkeylen=32&latency=120';
+    expect(resolveSrtRelayAddress('srt+relay://auto@us?latency=200', stored))
+      .toBe('srt+relay://kept-id@us?latency=200&passphrase=encv1:AAAA_bbb-ccc&pbkeylen=32');
+    expect(resolveSrtRelayAddress('srt+relay://auto@default', stored))
+      .toBe('srt+relay://kept-id?passphrase=encv1:AAAA_bbb-ccc&pbkeylen=32');
+    // A pbkeylen in the new query wins over the stored one.
+    expect(resolveSrtRelayAddress('srt+relay://auto@us?pbkeylen=16', stored))
+      .toBe('srt+relay://kept-id@us?pbkeylen=16&passphrase=encv1:AAAA_bbb-ccc');
+  });
+
+  it('an empty passphrase= removes the passphrase, with or without a relay switch, and is not stored', () => {
+    const stored = 'srt+relay://kept-id@eu-north?passphrase=encv1:AAAA_bbb-ccc&pbkeylen=32';
+    expect(resolveSrtRelayAddress('srt+relay://auto?passphrase=', stored)).toBe('srt+relay://kept-id@eu-north');
+    expect(resolveSrtRelayAddress('srt+relay://auto@us?latency=200&passphrase=', stored))
+      .toBe('srt+relay://kept-id@us?latency=200');
+    // On create (nothing stored) and on an explicit id it is dropped too.
+    const created = parseSrtRelayAddress(resolveSrtRelayAddress('srt+relay://auto?passphrase=&latency=200'))!;
+    expect(created.query).toBe('latency=200');
+    expect(resolveSrtRelayAddress('srt+relay://explicit-id-0123456789@us?passphrase=', stored))
+      .toBe('srt+relay://explicit-id-0123456789@us');
+  });
+
+  it('passphrase=<value> on a relay switch replaces the stored passphrase (and the stored pbkeylen goes)', () => {
+    const stored = 'srt+relay://kept-id?passphrase=encv1:AAAA_bbb-ccc&pbkeylen=32';
+    expect(resolveSrtRelayAddress('srt+relay://auto@us?passphrase=newpassphrase', stored))
+      .toBe('srt+relay://kept-id@us?passphrase=newpassphrase');
+  });
+
+  it('same relay, no passphrase key: the stored address comes back unchanged', () => {
+    const stored = 'srt+relay://kept-id@eu-north?passphrase=encv1:AAAA_bbb-ccc&pbkeylen=24';
+    expect(resolveSrtRelayAddress('srt+relay://auto', stored)).toBe(stored);
+    expect(resolveSrtRelayAddress('srt+relay://auto@eu-north', stored)).toBe(stored);
+  });
+
   it('generates a new id when the stored address is not a relay address', () => {
     const out = resolveSrtRelayAddress('srt+relay://auto', 'srt://:47100?mode=listener');
     expect(parseSrtRelayAddress(out)!.id).not.toBe('auto');
@@ -128,6 +164,9 @@ describe('relay id generation and auto/keep', () => {
 
   it('leaves an explicit id and plain SRT addresses alone', () => {
     expect(resolveSrtRelayAddress('srt+relay://mine', 'srt+relay://other')).toBe('srt+relay://mine');
+    expect(resolveSrtRelayAddress('srt+relay://mine-0123456789abcdef', 'srt+relay://other?passphrase=encv1:AAAA'))
+      .toBe('srt+relay://mine-0123456789abcdef');
+    expect(resolveSrtRelayAddress('srt://:0?mode=listener&passphrase=', 'srt+relay://other')).toBe('srt://:0?mode=listener&passphrase=');
     expect(resolveSrtRelayAddress('srt://:0?mode=listener', 'srt+relay://other')).toBe('srt://:0?mode=listener');
   });
 });
@@ -172,6 +211,12 @@ describe('srtUrl() — relay addresses', () => {
 
   it('refuses a query key without a value on a new address (it crashes GStreamer)', () => {
     expect(() => srtUrl('srt+relay://auto?latency', { newValue: true })).toThrow(/'latency' has no value/);
+  });
+
+  it('accepts an empty passphrase= on a new address (it removes the passphrase)', () => {
+    expect(() => srtUrl('srt+relay://auto?passphrase=', { newValue: true })).not.toThrow();
+    expect(() => srtUrl('srt+relay://auto@eu-north?latency=200&passphrase=', { newValue: true })).not.toThrow();
+    expect(() => srtUrl('srt+relay://auto?passphrase', { newValue: true })).toThrow(/'passphrase' has no value/);
   });
 
   it.each(['mode=caller', 'streamid=other', 'MODE=listener', 'localport=5000', 'localaddress=1.2.3.4', '%73treamid=x'])(
@@ -228,7 +273,8 @@ describe('relay addresses — passphrase encryption at rest', () => {
     expect(parseSrtRelayAddress(stored)!.id).toBe('sticky-id');
     expect(decryptAddressPassphrase(stored)).toBe(plain);
     // `auto` on a later patch keeps the id read from the encrypted stored form.
-    expect(resolveSrtRelayAddress('srt+relay://auto', stored)).toBe('srt+relay://sticky-id');
+    // ... and keeps the stored passphrase, still encrypted.
+    expect(resolveSrtRelayAddress('srt+relay://auto', stored)).toBe(stored.replace('&latency=200', ''));
   });
 });
 

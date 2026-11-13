@@ -219,7 +219,12 @@ components:
             and Open Live stores the default relay without `@`. A later `auto`
             without `@` also keeps the stored relay (so renewing the passphrase
             never moves the stream); `auto@<relay>` moves the stored id to that
-            relay, `auto@default` back to the default one. A relay id may be held
+            relay, `auto@default` back to the default one. On such an `auto` patch
+            the passphrase follows the query: no `passphrase` key keeps the stored
+            passphrase (and the stored `pbkeylen` unless one is sent), so moving to
+            another relay never needs it retyped; `passphrase=` (empty) removes it;
+            `passphrase=<value>` sets it. An empty `passphrase=` is never stored on
+            a relay address. A relay id may be held
             by one source or output only, whichever relay either uses (409 otherwise). Relay addresses bind no port; `mode`, `streamid`,
             `localaddress` and `localport` are not allowed on them. Passphrases are
             masked as `***` in responses.
@@ -387,7 +392,9 @@ components:
             Operator-authored SRT bind/listen URI (e.g. srt://:43524?mode=listener),
             or an SRT relay address `srt+relay://<id>[@<relay>][?params]`
             (`srt+relay://auto` generates the id once; a later `auto` keeps it,
-            and keeps the stored relay unless it names one; explicit ids are 16-64
+            and keeps the stored relay unless it names one, and the stored
+            passphrase unless it has a `passphrase` key, `passphrase=` removing
+            it, as on sources; explicit ids are 16-64
             characters and unique across sources and outputs, 409 otherwise;
             `@<relay>` as on sources, default relay when absent).
             Undefined for whep outputs. Round-tripped by POST/PATCH.

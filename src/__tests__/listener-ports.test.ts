@@ -132,12 +132,12 @@ describe('resolveSrtAddress (one resolver for ports and relay ids)', () => {
     expect(resolveSrtAddress('srt://cdn.example.com:9000', reserved, bindings)).toMatchObject({ ok: true, port: null, relayId: null, assigned: false });
   });
 
-  it('generates a relay id for auto, keeps a stored one, and binds no port', () => {
+  it('generates a relay id for auto, keeps a stored one (and its passphrase), and binds no port', () => {
     const r = resolveSrtAddress('srt+relay://auto?latency=200', { status: 'pending' }, bindings);
     expect(r).toMatchObject({ ok: true, port: null, assigned: true });
     expect(r.ok && r.relayId).toMatch(/^[A-Za-z0-9_-]{22}$/);
     expect(resolveSrtAddress('srt+relay://auto', reserved, bindings, { keepFrom: 'srt+relay://kept-id-0123456789?passphrase=encv1:x' }))
-      .toEqual({ ok: true, address: 'srt+relay://kept-id-0123456789', port: null, relayId: 'kept-id-0123456789', assigned: true });
+      .toEqual({ ok: true, address: 'srt+relay://kept-id-0123456789?passphrase=encv1:x', port: null, relayId: 'kept-id-0123456789', assigned: true });
   });
 
   it('refuses a relay id another document holds, but not its own', () => {
