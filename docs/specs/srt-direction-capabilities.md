@@ -9,6 +9,22 @@
   [Eyevinn/open-live-studio#259](https://github.com/Eyevinn/open-live-studio/pull/259) (draft, "Via relay"),
   which depend on [Eyevinn/strom#1258](https://github.com/Eyevinn/strom/pull/1258) (`GET /api/srt-relay`, open, ready for review)
 
+
+> **Implementation note (2026-11-13, #629).** Strom settled the contract differently from §3:
+> `GET /api/capabilities` (Strom branches `feat/capabilities` and `feat/srt-relay-v2`) returns
+> `{ network: { inbound_reachable, ports: [{first, last}] | null }, protocols: { srt: { modes:
+> { listener, caller, rendezvous }, relays: [{ name, public }] }, webrtc } }`, and
+> `GET /api/srt-relay` was removed before release. Relays are named
+> (`srt+relay://<id>[@<relay>]`, Strom env `STROM_SRT_RELAY_PUBLIC`, `STROM_SRT_RELAY_INTERNAL`,
+> `STROM_SRT_RELAYS`). What Open Live implements on #629, where it differs from this spec:
+> one cache over `GET /api/capabilities` only (`src/services/strom-capabilities.ts`);
+> `server-info.srt = { state, modes: { listener, caller, rendezvous }, relays: [{ name, public }],
+> inboundReachable, ports }` replaces `srtRelay`; SRT modes are **reported, never refused**
+> (no `srt-direction-unsupported` 422; `connect.warning` is `srt-listener-unsupported` or
+> `srt-rendezvous-unsupported`); relay refusals are 422 with `code` `srt-relay-not-configured`
+> or `srt-relay-unknown` and `relays` (the configured names). `docs/openapi.yaml` is the
+> contract; the sections below are kept as the original design.
+
 ---
 
 ## 1. Problem Statement
@@ -19,7 +35,7 @@ Kubernetes, or in Docker on a NAT bridge, a port Strom binds inside the pod cann
 outside. The operator picks Listener, gets a dial-in address nobody can reach, and nothing says why.
 
 Whether a direction works is a property of how Strom is deployed, so Strom is the one that knows
-(strom#1257: `STROM_INBOUND_REACHABLE`, `STROM_PORTS`, `STROM_SRT_RELAY`). Open Live must read it
+(strom#1257: `STROM_INBOUND_REACHABLE`, `STROM_PORTS`, `STROM_SRT_RELAY_PUBLIC` / `STROM_SRT_RELAYS`). Open Live must read it
 from Strom, not keep its own copy of the setting. This is the same principle #629 applies to the
 SRT relay.
 
@@ -76,7 +92,7 @@ the relay, and other listening blocks (RIST, UDP/RTP, RTMP/RTSP server) will rea
   "srt": {
     "listener": false,                 // == inbound_reachable
     "caller": true,                    // always true
-    "relay": true                      // STROM_SRT_RELAY configured
+    "relay": true                      // a relay configured (STROM_SRT_RELAY_PUBLIC / STROM_SRT_RELAYS)
   }
 }
 ```
@@ -382,7 +398,7 @@ sequenceDiagram
 |---------|---------|--------------------------|
 | `STROM_INBOUND_REACHABLE` | `true` | `false` → `srt.listener: false` → Listener hidden and refused |
 | `STROM_PORTS` | unset | reported as `srt.ports` → listener port picker |
-| `STROM_SRT_RELAY` | unset | `srt.relay: true` (and `/api/srt-relay` `configured`) → Via relay offered |
+| `STROM_SRT_RELAY_PUBLIC`, `STROM_SRT_RELAYS` | unset | `srt.relay: true` (and `/api/srt-relay` `configured`) → Via relay offered |
 
 No Strom pipeline JSON change: the flow generator is untouched.
 

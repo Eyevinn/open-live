@@ -7,6 +7,14 @@
 > Depends on Eyevinn/strom#1257 (open, not yet implemented) and builds on the draft
 > Eyevinn/open-live#629 (SRT relay status cache).
 
+> **Amended 2026-11-13 (#629).** Strom shipped `GET /api/capabilities` with SRT `modes` and named
+> `relays` and dropped `GET /api/srt-relay`, so Decision 2 is one poller over one endpoint.
+> Decision 3's shape became `server-info.srt { state, modes, relays, inboundReachable, ports }`
+> (replacing the unreleased `srtRelay`). Decision 4 was relaxed for modes: Open Live **reports**
+> an unsupported mode (`connect.warning`) and never refuses it, since the operator may know
+> better; only a relay Strom definitely does not have is refused (422,
+> `code: srt-relay-not-configured | srt-relay-unknown`). See the note in the spec.
+
 ## Context
 
 The studio offers Listener, Caller and (with #629) Via relay for every SRT source and output,
@@ -14,7 +22,7 @@ whatever Strom can actually do. On Strom in Kubernetes or behind Docker NAT, a l
 reachable from outside, so Listener yields an address nobody can dial and nothing explains why.
 
 Whether a direction works depends on how Strom is deployed. strom#1257 proposes that Strom be told
-(`STROM_INBOUND_REACHABLE`, `STROM_PORTS`, `STROM_SRT_RELAY`) and report the result over an API.
+(`STROM_INBOUND_REACHABLE`, `STROM_PORTS`, `STROM_SRT_RELAY_PUBLIC` / `STROM_SRT_RELAYS`) and report the result over an API.
 Open Live already reads the SRT relay from Strom (#629: `GET /api/srt-relay`, a cached
 stale-while-revalidate poller, 422 when Strom positively reports no relay).
 
