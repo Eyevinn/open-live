@@ -685,7 +685,7 @@ per-run teardown or a new live-session `ProductionDoc` field, put it in a shared
 `deactivatedDoc()` so both paths get it, and cover the idle path in
 `src/__tests__/idle-deactivate-intercom-clip.test.ts`.
 
-## Strom's `pad-caps` is keyed by GStreamer element name, and `decodebin` names pads by type, not PID
+## Strom's `pad-caps` is keyed by GStreamer element name, and `decodebin` numbers pads by type, then by stream-id/PID
 
 `GET /api/flows/{id}/pad-caps` (used by audio-stream discovery, issue #631) returns
 `{ "<element name>": [{ "pad", "direction", "caps" }] }` for every element in the pipeline,
@@ -694,6 +694,9 @@ a flow that is not running is a 404, not an empty map. Block elements are named
 `<blockId>:<role>`, so an SRT input's decoder is `b-input-<padIndex>-<suffix>:decodebin`. Its
 `src_N` pads are numbered in exposure order (decodebin puts video before audio), so filter by
 `audio/` caps and re-number from 0 — `src_1` is usually the *first* audio stream. Among audio,
-N follows the demuxer's PMT order; it equals `map_audio_by_pid`'s PID order only when the muxer
-assigns ascending PIDs (the common case). Decoded caps carry `channels` but no codec or
-language.
+N is ascending PID order, the same order `map_audio_by_pid` ranks by: decodebin2 sorts its end
+pads before naming them (`gstdecodebin2.c` `sort_end_pads` — by media class, then `strcmp` of
+the stream-id), and tsdemux stream-ids end in the PID as `%08x` behind a shared prefix (Strom
+v0.8.3 `backend/src/blocks/builtin/mpegtssrt_input/audio_by_pid.rs:411` relies on this). So
+discovered index k is what `audioStreamIndex = k` selects, whatever order the PMT lists the
+streams in. Decoded caps carry `channels` but no codec or language.

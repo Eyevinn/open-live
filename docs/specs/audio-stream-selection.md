@@ -194,11 +194,17 @@ reports every pad's negotiated caps on `GET /api/flows/{id}/pad-caps`
 flows; Strom v0.8.3 `get_flow_pad_caps`). For an `srt` source in an active production with a
 `stromFlowId`, Open Live reads the `<blockId>:decodebin` element of the source's
 `builtin.mpegtssrt_input` block (`b-input-<padIndex>-<endpointSuffix>`), takes its `src_N` pads
-whose caps start with `audio/`, orders them by N (demuxer/PMT order, which matches the PID order
-`map_audio_by_pid` ranks by for a muxer that assigns ascending PIDs) and reports
+whose caps start with `audio/`, orders them by N and reports
 `{ index, channels }`. Decoded caps carry no codec or language, so those fields are not reported;
 full codec/language/PID per stream would need a new Strom capability (a per-input PMT audio list)
 and is optional enrichment.
+
+Among the audio pads, N is ascending PID order — the order `map_audio_by_pid` ranks by — so
+reported `index` k is exactly the stream `audioStreamIndex = k` selects, whatever order the PMT
+lists them in. decodebin2 sorts its end pads before naming them `src_N` (GStreamer
+`gst/playback/gstdecodebin2.c` `sort_end_pads`: by media class, then by stream-id), and tsdemux
+stream-ids end in the PID as `%08x` behind a prefix shared by every stream in the TS; Strom
+v0.8.3 `backend/src/blocks/builtin/mpegtssrt_input/audio_by_pid.rs:411` relies on the same fact.
 
 `reason` when discovery is `unavailable`:
 
@@ -206,7 +212,7 @@ and is optional enrichment.
 |--------|-------|
 | `no-live-flow` | the source is not in an active production, or the production has no Strom flow |
 | `stream-type-unsupported` | not an `srt` (MPEG-TS) source, e.g. `efp` |
-| `no-signal` | Strom answers 404 for the flow, or no audio pad is negotiated on the input yet |
+| `no-signal` | Strom answers 404 for the flow (including an `activating` production whose flow has not started yet), or no audio pad is negotiated on the input yet |
 | `strom-unreachable` | Strom could not be reached, timed out or refused the request |
 
 - `404` if the source id is unknown (same as `GET /:id`).

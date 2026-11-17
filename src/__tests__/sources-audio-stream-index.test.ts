@@ -212,7 +212,7 @@ describe('GET /api/v1/sources/:id/audio-streams', () => {
     const { StromClientError } = await import('../lib/strom.js');
     padCapsMock.mockRejectedValue(new StromClientError(404, 'Flow not running'));
     expect(await getStreams()).toEqual({ selectedIndex: 0, discovery: 'unavailable', reason: 'no-signal', streams: null });
-    expect(padCapsMock).toHaveBeenCalledWith('flow-1');
+    expect(padCapsMock).toHaveBeenCalledWith('flow-1', 5000);
   });
 
   it('returns no-signal when the decodebin has no negotiated audio pad', async () => {

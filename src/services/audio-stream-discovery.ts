@@ -7,10 +7,14 @@
  * until the pad has data). An SRT source's `builtin.mpegtssrt_input` block
  * decodes through a `decodebin` element named `<blockId>:decodebin`; its
  * `src_N` pads carry one decoded elementary stream each. The `audio/` ones,
- * ordered by N, are the feed's audio streams in demuxer (PMT) order — the same
- * order `map_audio_by_pid` ranks by when the feed's PIDs ascend in PMT order,
- * which is how MPEG-TS muxers assign them. Decoded caps carry the channel
- * count but not the codec or language, so those are left out.
+ * ordered by N, are the feed's audio streams in ascending PID order — the
+ * order `map_audio_by_pid` ranks by, so discovered `index` k is the stream
+ * `audioStreamIndex = k` selects. decodebin2 sorts its end pads before naming
+ * them (`gstdecodebin2.c` `sort_end_pads`: by media class, then by stream-id),
+ * and tsdemux stream-ids end in the PID as `%08x`, so within the audio class
+ * stream-id order is PID order (Strom v0.8.3
+ * `mpegtssrt_input/audio_by_pid.rs:411` relies on the same fact). Decoded caps
+ * carry the channel count but not the codec or language, so those are left out.
  *
  * Discovery only works while the source is in an active production: there is
  * no flow to read otherwise.
@@ -42,7 +46,7 @@ export type AudioStreamDiscoveryResult =
 
 /** The part of the Strom client discovery needs. */
 export interface PadCapsReader {
-  flows: { padCaps: (flowId: string) => Promise<Record<string, unknown>> };
+  flows: { padCaps: (flowId: string, timeoutMs?: number) => Promise<Record<string, unknown>> };
 }
 
 /** How long one pad-caps read may take before Strom counts as unreachable. */
@@ -92,16 +96,6 @@ export function audioStreamsFromPadCaps(padCaps: unknown, blockId: string): Disc
   });
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new StromClientError(0, `Strom did not answer within ${ms} ms`)), ms);
-    promise.then(
-      (v) => { clearTimeout(timer); resolve(v); },
-      (e: unknown) => { clearTimeout(timer); reject(e); },
-    );
-  });
-}
-
 /**
  * Discover a source's audio streams from the live flows of the active
  * productions it is assigned in. `productions` are those productions (any
@@ -129,7 +123,7 @@ export async function discoverAudioStreams(
   for (const { flowId, blockIds } of flows) {
     let padCaps: Record<string, unknown>;
     try {
-      padCaps = await withTimeout(client.flows.padCaps(flowId), PAD_CAPS_TIMEOUT_MS);
+      padCaps = await client.flows.padCaps(flowId, PAD_CAPS_TIMEOUT_MS);
     } catch (err: unknown) {
       // 404 = Strom answered, but the flow is not running ("Flow not running").
       // Anything else (network error, timeout, 401/5xx) leaves Strom unreached.
