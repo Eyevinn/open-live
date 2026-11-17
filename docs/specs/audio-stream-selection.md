@@ -169,42 +169,61 @@ GET /api/v1/sources/:id/audio-streams
 ```
 
 ```jsonc
-// 200 OK — discovery available (requires the Strom capability in §5.3/§7.1)
+// 200 OK — discovery available (srt source live in an active production)
 {
   "selectedIndex": 1,          // the persisted audioStreamIndex, or 0 when absent (the effective default)
   "discovery": "available",
   "streams": [
-    { "index": 0, "codec": "aac", "channels": 2, "language": "eng" },
-    { "index": 1, "codec": "aac", "channels": 2, "language": "swe" }
+    { "index": 0, "channels": 2 },
+    { "index": 1, "channels": 2 }
   ]
 }
 
-// 200 OK — discovery not yet possible (no live flow / Strom lacks the probe)
+// 200 OK — discovery not possible right now
 {
   "selectedIndex": 1,
   "discovery": "unavailable",
-  "reason": "no-live-flow",   // enum: 'no-live-flow' | 'strom-probe-unsupported'
+  "reason": "no-live-flow",   // enum: 'no-live-flow' | 'stream-type-unsupported' | 'no-signal' | 'strom-unreachable'
   "streams": null
 }
 ```
+
+**How the list is derived (issue #631).** Strom has no per-input PMT probe, but a running flow
+reports every pad's negotiated caps on `GET /api/flows/{id}/pad-caps`
+(`{ "<element>": [{ "pad", "direction", "caps" }] }`, caps `"NOT NEGOTIATED"` until data
+flows; Strom v0.8.3 `get_flow_pad_caps`). For an `srt` source in an active production with a
+`stromFlowId`, Open Live reads the `<blockId>:decodebin` element of the source's
+`builtin.mpegtssrt_input` block (`b-input-<padIndex>-<endpointSuffix>`), takes its `src_N` pads
+whose caps start with `audio/`, orders them by N (demuxer/PMT order, which matches the PID order
+`map_audio_by_pid` ranks by for a muxer that assigns ascending PIDs) and reports
+`{ index, channels }`. Decoded caps carry no codec or language, so those fields are not reported;
+full codec/language/PID per stream would need a new Strom capability (a per-input PMT audio list)
+and is optional enrichment.
+
+`reason` when discovery is `unavailable`:
+
+| reason | cause |
+|--------|-------|
+| `no-live-flow` | the source is not in an active production, or the production has no Strom flow |
+| `stream-type-unsupported` | not an `srt` (MPEG-TS) source, e.g. `efp` |
+| `no-signal` | Strom answers 404 for the flow, or no audio pad is negotiated on the input yet |
+| `strom-unreachable` | Strom could not be reached, timed out or refused the request |
 
 - `404` if the source id is unknown (same as `GET /:id`).
 - The `streams` array is **derived, never persisted** — it reflects what the live flow / Strom
   reports at read time, so it can never go stale against the real feed (same read-time-derive
   principle `docs/specs/srt-output-address.md` §3 applies to a Strom-dependent value).
-- Until the Strom capability exists, this endpoint always returns `discovery: "unavailable"`
-  with `reason: "strom-probe-unsupported"`, so Studio can fall back to a free numeric input
-  (§5.3). This keeps the API contract stable across the capability landing.
+- Whenever discovery is `unavailable` (most commonly: the source is not live), Studio falls
+  back to a free numeric input (§5.3). The response shape is the same either way.
 
 `selectedIndex` is always present (it is local state), so the UI can show the current choice
 even when the stream list cannot be enumerated.
 
 ### 2.5 Changed contract (#516): input-scoped activation warning
 
-The sources endpoints (§2.2–§2.4) are **unchanged** by #516. In particular,
-`GET /api/v1/sources/:id/audio-streams` keeps returning
-`discovery: "unavailable", reason: "strom-probe-unsupported"` (`src/routes/sources.ts:581-597`)
-until Strom can report the stream list (§6 Q5).
+The sources endpoints (§2.2–§2.4) are **unchanged** by #516. (Discovery on
+`GET /api/v1/sources/:id/audio-streams` was later implemented by #631 from the live flow's pad
+caps; see §2.4.)
 
 The one contract change is an **additive variant on `ActivationWarning`**
 (`src/lib/flow-generator.ts:82`). Today the union has a single member, `recording-no-audio`. It
@@ -379,9 +398,10 @@ sequenceDiagram
     API-->>Studio: activationWarnings[]
     Studio-->>Op: warning badge on input tile for mixerInput + tooltip message
 
-    Note over Op,Strom: (d) Discovery — unchanged
+    Note over Op,Strom: (d) Discovery (#631, while the source is live)
     Studio->>API: GET /api/v1/sources/:id/audio-streams
-    API-->>Studio: { selectedIndex, discovery: "unavailable", reason: "strom-probe-unsupported", streams: null }
+    API->>Strom: GET /api/flows/{id}/pad-caps
+    API-->>Studio: { selectedIndex, discovery: "available", streams: [{ index, channels }] } or { discovery: "unavailable", reason, streams: null }
 ```
 
 The media path never touches Open Live. Strom demuxes and routes the chosen stream inside the

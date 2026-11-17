@@ -684,3 +684,16 @@ teardown, and cleared fewer doc fields). Both now call the same exported helpers
 per-run teardown or a new live-session `ProductionDoc` field, put it in a shared helper or in
 `deactivatedDoc()` so both paths get it, and cover the idle path in
 `src/__tests__/idle-deactivate-intercom-clip.test.ts`.
+
+## Strom's `pad-caps` is keyed by GStreamer element name, and `decodebin` names pads by type, not PID
+
+`GET /api/flows/{id}/pad-caps` (used by audio-stream discovery, issue #631) returns
+`{ "<element name>": [{ "pad", "direction", "caps" }] }` for every element in the pipeline,
+recursing into bins; an unnegotiated pad reports the literal caps string `"NOT NEGOTIATED"`, and
+a flow that is not running is a 404, not an empty map. Block elements are named
+`<blockId>:<role>`, so an SRT input's decoder is `b-input-<padIndex>-<suffix>:decodebin`. Its
+`src_N` pads are numbered in exposure order (decodebin puts video before audio), so filter by
+`audio/` caps and re-number from 0 — `src_1` is usually the *first* audio stream. Among audio,
+N follows the demuxer's PMT order; it equals `map_audio_by_pid`'s PID order only when the muxer
+assigns ascending PIDs (the common case). Decoded caps carry `channels` but no codec or
+language.
