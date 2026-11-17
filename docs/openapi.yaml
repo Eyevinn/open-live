@@ -1120,23 +1120,38 @@ components:
           enum: [available, unavailable]
         reason:
           type: string
-          enum: [no-live-flow, strom-probe-unsupported]
-          description: Present when `discovery` is `unavailable`.
+          enum: [no-live-flow, stream-type-unsupported, no-signal, strom-unreachable]
+          description: >-
+            Present when `discovery` is `unavailable`.
+            `no-live-flow`: the source is not in an active production, or that
+            production has no Strom flow yet.
+            `stream-type-unsupported`: not an `srt` (MPEG-TS) source.
+            `no-signal`: Strom reports the flow as not running, or no audio
+            stream has been negotiated on the source's input yet.
+            `strom-unreachable`: Strom could not be reached or refused the request.
         streams:
           type: array
           nullable: true
-          description: Derived at read time, never persisted. `null` when discovery is unavailable.
+          description: >-
+            Derived at read time from the live flow's negotiated pad caps, never
+            persisted. Ordered by audio-stream index (the `audioStreamIndex`
+            numbering). `null` when discovery is unavailable.
           items:
             type: object
+            required: [index]
             properties:
               index:
                 type: integer
-              codec:
-                type: string
+                minimum: 0
               channels:
                 type: integer
+                description: Channel count of the decoded stream, when the caps state it.
+              codec:
+                type: string
+                description: Reserved; not reported yet (decoded caps do not carry it).
               language:
                 type: string
+                description: Reserved; not reported yet (decoded caps do not carry it).
 
     Production:
       type: object
@@ -1975,9 +1990,12 @@ paths:
     get:
       summary: Discover a source's audio streams
       description: >-
-        Read-only (issue #515). Until Strom can report the stream list this
-        always returns `discovery: unavailable` with
-        `reason: strom-probe-unsupported` and `streams: null`.
+        Read-only (issues #515, #631). For an `srt` source in an active
+        production, lists the audio streams Strom has decoded on the source's
+        input (`GET /api/flows/{id}/pad-caps`), as `discovery: available` with
+        `streams` (`index`, `channels`). Otherwise returns
+        `discovery: unavailable`, `streams: null` and a `reason` naming the
+        cause. Discovery only works while the source is live in a production.
       operationId: getSourceAudioStreams
       tags: [Sources]
       responses:

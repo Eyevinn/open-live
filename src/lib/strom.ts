@@ -1030,7 +1030,8 @@ export class StromClient {
     latency: (id: string) => this.get<LatencyResponse>(`/api/flows/${id}/latency`),
     rtpStats: (id: string) => this.get<FlowStatsResponse>(`/api/flows/${id}/rtp-stats`),
     webrtcStats: (id: string) => this.get<WebRtcStatsResponse>(`/api/flows/${id}/webrtc-stats`),
-    padCaps: (id: string) => this.get<Record<string, unknown>>(`/api/flows/${id}/pad-caps`),
+    padCaps: (id: string, timeoutMs?: number) =>
+      this.request<Record<string, unknown>>('GET', `/api/flows/${id}/pad-caps`, undefined, timeoutMs),
     thumbnail: (id: string, blockId: string, index?: number) => {
       const q = index !== undefined ? `?index=${index}` : ''
       return `${this.baseUrl}/api/flows/${id}/blocks/${blockId}/thumbnail${q}`

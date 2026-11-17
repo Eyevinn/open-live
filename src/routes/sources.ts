@@ -13,6 +13,9 @@ import { getWhipIngestState } from '../services/whip-ingest-state.js';
 import { srtCapabilitiesFor } from '../services/strom-capabilities.js';
 import { resolveSrtConnect, type SrtStromInfo } from '../lib/srt-connect.js';
 import { config } from '../config.js';
+import { StromClient } from '../lib/strom.js';
+import { getStromToken } from '../lib/strom-token.js';
+import { discoverAudioStreams } from '../services/audio-stream-discovery.js';
 import { getAllClipStates } from '../services/clip-state.service.js';
 
 /**
@@ -607,10 +610,12 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
     return reply.send(toApi(updated));
   });
 
-  // Read-only audio-stream discovery (ADR-006 Decision 3). The stream list is
-  // derived at read time, never persisted. Until the Strom probe capability
-  // exists (#516) it always reports `unavailable`; `selectedIndex` is local
-  // state and always present (absent audioStreamIndex => 0).
+  // Read-only audio-stream discovery (ADR-006 Decision 3, issue #631). The
+  // stream list is derived at read time from the live Strom flow's negotiated
+  // pad caps (`services/audio-stream-discovery.ts`), never persisted; when it
+  // cannot be read the answer is `unavailable` with the cause as `reason`.
+  // `selectedIndex` is local state and always present (absent
+  // audioStreamIndex => 0).
   fastify.get<{ Params: { id: string } }>('/api/v1/sources/:id/audio-streams', async (req, reply) => {
     let doc: SourceDoc;
     try {
@@ -621,12 +626,23 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       }
       throw err;
     }
-    return reply.send({
-      selectedIndex: doc.audioStreamIndex ?? 0,
-      discovery: 'unavailable' as const,
-      reason: 'strom-probe-unsupported' as const,
-      streams: null,
+    const selectedIndex = doc.audioStreamIndex ?? 0;
+    const productions = doc.streamType === 'srt'
+      // findTrusted: operators are literals; doc._id is only a scalar value
+      // inside $elemMatch, never a selector fragment (#257).
+      ? (await getDb().findTrusted({
+          selector: { type: 'production', status: { $in: ['active', 'activating'] }, sources: { $elemMatch: { sourceId: doc._id } } },
+          fields: ['_id', 'sources', 'stromFlowId'],
+        })).docs as unknown as Array<Pick<ProductionDoc, '_id' | 'sources' | 'stromFlowId'>>
+      : [];
+    const result = await discoverAudioStreams(doc, productions, async () => {
+      const stromToken = await getStromToken(config.stromToken).catch(() => undefined);
+      return new StromClient({ baseUrl: config.stromUrl, token: stromToken });
     });
+    if (result.discovery === 'unavailable') {
+      req.log.debug({ sourceId: doc._id, reason: result.reason }, 'audio-stream discovery unavailable');
+    }
+    return reply.send({ selectedIndex, ...result });
   });
 
   // Design-C interactive-login provisioning — GATED. Stock upstream cefsrc has

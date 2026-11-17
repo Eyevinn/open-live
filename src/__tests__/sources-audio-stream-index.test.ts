@@ -1,11 +1,13 @@
 /**
  * Route tests for `audioStreamIndex` on POST/PATCH /api/v1/sources and
- * GET /api/v1/sources/:id/audio-streams (issue #515, ADR-006 Decisions 1-3).
+ * GET /api/v1/sources/:id/audio-streams (issues #515/#631, ADR-006 Decisions 1-3).
  * CouchDB, Strom, and the WS controller are mocked.
  */
 import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { GatewayDoc, SourceDoc } from '../db/types.js';
+
+const { padCapsMock } = vi.hoisted(() => ({ padCapsMock: vi.fn() }));
 
 const TEST_API_KEY = 'test-secret-key';
 process.env['API_KEY'] = TEST_API_KEY;
@@ -47,7 +49,7 @@ const prodDb = {
   get: vi.fn(),
   insert: vi.fn(),
   find: vi.fn(),
-  findTrusted: vi.fn(async () => ({ docs: [] })),
+  findTrusted: vi.fn(async (): Promise<{ docs: unknown[] }> => ({ docs: [] })),
 };
 
 vi.mock('../db/index.js', () => ({
@@ -76,7 +78,7 @@ vi.mock('../lib/strom.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/strom.js')>();
   class MockStromClient {
     system = { version: vi.fn(), iceServers: vi.fn() };
-    flows = { get: vi.fn(), start: vi.fn(), stop: vi.fn(), delete: vi.fn() };
+    flows = { get: vi.fn(), start: vi.fn(), stop: vi.fn(), delete: vi.fn(), padCaps: padCapsMock };
     mixer = { multiviewEndpoint: vi.fn() };
     ports = { pool: vi.fn(), reservations: { create: vi.fn(), renew: vi.fn(), release: vi.fn(), list: vi.fn(), get: vi.fn(), assign: vi.fn(), unassign: vi.fn() } };
   }
@@ -110,6 +112,9 @@ beforeAll(async () => {
 
 beforeEach(() => {
   sourcesStore.clear();
+  prodDb.findTrusted.mockReset();
+  prodDb.findTrusted.mockResolvedValue({ docs: [] });
+  padCapsMock.mockReset();
 });
 
 function seed(streamType: SourceDoc['streamType'] = 'srt', audioStreamIndex?: number): void {
@@ -173,12 +178,91 @@ describe('audioStreamIndex on PATCH /api/v1/sources/:id', () => {
   });
 });
 
+// An active production with src-1 on video_in_2: its input block is
+// `b-input-2-abcdef12` (`b-input-<padIndex>-<first 8 of the id sans prod->`).
+const PROD = { _id: 'prod-abcdef1234', sources: [{ sourceId: 'src-1', mixerInput: 'video_in_2' }], stromFlowId: 'flow-1' };
+const DECODEBIN = 'b-input-2-abcdef12:decodebin';
+const RAW_AUDIO = (ch: number) =>
+  `audio/x-raw, format=(string)F32LE, layout=(string)interleaved, rate=(int)48000, channels=(int)${ch}, channel-mask=(bitmask)0x0000000000000003`;
+const RAW_VIDEO = 'video/x-raw, format=(string)I420, width=(int)1920, height=(int)1080, framerate=(fraction)50/1';
+
+async function getStreams() {
+  const res = await app.inject({ method: 'GET', url: '/api/v1/sources/src-1/audio-streams', headers: AUTH });
+  expect(res.statusCode).toBe(200);
+  return res.json();
+}
+
 describe('GET /api/v1/sources/:id/audio-streams', () => {
-  it('returns the unavailable shape with selectedIndex defaulting to 0', async () => {
+  it('returns no-live-flow with selectedIndex defaulting to 0 when the source is in no active production', async () => {
     seed();
-    const res = await app.inject({ method: 'GET', url: '/api/v1/sources/src-1/audio-streams', headers: AUTH });
-    expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ selectedIndex: 0, discovery: 'unavailable', reason: 'strom-probe-unsupported', streams: null });
+    expect(await getStreams()).toEqual({ selectedIndex: 0, discovery: 'unavailable', reason: 'no-live-flow', streams: null });
+    expect(padCapsMock).not.toHaveBeenCalled();
+  });
+
+  it('returns no-live-flow when the active production has no Strom flow yet', async () => {
+    seed();
+    prodDb.findTrusted.mockResolvedValue({ docs: [{ ...PROD, stromFlowId: undefined }] });
+    expect(await getStreams()).toMatchObject({ discovery: 'unavailable', reason: 'no-live-flow', streams: null });
+    expect(padCapsMock).not.toHaveBeenCalled();
+  });
+
+  it('returns no-signal when Strom answers 404 for the flow', async () => {
+    seed();
+    prodDb.findTrusted.mockResolvedValue({ docs: [PROD] });
+    const { StromClientError } = await import('../lib/strom.js');
+    padCapsMock.mockRejectedValue(new StromClientError(404, 'Flow not running'));
+    expect(await getStreams()).toEqual({ selectedIndex: 0, discovery: 'unavailable', reason: 'no-signal', streams: null });
+    expect(padCapsMock).toHaveBeenCalledWith('flow-1', 5000);
+  });
+
+  it('returns no-signal when the decodebin has no negotiated audio pad', async () => {
+    seed();
+    prodDb.findTrusted.mockResolvedValue({ docs: [PROD] });
+    padCapsMock.mockResolvedValue({
+      [DECODEBIN]: [
+        { pad: 'sink', direction: 'sink', caps: 'video/mpegts, systemstream=(boolean)true, packetsize=(int)188' },
+        { pad: 'src_0', direction: 'src', caps: RAW_VIDEO },
+        { pad: 'src_1', direction: 'src', caps: 'NOT NEGOTIATED' },
+      ],
+    });
+    expect(await getStreams()).toMatchObject({ discovery: 'unavailable', reason: 'no-signal', streams: null });
+  });
+
+  it('returns strom-unreachable when Strom cannot be reached', async () => {
+    seed();
+    prodDb.findTrusted.mockResolvedValue({ docs: [PROD] });
+    const { StromClientError } = await import('../lib/strom.js');
+    padCapsMock.mockRejectedValue(new StromClientError(0, 'Strom unreachable: fetch failed'));
+    expect(await getStreams()).toMatchObject({ discovery: 'unavailable', reason: 'strom-unreachable', streams: null });
+  });
+
+  it('lists two audio streams in src_N order with their channel counts', async () => {
+    seed('srt', 1);
+    prodDb.findTrusted.mockResolvedValue({ docs: [PROD] });
+    padCapsMock.mockResolvedValue({
+      'b-input-2-abcdef12:srtsrc': [{ pad: 'src', direction: 'src', caps: 'video/mpegts' }],
+      // Pad order in Strom's list is not guaranteed; src_10 must sort after src_2.
+      [DECODEBIN]: [
+        { pad: 'src_10', direction: 'src', caps: RAW_AUDIO(6) },
+        { pad: 'sink', direction: 'sink', caps: 'video/mpegts, systemstream=(boolean)true' },
+        { pad: 'src_0', direction: 'src', caps: RAW_VIDEO },
+        { pad: 'src_2', direction: 'src', caps: RAW_AUDIO(2) },
+      ],
+      // Another input's decodebin must not leak in.
+      'b-input-3-abcdef12:decodebin': [{ pad: 'src_1', direction: 'src', caps: RAW_AUDIO(1) }],
+    });
+    expect(await getStreams()).toEqual({
+      selectedIndex: 1,
+      discovery: 'available',
+      streams: [{ index: 0, channels: 2 }, { index: 1, channels: 6 }],
+    });
+  });
+
+  it('returns stream-type-unsupported for an EFP source without asking Strom', async () => {
+    seed('efp');
+    prodDb.findTrusted.mockResolvedValue({ docs: [PROD] });
+    expect(await getStreams()).toEqual({ selectedIndex: 0, discovery: 'unavailable', reason: 'stream-type-unsupported', streams: null });
+    expect(padCapsMock).not.toHaveBeenCalled();
   });
 
   it('reports the persisted selectedIndex', async () => {
