@@ -3,7 +3,7 @@ import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { getOutputsDb, getDb, getStorageConnectionsDb } from '../db/index.js';
 import type { OutputDoc, ProductionDoc, OutputStatus, RtmpDestination, StorageConnectionDoc } from '../db/types.js';
-import { updateProductionDoc } from './productions.js';
+import { mutateProductionDoc, IDLE_PRODUCTION_STATUSES } from './productions.js';
 import { deriveOutputStatus } from '../lib/production-health.js';
 import { srtUrl } from '../lib/url-validation.js';
 import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
@@ -466,16 +466,23 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
         return reply.status(409).send({ error: 'Output is used in an active production', statusCode: 409 });
       }
 
-      // Remove references from inactive productions and record a warning
+      // Remove references from every production that is not on air (`inactive`
+      // and `ended`, #633) and record a warning — re-derived from the freshly
+      // read doc on every write attempt so overlapping deletes both land.
       for (const p of allProds.docs) {
         const prod = p as unknown as ProductionDoc;
-        if (prod.status !== 'inactive') continue;
-        if (!prod.outputAssignments?.some((a) => a.outputId === req.params.id)) continue;
-        const warnings = prod.deletionWarnings ?? [];
-        warnings.push({ type: 'output', name: doc.name });
-        await updateProductionDoc(prod._id, {
-          outputAssignments: (prod.outputAssignments ?? []).filter((a) => a.outputId !== req.params.id),
-          deletionWarnings: warnings,
+        if (!IDLE_PRODUCTION_STATUSES.includes(prod.status)) continue;
+        if (!(prod.outputAssignments ?? []).some((a) => a.outputId === req.params.id)) continue;
+        await mutateProductionDoc(prod._id, (fresh) => {
+          if (!IDLE_PRODUCTION_STATUSES.includes(fresh.status)) return null;
+          const current = fresh.outputAssignments ?? [];
+          const outputAssignments = current.filter((a) => a.outputId !== req.params.id);
+          if (outputAssignments.length === current.length) return null;
+          return {
+            ...fresh,
+            outputAssignments,
+            deletionWarnings: [...(fresh.deletionWarnings ?? []), { type: 'output', name: doc.name }],
+          };
         });
       }
 

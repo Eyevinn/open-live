@@ -3,7 +3,7 @@ import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { getSourcesDb, getGatewaysDb, getDb } from '../db/index.js';
 import type { SourceDoc, ProductionDoc, HtmlSourceAuth } from '../db/types.js';
-import { updateProductionDoc } from './productions.js';
+import { mutateProductionDoc, IDLE_PRODUCTION_STATUSES } from './productions.js';
 import { graphicUrl, srtUrl } from '../lib/url-validation.js';
 import { deserializeClipReference } from '../lib/clip-reference.js';
 import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
@@ -703,21 +703,27 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
         return reply.status(409).send({ error: `Source is in use by active production "${prod.name}"` });
       }
 
-      // Remove references from inactive productions and record a warning
+      // Remove references from every production that is not on air — `inactive`
+      // AND `ended` (a deactivated production, issue #633) — and record a
+      // warning. The filter and the warning are applied to the freshly read doc
+      // inside the retry loop, so two overlapping deletes both land.
       // findTrusted: operators are literals here; req.params.id is only ever a
       // scalar value inside $elemMatch, never a selector fragment (#257)
-      const inactiveProductions = await getDb().findTrusted({
-        selector: { type: 'production', status: 'inactive', 'sources': { $elemMatch: { sourceId: req.params.id } } },
-        fields: ['_id', 'name', 'sources', 'deletionWarnings'],
+      const idleProductions = await getDb().findTrusted({
+        selector: { type: 'production', status: { $in: [...IDLE_PRODUCTION_STATUSES] }, 'sources': { $elemMatch: { sourceId: req.params.id } } },
+        fields: ['_id'],
         limit: 100,
       });
-      for (const p of inactiveProductions.docs) {
-        const prod = p as unknown as ProductionDoc;
-        const warnings = prod.deletionWarnings ?? [];
-        warnings.push({ type: 'source', name: doc.name });
-        await updateProductionDoc(prod._id, {
-          sources: prod.sources.filter((s) => s.sourceId !== req.params.id),
-          deletionWarnings: warnings,
+      for (const p of idleProductions.docs) {
+        await mutateProductionDoc((p as unknown as Pick<ProductionDoc, '_id'>)._id, (prod) => {
+          if (!IDLE_PRODUCTION_STATUSES.includes(prod.status)) return null;
+          const sources = prod.sources.filter((s) => s.sourceId !== req.params.id);
+          if (sources.length === prod.sources.length) return null;
+          return {
+            ...prod,
+            sources,
+            deletionWarnings: [...(prod.deletionWarnings ?? []), { type: 'source', name: doc.name }],
+          };
         });
       }
 

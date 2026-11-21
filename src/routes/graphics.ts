@@ -3,7 +3,7 @@ import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { getGraphicsDb, getDb } from '../db/index.js';
 import type { GraphicDoc, ProductionDoc } from '../db/types.js';
-import { updateProductionDoc } from './productions.js';
+import { mutateProductionDoc, IDLE_PRODUCTION_STATUSES } from './productions.js';
 import { graphicUrl } from '../lib/url-validation.js';
 
 // Accept only safe http/https URLs or data:image/(png|jpeg|gif|webp) base64 URIs.
@@ -101,16 +101,23 @@ const graphicsRoutes: FastifyPluginAsync = async (fastify) => {
         return reply.status(409).send({ error: `Graphic is in use by active production "${prod.name}"` });
       }
 
-      // Remove references from inactive productions and record a warning
+      // Remove references from every production that is not on air (`inactive`
+      // and `ended`, #633) and record a warning — re-derived from the freshly
+      // read doc on every write attempt so overlapping deletes both land.
       for (const p of allProductions.docs) {
         const prod = p as unknown as ProductionDoc;
-        if (prod.status !== 'inactive') continue;
+        if (!IDLE_PRODUCTION_STATUSES.includes(prod.status)) continue;
         if (!(prod.graphicAssignments ?? []).some((a) => a.graphicId === req.params.id)) continue;
-        const warnings = prod.deletionWarnings ?? [];
-        warnings.push({ type: 'graphic', name: doc.name });
-        await updateProductionDoc(prod._id, {
-          graphicAssignments: (prod.graphicAssignments ?? []).filter((a) => a.graphicId !== req.params.id),
-          deletionWarnings: warnings,
+        await mutateProductionDoc(prod._id, (fresh) => {
+          if (!IDLE_PRODUCTION_STATUSES.includes(fresh.status)) return null;
+          const current = fresh.graphicAssignments ?? [];
+          const graphicAssignments = current.filter((a) => a.graphicId !== req.params.id);
+          if (graphicAssignments.length === current.length) return null;
+          return {
+            ...fresh,
+            graphicAssignments,
+            deletionWarnings: [...(fresh.deletionWarnings ?? []), { type: 'graphic', name: doc.name }],
+          };
         });
       }
 

@@ -700,3 +700,18 @@ the stream-id), and tsdemux stream-ids end in the PID as `%08x` behind a shared 
 v0.8.3 `backend/src/blocks/builtin/mpegtssrt_input/audio_by_pid.rs:411` relies on this). So
 discovered index k is what `audioStreamIndex = k` selects, whatever order the PMT lists the
 streams in. Decoded caps carry `channels` but no codec or language.
+
+## `updateProductionDoc` spreads its patch as-is — derive array edits inside `mutateProductionDoc`
+
+`updateProductionDoc(id, patch)` re-reads `_rev` on a 409, but it spreads the SAME `patch` over the
+fresh doc. A patch computed from an earlier read (a filtered `sources`, an appended
+`deletionWarnings`) therefore overwrites a concurrent writer's change on retry: two overlapping
+`DELETE /api/v1/sources/:id` calls left the first-deleted id in the production (#633). Use
+`mutateProductionDoc(id, (fresh) => next | null)` for any read-modify-write of an array field — the
+mutator runs on the freshly read doc on every attempt. Separately, source/graphic/output deletes
+clean every production in `IDLE_PRODUCTION_STATUSES` (`inactive` **and** `ended`); `ended` is a
+deactivated production and was missed before. At activation, an assignment whose source doc is
+gone is dropped from the whole build (`liveAssignments` in `activateStromFlow`) with a
+`source-missing` warning — it gets no `mixerInputMap` entry, so the WS layer's
+`mixerInputToStromPad` falls back to its stored pad index for it, the same as for an input assigned
+after activation.

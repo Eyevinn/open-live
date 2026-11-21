@@ -1009,6 +1009,7 @@ components:
         - $ref: '#/components/schemas/AudioStreamNotAppliedWarning'
         - $ref: '#/components/schemas/InputRecordingInputsWarning'
         - $ref: '#/components/schemas/InputRecordingUnsupportedSourceWarning'
+        - $ref: '#/components/schemas/SourceMissingWarning'
       discriminator:
         propertyName: type
         mapping:
@@ -1018,6 +1019,7 @@ components:
           input-recording-no-output: '#/components/schemas/InputRecordingInputsWarning'
           input-recording-capped: '#/components/schemas/InputRecordingInputsWarning'
           input-recording-unsupported-source: '#/components/schemas/InputRecordingUnsupportedSourceWarning'
+          source-missing: '#/components/schemas/SourceMissingWarning'
 
     InputRecordingInputsWarning:
       type: object
@@ -1038,6 +1040,24 @@ components:
           type: array
           items:
             type: string
+        message:
+          type: string
+
+    SourceMissingWarning:
+      type: object
+      description: >-
+        An input assigned to a source that no longer exists (the source was
+        deleted while assigned). The slot is left out of the live flow: no
+        mixer input, no multiview tile, no `mixerInputMap` entry (#633).
+      required: [type, mixerInput, sourceId, message]
+      properties:
+        type:
+          type: string
+          enum: [source-missing]
+        mixerInput:
+          type: string
+        sourceId:
+          type: string
         message:
           type: string
 
