@@ -38,7 +38,9 @@ function makeStromClient() {
   };
 }
 
-function makeProduction(sources: Array<{ sourceId: string; mixerInput: string }>) {
+function makeProduction(
+  sources: Array<{ sourceId: string; mixerInput: string; returnFeed?: { synced: 'program' | 'program-minus' } }>,
+) {
   return {
     _id: 'prod-test-only',
     _rev: '1-abc',
@@ -109,6 +111,28 @@ describe('activateStromFlow — assignment whose source doc is gone (#633)', () 
       sourceId: GONE,
       message: expect.stringContaining(GONE),
     });
+  });
+
+  it('keeps guest-slot numbering in step with the controller when an orphan is a return-feed slot', async () => {
+    // guestSlotNumber counts every returnFeed assignment, orphans included, the
+    // same way the controller's guest-slot-label.ts does, so a dropped orphan
+    // guest slot must not renumber the guests that remain.
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    const { guestSlotNumber } = await import('../lib/guest-slot-label.js');
+    const strom = makeStromClient();
+    const production = makeProduction([
+      { sourceId: 'src-cam', mixerInput: 'video_in_0' },
+      { sourceId: 'Whip', mixerInput: 'video_in_14', returnFeed: { synced: 'program-minus' } },
+      { sourceId: GONE, mixerInput: 'video_in_15', returnFeed: { synced: 'program-minus' } },
+    ]);
+
+    const result = await activateStromFlow(production as never, strom as never);
+
+    expect(result.mixerInputMap).toEqual({ video_in_0: 0, video_in_14: 1 });
+    // The orphan in video_in_15 still holds Guest 1, so the live guest is Guest 2
+    // in both the flow's tile label and the controller's numbering.
+    expect(guestSlotNumber(production as never, 'video_in_14')).toBe(2);
+    expect(visionMixerProps(strom.capturedFlows[0]!)['input_1_label']).toBe('Guest 2 · In 15');
   });
 
   it('raises no source-missing warning when every source exists', async () => {

@@ -712,6 +712,10 @@ mutator runs on the freshly read doc on every attempt. Separately, source/graphi
 clean every production in `IDLE_PRODUCTION_STATUSES` (`inactive` **and** `ended`); `ended` is a
 deactivated production and was missed before. At activation, an assignment whose source doc is
 gone is dropped from the whole build (`liveAssignments` in `activateStromFlow`) with a
-`source-missing` warning — it gets no `mixerInputMap` entry, so the WS layer's
-`mixerInputToStromPad` falls back to its stored pad index for it, the same as for an input assigned
-after activation.
+`source-missing` warning — it gets no `mixerInputMap` entry but stays in `production.sources`, so
+Studio can still address it. An input with no map entry (this orphan, or an input assigned after
+activation) is never sent to Strom: when a map exists, `mixerInputToStromPad` and
+`storedPadToStromPad` return `null` instead of the stored index (which would be another input's
+compact pad — `video_in_5` → pad 5 = the guest in `video_in_15`), CUT/TRANSITION/TAKE to it are
+refused (tally rolled back, NACK), SET_PVW and SET_EFFECT send nothing, and PiP backgrounds/zone
+sources drop it. Only a production with no `mixerInputMap` at all still uses the stored index.
