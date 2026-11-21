@@ -18,7 +18,7 @@ import { CONTRACT_VERSION, computeTallyContributions, isMixerInputOnProgram } fr
 import { startMeterRelay, stopMeterRelay, reconcileMeterRelay } from '../services/meter-relay.js';
 import { guestInputBlocks, guestHealthSnapshot } from '../services/guest-health.js';
 import { StromClient, StromClientError, StromPropertiesRejectedError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms, type VideoEffect, type EffectTarget, type SetVideoEffectRequest } from '../lib/strom.js';
-import { mixerInputToStromPad, storedPadToStromPad, expandToStoredPadIndex } from '../lib/mixer-input-map.js';
+import { mixerInputToStromPad, storedPadToStromPad, storedPadIndex, expandToStoredPadIndex } from '../lib/mixer-input-map.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { graphicUrl } from '../lib/url-validation.js';
 import { decryptAddressPassphrase } from '../lib/srt-passphrase-crypto.js';
@@ -566,10 +566,26 @@ function padToIndex(mixerInput: string): number | null {
  * Translate a PiP config's zone `sources` (stored pad indices) to the COMPACT
  * Strom pad indices actually wired in the flow (issue #463). In-memory and
  * broadcast PiP state stays in stored space; this runs only at the Strom boundary.
+ * A source with no pad in the live mixer (not in the map, e.g. a dropped orphan
+ * slot, #633) is left out rather than sent as another input's pad.
  */
 function remapZonesToStromPads(zones: PipZone[], map: Record<string, number> | undefined): PipZone[] {
   if (!map) return zones;
-  return zones.map((z) => ({ ...z, sources: z.sources.map((s) => storedPadToStromPad(s, map)) }));
+  return zones.map((z) => ({
+    ...z,
+    sources: z.sources
+      .map((s) => storedPadToStromPad(s, map))
+      .filter((p): p is number => p !== null),
+  }));
+}
+
+/**
+ * The COMPACT Strom pad for a PiP background (stored pad index). `null` stays
+ * `null`, and so does a background with no pad in the live mixer (#633) — the
+ * PiP is sent without one instead of over another input's pad.
+ */
+function pipBgToStromPad(bg: number | null, map: Record<string, number> | undefined): number | null {
+  return bg === null ? null : storedPadToStromPad(bg, map);
 }
 
 /**
@@ -662,6 +678,14 @@ async function stromTransition(
   // Identity when this production has no compaction map.
   const toIndex = mixerInputToStromPad(toMixerInput, doc.mixerInputMap);
   if (toIndex === null) {
+    if (doc.mixerInputMap && storedPadIndex(toMixerInput) !== null) {
+      // A `video_in_N` input with no pad in the live mixer (a slot dropped at
+      // activation because its source was deleted, #633, or one assigned after
+      // activation). Nothing of it is on air, so refuse the switch: the caller
+      // rolls the tally back and NACKs instead of reporting it on program.
+      console.warn('[controller] Strom transition refused — input has no pad in the live mixer:', toMixerInput);
+      return false;
+    }
     console.warn('[controller] Strom transition skipped — cannot parse index from pad:', toMixerInput);
     return true;
   }
@@ -2104,7 +2128,7 @@ export async function handleMessage(
         // In-memory + broadcast PiP state stays in STORED pad space; only the
         // Strom write translates bg + zone sources to COMPACT pads (issue #463).
         const resp = await strom.mixer.updatePipConfig(doc.stromFlowId, doc.mixerBlockId, msg.pip, {
-          bg: msg.bg === null ? null : storedPadToStromPad(msg.bg, doc.mixerInputMap),
+          bg: pipBgToStromPad(msg.bg, doc.mixerInputMap),
           zones: remapZonesToStromPads(msg.zones, doc.mixerInputMap),
           transforms,
         });
@@ -3171,9 +3195,17 @@ export async function handleMessage(
       const effect = msg.effect as VideoEffect;
       // The Strom call addresses the COMPACT pad; in-memory FX state is kept in
       // STORED pad space so FX_STATE broadcasts match the client (issue #463).
-      const stromTarget: EffectTarget = target === 'master'
-        ? 'master'
-        : { input: storedPadToStromPad(target.input, doc.mixerInputMap) };
+      let stromTarget: EffectTarget = 'master';
+      if (target !== 'master') {
+        const stromInput = storedPadToStromPad(target.input, doc.mixerInputMap);
+        if (stromInput === null) {
+          // No pad in the live mixer for this input (#633): never send the
+          // effect to another input's pad.
+          ws.send(JSON.stringify({ type: 'ERROR', error: `FX: input ${target.input} is not in the live mixer` }));
+          break;
+        }
+        stromTarget = { input: stromInput };
+      }
       try {
         const strom = await makeStromClient();
         await strom.mixer.setVideoEffect(doc.stromFlowId, doc.mixerBlockId, { target: stromTarget, effect });
@@ -3674,7 +3706,7 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             await strom.mixer.updatePipConfig(flowId, mixerBlockId, i, {
               // Persisted PiP layout is in STORED pad space — translate to COMPACT
               // Strom pads for the re-push (issue #463).
-              bg: cfg.bg === null ? null : storedPadToStromPad(cfg.bg, connectDoc.mixerInputMap),
+              bg: pipBgToStromPad(cfg.bg, connectDoc.mixerInputMap),
               zones: remapZonesToStromPads(cfg.zones, connectDoc.mixerInputMap),
               transforms: cfg.transforms,
             }).catch((err) => console.warn('[controller] restore pipConfig error:', err));

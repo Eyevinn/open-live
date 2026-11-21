@@ -51,29 +51,37 @@ export function withGuestSlotStudioInputSuffix(label: string, mixerInput: string
 }
 
 /**
- * Forward: the compact Strom pad index for a stored `mixerInput` name. Falls back
- * to the stored numeric index when the input is not in the map.
+ * Forward: the compact Strom pad index for a stored `mixerInput` name.
+ *
+ * With no map (a legacy production, or one with no compaction) this is the
+ * stored numeric index. With a map, an input that is NOT in it has no pad in the
+ * live mixer — a slot whose source doc was deleted (issue #633) or an input
+ * assigned after activation — so this returns `null` and the caller must not
+ * send anything to Strom: falling back to the stored index would address a
+ * different input's compact pad and put the wrong source on air.
  */
 export function mixerInputToStromPad(
   mixerInput: string,
   map: Record<string, number> | undefined,
 ): number | null {
-  const mapped = map?.[mixerInput];
-  if (typeof mapped === 'number') return mapped;
-  return storedPadIndex(mixerInput);
+  if (!map) return storedPadIndex(mixerInput);
+  const mapped = map[mixerInput];
+  return typeof mapped === 'number' ? mapped : null;
 }
 
 /**
  * Forward: the compact Strom pad index for a stored numeric pad index (as carried
- * by PiP `bg` / zone `sources` / effect `target.input`). Identity when the input
- * is not compacted.
+ * by PiP `bg` / zone `sources` / effect `target.input`). Identity when there is
+ * no map; `null` when a map exists and the pad is not in it (same reason as
+ * `mixerInputToStromPad`) — callers drop or skip it rather than send it.
  */
 export function storedPadToStromPad(
   storedIndex: number,
   map: Record<string, number> | undefined,
-): number {
-  const mapped = map?.[`video_in_${storedIndex}`];
-  return typeof mapped === 'number' ? mapped : storedIndex;
+): number | null {
+  if (!map) return storedIndex;
+  const mapped = map[`video_in_${storedIndex}`];
+  return typeof mapped === 'number' ? mapped : null;
 }
 
 /**

@@ -38,8 +38,10 @@ describe('mixerInputToStromPad (forward, by name)', () => {
     expect(mixerInputToStromPad('video_in_14', MAP)).toBe(4);
     expect(mixerInputToStromPad('video_in_0', MAP)).toBe(0);
   });
-  it('falls back to the stored numeric index when not in the map', () => {
-    expect(mixerInputToStromPad('video_in_7', MAP)).toBe(7);
+  it('returns null for an input not in the map, never another input\'s pad (#633)', () => {
+    // video_in_5 would be compact pad 5 = Guest 1 (video_in_15) if it fell back.
+    expect(mixerInputToStromPad('video_in_5', MAP)).toBeNull();
+    expect(mixerInputToStromPad('video_in_7', MAP)).toBeNull();
   });
   it('is identity when no map is present', () => {
     expect(mixerInputToStromPad('video_in_15', undefined)).toBe(15);
@@ -51,8 +53,12 @@ describe('storedPadToStromPad (forward, by numeric index)', () => {
     expect(storedPadToStromPad(15, MAP)).toBe(5);
     expect(storedPadToStromPad(3, MAP)).toBe(3);
   });
-  it('is identity for an unmapped index or no map', () => {
-    expect(storedPadToStromPad(9, MAP)).toBe(9);
+  it('returns null for an index not in the map (#633)', () => {
+    expect(storedPadToStromPad(5, MAP)).toBeNull();
+    expect(storedPadToStromPad(9, MAP)).toBeNull();
+  });
+  it('is identity when no map is present', () => {
+    expect(storedPadToStromPad(9, undefined)).toBe(9);
     expect(storedPadToStromPad(15, undefined)).toBe(15);
   });
 });
