@@ -188,6 +188,25 @@ describe('switching to a mixer input that is not in mixerInputMap (#633)', () =>
     expect(sentToClient().filter((m) => m.type === 'NACK').at(-1)).toMatchObject({ cmdId: 'c-2' });
   });
 
+  it('reverse-PiP TAKE to the unmapped input on PVW sends nothing and is refused', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await send({ type: 'SELECT_PVW_PIP', pip: 0 });
+    await send({ type: 'TAKE', cmdId: 't-1' }); // PiP 0 to PGM
+    await send({ type: 'SET_PVW', mixerInput: 'video_in_5' });
+    const before = getTally(PROD);
+    stromRequests.length = 0;
+    (ws.send as ReturnType<typeof vi.fn>).mockClear();
+
+    await send({ type: 'TAKE', cmdId: 't-2' }); // PiP on PGM → the orphan input
+    warn.mockRestore();
+
+    expect(requestsTo(TRANSITION)).toHaveLength(0);
+    expect(before).toEqual({ pgm: null, pvw: 'video_in_5' });
+    expect(getTally(PROD)).toEqual(before);
+    expect(sentToClient().filter((m) => m.type === 'NACK').at(-1)).toMatchObject({ cmdId: 't-2' });
+    expect(sentToClient().filter((m) => m.type === 'ACK' && m.cmdId === 't-2' && m.phase === 'executed')).toHaveLength(0);
+  });
+
   it('SET_PVW does not preview another input\'s pad', async () => {
     await send({ type: 'SET_PVW', mixerInput: 'video_in_5' });
 

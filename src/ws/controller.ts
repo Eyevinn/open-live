@@ -657,6 +657,15 @@ async function makeStromClient(): Promise<StromClient> {
   return new StromClient({ baseUrl: config.stromUrl, token, blockPropertiesReadTimeoutMs: config.stromBlockPropertiesReadTimeoutMs })
 }
 
+// True when `mixerInput` is a `video_in_N` input that has no pad in the live
+// mixer: the production has a compaction map and the input is not in it (a
+// slot dropped at activation because its source was deleted, #633, or one
+// assigned after activation). Switching to such an input must be refused, never
+// sent to Strom, so every take path shares this check.
+function hasNoLivePad(mixerInput: string, map: Record<string, number> | undefined): boolean {
+  return !!map && storedPadIndex(mixerInput) !== null && mixerInputToStromPad(mixerInput, map) === null;
+}
+
 // Returns true when the transition either reached Strom successfully or there
 // was nothing to send (no flow configured / a degenerate skip) — i.e. nothing
 // Strom could disagree with. Returns false only when Strom actively rejected
@@ -678,7 +687,7 @@ async function stromTransition(
   // Identity when this production has no compaction map.
   const toIndex = mixerInputToStromPad(toMixerInput, doc.mixerInputMap);
   if (toIndex === null) {
-    if (doc.mixerInputMap && storedPadIndex(toMixerInput) !== null) {
+    if (hasNoLivePad(toMixerInput, doc.mixerInputMap)) {
       // A `video_in_N` input with no pad in the live mixer (a slot dropped at
       // activation because its source was deleted, #633, or one assigned after
       // activation). Nothing of it is on air, so refuse the switch: the caller
@@ -2024,7 +2033,13 @@ export async function handleMessage(
         }
       } else if (curPgmPip !== null) {
         // PiP is on PGM → taking to a real input; PiP moves to PVW.
-        if (doc.stromFlowId && doc.mixerBlockId) {
+        if (doc.stromFlowId && doc.mixerBlockId && tally.pvw && hasNoLivePad(tally.pvw, doc.mixerInputMap)) {
+          // The PVW input has no pad in the live mixer (#633). Strom's vision
+          // mixer would swap in whatever its own preview bus holds, so refuse
+          // like `stromTransition` does: roll back and NACK below.
+          console.warn('[controller] Strom reverse-PiP transition refused — input has no pad in the live mixer:', tally.pvw);
+          takeTransitionOk = false;
+        } else if (doc.stromFlowId && doc.mixerBlockId) {
           try {
             const strom = await makeStromClient();
             await strom.mixer.transition(doc.stromFlowId, doc.mixerBlockId, {

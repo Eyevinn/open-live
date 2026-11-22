@@ -716,6 +716,9 @@ gone is dropped from the whole build (`liveAssignments` in `activateStromFlow`) 
 Studio can still address it. An input with no map entry (this orphan, or an input assigned after
 activation) is never sent to Strom: when a map exists, `mixerInputToStromPad` and
 `storedPadToStromPad` return `null` instead of the stored index (which would be another input's
-compact pad — `video_in_5` → pad 5 = the guest in `video_in_15`), CUT/TRANSITION/TAKE to it are
-refused (tally rolled back, NACK), SET_PVW and SET_EFFECT send nothing, and PiP backgrounds/zone
-sources drop it. Only a production with no `mixerInputMap` at all still uses the stored index.
+compact pad — `video_in_5` → pad 5 = the guest in `video_in_15`). CUT, TRANSITION and every TAKE
+to it, including the reverse-PiP TAKE (PiP on PGM, the unmapped input on PVW), are refused with no
+`/transition` call: the tally is rolled back and the command NACKed. All take paths share the
+`hasNoLivePad` check in `src/ws/controller.ts`, so a new take path must use it too. SET_PVW to it is
+still accepted and ACKed (tally PVW names it) but sends no preview select to Strom. SET_EFFECT sends
+nothing and returns an `FX:` error, and PiP backgrounds/zone sources drop it. Only a production with no `mixerInputMap` at all still uses the stored index.
