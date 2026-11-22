@@ -975,6 +975,12 @@ export type ActivationWarning =
   | { type: 'input-recording-capped'; mixerInputs: string[]; message: string }
   /** An input asked to record a source whose type cannot be recorded. */
   | { type: 'input-recording-unsupported-source'; mixerInput: string; sourceId: string; message: string }
+  /**
+   * An assignment points at a source doc that no longer exists (deleted while
+   * assigned, issue #633). The slot is left out of the flow entirely: no input
+   * block, no mixer pad, no multiview tile, no `mixerInputMap` entry.
+   */
+  | { type: 'source-missing'; mixerInput: string; sourceId: string; message: string }
   | {
       type: 'audio-stream-not-applied';
       /** SourceDoc._id */
@@ -1150,7 +1156,7 @@ export interface ProductionDoc {
    * with `intercomProductionId`.
    */
   intercomManagerOrigin?: string;
-  /** Warnings accumulated when a referenced source/graphic/output was deleted while production was inactive */
+  /** Warnings accumulated when a referenced source/graphic/output was deleted while production was not on air (`inactive` or `ended`) */
   deletionWarnings?: Array<{ type: 'source' | 'graphic' | 'output'; name: string }>;
   /**
    * Problems found while going on air that did not stop activation, such as a

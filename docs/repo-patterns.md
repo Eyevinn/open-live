@@ -700,3 +700,25 @@ the stream-id), and tsdemux stream-ids end in the PID as `%08x` behind a shared 
 v0.8.3 `backend/src/blocks/builtin/mpegtssrt_input/audio_by_pid.rs:411` relies on this). So
 discovered index k is what `audioStreamIndex = k` selects, whatever order the PMT lists the
 streams in. Decoded caps carry `channels` but no codec or language.
+
+## `updateProductionDoc` spreads its patch as-is — derive array edits inside `mutateProductionDoc`
+
+`updateProductionDoc(id, patch)` re-reads `_rev` on a 409, but it spreads the SAME `patch` over the
+fresh doc. A patch computed from an earlier read (a filtered `sources`, an appended
+`deletionWarnings`) therefore overwrites a concurrent writer's change on retry: two overlapping
+`DELETE /api/v1/sources/:id` calls left the first-deleted id in the production (#633). Use
+`mutateProductionDoc(id, (fresh) => next | null)` for any read-modify-write of an array field — the
+mutator runs on the freshly read doc on every attempt. Separately, source/graphic/output deletes
+clean every production in `IDLE_PRODUCTION_STATUSES` (`inactive` **and** `ended`); `ended` is a
+deactivated production and was missed before. At activation, an assignment whose source doc is
+gone is dropped from the whole build (`liveAssignments` in `activateStromFlow`) with a
+`source-missing` warning — it gets no `mixerInputMap` entry but stays in `production.sources`, so
+Studio can still address it. An input with no map entry (this orphan, or an input assigned after
+activation) is never sent to Strom: when a map exists, `mixerInputToStromPad` and
+`storedPadToStromPad` return `null` instead of the stored index (which would be another input's
+compact pad — `video_in_5` → pad 5 = the guest in `video_in_15`). CUT, TRANSITION and every TAKE
+to it, including the reverse-PiP TAKE (PiP on PGM, the unmapped input on PVW), are refused with no
+`/transition` call: the tally is rolled back and the command NACKed. All take paths share the
+`hasNoLivePad` check in `src/ws/controller.ts`, so a new take path must use it too. SET_PVW to it is
+still accepted and ACKed (tally PVW names it) but sends no preview select to Strom. SET_EFFECT sends
+nothing and returns an `FX:` error, and PiP backgrounds/zone sources drop it. Only a production with no `mixerInputMap` at all still uses the stored index.

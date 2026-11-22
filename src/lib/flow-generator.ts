@@ -282,6 +282,23 @@ export async function activateStromFlow(
       console.warn(`[flow-generator] Source ${assignment.sourceId} (${assignment.mixerInput}) not found — skipping`);
     }
   }
+  // Assignments whose source doc is gone are left out of the flow ENTIRELY
+  // (issue #633): no input block, no mixer pad, no `mixerInputMap` entry, no
+  // multiview label. Keeping them in the pad compaction built a dead tile that
+  // Strom labelled with the raw source id. Every build step below works off
+  // `liveAssignments`; each dropped slot is reported as a `source-missing`
+  // activation warning.
+  const liveAssignments = production.sources.filter(
+    (a) => a.sourceId in VIRTUAL_SOURCES || sourceMap.has(a.sourceId),
+  );
+  const missingSourceWarnings: ActivationWarning[] = production.sources
+    .filter((a) => !(a.sourceId in VIRTUAL_SOURCES) && !sourceMap.has(a.sourceId))
+    .map((a) => ({
+      type: 'source-missing' as const,
+      mixerInput: a.mixerInput,
+      sourceId: a.sourceId,
+      message: `Input ${a.mixerInput} is assigned to source ${a.sourceId}, which no longer exists; the input was left out of this broadcast.`,
+    }));
 
   // Strom's block catalog, read lazily and at most once per activation: an
   // activation with no recorder and no SRT audio-stream selection never asks.
@@ -368,7 +385,7 @@ export async function activateStromFlow(
   // viewer — a return goes to exactly one guest's own WHEP output.
   const numCrewAuxBuses = numAuxBuses ?? 0;
   const returnBuses = assignReturnBuses(
-    production.sources,
+    liveAssignments,
     (id) => sourceMap.get(id) ?? (VIRTUAL_SOURCES[id] as SourceDoc | undefined),
     numCrewAuxBuses,
   );
@@ -578,7 +595,7 @@ export async function activateStromFlow(
 
   // Dynamically generate input blocks based on each source's streamType and wire
   // them to the correct mixer pad.
-  const sortedAssignments = [...production.sources].sort((a, b) =>
+  const sortedAssignments = [...liveAssignments].sort((a, b) =>
     a.mixerInput.localeCompare(b.mixerInput),
   );
 
@@ -601,7 +618,7 @@ export async function activateStromFlow(
     return m ? parseInt(m[1], 10) : null;
   };
   const mixerInputMap: Record<string, number> = {};
-  [...production.sources]
+  [...liveAssignments]
     .filter((a) => storedPadIndexOf(a.mixerInput) !== null)
     .sort((a, b) => storedPadIndexOf(a.mixerInput)! - storedPadIndexOf(b.mixerInput)!)
     .forEach((a, i) => { mixerInputMap[a.mixerInput] = i; });
@@ -641,6 +658,8 @@ export async function activateStromFlow(
   const guestSlotPadIndex = (mixerInput: string): number =>
     parseInt(/(\d+)$/.exec(mixerInput)?.[1] ?? '0', 10);
   const guestSlotNumber = new Map<string, number>();
+  // Numbered over ALL assignments (not `liveAssignments`) so the numbering stays
+  // identical to the controller's, which counts every returnFeed slot.
   [...production.sources]
     .filter((a) => !!a.returnFeed)
     .sort((a, b) => guestSlotPadIndex(b.mixerInput) - guestSlotPadIndex(a.mixerInput))
@@ -791,7 +810,7 @@ export async function activateStromFlow(
   // Maps mixerInput → time_offset block ID — returned so the WS layer can apply live changes.
   const sourceOffsetBlockIds: Record<string, string> = {};
   const sourceAudioOffsetBlockIds: Record<string, string> = {};
-  const warnings: ActivationWarning[] = [];
+  const warnings: ActivationWarning[] = [...missingSourceWarnings];
   // Maps mixerInput → builtin.media_player block ID for 'clip' sources — returned so the
   // clip cue/play control surface (#277/#278) can target the player block by mixer input.
   const clipPlayerBlockIds: Record<string, string> = {};
@@ -1415,7 +1434,7 @@ export async function activateStromFlow(
   const inputRecorders: ActiveInputRecording[] = [];
   {
     const plan = planInputRecordings(
-      production.sources,
+      liveAssignments,
       (id) => sourceMap.get(id) ?? (VIRTUAL_SOURCES[id] as SourceDoc | undefined),
       { recorderType, maxInputs: config.recordingMaxInputs },
     );

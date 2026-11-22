@@ -5,7 +5,7 @@ import { getDb, getOutputsDb, getRecordingsDb, getSourcesDb } from '../db/index.
 import { isDocNotFoundError } from '../lib/db-errors.js';
 import { VIRTUAL_SOURCES } from '../lib/audio-channels.js';
 import { sweepGuestsOnProductionEnd } from '../services/guest-sweep.js';
-import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc, RecordingDoc, ActiveRecording, RecordingUploadSummary, RecorderType, ActiveInputRecording } from '../db/types.js';
+import type { ProductionDoc, ProductionStatus, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc, RecordingDoc, ActiveRecording, RecordingUploadSummary, RecorderType, ActiveInputRecording } from '../db/types.js';
 import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { stromBrowserBaseUrl } from '../lib/strom-public-url.js';
@@ -49,6 +49,14 @@ const FLOW_POLL_TIMEOUT_MS = 30_000;
 /** Longest an activation waits for the recorder-event socket before `flows.start` (spec §6). */
 const RECORDER_EVENTS_READY_MS = 2000;
 const MAX_DB_WRITE_RETRIES = 3;
+
+/**
+ * Production statuses that are not on air. Deleting a source/graphic/output a
+ * production in one of these uses removes the reference and records a
+ * `deletionWarnings` entry; `active`/`activating` refuse the delete instead.
+ * `ended` is a deactivated production and is just as idle as `inactive` (#633).
+ */
+export const IDLE_PRODUCTION_STATUSES: readonly ProductionStatus[] = ['inactive', 'ended'];
 
 // ---------------------------------------------------------------------------
 // AbortController map — keyed by production ID, allows deactivate to cancel
@@ -159,17 +167,38 @@ function isConflict(err: unknown): boolean {
 /**
  * Write a partial update to ProductionDoc with retry-on-409.
  * Re-reads the document before each retry to get the latest _rev.
+ *
+ * The patch is spread over the fresh doc as-is, so it must not be derived from
+ * an earlier read of a field another writer may change concurrently (a filtered
+ * `sources` array, an appended `deletionWarnings` list): use
+ * `mutateProductionDoc` for those, which re-derives the change on every attempt.
  */
 export async function updateProductionDoc(
   productionId: string,
   patch: Partial<ProductionDoc>,
 ): Promise<void> {
+  await mutateProductionDoc(productionId, (doc) => ({ ...doc, ...patch }));
+}
+
+/**
+ * Read-modify-write a ProductionDoc with retry-on-409, applying `mutate` to the
+ * FRESHLY read doc on every attempt (issue #633). Two overlapping writers that
+ * each filter/append an array field both land, instead of the later one
+ * re-writing the array from its stale snapshot and undoing the earlier one.
+ * `mutate` returns the doc to insert (`updatedAt` is stamped here), or `null`
+ * when there is nothing to change, in which case no write is made.
+ */
+export async function mutateProductionDoc(
+  productionId: string,
+  mutate: (doc: ProductionDoc) => ProductionDoc | null,
+): Promise<void> {
   for (let attempt = 0; attempt < MAX_DB_WRITE_RETRIES; attempt++) {
     try {
       const doc = await getDb().get(productionId);
+      const next = mutate(doc);
+      if (next === null) return;
       const updated: ProductionDoc = {
-        ...doc,
-        ...patch,
+        ...next,
         updatedAt: new Date().toISOString(),
       };
       await getDb().insert(updated);
