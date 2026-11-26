@@ -65,6 +65,38 @@ function parseRecordingBlockEnv(name: string): RecordingBlockSetting {
   throw new Error(`Environment variable ${name} must be "auto" or "recorder", got "${raw}"`);
 }
 
+/** Parses an optional env var that must be one of `allowed`; anything else fails startup. */
+function parseChoiceEnv<T extends string>(name: string, allowed: readonly T[], defaultValue: T): T {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return defaultValue;
+  const value = raw.trim().toLowerCase();
+  if ((allowed as readonly string[]).includes(value)) return value as T;
+  throw new Error(`Environment variable ${name} must be one of ${allowed.join(', ')}, got "${raw}"`);
+}
+
+/** Parses `TAMS_GATEWAY_URL`: an http(s) base URL without credentials; anything else fails startup. */
+function parseTamsGatewayUrl(name: string): string | undefined {
+  const raw = optionalEnv(name);
+  if (!raw) return undefined;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`Environment variable ${name} must be an http(s) URL, got "${raw}"`);
+  }
+  if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password) {
+    throw new Error(`Environment variable ${name} must be an http(s) URL without credentials`);
+  }
+  return raw.replace(/\/+$/, '');
+}
+
+/** Parses `TAMS_SEGMENT_MS`: unset or 0 (off), or an integer from 200 to 10000. */
+function parseTamsSegmentMs(name: string): number {
+  const value = parseNonNegativeIntEnv(name, 0, 10_000);
+  if (value !== 0 && value < 200) throw new Error(`Environment variable ${name} must be 0 (off) or from 200 to 10000, got "${process.env[name]}"`);
+  return value;
+}
+
 /** Parses an optional integer env var that must lie in `[min, max]`; anything else fails startup. */
 function parseIntRangeEnv(name: string, defaultValue: number, min: number, max: number): number {
   const raw = process.env[name];
@@ -395,6 +427,43 @@ export const config = {
   recordingMaxInputs: parseIntRangeEnv('RECORDING_MAX_INPUTS', 4, 0, 16),
   /** `bitrate` (kbit/s) of each input recorder's H.264 encode (OL-32). Integer 500-50000, default 4000. */
   recordingInputVideoBitrateKbps: parseIntRangeEnv('RECORDING_INPUT_VIDEO_BITRATE_KBPS', 4000, 500, 50_000),
+  // --- TAMS tap (every input also written to a TAMS store, inside the production's flow) ---
+  /**
+   * Base URL of the TAMS gateway (`src/lib/tams-tap.ts`). Unset: the tap is off
+   * and flows are built exactly as before. Set: every input of a production is
+   * written to this gateway. No credential belongs here or in the flow: the
+   * token is read by Strom (`STROM_TAMS_API_TOKEN`, or the OSC PAT in `osc` mode).
+   */
+  tamsGatewayUrl: parseTamsGatewayUrl('TAMS_GATEWAY_URL'),
+  /** How Strom authenticates to the gateway: `static` bearer token (default) or `osc` PAT/SAT. */
+  tamsAuthMode: parseChoiceEnv('TAMS_AUTH_MODE', ['static', 'osc'] as const, 'static'),
+  /** Segment container: `mpegts` (default, one muxed flow per input) or `mp4` (one flow per essence). */
+  tamsContainer: parseChoiceEnv('TAMS_CONTAINER', ['mpegts', 'mp4'] as const, 'mpegts'),
+  /** Length in seconds of each TAMS segment. Integer 1-10, default 1 (replay reads segments as they land). */
+  tamsSegmentSecs: parseIntRangeEnv('TAMS_SEGMENT_SECS', 1, 1, 10),
+  /**
+   * Segment length in ms, for sub-second segments. `0` (default) leaves it to `TAMS_SEGMENT_SECS`; otherwise 200 to
+   * 10000, and it wins. Needs a Strom whose TAMS Output has `segment_duration_ms`: an older one ignores it or refuses
+   * the flow. Shorter segments cut the wait for a segment and the replay's polling, and double the gateway writes.
+   */
+  tamsSegmentMs: parseTamsSegmentMs('TAMS_SEGMENT_MS'),
+  /**
+   * Keyframe interval in frames of each tap's H.264 encode. Strom cuts a segment on a
+   * keyframe, so it must divide the segment length: 15 frames is 0.5 s at 30 fps.
+   * Integer 1-300, default 15.
+   */
+  tamsKeyframeInterval: parseIntRangeEnv('TAMS_KEYFRAME_INTERVAL', 15, 1, 300),
+  /** `bitrate` (kbit/s) of each tap's H.264 encode. Integer 500-50000, default 4000. */
+  tamsVideoBitrateKbps: parseIntRangeEnv('TAMS_VIDEO_BITRATE_KBPS', 4000, 500, 50_000),
+  /**
+   * x264 speed preset of each tap's encode. `ultrafast` (default) is cheapest on CPU; slower presets give more
+   * picture per bit, which matters when the store is a master copy for replay or air.
+   */
+  tamsVideoPreset: parseChoiceEnv('TAMS_VIDEO_PRESET', ['ultrafast', 'fast', 'medium', 'slow', 'veryslow'] as const, 'ultrafast'),
+  /** x264 tune of each tap's encode. `zerolatency` (default) turns off look-ahead and B-frames; `film` keeps them. */
+  tamsVideoTune: parseChoiceEnv('TAMS_VIDEO_TUNE', ['zerolatency', 'film', 'animation', 'grain', 'stillimage', 'fastdecode'] as const, 'zerolatency'),
+  /** Most inputs one production writes to TAMS; each adds one H.264 encode on Strom. Integer 0-32, default 20. */
+  tamsMaxInputs: parseIntRangeEnv('TAMS_MAX_INPUTS', 20, 0, 32),
   // --- Storage connections (issue #520, OL-21, docs/specs/storage-connections.md, ADR-009) ---
   /**
    * SSRF allowlist for operator-supplied storage-connection endpoints (ADR-009

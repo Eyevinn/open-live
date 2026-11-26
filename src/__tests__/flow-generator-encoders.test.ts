@@ -80,12 +80,12 @@ describe('flow-generator — viewer/program encoder split (#413)', () => {
     const links = flow['links'] as Link[];
 
     const encView = byName(blocks, 'Enc View');
-    const encPgm = byName(blocks, 'Enc PGM');
     expect(encView).toBeDefined();
-    expect(encPgm).toBeDefined();
-    // Default viewer encode is low-bitrate (~4 Mbit/s), program encode stays 10 Mbit/s.
+    // Default viewer encode is low-bitrate (~4 Mbit/s). The full-rate program encode
+    // (Enc PGM) feeds only recorder/RTMP/SRT outputs, so with none assigned it is
+    // dropped rather than left encoding for nobody (see flow-generator-idle-pgm-encoder).
+    expect(byName(blocks, 'Enc PGM')).toBeUndefined();
     expect((encView!['properties'] as Block)['bitrate']).toBe(4000);
-    expect((encPgm!['properties'] as Block)['bitrate']).toBe(10000);
 
     const mixer = blocks.find((b) => b['block_definition_id'] === 'builtin.vision_mixer')!;
     const mixerId = mixer['id'] as string;
@@ -98,7 +98,6 @@ describe('flow-generator — viewer/program encoder split (#413)', () => {
     const pgmWhep = blocks.find((b) => b['block_definition_id'] === 'builtin.whep_output' && b['name'] === 'PGM Output')!;
     const pgmWhepFeed = links.find((l) => l['to'] === `${pgmWhep['id'] as string}:video_in`)!;
     expect(pgmWhepFeed['from']).toBe(`${encViewId}:encoded_out`);
-    expect(pgmWhepFeed['from']).not.toBe(`${encPgm!['id'] as string}:encoded_out`);
   });
 
   it('routes the recorder to Enc PGM and a WHEP output to Enc View', async () => {
@@ -176,7 +175,10 @@ describe('flow-generator — viewer/program encoder split (#413)', () => {
       viewer_bitrate: 2500,
     });
 
-    await activateStromFlow(production as never, strom as never);
+    // An output on the program encode keeps Enc PGM, so its bitrate can be checked.
+    await activateStromFlow(production as never, strom as never, 'http://localhost:7000', [
+      { _id: 'output-rec-abc12345', type: 'output', outputType: recordingOutput, name: 'VOD', createdAt: '', updatedAt: '' },
+    ] as never);
     const blocks = strom.capturedFlows[0]!['blocks'] as Block[];
     expect((byName(blocks, 'Enc PGM')!['properties'] as Block)['bitrate']).toBe(8000);
     expect((byName(blocks, 'Enc MV')!['properties'] as Block)['bitrate']).toBe(3000);

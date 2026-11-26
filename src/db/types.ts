@@ -175,6 +175,8 @@ export interface SourceDoc {
   streamType: StreamType;
   status: SourceStatus;
   liveCamera?: boolean;
+  /** false: never written to the TAMS store (e.g. an Open Replay program fed back in). Absent => written. */
+  recordToTams?: boolean;
   /** SRT receiver buffer latency in ms. Only applies to srt/efp stream types. Default 125. */
   latency?: number;
   /**
@@ -975,6 +977,17 @@ export type ActivationWarning =
   | { type: 'input-recording-capped'; mixerInputs: string[]; message: string }
   /** An input asked to record a source whose type cannot be recorded. */
   | { type: 'input-recording-unsupported-source'; mixerInput: string; sourceId: string; message: string }
+  /** `TAMS_GATEWAY_URL` is set but this Strom lacks the TAMS Output or Video Encoder block (or its block list was unreadable). */
+  | { type: 'tams-unavailable'; mixerInputs: string[]; message: string }
+  /** The production asked for the latency burn-in (`values.latency_burn_in`) but this Strom lacks `builtin.reference_timestamp`. */
+  | { type: 'latency-burn-in-unavailable'; message: string }
+  /**
+   * `TAMS_AUTH_MODE=osc` but Open Live has no OSC token to give Strom (so the inputs are not
+   * written to TAMS), or Strom refused it (the TAMS blocks are in the flow but cannot sign in).
+   */
+  | { type: 'tams-no-token'; mixerInputs: string[]; message: string }
+  /** More inputs than `TAMS_MAX_INPUTS`; lists the ones not written to TAMS. */
+  | { type: 'tams-capped'; mixerInputs: string[]; message: string }
   /**
    * An assignment points at a source doc that no longer exists (deleted while
    * assigned, issue #633). The slot is left out of the flow entirely: no input

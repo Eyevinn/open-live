@@ -962,6 +962,24 @@ export class StromClient {
   // Port pool
   // -------------------------------------------------------------------------
 
+  // -------------------------------------------------------------------------
+  // OSC PAT (per-flow credential for OSC-backed blocks, e.g. TAMS Output)
+  // -------------------------------------------------------------------------
+
+  osc = {
+    /**
+     * Hands an OSC Personal Access Token to Strom for one flow (key = flow id).
+     * Strom holds it in memory only and mints Service Access Tokens from it for
+     * that flow's OSC-backed blocks, so the token never sits in Strom's
+     * environment or in the flow definition. Push it after `flows.create` and
+     * before `flows.start`.
+     */
+    setPat: (flowId: string, pat: string) =>
+      this.put<unknown>(`/api/osc/pat/${encodeURIComponent(flowId)}`, { pat }),
+    /** Forgets the flow's PAT. Strom answers 200 whether or not one was set. */
+    clearPat: (flowId: string) => this.del<unknown>(`/api/osc/pat/${encodeURIComponent(flowId)}`),
+  }
+
   ports = {
     /**
      * Answers whether this Strom hands out ports at all, and how much of its

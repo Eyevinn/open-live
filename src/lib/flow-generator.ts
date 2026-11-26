@@ -18,6 +18,12 @@ import { buildStromPropsFromStore } from './audio-processing.js';
 import { withGuestSlotStudioInputSuffix } from './mixer-input-map.js';
 import { PREVIEW_STREAM_TYPES } from './commentator-preview.js';
 import { inputRecordingDir, inputRecordingPrefix, planInputRecordings } from './input-recording.js';
+import { BURN_IN_BLOCK, burnInRequested, spliceBurnIn } from './burn-in.js';
+import {
+  planTamsTaps, tamsSourceId, tamsTags, TAMS_AUDIO_ENCODER_BLOCK, TAMS_OUTPUT_BLOCK,
+  TAMS_REFERENCE_TIMESTAMP_BLOCK, TAMS_VIDEO_ENCODER_BLOCK,
+  type ActiveTamsTap,
+} from './tams-tap.js';
 import { assignPortsToFlow, unassignPortsFromFlow } from '../services/port-reservation.js';
 import { listenerPortRequest } from '../services/listener-ports.js';
 
@@ -58,6 +64,11 @@ export interface ActivationResult {
    * with Live Recorder and some assignment has `record: 'transcode'`.
    */
   inputRecorders: ActiveInputRecording[];
+  /**
+   * One entry per input written to a TAMS store (`src/lib/tams-tap.ts`). Empty
+   * unless `TAMS_GATEWAY_URL` is set.
+   */
+  tamsTaps: ActiveTamsTap[];
   /**
    * Problems that did not stop the production from going on air but that the
    * operator needs to know about (e.g. a recording with no sound).
@@ -219,6 +230,35 @@ function findPgmFeedPad(flow: FlowTopology): string | null {
   ) as Record<string, unknown> | undefined;
   if (encPgm) return `${encPgm['id'] as string}:video_out`;
   return null;
+}
+
+/**
+ * Drops the template's `Enc PGM` when nothing consumes its encoded output.
+ *
+ * `Enc PGM` is the full-rate (10 Mbit/s) program encode that the recording, RTMP
+ * and SRT outputs hang on. The template wires it only to its own SRT output block,
+ * which the generator strips, so a production with no such output assigned keeps an
+ * encoder that encodes the program for nobody, at full rate, and falls behind on a
+ * modest node. WHEP viewers and guest returns use `Enc View`, never `Enc PGM`.
+ * Run this once every output has been wired. Returns whether it dropped the block.
+ */
+function pruneIdleProgramEncoder(flow: FlowTopology): boolean {
+  const enc = flow.blocks.find(
+    (b) =>
+      (b as Record<string, unknown>)['block_definition_id'] === 'builtin.videoenc' &&
+      (b as Record<string, unknown>)['name'] === 'Enc PGM',
+  ) as Record<string, unknown> | undefined;
+  if (!enc) return false;
+  const id = enc['id'] as string;
+  const touches = (end: unknown) => String(end ?? '').split(':')[0] === id;
+  const consumed = flow.links.some((l) => touches((l as Record<string, unknown>)['from']));
+  if (consumed) return false;
+  flow.blocks = flow.blocks.filter((b) => (b as Record<string, unknown>)['id'] !== id);
+  flow.links = flow.links.filter((l) => {
+    const link = l as Record<string, unknown>;
+    return !touches(link['from']) && !touches(link['to']);
+  });
+  return true;
 }
 
 /**
@@ -1418,6 +1458,23 @@ export async function activateStromFlow(
     }
   }
 
+  // Latency burn-in (src/lib/burn-in.ts): on request, stamp each input with its time and draw the time into the
+  // picture, right after the input and before everything that taps it, so the program output, the ISO recorder
+  // and the TAMS tap all carry it and a viewer can read the delay off any of them.
+  if (burnInRequested(production.values)) {
+    const catalog = await getStromBlocks();
+    if (catalog?.some((b) => b.id === BURN_IN_BLOCK)) {
+      spliceBurnIn(flow, inputTaps, endpointSuffix, COL_OFFSET - 130);
+    } else {
+      warnings.push({
+        type: 'latency-burn-in-unavailable',
+        message: catalog
+          ? `The production asks for the latency burn-in, but this Strom has no ${BURN_IN_BLOCK} block.`
+          : "The production asks for the latency burn-in, but Strom's block list could not be read.",
+      });
+    }
+  }
+
   // ISO input recorders (OL-32, spec iso-input-recording.md §4.3, ADR-011). Only
   // on the Live Recorder path: one builtin.liverecorder per recorded input,
   // holding the input's video (re-encoded to H.264 for clean splits) and raw
@@ -1502,6 +1559,142 @@ export async function activateStromFlow(
         streamType,
         recorderBlockId: recId,
         outputDir,
+      });
+    }
+  }
+
+  // TAMS tap: every input is also written to a TAMS store from inside this same
+  // flow (src/lib/tams-tap.ts). Same tap point and the same leaky queues as the
+  // input recorder above: a slow gateway may drop frames from the store, never
+  // back-pressure the tee that feeds the mixers. Video and audio are both encoded
+  // here because builtin.tams_output refuses raw input of either kind. Off unless
+  // TAMS_GATEWAY_URL is set.
+  const tamsTaps: ActiveTamsTap[] = [];
+  if (config.tamsGatewayUrl) {
+    const tappable = liveAssignments.filter(
+      (a) => inputTaps.has(a.mixerInput) && sourceMap.get(a.sourceId)?.recordToTams !== false,
+    );
+    // OSC mode signs in with Open Live's own PAT, which it hands to Strom for
+    // this flow (below). With none to hand over the blocks could never write,
+    // so leave them out and say why, rather than ship blocks that fail quietly.
+    const noToken = config.tamsAuthMode === 'osc' && !config.oscPat && tappable.length > 0;
+    if (noToken) {
+      warnings.push({
+        type: 'tams-no-token',
+        mixerInputs: tappable.map((a) => a.mixerInput),
+        message:
+          `Inputs ${tappable.map((a) => a.mixerInput).join(', ')} are not written to TAMS: TAMS_AUTH_MODE=osc ` +
+          'needs an OSC access token (OSC_ACCESS_TOKEN) on Open Live, and none is set.',
+      });
+    }
+    const catalog = tappable.length > 0 && !noToken ? await getStromBlocks() : null;
+    const plan = noToken ? { taps: [], warnings: [], referenceTimestamp: false } : planTamsTaps(
+      tappable,
+      (id) => sourceMap.get(id) ?? (VIRTUAL_SOURCES[id] as SourceDoc | undefined),
+      { blockIds: catalog ? new Set(catalog.map((b) => b.id)) : null, maxInputs: config.tamsMaxInputs },
+    );
+    warnings.push(...plan.warnings);
+    const leakyQueue = { leaky: 'downstream', 'max-size-buffers': 0, 'max-size-bytes': 0, 'max-size-time': 1_000_000_000 };
+    const COL_TAMS = COL_OUTPUT - 400;
+    for (const { assignment } of plan.taps) {
+      const tap = inputTaps.get(assignment.mixerInput)!;
+      const source = sourceMap.get(assignment.sourceId) ?? (VIRTUAL_SOURCES[assignment.sourceId] as SourceDoc | undefined);
+      const sourceName = multiviewLabels.get(assignment.mixerInput) ?? source?.name ?? assignment.mixerInput;
+      // Keyed by the STORED pad index, like b-offset-N — never the compacted one.
+      const n = tap.padIndex;
+      const vqId = `e-tams-vq-${n}-${endpointSuffix}`;
+      const aqId = `e-tams-aq-${n}-${endpointSuffix}`;
+      const tsId = `b-tams-ts-${n}-${endpointSuffix}`;
+      const vencId = `b-tams-venc-${n}-${endpointSuffix}`;
+      const aencId = `b-tams-aenc-${n}-${endpointSuffix}`;
+      const tamsId = `b-tams-${n}-${endpointSuffix}`;
+      const stableSourceId = tamsSourceId(production._id, assignment.mixerInput);
+      flow.elements.push(
+        { id: vqId, element_type: 'queue', properties: { ...leakyQueue }, position: [COL_TAMS - 200, tap.y + 120] },
+        { id: aqId, element_type: 'queue', properties: { ...leakyQueue }, position: [COL_TAMS - 200, tap.y + 180] },
+      );
+      if (plan.referenceTimestamp) {
+        // Absolute time on every frame, which TAMS Output anchors its TAI grid on.
+        flow.blocks.push({
+          id: tsId,
+          block_definition_id: TAMS_REFERENCE_TIMESTAMP_BLOCK,
+          name: `TAMS ${assignment.mixerInput} timestamp`,
+          properties: { timescale: 'tai', burn_in: false },
+          position: { x: COL_TAMS - 100, y: tap.y + 120 },
+        });
+      }
+      flow.blocks.push(
+        {
+          id: vencId,
+          block_definition_id: TAMS_VIDEO_ENCODER_BLOCK,
+          name: `TAMS ${assignment.mixerInput} video encoder`,
+          properties: {
+            codec: 'h264',
+            bitrate: config.tamsVideoBitrateKbps,
+            // A short GOP for fast seeking and jog (~0.5 s), and no limit on keyframe
+            // requests: Strom's default of one per second stops TAMS Output asking for
+            // a keyframe at every grid point, so segments would miss whole TAI seconds.
+            keyframe_interval: config.tamsKeyframeInterval,
+            min_keyframe_request_interval_ms: 0,
+            tune: config.tamsVideoTune,
+            quality_preset: config.tamsVideoPreset,
+          },
+          position: { x: COL_TAMS, y: tap.y + 120 },
+        },
+        {
+          id: aencId,
+          block_definition_id: TAMS_AUDIO_ENCODER_BLOCK,
+          name: `TAMS ${assignment.mixerInput} audio encoder`,
+          // AAC at the block's defaults (128 kbit/s, 48 kHz): a codec TAMS Output accepts.
+          properties: { codec: 'aac' },
+          position: { x: COL_TAMS, y: tap.y + 180 },
+        },
+        {
+          id: tamsId,
+          block_definition_id: TAMS_OUTPUT_BLOCK,
+          name: `TAMS ${assignment.mixerInput}`,
+          // No token here: Strom reads it from its own environment.
+          properties: {
+            gateway_url: config.tamsGatewayUrl,
+            auth_mode: config.tamsAuthMode,
+            container: config.tamsContainer,
+            segment_duration_secs: config.tamsSegmentSecs,
+            // Sub-second segments, only when asked for: a Strom without the property would not know it.
+            ...(config.tamsSegmentMs > 0 ? { segment_duration_ms: config.tamsSegmentMs } : {}),
+            num_video_tracks: 1,
+            num_audio_tracks: 1,
+            tams_source_id: stableSourceId,
+            label: sourceName,
+            tags: tamsTags({
+              productionId: production._id,
+              productionName: production.name,
+              mixerInput: assignment.mixerInput,
+              sourceId: assignment.sourceId,
+              sourceName,
+            }),
+          },
+          position: { x: COL_TAMS + 200, y: tap.y + 120 },
+        },
+      );
+      flow.links.push(
+        { from: tap.video, to: `${vqId}:sink` },
+        ...(plan.referenceTimestamp
+          ? [
+              { from: `${vqId}:src`, to: `${tsId}:in` },
+              { from: `${tsId}:out`, to: `${vencId}:video_in` },
+            ]
+          : [{ from: `${vqId}:src`, to: `${vencId}:video_in` }]),
+        { from: `${vencId}:encoded_out`, to: `${tamsId}:video_in_0` },
+        { from: tap.audio, to: `${aqId}:sink` },
+        { from: `${aqId}:src`, to: `${aencId}:audio_in` },
+        { from: `${aencId}:encoded_out`, to: `${tamsId}:audio_in_0` },
+      );
+      tamsTaps.push({
+        mixerInput: assignment.mixerInput,
+        sourceId: assignment.sourceId,
+        sourceName,
+        tamsBlockId: tamsId,
+        tamsSourceId: stableSourceId,
       });
     }
   }
@@ -1618,6 +1811,9 @@ export async function activateStromFlow(
     }
   }
 
+  // Every output is wired by now: drop the program encoder if none of them uses it.
+  pruneIdleProgramEncoder(flow);
+
   // POST /api/flows takes the full Flow struct. The server requires 'id' in the
   // body but overwrites it with a new UUID — always use created.flow.id for
   // all subsequent calls.
@@ -1656,9 +1852,31 @@ export async function activateStromFlow(
   ];
   void assignPortsToFlow(portLog, flowId, boundPorts);
 
+  // Hand Strom the OSC token for this flow before it starts, so the TAMS Output
+  // blocks can sign in to the gateway from their first segment. Keyed by the flow
+  // id, held in Strom's memory only, and cleared on deactivate. A refusal (an old
+  // Strom without the endpoint, a bad token) must not stop the production: it
+  // goes on air and the operator is warned that the TAMS blocks cannot sign in.
+  let patPushed = false;
+  if (tamsTaps.length > 0 && config.tamsAuthMode === 'osc' && config.oscPat) {
+    try {
+      await strom.osc.setPat(flowId, config.oscPat);
+      patPushed = true;
+    } catch (err) {
+      warnings.push({
+        type: 'tams-no-token',
+        mixerInputs: tamsTaps.map((t) => t.mixerInput),
+        message:
+          'The inputs are in the flow but cannot write to TAMS: Strom did not accept the OSC token ' +
+          `(${err instanceof Error ? err.message : String(err)}).`,
+      });
+    }
+  }
+
   try {
     await strom.flows.start(flowId);
   } catch (err) {
+    if (patPushed) await strom.osc.clearPat(flowId).catch(() => undefined);
     // Log a sanitized flow projection — never log block properties (may contain SRT URIs, tokens, passphrases)
     const safeFlow = safeFlowProjection(flow as unknown as Record<string, unknown>);
     console.error('[flow-generator] Flow start failed. Flow topology (properties redacted):',
@@ -1684,6 +1902,7 @@ export async function activateStromFlow(
     recorderOutputId,
     recorderOutputDir,
     inputRecorders,
+    tamsTaps,
     warnings,
     sourceOffsetBlockIds,
     sourceAudioOffsetBlockIds,
@@ -1717,6 +1936,15 @@ export async function deactivateStromFlow(
     await strom.flows.delete(stromFlowId);
   } catch {
     // ignore — flow may not exist
+  }
+  // The flow is stopped, so its last segments have been written: forget the OSC
+  // token Strom held for it (see activateStromFlow). Only OSC mode ever pushed one.
+  if (config.tamsGatewayUrl && config.tamsAuthMode === 'osc') {
+    try {
+      await strom.osc.clearPat(stromFlowId);
+    } catch {
+      // ignore — Strom may be older, gone, or never have held one
+    }
   }
   // The ports go back to our reservation, not to Strom's pool. Strom drops the
   // association on its own once the flow is gone, so this only makes it prompt.

@@ -129,6 +129,9 @@ const SourceInput = z.object({
   streamType: z.enum(['srt', 'efp', 'whip', 'html', 'clip']),
   status: z.enum(['active', 'inactive']).default('inactive'),
   liveCamera: z.boolean().optional(),
+  // false keeps this source out of the TAMS store (an Open Replay program fed back in would
+  // otherwise be recorded as an angle of its own production). Absent => written.
+  recordToTams: z.boolean().optional(),
   latency: z.number().int().min(20).max(8000).optional(),
   // Optional 0-based audio elementary-stream index (ADR-006 Decision 1). SRT/EFP only
   // (enforced in the route handler); absent => 0. Non-live property: no 409 guard.
@@ -150,6 +153,9 @@ const SourcePatch = z.object({
   streamType: z.enum(['srt', 'efp', 'whip', 'html', 'clip']).optional(),
   status: z.enum(['active', 'inactive']).optional(),
   liveCamera: z.boolean().optional(),
+  // false keeps this source out of the TAMS store (an Open Replay program fed back in would
+  // otherwise be recorded as an angle of its own production). Absent => written.
+  recordToTams: z.boolean().optional(),
   latency: z.number().int().min(20).max(8000).optional(),
   // Optional 0-based audio elementary-stream index (ADR-006 Decision 1). SRT/EFP only
   // (enforced in the route handler); absent => 0. Non-live property: no 409 guard.
@@ -379,6 +385,7 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
         streamType: body.streamType,
         status: body.status,
         liveCamera: body.liveCamera,
+        ...(body.recordToTams !== undefined ? { recordToTams: body.recordToTams } : {}),
         latency: body.latency,
         ...(body.audioStreamIndex !== undefined ? { audioStreamIndex: body.audioStreamIndex } : {}),
         // Only persist gatewayId when supplied — existing clients omit it and
